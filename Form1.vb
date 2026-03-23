@@ -797,9 +797,25 @@ Public Class Form1
         ' allocating via GMP's allocator.  After installing the VirtualAlloc custom
         ' allocator, gmp_lib.free on a GMP-allocated export buffer would call CRT
         ' free() on a VirtualAlloc'd pointer — undefined behaviour / crash.
+        '
+        ' Issue #11 fix: use VirtualAlloc/VirtualFree instead of Marshal.AllocHGlobal
+        ' for large export buffers.  HeapFree on the process heap does NOT decommit
+        ' pages for large allocations — Windows keeps them in the heap free list.
+        ' After serialising mpR0 and mpR1 (~391 MB each), ~782 MB of "freed" heap
+        ' pages remain committed, pushing the committed-memory baseline high enough
+        ' that VirtualAlloc fails during Pass 2's mpz_mul FFT scratch allocation.
         Dim bitCount As Long = CLng(gmp_lib.mpz_sizeinbase(val, 2))
         Dim capacity As Long = (bitCount + 7) \ 8L + 1L
-        Dim buf As IntPtr = Marshal.AllocHGlobal(New IntPtr(capacity))
+        Dim buf As IntPtr
+        Dim useVA As Boolean = (capacity >= GMP_LARGE_THRESHOLD)
+        If useVA Then
+            buf = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(capacity)),
+                               MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If buf = IntPtr.Zero Then _
+                Throw New OutOfMemoryException($"VirtualAlloc({capacity:N0}) failed in SerializeOneMpz")
+        Else
+            buf = Marshal.AllocHGlobal(New IntPtr(capacity))
+        End If
         Try
             Dim count As size_t = New size_t(0)
             gmp_lib.mpz_export(New void_ptr(buf), count, 1, New size_t(1), 0, New size_t(0), val)
@@ -817,7 +833,11 @@ Public Class Form1
                 End While
             End If
         Finally
-            Marshal.FreeHGlobal(buf)
+            If useVA Then
+                VirtualFree(buf, UIntPtr.Zero, MEM_RELEASE)
+            Else
+                Marshal.FreeHGlobal(buf)
+            End If
         End Try
     End Sub
 
@@ -880,14 +900,27 @@ Public Class Form1
 
     ''' <summary>
     ''' Reads one serialized mpz_t from the BinaryReader into unmanaged memory,
-    ''' then calls mpz_import.  The unmanaged buffer is allocated with
-    ''' Marshal.AllocHGlobal (outside the managed heap) and freed in a Finally
-    ''' block so it cannot leak on exceptions.
+    ''' then calls mpz_import.  The unmanaged buffer uses VirtualAlloc for large
+    ''' allocations (>= 512 KB) and Marshal.AllocHGlobal for small ones; freed in
+    ''' a Finally block so it cannot leak on exceptions.
     ''' </summary>
     Private Sub DeserializeOneMpz(val As mpz_t, br As BinaryReader, staging As Byte())
         Dim byteLen As Integer = br.ReadInt32()
         If byteLen <= 0 Then Return
-        Dim unmanaged As IntPtr = Marshal.AllocHGlobal(byteLen)
+        ' Issue #11 fix: same VirtualAlloc/VirtualFree approach as SerializeOneMpz —
+        ' see comment there for the reason.  The import buffer is the same size as the
+        ' export buffer and causes the same committed-memory accumulation when freed
+        ' via HeapFree.
+        Dim useVA As Boolean = (byteLen >= GMP_LARGE_THRESHOLD)
+        Dim unmanaged As IntPtr
+        If useVA Then
+            unmanaged = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(byteLen)),
+                                     MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If unmanaged = IntPtr.Zero Then _
+                Throw New OutOfMemoryException($"VirtualAlloc({byteLen:N0}) failed in DeserializeOneMpz")
+        Else
+            unmanaged = Marshal.AllocHGlobal(byteLen)
+        End If
         Try
             Dim remaining As Integer = byteLen
             Dim offset As Integer = 0
@@ -903,7 +936,11 @@ Public Class Form1
             End While
             gmp_lib.mpz_import(val, New size_t(CULng(byteLen)), 1, New size_t(1), 0, New size_t(0), New void_ptr(unmanaged))
         Finally
-            Marshal.FreeHGlobal(unmanaged)
+            If useVA Then
+                VirtualFree(unmanaged, UIntPtr.Zero, MEM_RELEASE)
+            Else
+                Marshal.FreeHGlobal(unmanaged)
+            End If
         End Try
     End Sub
 
@@ -1488,8 +1525,10 @@ Public Class Form1
             End Using
             Try : System.IO.File.Delete(Q2_path) : Catch : End Try
 #If LOGGING_DETAIL >= 1 Then
-            Dim ramP2 As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
-            WriteToLog($"[ComputePi] Pass 2: r2 = gmpNumer * Q2 (separate var)  RAM:{ramP2:N0}MB")
+            Dim _procP2 = Process.GetCurrentProcess()
+            Dim ramP2 As Long = _procP2.WorkingSet64 \ 1048576
+            Dim vmP2 As Long = _procP2.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] Pass 2: r2 = gmpNumer * Q2 (separate var)  RAM:{ramP2:N0}MB  Committed:{vmP2:N0}MB")
 #End If
             Dim mpR2 As New mpz_t()
             gmp_lib.mpz_init(mpR2)
