@@ -1460,9 +1460,18 @@ Public Class Form1
             End Using
             gmp_lib.mpz_clear(mpQ1)
 #If LOGGING_DETAIL >= 1 Then
-            Dim ramSplit As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
-            WriteToLog($"[ComputePi] Q split 3-way (k={thirdBits:N0} bits); Q1,Q2 spilled; RAM:{ramSplit:N0}MB")
-            WriteToLog($"[ComputePi] Pass 0: r0 = gmpNumer * Q0")
+            Dim _procSplit = Process.GetCurrentProcess()
+            Dim ramSplit As Long = _procSplit.WorkingSet64 \ 1048576
+            Dim vmSplit As Long = _procSplit.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] Q split 3-way (k={thirdBits:N0} bits); Q1,Q2 spilled  RAM:{ramSplit:N0}MB  Committed:{vmSplit:N0}MB")
+#End If
+#If LOGGING_DETAIL >= 2 Then
+            Dim _q0Bits As Long = CLng(gmp_lib.mpz_sizeinbase(finalQ, 2))
+            Dim _numerBits0 As Long = CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2))
+            WriteToLog($"[ComputePi] Pass 0 operands: gmpNumer={_numerBits0:N0} bits ({_numerBits0 \ 8388608:N0} MB)  Q0={_q0Bits:N0} bits ({_q0Bits \ 8388608:N0} MB)  result≈{(_numerBits0 + _q0Bits) \ 8388608:N0} MB")
+#End If
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Pass 0 multiply: gmpNumer * Q0  RAM:{ramSplit:N0}MB  Committed:{vmSplit:N0}MB")
 #End If
 
             ' ── Pass 0: r0 = gmpNumer * Q0  (finalQ is Q0 after truncations) ──
@@ -1470,6 +1479,15 @@ Public Class Form1
             gmp_lib.mpz_init(mpR0)
             gmp_lib.mpz_mul(mpR0, gmpNumer, finalQ)
             gmp_lib.mpz_clears(finalQ, Nothing)   ' Q0 done; ~183 MB buffer freed
+#If LOGGING_DETAIL >= 1 Then
+            Dim _procP0a = Process.GetCurrentProcess()
+            Dim _ramP0a As Long = _procP0a.WorkingSet64 \ 1048576
+            Dim _vmP0a As Long = _procP0a.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] Pass 0 multiply done  RAM:{_ramP0a:N0}MB  Committed:{_vmP0a:N0}MB")
+#End If
+#If LOGGING_DETAIL >= 2 Then
+            WriteToLog($"[ComputePi] Pass 0 result: r0={CLng(gmp_lib.mpz_sizeinbase(mpR0, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(mpR0, 2)) \ 8388608:N0} MB)")
+#End If
 
             Dim R0_path As String = $"{DISK_CACHE_DIR}R0_spill.bin"
             Using fsW As New FileStream(R0_path, FileMode.Create, FileAccess.Write)
@@ -1479,8 +1497,10 @@ Public Class Form1
             End Using
             gmp_lib.mpz_clear(mpR0)
 #If LOGGING_DETAIL >= 1 Then
-            Dim ramP0 As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
-            WriteToLog($"[ComputePi] r0 spilled; RAM:{ramP0:N0}MB")
+            Dim _procP0b = Process.GetCurrentProcess()
+            Dim ramP0 As Long = _procP0b.WorkingSet64 \ 1048576
+            Dim _vmP0b As Long = _procP0b.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] r0 spilled  RAM:{ramP0:N0}MB  Committed:{_vmP0b:N0}MB")
 #End If
 
             ' ── Pass 1: r1 = gmpNumer * Q1 ──
@@ -1491,14 +1511,30 @@ Public Class Form1
                 End Using
             End Using
             Try : System.IO.File.Delete(Q1_path) : Catch : End Try
+#If LOGGING_DETAIL >= 2 Then
+            Dim _q1Bits As Long = CLng(gmp_lib.mpz_sizeinbase(mpQ1, 2))
+            Dim _numerBits1 As Long = CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2))
+            WriteToLog($"[ComputePi] Pass 1 operands: gmpNumer={_numerBits1:N0} bits ({_numerBits1 \ 8388608:N0} MB)  Q1={_q1Bits:N0} bits ({_q1Bits \ 8388608:N0} MB)  result≈{(_numerBits1 + _q1Bits) \ 8388608:N0} MB")
+#End If
 #If LOGGING_DETAIL >= 1 Then
-            Dim ramP1 As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
-            WriteToLog($"[ComputePi] Pass 1: r1 = gmpNumer * Q1  RAM:{ramP1:N0}MB")
+            Dim _procP1a = Process.GetCurrentProcess()
+            Dim ramP1 As Long = _procP1a.WorkingSet64 \ 1048576
+            Dim _vmP1a As Long = _procP1a.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] Pass 1 multiply: gmpNumer * Q1  RAM:{ramP1:N0}MB  Committed:{_vmP1a:N0}MB")
 #End If
             Dim mpR1 As New mpz_t()
             gmp_lib.mpz_init(mpR1)
             gmp_lib.mpz_mul(mpR1, gmpNumer, mpQ1)
             gmp_lib.mpz_clear(mpQ1)
+#If LOGGING_DETAIL >= 1 Then
+            Dim _procP1b = Process.GetCurrentProcess()
+            Dim _ramP1b As Long = _procP1b.WorkingSet64 \ 1048576
+            Dim _vmP1b As Long = _procP1b.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] Pass 1 multiply done  RAM:{_ramP1b:N0}MB  Committed:{_vmP1b:N0}MB")
+#End If
+#If LOGGING_DETAIL >= 2 Then
+            WriteToLog($"[ComputePi] Pass 1 result: r1={CLng(gmp_lib.mpz_sizeinbase(mpR1, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(mpR1, 2)) \ 8388608:N0} MB)")
+#End If
 
             Dim R1_path As String = $"{DISK_CACHE_DIR}R1_spill.bin"
             Using fsW As New FileStream(R1_path, FileMode.Create, FileAccess.Write)
@@ -1508,8 +1544,10 @@ Public Class Form1
             End Using
             gmp_lib.mpz_clear(mpR1)
 #If LOGGING_DETAIL >= 1 Then
-            Dim ramP1b As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
-            WriteToLog($"[ComputePi] r1 spilled; RAM:{ramP1b:N0}MB")
+            Dim _procP1c = Process.GetCurrentProcess()
+            Dim ramP1b As Long = _procP1c.WorkingSet64 \ 1048576
+            Dim _vmP1c As Long = _procP1c.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] r1 spilled  RAM:{ramP1b:N0}MB  Committed:{_vmP1c:N0}MB")
 #End If
 
             ' ── Pass 2: r2 = gmpNumer * Q2  (separate output to avoid aliasing) ──
@@ -1524,11 +1562,16 @@ Public Class Form1
                 End Using
             End Using
             Try : System.IO.File.Delete(Q2_path) : Catch : End Try
+#If LOGGING_DETAIL >= 2 Then
+            Dim _q2Bits As Long = CLng(gmp_lib.mpz_sizeinbase(mpQ2, 2))
+            Dim _numerBits2 As Long = CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2))
+            WriteToLog($"[ComputePi] Pass 2 operands: gmpNumer={_numerBits2:N0} bits ({_numerBits2 \ 8388608:N0} MB)  Q2={_q2Bits:N0} bits ({_q2Bits \ 8388608:N0} MB)  result≈{(_numerBits2 + _q2Bits) \ 8388608:N0} MB")
+#End If
 #If LOGGING_DETAIL >= 1 Then
             Dim _procP2 = Process.GetCurrentProcess()
             Dim ramP2 As Long = _procP2.WorkingSet64 \ 1048576
             Dim vmP2 As Long = _procP2.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Pass 2: r2 = gmpNumer * Q2 (separate var)  RAM:{ramP2:N0}MB  Committed:{vmP2:N0}MB")
+            WriteToLog($"[ComputePi] Pass 2 multiply: gmpNumer * Q2 (separate var)  RAM:{ramP2:N0}MB  Committed:{vmP2:N0}MB")
 #End If
             Dim mpR2 As New mpz_t()
             gmp_lib.mpz_init(mpR2)
@@ -1537,11 +1580,45 @@ Public Class Form1
             ' Swap result into gmpNumer; clear frees the old ~208 MB gmpNumer buffer.
             gmp_lib.mpz_swap(gmpNumer, mpR2)
             gmp_lib.mpz_clear(mpR2)
+#If LOGGING_DETAIL >= 1 Then
+            Dim _procP2b = Process.GetCurrentProcess()
+            Dim _ramP2b As Long = _procP2b.WorkingSet64 \ 1048576
+            Dim _vmP2b As Long = _procP2b.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] Pass 2 multiply done; entering Combine  RAM:{_ramP2b:N0}MB  Committed:{_vmP2b:N0}MB")
+#End If
+#If LOGGING_DETAIL >= 2 Then
+            WriteToLog($"[ComputePi] r2 (= gmpNumer after swap) = {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
+#End If
 
             ' ── Combine: gmpNumer = ((r2 << k) + r1) << k + r0 ──
-            ' Step A: gmpNumer = r2 << k
-            gmp_lib.mpz_mul_2exp(gmpNumer, gmpNumer, k1)
-            ' Step B: reload r1; add into gmpNumer
+            ' NOTE: mpz_t is a value type (struct) in GMP.NET.  Passing the same
+            ' variable as BOTH destination and source gives GMP two struct copies
+            ' that share the same _mp_d pointer.  GMP's aliasing guard compares
+            ' struct addresses (not _mp_d), sees no match, takes the non-aliased
+            ' path, reallocates rop's limb buffer via MPZ_REALLOC, then reads from
+            ' op's now-freed _mp_d → crash.  Every step below uses a fresh output
+            ' variable + mpz_swap to sidestep this.
+
+            ' Step A: gmpNumer = r2 << k  (~390 MB → ~572 MB)
+#If LOGGING_DETAIL >= 2 Then
+            WriteToLog($"[ComputePi] Combine A: shift r2 ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) left {CLng(k1):N0} bits → result≈{(CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) + CLng(k1)) \ 8388608:N0} MB")
+#End If
+            Dim mpShiftA As New mpz_t()
+            gmp_lib.mpz_init(mpShiftA)
+            gmp_lib.mpz_mul_2exp(mpShiftA, gmpNumer, k1)
+            gmp_lib.mpz_swap(gmpNumer, mpShiftA)
+            gmp_lib.mpz_clear(mpShiftA)     ' frees the old ~390 MB limb buffer
+#If LOGGING_DETAIL >= 1 Then
+            Dim _procCA = Process.GetCurrentProcess()
+            Dim _ramCombA As Long = _procCA.WorkingSet64 \ 1048576
+            Dim _vmCombA As Long = _procCA.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] Combine A done (r2<<k)  RAM:{_ramCombA:N0}MB  Committed:{_vmCombA:N0}MB")
+#End If
+#If LOGGING_DETAIL >= 2 Then
+            WriteToLog($"[ComputePi] Combine A result: {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
+#End If
+
+            ' Step B: reload r1; gmpNumer += r1  (~572 MB + ~390 MB → ~572 MB)
             gmp_lib.mpz_init(mpR1)
             Using fsR As New FileStream(R1_path, FileMode.Open, FileAccess.Read)
                 Using brR As New BinaryReader(fsR)
@@ -1549,11 +1626,51 @@ Public Class Form1
                 End Using
             End Using
             Try : System.IO.File.Delete(R1_path) : Catch : End Try
-            gmp_lib.mpz_add(gmpNumer, gmpNumer, mpR1)
+#If LOGGING_DETAIL >= 2 Then
+            WriteToLog($"[ComputePi] Combine B: add gmpNumer ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) + r1 ({CLng(gmp_lib.mpz_sizeinbase(mpR1, 2)):N0} bits)")
+#End If
+#If LOGGING_DETAIL >= 1 Then
+            Dim _procCBpre = Process.GetCurrentProcess()
+            Dim _ramCombBpre As Long = _procCBpre.WorkingSet64 \ 1048576
+            Dim _vmCombBpre As Long = _procCBpre.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] Combine B r1 loaded  RAM:{_ramCombBpre:N0}MB  Committed:{_vmCombBpre:N0}MB")
+#End If
+            Dim mpAddB As New mpz_t()
+            gmp_lib.mpz_init(mpAddB)
+            gmp_lib.mpz_add(mpAddB, gmpNumer, mpR1)
+            gmp_lib.mpz_swap(gmpNumer, mpAddB)
+            gmp_lib.mpz_clear(mpAddB)
             gmp_lib.mpz_clear(mpR1)
-            ' Step C: gmpNumer = (r2<<k + r1) << k
-            gmp_lib.mpz_mul_2exp(gmpNumer, gmpNumer, k1)
-            ' Step D: reload r0; add into gmpNumer
+#If LOGGING_DETAIL >= 1 Then
+            Dim _procCB = Process.GetCurrentProcess()
+            Dim _ramCombB As Long = _procCB.WorkingSet64 \ 1048576
+            Dim _vmCombB As Long = _procCB.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] Combine B done (+r1)  RAM:{_ramCombB:N0}MB  Committed:{_vmCombB:N0}MB")
+#End If
+#If LOGGING_DETAIL >= 2 Then
+            WriteToLog($"[ComputePi] Combine B result: {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
+#End If
+
+            ' Step C: gmpNumer = (r2<<k + r1) << k  (~572 MB → ~755 MB)
+#If LOGGING_DETAIL >= 2 Then
+            WriteToLog($"[ComputePi] Combine C: shift ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) left {CLng(k1):N0} bits → result≈{(CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) + CLng(k1)) \ 8388608:N0} MB")
+#End If
+            Dim mpShiftC As New mpz_t()
+            gmp_lib.mpz_init(mpShiftC)
+            gmp_lib.mpz_mul_2exp(mpShiftC, gmpNumer, k1)
+            gmp_lib.mpz_swap(gmpNumer, mpShiftC)
+            gmp_lib.mpz_clear(mpShiftC)
+#If LOGGING_DETAIL >= 1 Then
+            Dim _procCC = Process.GetCurrentProcess()
+            Dim _ramCombC As Long = _procCC.WorkingSet64 \ 1048576
+            Dim _vmCombC As Long = _procCC.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] Combine C done ((r2<<k+r1)<<k)  RAM:{_ramCombC:N0}MB  Committed:{_vmCombC:N0}MB")
+#End If
+#If LOGGING_DETAIL >= 2 Then
+            WriteToLog($"[ComputePi] Combine C result: {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
+#End If
+
+            ' Step D: reload r0; gmpNumer += r0  (~755 MB + ~390 MB → ~755 MB)
             gmp_lib.mpz_init(mpR0)
             Using fsR As New FileStream(R0_path, FileMode.Open, FileAccess.Read)
                 Using brR As New BinaryReader(fsR)
@@ -1561,8 +1678,30 @@ Public Class Form1
                 End Using
             End Using
             Try : System.IO.File.Delete(R0_path) : Catch : End Try
-            gmp_lib.mpz_add(gmpNumer, gmpNumer, mpR0)
+#If LOGGING_DETAIL >= 2 Then
+            WriteToLog($"[ComputePi] Combine D: add gmpNumer ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) + r0 ({CLng(gmp_lib.mpz_sizeinbase(mpR0, 2)):N0} bits)")
+#End If
+#If LOGGING_DETAIL >= 1 Then
+            Dim _procCDpre = Process.GetCurrentProcess()
+            Dim _ramCombDpre As Long = _procCDpre.WorkingSet64 \ 1048576
+            Dim _vmCombDpre As Long = _procCDpre.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] Combine D r0 loaded  RAM:{_ramCombDpre:N0}MB  Committed:{_vmCombDpre:N0}MB")
+#End If
+            Dim mpAddD As New mpz_t()
+            gmp_lib.mpz_init(mpAddD)
+            gmp_lib.mpz_add(mpAddD, gmpNumer, mpR0)
+            gmp_lib.mpz_swap(gmpNumer, mpAddD)
+            gmp_lib.mpz_clear(mpAddD)
             gmp_lib.mpz_clear(mpR0)
+#If LOGGING_DETAIL >= 1 Then
+            Dim _procCD = Process.GetCurrentProcess()
+            Dim _ramCombD As Long = _procCD.WorkingSet64 \ 1048576
+            Dim _vmCombD As Long = _procCD.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] Combine D done (+r0)  RAM:{_ramCombD:N0}MB  Committed:{_vmCombD:N0}MB")
+#End If
+#If LOGGING_DETAIL >= 2 Then
+            WriteToLog($"[ComputePi] Combine D result (final gmpNumer): {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
+#End If
 
             LogPhase("Numerator complete")
 
