@@ -1,0 +1,1726 @@
+Option Strict On
+Option Explicit On
+
+' ── Logging detail level ─────────────────────────────────────────────────────
+' LOGGING_DETAIL = 0  Major [PHASE] markers and exceptions only.
+'                     Lowest I/O overhead; use for normal production runs.
+'
+' LOGGING_DETAIL = 1  Detail on the last combine level and all ComputePiGMP
+'                     steps only.  (RECOMMENDED for crash diagnosis — captures
+'                     the high-value final operations without logging every
+'                     intermediate level, which would slow the run noticeably.)
+'
+' LOGGING_DETAIL = 2  Per-operation trace on every BinarySplitChunk call and
+'                     every combine level.  Use only when debugging an early-
+'                     level crash; generates very large log files.
+' ────────────────────────────────────────────────────────────────────────────
+#Const LOGGING_DETAIL = 1
+
+Imports System.Numerics
+Imports System.IO
+Imports System.Threading
+Imports System.Runtime.InteropServices
+Imports Math.Gmp.Native
+Imports System.Diagnostics
+
+Public Class Form1
+
+    Private stopWatch As New Stopwatch()
+    Private phaseStopWatch As New Stopwatch()
+    Private cts As CancellationTokenSource
+    Private DIGITS As Long
+    Private Const outputFile As String = "c:\PiOutput\pi_digits.txt"
+    Private displayStr As String = ""
+    Private displayIdx As Integer = 0
+    Private displayTotal As Long = 0
+    Private WithEvents displayTimer As New System.Windows.Forms.Timer()
+    Private gmpC3Const As mpz_t = Nothing
+
+    ' Disk-based node storage for massive computations
+    Private Const DISK_CACHE_DIR As String = "c:\PiOutput\NodeCache\"
+
+    ' ── Issue #4 fix: DiskNode changed from Class to Structure ──────────────
+    ' Value types stored in List(Of DiskNode) live inside the list's internal
+    ' array as contiguous memory — no individual heap allocations per node,
+    ' no Gen0/Gen1 pressure from the ~137 K nodes created per billion digits.
+    '
+    ' Issue #6 fix (partial): MemP/MemQ/MemT replace Tuple(Of mpz_t,mpz_t,mpz_t)
+    ' so no throw-away Tuple object is created when storing in-memory nodes.
+    Private Structure DiskNode
+        Public FilePath As String
+        Public IsInMemory As Boolean
+        Public MemP As mpz_t   ' used only when IsInMemory = True
+        Public MemQ As mpz_t
+        Public MemT As mpz_t
+        Public Level As Integer
+        Public Index As Integer
+    End Structure
+
+    ' Structures for iterative binary splitting
+    Private Structure WorkItem
+        Public a As Long
+        Public b As Long
+        Public resultIndex As Integer
+        Public isComplete As Boolean
+        Public leftChildIndex As Integer
+        Public rightChildIndex As Integer
+    End Structure
+
+    Private Structure Result
+        Public P As mpz_t
+        Public Q As mpz_t
+        Public T As mpz_t
+    End Structure
+
+    ' ═══════════════════════════════════════════════════════════════════════
+    ' GMP Custom Memory Pool - COMMENTED OUT - CAUSED MEMORY CORRUPTION
+    ' The bump allocator violated GMP's memory contract causing crashes after
+    ' ~300 iterations due to incompatible free/realloc semantics.
+    ' Using system allocator instead (reliable and well-tested with GMP).
+    ' ═══════════════════════════════════════════════════════════════════════
+
+    '<DllImport("kernel32.dll", SetLastError:=True)>
+    'Private Shared Function VirtualAlloc(lpAddress As IntPtr,
+    '                                  dwSize As UIntPtr,
+    '                                  flAllocationType As UInteger,
+    '                                  flProtect As UInteger) As IntPtr
+    'End Function
+
+    '<DllImport("kernel32.dll", SetLastError:=True)>
+    'Private Shared Function VirtualFree(lpAddress As IntPtr,
+    '                                 dwSize As UIntPtr,
+    '                                 dwFreeType As UInteger) As Boolean
+    'End Function
+
+    '<DllImport("kernel32.dll", EntryPoint:="RtlMoveMemory")>
+    'Private Shared Sub CopyMemory(dest As IntPtr, src As IntPtr,
+    '                           length As UIntPtr)
+    'End Sub
+
+
+
+    'Private Const MEM_RESERVE As UInteger = &H2000UI
+    'Private Const MEM_COMMIT As UInteger = &H1000UI
+    'Private Const MEM_RELEASE As UInteger = &H8000UI
+    'Private Const PAGE_READWRITE As UInteger = &H4UI
+
+
+
+    '' Pool state
+    'Private _poolBase As IntPtr
+    'Private _poolSize As ULong = 20UL * 1024UL * 1024UL * 1024UL  ' 20GB
+    'Private _poolOffset As ULong
+
+    '' Keep delegates alive - GC must NOT collect these!
+    'Private _allocDel As allocate_function
+    'Private _reallocDel As reallocate_function
+    'Private _freeDel As free_function
+
+    'Private Function AlignUp(value As ULong, alignment As ULong) As ULong
+    '    Return (value + alignment - 1UL) And Not (alignment - 1UL)
+    'End Function
+
+    'Private Function GmpAlloc(size As size_t) As void_ptr
+    '    Dim needed As ULong = AlignUp(CULng(size), 16UL)
+    '    If _poolOffset + needed > _poolSize Then
+    '        Throw New OutOfMemoryException(
+    '        $"GMP pool exhausted! Used {_poolOffset \ (1024UL * 1024UL * 1024UL)}GB")
+    '    End If
+    '    Dim result As IntPtr = IntPtr.Add(_poolBase, CInt(_poolOffset))  ' BUG: CInt overflows at 2GB!
+    '    _poolOffset += needed
+    '    Return New void_ptr(result)
+    'End Function
+
+    'Private Function GmpRealloc(ptr As void_ptr,
+    '                          old_size As size_t,
+    '                          new_size As size_t) As void_ptr
+    '    Dim newPtr As void_ptr = GmpAlloc(new_size)
+    '    If ptr.ToIntPtr() <> IntPtr.Zero Then
+    '        Dim copyBytes As UIntPtr = New UIntPtr(
+    '        System.Math.Min(CULng(old_size), CULng(new_size)))
+    '        CopyMemory(newPtr.ToIntPtr(), ptr.ToIntPtr(), copyBytes)
+    '    End If
+    '    Return newPtr  ' BUG: Old pointer becomes dangling - GMP expects free to mark it reusable
+    'End Function
+
+    'Private Sub GmpFree(ptr As void_ptr, size As size_t)
+    '    ' Bump allocator - no-op
+    '    ' BUG: GMP expects freed memory to be tracked/reusable, causing metadata corruption
+    'End Sub
+
+    'Private Sub InitGmpPool()
+    '    ...commented out...
+    'End Sub
+
+    ' ── GMP VirtualAlloc custom memory functions ─────────────────────────────
+    ' Problem: GMP's default Windows CRT allocator keeps freed large blocks in
+    ' its private heap free-list instead of calling VirtualFree.  When several
+    ' large multiply+free cycles happen sequentially (binary split combine,
+    ' sqrt, then 3-pass multiply), the "committed but idle" pages accumulate
+    ' until the system commit limit is reached and malloc() returns NULL, which
+    ' GMP turns into abort().  The working-set reading looks fine (e.g. 450 MB)
+    ' but the actual committed bytes can be 2-3x higher.
+    '
+    ' Fix: replace GMP's allocator with one that uses VirtualAlloc/VirtualFree
+    ' directly for allocations >= 512 KB.  VirtualFree immediately decommits
+    ' those pages, keeping committed memory proportional to live data.
+    ' Allocations < 512 KB delegate to GMP's own default CRT allocator so that
+    ' we never mix the CRT heap with Marshal.AllocHGlobal or VirtualAlloc for
+    ' the same small block — heap mismatches corrupt GMP's internal state.
+    Private Const GMP_LARGE_THRESHOLD As Long = 524288L   ' 512 KB
+
+    <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Shared Function VirtualAlloc(lpAddress As IntPtr,
+                                          dwSize As UIntPtr,
+                                          flAllocationType As UInteger,
+                                          flProtect As UInteger) As IntPtr
+    End Function
+
+    <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Shared Function VirtualFree(lpAddress As IntPtr,
+                                         dwSize As UIntPtr,
+                                         dwFreeType As UInteger) As Boolean
+    End Function
+
+    <DllImport("kernel32.dll", EntryPoint:="RtlMoveMemory")>
+    Private Shared Sub CopyMemory(dest As IntPtr, src As IntPtr, length As UIntPtr)
+    End Sub
+
+    Private Const MEM_COMMIT_RESERVE As UInteger = &H3000UI  ' MEM_COMMIT | MEM_RESERVE
+    Private Const MEM_RELEASE As UInteger = &H8000UI
+    Private Const VA_PAGE_READWRITE As UInteger = &H4UI
+
+    ' GC-anchor ALL six delegates — collected delegates crash the process.
+    ' Shared so the Shared callback methods can reach the saved defaults.
+    Private Shared _gmpAlloc As allocate_function
+    Private Shared _gmpRealloc As reallocate_function
+    Private Shared _gmpFree As free_function
+    Private Shared _savedGmpAlloc As allocate_function   ' GMP's original CRT alloc
+    Private Shared _savedGmpRealloc As reallocate_function
+    Private Shared _savedGmpFree As free_function
+
+    ' Large allocations (>= 512 KB) use VirtualAlloc so VirtualFree immediately
+    ' decommits the pages.  Small allocations delegate to GMP's own default CRT
+    ' allocator — the static CRT heap inside libgmp-10.dll — which is the SAME
+    ' heap GMP would have used without our override.  Mixing that heap with
+    ' Marshal.AllocHGlobal (process default heap) for the same blocks corrupts
+    ' GMP's internal state (crash/NullReferenceException in BinarySplitChunk).
+
+    Private Shared Function GmpAllocFunc(alloc_size As size_t) As void_ptr
+        If CLng(alloc_size) >= GMP_LARGE_THRESHOLD Then
+            Dim ptr As IntPtr = VirtualAlloc(IntPtr.Zero,
+                                             New UIntPtr(CULng(CLng(alloc_size))),
+                                             MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            Return New void_ptr(ptr)
+        End If
+        Return _savedGmpAlloc(alloc_size)
+    End Function
+
+    Private Shared Function GmpReallocFunc(old_ptr As void_ptr,
+                                            old_size As size_t,
+                                            new_size As size_t) As void_ptr
+        Dim oldSz As Long = CLng(old_size)
+        Dim newSz As Long = CLng(new_size)
+
+        If oldSz < GMP_LARGE_THRESHOLD AndAlso newSz < GMP_LARGE_THRESHOLD Then
+            ' small → small: unchanged CRT behaviour
+            Return _savedGmpRealloc(old_ptr, old_size, new_size)
+        End If
+
+        Dim oldP As IntPtr = old_ptr.ToIntPtr()
+        Dim newP As IntPtr = IntPtr.Zero
+        Dim copyBytes As UIntPtr = New UIntPtr(CULng(System.Math.Min(oldSz, newSz)))
+
+        If oldSz >= GMP_LARGE_THRESHOLD AndAlso newSz >= GMP_LARGE_THRESHOLD Then
+            ' large → large: new VirtualAlloc, copy, free old
+            newP = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(newSz)),
+                                MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If newP <> IntPtr.Zero Then
+                If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
+                VirtualFree(oldP, UIntPtr.Zero, MEM_RELEASE)
+            End If
+        ElseIf newSz >= GMP_LARGE_THRESHOLD Then
+            ' small → large: VirtualAlloc for new, CRT-free for old
+            newP = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(newSz)),
+                                MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If newP <> IntPtr.Zero Then
+                If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
+                _savedGmpFree(old_ptr, old_size)
+            End If
+        Else
+            ' large → small: CRT-alloc for new, VirtualFree for old
+            Dim newVoid As void_ptr = _savedGmpAlloc(new_size)
+            newP = newVoid.ToIntPtr()
+            If newP <> IntPtr.Zero Then
+                If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
+                VirtualFree(oldP, UIntPtr.Zero, MEM_RELEASE)
+            End If
+        End If
+
+        Return New void_ptr(newP)
+    End Function
+
+    Private Shared Sub GmpFreeFunc(ptr As void_ptr, size As size_t)
+        Dim p As IntPtr = ptr.ToIntPtr()
+        If p = IntPtr.Zero Then Return
+        If CLng(size) >= GMP_LARGE_THRESHOLD Then
+            VirtualFree(p, UIntPtr.Zero, MEM_RELEASE)
+        Else
+            _savedGmpFree(ptr, size)
+        End If
+    End Sub
+
+    ' Direct P/Invoke to set GMP's native memory function table, bypassing the
+    ' Math.Gmp.Native managed wrapper.  Math.Gmp.Native's mp_set_memory_functions
+    ' calls __gmp_set_memory_functions and then immediately re-reads the table via
+    ' _get_memory_functions(), updating its internal allocate_func_ptr lambda to
+    ' capture our managed thunk pointers.  Under .NET 10, Marshal.GetDelegateForFunctionPointer
+    ' on a managed thunk pointer returns the ORIGINAL delegate (our allocate_function)
+    ' rather than creating a new _allocate_function_x64, so the subsequent cast inside
+    ' the lambda fails with InvalidCastException.  Calling __gmp_set_memory_functions
+    ' directly avoids that re-read; Math.Gmp.Native's lambda retains the original
+    ' CRT malloc IntPtr and continues to work normally.
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmp_set_memory_functions",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpSetMemoryFunctionsNative(
+        allocFn As IntPtr,
+        reallocFn As IntPtr,
+        freeFn As IntPtr)
+    End Sub
+
+    Private Sub InitGmpVirtualAllocFunctions()
+        ' Step 1: Force gmp_lib's static initializer to run NOW, while the native
+        ' GMP table still points to the default CRT malloc/realloc/free.
+        ' gmp_lib initializes lazily (first access).  If it runs AFTER our thunks
+        ' are installed it would read our thunk pointers into allocate_func_ptr, and
+        ' .NET 10's GetDelegateForFunctionPointer would return our allocate_function
+        ' delegate instead of creating _allocate_function_x64 — crashing on the cast.
+        ' Calling mp_get_memory_functions here is the cleanest trigger; it also gives
+        ' us the saved CRT delegates we need for small-allocation fallback.
+        gmp_lib.mp_get_memory_functions(_savedGmpAlloc, _savedGmpRealloc, _savedGmpFree)
+
+        ' Step 2: Install our thunks ONLY in GMP's native function pointer table.
+        ' Math.Gmp.Native's allocate_func_ptr lambda is already set (from step 1)
+        ' and captures the original CRT malloc IntPtr — it will NOT be touched here.
+        ' So gmp_lib.allocate / mpz_t.Initializing / mpz_init continue to use CRT
+        ' malloc normally for managed-side __mpz_struct allocations.
+        _gmpAlloc = New allocate_function(AddressOf GmpAllocFunc)
+        _gmpRealloc = New reallocate_function(AddressOf GmpReallocFunc)
+        _gmpFree = New free_function(AddressOf GmpFreeFunc)
+        GmpSetMemoryFunctionsNative(
+            Marshal.GetFunctionPointerForDelegate(_gmpAlloc),
+            Marshal.GetFunctionPointerForDelegate(_gmpRealloc),
+            Marshal.GetFunctionPointerForDelegate(_gmpFree))
+    End Sub
+
+    ' ── Native crash handler (Issue #10 / native-code crash capture) ────────
+    ' Keeps the delegate alive so the GC never collects it while the process runs.
+    <DllImport("kernel32.dll", SetLastError:=False)>
+    Private Shared Function SetUnhandledExceptionFilter(
+        lpTopLevelExceptionFilter As NativeCrashFilterCallback) As IntPtr
+    End Function
+
+    ' Return value: EXCEPTION_EXECUTE_HANDLER = 1 (don't re-call default handler;
+    ' Windows will terminate the process after our callback returns 0).
+    Private Delegate Function NativeCrashFilterCallback(exceptionInfo As IntPtr) As Integer
+    Private _nativeCrashCallback As NativeCrashFilterCallback  ' must be a field — prevents GC collection
+
+    ''' <summary>
+    ''' Called by Windows for any unhandled exception that reaches the OS,
+    ''' including native SEH exceptions from inside GMP that bypass .NET's
+    ''' exception machinery.  The managed heap may be corrupted at this point,
+    ''' so we keep the implementation minimal: one synchronous file write, then
+    ''' return 0 (EXCEPTION_CONTINUE_SEARCH) so Windows can write a crash dump.
+    ''' </summary>
+    Private Function HandleNativeCrash(exceptionInfo As IntPtr) As Integer
+        Try
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[NATIVE CRASH] Process terminating — unhandled native exception at {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}" &
+                vbCrLf &
+                "[NATIVE CRASH] Review the last log entries above to identify the failing GMP call." &
+                vbCrLf)
+        Catch
+        End Try
+        Return 0   ' EXCEPTION_CONTINUE_SEARCH — let Windows handle it (WER, minidump, etc.)
+    End Function
+
+    Private Sub Form1_Load(sender As Object, e As EventArgs) Handles MyBase.Load
+        LblStatus.Text = "Ready"
+        TxtDigitsofPI.Text = "1,000,000"
+        ChkboxDisplay.Checked = True
+        RtbPiDigits.MaxLength = 0
+        RtbPiDigits.ReadOnly = False
+        RtbPiDigits.Font = New Font("Consolas", 10)
+        RtbPiDigits.BackColor = Color.Black
+        RtbPiDigits.ForeColor = Color.Lime
+        RtbPiDigits.WordWrap = True
+        RtbPiDigits.ScrollBars = RichTextBoxScrollBars.Vertical
+        displayTimer.Interval = 100
+        displayTimer.Enabled = False
+        RtbPiDigits.Dock = DockStyle.Fill
+        TxtChunkSize.Text = "500"
+        LstBoxPhases.Items.Clear()
+
+        ' ── Subscribe to AppDomain.UnhandledException ─────────────────────────
+        ' This fires for any managed exception that is not caught anywhere,
+        ' including AccessViolationException marshaled back from a P/Invoke call
+        ' into GMP.  It complements ApplicationEvents.vb which handles the VB
+        ' application-level equivalent.
+        AddHandler AppDomain.CurrentDomain.UnhandledException,
+            AddressOf OnAppDomainUnhandledException
+
+        ' ── Register native crash filter ──────────────────────────────────────
+        ' SetUnhandledExceptionFilter installs a Win32-level last-resort handler
+        ' that runs even when the CLR cannot marshal the exception to managed
+        ' code (e.g., GMP abort(), stack overflow deep in native code).
+        ' Note: in .NET 5+ the CLR may override this for some exception types;
+        ' the handler is therefore "best-effort" for truly native crashes.
+        _nativeCrashCallback = New NativeCrashFilterCallback(AddressOf HandleNativeCrash)
+        SetUnhandledExceptionFilter(_nativeCrashCallback)
+
+        ' Install VirtualAlloc/VirtualFree custom GMP allocator so large limb
+        ' buffers are immediately decommitted on free, preventing commit-charge
+        ' accumulation that caused abort() in multi-pass multiply.
+        InitGmpVirtualAllocFunctions()
+
+        ' Initialize constant for Chudnovsky algorithm
+        gmpC3Const = New mpz_t()
+        gmp_lib.mpz_init(gmpC3Const)
+        gmp_lib.mpz_set_str(gmpC3Const, New char_ptr("10939058860032000"), 10)
+
+        ' Ensure output directories exist
+        Try
+            Dim outputDir As String = System.IO.Path.GetDirectoryName(outputFile)
+            If Not String.IsNullOrEmpty(outputDir) AndAlso Not System.IO.Directory.Exists(outputDir) Then
+                System.IO.Directory.CreateDirectory(outputDir)
+            End If
+
+            ' Create disk cache directory
+            If Not System.IO.Directory.Exists(DISK_CACHE_DIR) Then
+                System.IO.Directory.CreateDirectory(DISK_CACHE_DIR)
+            End If
+        Catch ex As Exception
+            MessageBox.Show("Warning: Could not create output directory: " & ex.Message)
+        End Try
+
+        ' Verify which libgmp DLL is loaded
+        Dim gmpDllPath As String = "Unknown"
+        Try
+            For Each pm As ProcessModule In Process.GetCurrentProcess().Modules
+                If pm.ModuleName.ToLower().Contains("libgmp") Then
+                    gmpDllPath = pm.FileName
+                    Exit For
+                End If
+            Next
+        Catch
+        End Try
+
+        MessageBox.Show(
+        "64-bit process: " & Environment.Is64BitProcess.ToString() & vbCrLf &
+        "IntPtr.Size: " & IntPtr.Size.ToString() & " (must be 8)" & vbCrLf &
+        "Available RAM: " & (GC.GetGCMemoryInfo().TotalAvailableMemoryBytes \ 1048576).ToString() & "MB" & vbCrLf &
+        "GMP DLL: " & gmpDllPath & vbCrLf &
+        "GMP Memory: System allocator (default)",
+        "Process Info")
+    End Sub
+
+    ' ── AppDomain-level unhandled exception handler ──────────────────────────
+    Private Sub OnAppDomainUnhandledException(sender As Object, e As UnhandledExceptionEventArgs)
+        Try
+            Dim ex As Exception = TryCast(e.ExceptionObject, Exception)
+            If ex IsNot Nothing Then
+                WriteExceptionToLog("AppDomain.UnhandledException", ex)
+            Else
+                WriteToLog($"[APPDOMAIN CRASH] Non-Exception object: {e.ExceptionObject?.GetType()?.FullName}")
+            End If
+            WriteToLog($"[APPDOMAIN CRASH] IsTerminating={e.IsTerminating}")
+        Catch
+        End Try
+    End Sub
+
+    ' ════════════════════════════════════════════════════════════════════════
+    '  Logging helpers
+    ' ════════════════════════════════════════════════════════════════════════
+
+    Private Const LOG_FILE As String = "c:\PiOutput\pi_phase_log.txt"
+
+    ''' <summary>
+    ''' Low-level log writer. Thread-safe, no UI interaction.
+    ''' Includes timestamp (ms precision), thread ID, elapsed time, and RAM.
+    ''' File.AppendAllText opens, writes, and closes synchronously, so the
+    ''' entry is guaranteed on disk before the next GMP call — which means the
+    ''' last entry in the log identifies the operation that crashed the process.
+    ''' </summary>
+    Private Sub WriteToLog(message As String)
+        Try
+            Dim elapsed As TimeSpan = stopWatch.Elapsed
+            Dim threadId As Integer = Thread.CurrentThread.ManagedThreadId
+            Dim procMem As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} | T{threadId} | {elapsed:hh\:mm\:ss\.fff} | RAM:{procMem:N0}MB | {message}" & vbCrLf)
+        Catch
+        End Try
+    End Sub
+
+    ''' <summary>
+    ''' Writes an exception with full stack trace and inner exception chain to
+    ''' the log file.  Walks the entire InnerException chain so nested causes
+    ''' from native interop are not lost.
+    ''' </summary>
+    Private Sub WriteExceptionToLog(context As String, ex As Exception)
+        Try
+            Dim sb As New System.Text.StringBuilder()
+            sb.AppendLine($"*** EXCEPTION in {context} ***")
+            Dim current As Exception = ex
+            Dim depth As Integer = 0
+            While current IsNot Nothing
+                Dim prefix As String = If(depth = 0, "Exception", $"InnerException[{depth}]")
+                sb.AppendLine($"  {prefix}: {current.GetType().FullName}")
+                sb.AppendLine($"  Message: {current.Message}")
+                sb.AppendLine($"  StackTrace:")
+                sb.AppendLine(current.StackTrace)
+                current = current.InnerException
+                depth += 1
+            End While
+            WriteToLog(sb.ToString())
+        Catch
+        End Try
+    End Sub
+
+    Private Sub LogPhase(phaseName As String)
+        Dim elapsed As TimeSpan = stopWatch.Elapsed
+        Dim phaseTime As TimeSpan = phaseStopWatch.Elapsed
+        phaseStopWatch.Restart()
+        Dim procMem As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+        Dim virtMem As Long = Process.GetCurrentProcess().VirtualMemorySize64 \ 1048576
+        Dim entry As String = $"{elapsed:hh\:mm\:ss\.ff} | +{phaseTime:mm\:ss\.ff} | RAM:{procMem:N0}MB | VIRT:{virtMem:N0}MB | {phaseName}"
+        WriteToLog($"[PHASE] {phaseName}")
+        Me.BeginInvoke(Sub()
+                           LstBoxPhases.Items.Add(entry)
+                           LstBoxPhases.SelectedIndex = LstBoxPhases.Items.Count - 1
+                           LblStatus.Text = phaseName
+                       End Sub)
+    End Sub
+
+    ' ════════════════════════════════════════════════════════════════════════
+    '  UI event handlers
+    ' ════════════════════════════════════════════════════════════════════════
+
+    Private Sub BtnCompute_Click(sender As Object, e As EventArgs) Handles BtnCompute.Click
+        BtnCompute.Enabled = False
+        BtnPause.Enabled = True
+        DIGITS = CLng(TxtDigitsofPI.Text.Replace(",", ""))
+        stopWatch.Restart()
+        phaseStopWatch.Restart()
+        cts = New CancellationTokenSource()
+        Timer1.Start()
+        LstBoxPhases.Items.Clear()
+        LstBoxPhases.Items.Add($"Starting {DIGITS:N0} digits at {DateTime.Now:HH:mm:ss}")
+        Try
+#If LOGGING_DETAIL = 2 Then
+            Dim loggingMode As String = "FULL DETAIL (every level + BinarySplitChunk)"
+#ElseIf LOGGING_DETAIL = 1 Then
+            Dim loggingMode As String = "FINAL LEVEL DETAIL (last combine level + ComputePiGMP)"
+#Else
+            Dim loggingMode As String = "MAJOR PHASES ONLY"
+#End If
+            System.IO.File.WriteAllText("c:\PiOutput\pi_phase_log.txt",
+                $"=== PI Computation Started {DateTime.Now} ===" & vbCrLf &
+                $"=== Digits: {DIGITS:N0} ===" & vbCrLf &
+                $"=== Logging: {loggingMode} ===" & vbCrLf)
+        Catch
+        End Try
+        RtbPiDigits.AppendText("Starting computation..." & vbCrLf)
+        Dim computeThread As New System.Threading.Thread(
+            Sub()
+                Try
+                    Dim result As String = ComputePiGMP(DIGITS, cts.Token)
+                    If result <> "" Then
+                        Me.Invoke(Sub() StreamPiToScreen(result))
+                    End If
+                Catch oex As OutOfMemoryException
+                    WriteExceptionToLog("ComputeThread/OutOfMemoryException", oex)
+                    Me.Invoke(Sub()
+                                  MessageBox.Show("OUT OF MEMORY!" & vbCrLf & oex.Message & vbCrLf & oex.StackTrace)
+                                  LblStatus.Text = "Error: Out of memory"
+                                  BtnCompute.Enabled = True
+                                  BtnPause.Enabled = False
+                                  Timer1.Stop()
+                              End Sub)
+                Catch ovex As OverflowException
+                    WriteExceptionToLog("ComputeThread/OverflowException", ovex)
+                    Me.Invoke(Sub()
+                                  MessageBox.Show("OVERFLOW!" & vbCrLf & ovex.Message & vbCrLf & ovex.StackTrace)
+                                  LblStatus.Text = "Error: Overflow"
+                                  BtnCompute.Enabled = True
+                                  BtnPause.Enabled = False
+                                  Timer1.Stop()
+                              End Sub)
+                Catch ex As Exception
+                    WriteExceptionToLog("ComputeThread", ex)
+                    Me.Invoke(Sub()
+                                  MessageBox.Show("EXCEPTION: " & ex.GetType().Name & vbCrLf & ex.Message & vbCrLf & ex.StackTrace)
+                                  LblStatus.Text = "Error: " & ex.Message
+                                  BtnCompute.Enabled = True
+                                  BtnPause.Enabled = False
+                                  Timer1.Stop()
+                              End Sub)
+                End Try
+            End Sub, 256 * 1024 * 1024)
+        computeThread.IsBackground = True
+        computeThread.Start()
+    End Sub
+
+    Private Sub BtnPause_Click_1(sender As Object, e As EventArgs) Handles BtnPause.Click
+        cts.Cancel()
+        displayTimer.Enabled = False
+        BtnPause.Enabled = False
+        BtnCompute.Enabled = True
+        Timer1.Stop()
+        LblStatus.Text = "Paused."
+        If ChkboxWriteToFile.Checked Then
+            Try
+                If Not System.IO.Directory.Exists(System.IO.Path.GetDirectoryName(outputFile)) Then
+                    System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(outputFile))
+                End If
+                System.IO.File.WriteAllText(outputFile, RtbPiDigits.Text)
+                LblStatus.Text = "Paused. Saved to file."
+            Catch ex As Exception
+                LblStatus.Text = "Paused. File save error: " & ex.Message
+            End Try
+        End If
+    End Sub
+
+    ' ════════════════════════════════════════════════════════════════════════
+    '  Chudnovsky binary splitting — chunk level
+    ' ════════════════════════════════════════════════════════════════════════
+
+    Private Sub BinarySplitChunk(a As Long, b As Long,
+                          ByRef Pab As mpz_t,
+                          ByRef Qab As mpz_t,
+                          ByRef Tab As mpz_t)
+#If LOGGING_DETAIL = 2 Then
+        WriteToLog($"[BinarySplitChunk] Enter  a={a:N0}  b={b:N0}  terms={b - a:N0}")
+#End If
+
+        ' Issue #5 fix: pre-size both collections to avoid internal array resizes.
+        ' maxDepth is an upper bound on the stack depth for this range.
+        ' The dictionary holds at most (b-a) simultaneous results.
+        Dim maxDepth As Integer = CInt(System.Math.Ceiling(System.Math.Log(b - a, 2))) * 2
+        Dim workStack As New Stack(Of WorkItem)(maxDepth + 4)
+        Dim results As New Dictionary(Of Integer, Result)(CInt(b - a))
+        Dim nextIndex As Integer = 0
+
+        ' Push initial work
+        workStack.Push(New WorkItem With {.a = a, .b = b, .resultIndex = 0, .isComplete = False})
+
+        Dim currentWorkItem As WorkItem  ' declared outside loop to log on exception
+        Try
+            While workStack.Count > 0
+                currentWorkItem = workStack.Pop()
+
+                ' Base case: single term
+                If currentWorkItem.b - currentWorkItem.a = 1 Then
+                    Dim res As New Result With {
+                        .P = New mpz_t(),
+                        .Q = New mpz_t(),
+                        .T = New mpz_t()
+                    }
+                    gmp_lib.mpz_inits(res.P, res.Q, res.T, Nothing)
+
+                    If currentWorkItem.a = 0 Then
+                        gmp_lib.mpz_set_ui(res.P, 1UI)
+                        gmp_lib.mpz_set_ui(res.Q, 1UI)
+                        gmp_lib.mpz_set_ui(res.T, 13591409UI)
+                    Else
+                        Dim aBig As New mpz_t()
+                        Dim t1 As New mpz_t()
+                        Dim t2 As New mpz_t()
+                        gmp_lib.mpz_inits(aBig, t1, t2, Nothing)
+                        gmp_lib.mpz_set_si(aBig, CInt(currentWorkItem.a))
+
+                        gmp_lib.mpz_mul_ui(t1, aBig, 6UI)
+                        gmp_lib.mpz_sub_ui(t1, t1, 5UI)
+                        gmp_lib.mpz_mul_ui(t2, aBig, 2UI)
+                        gmp_lib.mpz_sub_ui(t2, t2, 1UI)
+                        gmp_lib.mpz_mul(res.P, t1, t2)
+                        gmp_lib.mpz_mul_ui(t1, aBig, 6UI)
+                        gmp_lib.mpz_sub_ui(t1, t1, 1UI)
+                        gmp_lib.mpz_mul(res.P, res.P, t1)
+
+                        gmp_lib.mpz_pow_ui(res.Q, aBig, 3UI)
+                        gmp_lib.mpz_mul(res.Q, res.Q, gmpC3Const)
+
+                        gmp_lib.mpz_mul_ui(t1, aBig, 545140134UI)
+                        gmp_lib.mpz_add_ui(t1, t1, 13591409UI)
+                        gmp_lib.mpz_mul(res.T, res.P, t1)
+                        If (currentWorkItem.a And 1L) = 1L Then gmp_lib.mpz_neg(res.T, res.T)
+
+                        gmp_lib.mpz_clears(aBig, t1, t2, Nothing)
+                    End If
+
+                    results(currentWorkItem.resultIndex) = res
+
+                ElseIf currentWorkItem.isComplete Then
+                    ' Combine results from left and right children
+                    Dim leftRes As Result = results(currentWorkItem.leftChildIndex)
+                    Dim rightRes As Result = results(currentWorkItem.rightChildIndex)
+
+                    Dim res As New Result With {
+                        .P = New mpz_t(),
+                        .Q = New mpz_t(),
+                        .T = New mpz_t()
+                    }
+                    Dim tempA As New mpz_t()
+                    Dim tempB As New mpz_t()
+                    gmp_lib.mpz_inits(res.P, res.Q, res.T, tempA, tempB, Nothing)
+
+                    gmp_lib.mpz_mul(res.P, leftRes.P, rightRes.P)
+                    gmp_lib.mpz_mul(res.Q, leftRes.Q, rightRes.Q)
+                    gmp_lib.mpz_mul(tempA, leftRes.T, rightRes.Q)
+                    gmp_lib.mpz_mul(tempB, leftRes.P, rightRes.T)
+                    gmp_lib.mpz_add(res.T, tempA, tempB)
+
+                    gmp_lib.mpz_clears(leftRes.P, leftRes.Q, leftRes.T, Nothing)
+                    gmp_lib.mpz_clears(rightRes.P, rightRes.Q, rightRes.T, Nothing)
+                    gmp_lib.mpz_clears(tempA, tempB, Nothing)
+
+                    results.Remove(currentWorkItem.leftChildIndex)
+                    results.Remove(currentWorkItem.rightChildIndex)
+                    results(currentWorkItem.resultIndex) = res
+                Else
+                    ' Split into two sub-problems
+                    Dim mid As Long = (currentWorkItem.a + currentWorkItem.b) \ 2
+                    nextIndex += 1
+                    Dim leftIdx As Integer = nextIndex
+                    nextIndex += 1
+                    Dim rightIdx As Integer = nextIndex
+
+                    ' Push marker to combine results later
+                    workStack.Push(New WorkItem With {
+                        .a = currentWorkItem.a,
+                        .b = currentWorkItem.b,
+                        .resultIndex = currentWorkItem.resultIndex,
+                        .isComplete = True,
+                        .leftChildIndex = leftIdx,
+                        .rightChildIndex = rightIdx
+                    })
+
+                    ' Push right child first (processed second)
+                    workStack.Push(New WorkItem With {
+                        .a = mid,
+                        .b = currentWorkItem.b,
+                        .resultIndex = rightIdx,
+                        .isComplete = False
+                    })
+
+                    ' Push left child (processed first)
+                    workStack.Push(New WorkItem With {
+                        .a = currentWorkItem.a,
+                        .b = mid,
+                        .resultIndex = leftIdx,
+                        .isComplete = False
+                    })
+                End If
+            End While
+
+        Catch ex As Exception
+            ' Log the exact work item that triggered the failure before re-throwing.
+            WriteExceptionToLog(
+                $"BinarySplitChunk(a={a},b={b}) — failed on WorkItem(a={currentWorkItem.a},b={currentWorkItem.b},isComplete={currentWorkItem.isComplete})",
+                ex)
+            Throw
+        End Try
+
+        ' Return the final result
+        Dim finalResult As Result = results(0)
+        Pab = finalResult.P
+        Qab = finalResult.Q
+        Tab = finalResult.T
+#If LOGGING_DETAIL = 2 Then
+        WriteToLog($"[BinarySplitChunk] Exit   a={a:N0}  b={b:N0}  stackPeak={maxDepth}")
+#End If
+    End Sub
+
+    ' ════════════════════════════════════════════════════════════════════════
+    '  Disk serialization / deserialization
+    ' ════════════════════════════════════════════════════════════════════════
+
+    ' Issue #2 fix: replaced per-field managed byte arrays (which land on the
+    ' LOH and never get compacted) with a single small staging buffer that is
+    ' reused for all three fields.  The 64 KB size is well below the 85 KB LOH
+    ' threshold so it always lives in the SOH and is freely compactable.
+    '
+    ' Issue #6 fix (partial): signature takes three mpz_t directly instead of a
+    ' Tuple(Of mpz_t,mpz_t,mpz_t), eliminating one throw-away heap allocation
+    ' per call (~137 K calls for 1 B digits).
+    Private Sub SerializeNodeToDisk(p As mpz_t, q As mpz_t, t As mpz_t, filePath As String,
+                                    Optional detailLog As Boolean = True)
+#If LOGGING_DETAIL = 2 Then
+        WriteToLog($"[Serialize] Writing {System.IO.Path.GetFileName(filePath)}")
+#ElseIf LOGGING_DETAIL = 1 Then
+        If detailLog Then WriteToLog($"[Serialize] Writing {System.IO.Path.GetFileName(filePath)}")
+#End If
+        Dim staging(65535) As Byte  ' 64 KB staging buffer — always SOH, reused for all three fields
+        Try
+            Using fs As New FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 65536)
+                Using bw As New BinaryWriter(fs)
+                    SerializeOneMpz(p, bw, staging)
+                    SerializeOneMpz(q, bw, staging)
+                    SerializeOneMpz(t, bw, staging)
+                End Using
+            End Using
+#If LOGGING_DETAIL = 2 Then
+            Dim fileSize As Long = New FileInfo(filePath).Length
+            WriteToLog($"[Serialize] Done   {System.IO.Path.GetFileName(filePath)}  size={fileSize \ 1024:N0}KB")
+#ElseIf LOGGING_DETAIL = 1 Then
+            If detailLog Then
+                Dim fileSize As Long = New FileInfo(filePath).Length
+                WriteToLog($"[Serialize] Done   {System.IO.Path.GetFileName(filePath)}  size={fileSize \ 1024:N0}KB")
+            End If
+#End If
+        Catch ex As Exception
+            WriteExceptionToLog($"SerializeNodeToDisk({filePath})", ex)
+            LogPhase($"Error serializing node to {filePath}: {ex.Message}")
+            Throw
+        End Try
+    End Sub
+
+    ''' <summary>
+    ''' Streams one mpz_t from GMP's native buffer into the BinaryWriter without
+    ''' allocating a managed byte array for the full number.  GMP's mpz_export
+    ''' returns a native heap pointer; we walk it in 64 KB chunks through the
+    ''' SOH staging buffer and write each chunk directly to the stream.
+    ''' </summary>
+    Private Sub SerializeOneMpz(val As mpz_t, bw As BinaryWriter, staging As Byte())
+        ' Pre-allocate a buffer so mpz_export writes into our memory rather than
+        ' allocating via GMP's allocator.  After installing the VirtualAlloc custom
+        ' allocator, gmp_lib.free on a GMP-allocated export buffer would call CRT
+        ' free() on a VirtualAlloc'd pointer — undefined behaviour / crash.
+        Dim bitCount As Long = CLng(gmp_lib.mpz_sizeinbase(val, 2))
+        Dim capacity As Long = (bitCount + 7) \ 8L + 1L
+        Dim buf As IntPtr = Marshal.AllocHGlobal(New IntPtr(capacity))
+        Try
+            Dim count As size_t = New size_t(0)
+            gmp_lib.mpz_export(New void_ptr(buf), count, 1, New size_t(1), 0, New size_t(0), val)
+            Dim byteLen As Integer = CInt(CLng(count))
+            bw.Write(byteLen)
+            If byteLen > 0 Then
+                Dim remaining As Integer = byteLen
+                Dim offset As Integer = 0
+                While remaining > 0
+                    Dim chunkSize As Integer = System.Math.Min(remaining, staging.Length)
+                    Marshal.Copy(IntPtr.Add(buf, offset), staging, 0, chunkSize)
+                    bw.Write(staging, 0, chunkSize)
+                    offset += chunkSize
+                    remaining -= chunkSize
+                End While
+            End If
+        Finally
+            Marshal.FreeHGlobal(buf)
+        End Try
+    End Sub
+
+    ' Issue #1 fix: replaced GCHandle.Alloc(Pinned) with Marshal.AllocHGlobal.
+    '   • Pinned managed arrays prevent GC compaction of the heap segment they
+    '     live in, creating permanent holes.  If an exception occurs between
+    '     Alloc and Free the pin leaks for the life of the process.
+    '   • Unmanaged memory allocated by Marshal.AllocHGlobal is invisible to
+    '     the GC compactor, so it causes zero heap fragmentation.  It is freed
+    '     in a Finally block so it cannot leak on exceptions.
+    '
+    ' Issue #2 fix (deserialization side): data is read from the BinaryReader
+    ' into the same small 64 KB SOH staging buffer, then copied chunk-by-chunk
+    ' into the unmanaged destination.  No LOH-sized managed byte array is ever
+    ' created for the full number.
+    '
+    ' Issue #6 fix (partial): returns via ByRef parameters instead of a Tuple,
+    ' eliminating one throw-away heap allocation per call.
+    Private Sub LoadNodeFromDisk(filePath As String,
+                                 ByRef p As mpz_t,
+                                 ByRef q As mpz_t,
+                                 ByRef t As mpz_t,
+                                 Optional detailLog As Boolean = True)
+#If LOGGING_DETAIL = 2 Then
+        Dim fileSize As Long = If(System.IO.File.Exists(filePath), New FileInfo(filePath).Length, -1)
+        WriteToLog($"[Deserialize] Loading {System.IO.Path.GetFileName(filePath)}  size={fileSize \ 1024:N0}KB")
+#ElseIf LOGGING_DETAIL = 1 Then
+        If detailLog Then
+            Dim fileSize As Long = If(System.IO.File.Exists(filePath), New FileInfo(filePath).Length, -1)
+            WriteToLog($"[Deserialize] Loading {System.IO.Path.GetFileName(filePath)}  size={fileSize \ 1024:N0}KB")
+        End If
+#End If
+
+        p = New mpz_t()
+        q = New mpz_t()
+        t = New mpz_t()
+        gmp_lib.mpz_inits(p, q, t, Nothing)
+
+        Dim staging(65535) As Byte  ' 64 KB staging buffer — always SOH
+        Try
+            Using fs As New FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536)
+                Using br As New BinaryReader(fs)
+                    DeserializeOneMpz(p, br, staging)
+                    DeserializeOneMpz(q, br, staging)
+                    DeserializeOneMpz(t, br, staging)
+                End Using
+            End Using
+        Catch ex As Exception
+            gmp_lib.mpz_clears(p, q, t, Nothing)
+            WriteExceptionToLog($"LoadNodeFromDisk({filePath})", ex)
+            LogPhase($"Error loading node from {filePath}: {ex.Message}")
+            Throw
+        End Try
+#If LOGGING_DETAIL = 2 Then
+        WriteToLog($"[Deserialize] Done {System.IO.Path.GetFileName(filePath)}")
+#ElseIf LOGGING_DETAIL = 1 Then
+        If detailLog Then WriteToLog($"[Deserialize] Done {System.IO.Path.GetFileName(filePath)}")
+#End If
+    End Sub
+
+    ''' <summary>
+    ''' Reads one serialized mpz_t from the BinaryReader into unmanaged memory,
+    ''' then calls mpz_import.  The unmanaged buffer is allocated with
+    ''' Marshal.AllocHGlobal (outside the managed heap) and freed in a Finally
+    ''' block so it cannot leak on exceptions.
+    ''' </summary>
+    Private Sub DeserializeOneMpz(val As mpz_t, br As BinaryReader, staging As Byte())
+        Dim byteLen As Integer = br.ReadInt32()
+        If byteLen <= 0 Then Return
+        Dim unmanaged As IntPtr = Marshal.AllocHGlobal(byteLen)
+        Try
+            Dim remaining As Integer = byteLen
+            Dim offset As Integer = 0
+            While remaining > 0
+                Dim toRead As Integer = System.Math.Min(remaining, staging.Length)
+                Dim bytesRead As Integer = br.Read(staging, 0, toRead)
+                If bytesRead <= 0 Then
+                    Throw New EndOfStreamException($"Unexpected end of stream (wanted {toRead}, got {bytesRead})")
+                End If
+                Marshal.Copy(staging, 0, IntPtr.Add(unmanaged, offset), bytesRead)
+                offset += bytesRead
+                remaining -= bytesRead
+            End While
+            gmp_lib.mpz_import(val, New size_t(CULng(byteLen)), 1, New size_t(1), 0, New size_t(0), New void_ptr(unmanaged))
+        Finally
+            Marshal.FreeHGlobal(unmanaged)
+        End Try
+    End Sub
+
+    ' ════════════════════════════════════════════════════════════════════════
+    '  Chudnovsky binary splitting — tree merge level
+    ' ════════════════════════════════════════════════════════════════════════
+
+    ' Issue #4 fix: DiskNode is now a Structure (see definition at top of class).
+    ' Issue #6 fix: all Tuple(Of mpz_t,mpz_t,mpz_t) replaced with Result struct
+    '   or individual mpz_t variables; SerializeNodeToDisk/LoadNodeFromDisk now
+    '   take/return three mpz_t directly.
+    ' Issue #7 fix: removed GC.Collect() every 10 combine pairs.  The GC is
+    '   better left to make its own decisions; forcing it that frequently was
+    '   interfering with compaction around live pinned objects (now gone) and
+    '   adding overhead without benefit.  The between-level GC.Collect is kept
+    '   since it runs only ~17 times per billion-digit computation.
+    Private Sub BinarySplitGMP(numTerms As Long,
+                                ByRef nodes As List(Of Result))
+
+        Const CHUNK_SIZE As Long = 512L
+        Const STOP_AT As Long = 1L
+        Const DISK_THRESHOLD As Integer = 1  ' Stay in disk mode until final 2→1 combine only
+
+        Dim numChunks As Long = (numTerms + CHUNK_SIZE - 1) \ CHUNK_SIZE
+
+        ' Validate array size before allocation
+        If numChunks > Integer.MaxValue Then
+            Throw New OverflowException($"Too many chunks: {numChunks:N0} exceeds Integer.MaxValue ({Integer.MaxValue:N0})")
+        End If
+
+        LogPhase($"Processing {numChunks:N0} chunks of {CHUNK_SIZE} terms each (streaming to disk)...")
+
+        ' Clear old cache
+        Try
+            If System.IO.Directory.Exists(DISK_CACHE_DIR) Then
+                For Each file In System.IO.Directory.GetFiles(DISK_CACHE_DIR, "*.bin")
+                    System.IO.File.Delete(file)
+                Next
+            End If
+        Catch
+        End Try
+
+        ' Issue #4: List(Of DiskNode) now holds value types — no per-element heap allocation.
+        Dim diskNodes As New List(Of DiskNode)()
+        Dim currentSize As Long = numChunks
+        Dim level As Integer = 0
+
+        ' ── Phase 1: stream all chunks to disk ──────────────────────────────
+        ' Compute one chunk at a time, serialize immediately, clear GMP memory.
+        ' Only one chunk's worth of GMP integers lives in RAM at any point.
+        For i As Long = 0 To numChunks - 1
+            Dim chunkStart As Long = i * CHUNK_SIZE
+            Dim chunkEnd As Long = System.Math.Min(chunkStart + CHUNK_SIZE, numTerms)
+
+            Dim tempP As mpz_t = Nothing
+            Dim tempQ As mpz_t = Nothing
+            Dim tempT As mpz_t = Nothing
+            BinarySplitChunk(chunkStart, chunkEnd, tempP, tempQ, tempT)
+
+            Dim node As DiskNode
+            node.FilePath = Nothing
+            node.MemP = Nothing
+            node.MemQ = Nothing
+            node.MemT = Nothing
+            node.Level = 0
+            node.Index = CInt(i)
+            node.IsInMemory = (numChunks <= DISK_THRESHOLD)
+
+            If node.IsInMemory Then
+                node.MemP = tempP
+                node.MemQ = tempQ
+                node.MemT = tempT
+            Else
+                node.FilePath = $"{DISK_CACHE_DIR}L0_N{i}.bin"
+                SerializeNodeToDisk(tempP, tempQ, tempT, node.FilePath)
+                gmp_lib.mpz_clears(tempP, tempQ, tempT, Nothing)
+            End If
+
+            diskNodes.Add(node)
+
+            If i Mod 100 = 0 AndAlso i > 0 Then
+                LogPhase($"Chunks: {i:N0}/{numChunks:N0} (streamed to disk)")
+            End If
+        Next
+
+        If currentSize > DISK_THRESHOLD Then
+            LogPhase($"Streamed {currentSize:N0} chunks directly to disk (no array allocation)")
+        Else
+            LogPhase($"Computed {currentSize:N0} chunks in memory")
+        End If
+
+        ' ── Phase 2: combine levels until one node remains ──────────────────
+        While currentSize > STOP_AT
+            level += 1
+            Dim nextSize As Long = (currentSize + 1) \ 2
+            Dim nextDiskNodes As New List(Of DiskNode)()
+            Dim useDisk As Boolean = nextSize > DISK_THRESHOLD
+            ' True only for the final combine pass (2 nodes → 1).  Controls
+            ' whether LOGGING_DETAIL=1 emits per-operation trace for this level.
+            Dim isLastLevel As Boolean = (currentSize <= 2)
+
+            If useDisk Then
+                LogPhase($"Level {level}: Processing {currentSize:N0} → {nextSize:N0} nodes (DISK mode)")
+            Else
+                LogPhase($"Level {level}: Processing {currentSize:N0} → {nextSize:N0} nodes (MEMORY mode)")
+            End If
+
+            Dim nodeIdx As Long = 0
+            While nodeIdx < diskNodes.Count - 1
+
+                ' ── Load left operand ────────────────────────────────────────
+                Dim leftP As mpz_t = Nothing
+                Dim leftQ As mpz_t = Nothing
+                Dim leftT As mpz_t = Nothing
+
+                If diskNodes(CInt(nodeIdx)).IsInMemory Then
+                    leftP = diskNodes(CInt(nodeIdx)).MemP
+                    leftQ = diskNodes(CInt(nodeIdx)).MemQ
+                    leftT = diskNodes(CInt(nodeIdx)).MemT
+                Else
+                    LoadNodeFromDisk(diskNodes(CInt(nodeIdx)).FilePath, leftP, leftQ, leftT, isLastLevel)
+                    Try
+                        System.IO.File.Delete(diskNodes(CInt(nodeIdx)).FilePath)
+                    Catch
+                    End Try
+                End If
+
+                ' ── Load right operand ───────────────────────────────────────
+                Dim rightP As mpz_t = Nothing
+                Dim rightQ As mpz_t = Nothing
+                Dim rightT As mpz_t = Nothing
+
+                If diskNodes(CInt(nodeIdx + 1)).IsInMemory Then
+                    rightP = diskNodes(CInt(nodeIdx + 1)).MemP
+                    rightQ = diskNodes(CInt(nodeIdx + 1)).MemQ
+                    rightT = diskNodes(CInt(nodeIdx + 1)).MemT
+                Else
+                    LoadNodeFromDisk(diskNodes(CInt(nodeIdx + 1)).FilePath, rightP, rightQ, rightT, isLastLevel)
+                    Try
+                        System.IO.File.Delete(diskNodes(CInt(nodeIdx + 1)).FilePath)
+                    Catch
+                    End Try
+                End If
+
+                ' ── Combine ──────────────────────────────────────────────────
+                Dim newP As New mpz_t()
+                Dim newQ As New mpz_t()
+                Dim tempA As New mpz_t()
+                Dim tempB As New mpz_t()
+                gmp_lib.mpz_inits(newP, newQ, tempA, tempB, Nothing)
+
+                ' Early-free optimisation: release each input operand immediately
+                ' after its last use so GMP can reuse that memory for the next
+                ' allocation.  Holding all 6 inputs alive through all 4 multiplies
+                ' was the primary cause of the Level-17 OOM crash — peak RAM was
+                ' ~2 GB higher than necessary.
+                '
+                ' Dependency map (determines earliest safe free point):
+                '   rightP  → only needed for newP      → free after step 1
+                '   leftQ   → only needed for newQ      → free after step 2
+                '   rightQ  → needed for newQ AND tempA → free after step 3
+                '   leftT   → only needed for tempA     → free after step 3
+                '   leftP   → needed for newP AND tempB → free after step 4
+                '   rightT  → only needed for tempB     → free after step 4
+                '
+                ' In-place add optimisation (Level-17 crash fix):
+                '   mpz_add(tempA, tempA, tempB) accumulates the T result into
+                '   tempA's already-allocated limb buffer (GMP §5.5 explicitly
+                '   permits an aliased destination).  This avoids allocating a
+                '   fresh ~443 MB block for newT while newP, newQ, tempA, and
+                '   tempB are all still live, which was pushing peak RAM from
+                '   ~1,781 MB to ~2,215 MB and triggering a GMP abort().
+                '   After the add, tempB is freed and tempA holds the T result.
+#If LOGGING_DETAIL = 2 Then
+                WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newP")
+#ElseIf LOGGING_DETAIL = 1 Then
+                If isLastLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newP")
+#End If
+                gmp_lib.mpz_mul(newP, leftP, rightP)
+                gmp_lib.mpz_clears(rightP, Nothing)             ' rightP done
+
+#If LOGGING_DETAIL = 2 Then
+                WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newQ")
+#ElseIf LOGGING_DETAIL = 1 Then
+                If isLastLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newQ")
+#End If
+                gmp_lib.mpz_mul(newQ, leftQ, rightQ)
+                gmp_lib.mpz_clears(leftQ, Nothing)              ' leftQ done
+
+#If LOGGING_DETAIL = 2 Then
+                WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempA")
+#ElseIf LOGGING_DETAIL = 1 Then
+                If isLastLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempA")
+#End If
+                gmp_lib.mpz_mul(tempA, leftT, rightQ)
+                gmp_lib.mpz_clears(leftT, rightQ, Nothing)      ' leftT, rightQ done
+
+#If LOGGING_DETAIL = 2 Then
+                WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempB")
+#ElseIf LOGGING_DETAIL = 1 Then
+                If isLastLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempB")
+#End If
+                gmp_lib.mpz_mul(tempB, leftP, rightT)
+                gmp_lib.mpz_clears(leftP, rightT, Nothing)      ' leftP, rightT done
+
+#If LOGGING_DETAIL = 2 Then
+                WriteToLog($"[Combine] L{level} N{nodeIdx\2}: add newT (in-place into tempA)")
+#ElseIf LOGGING_DETAIL = 1 Then
+                If isLastLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: add newT (in-place into tempA)")
+#End If
+                gmp_lib.mpz_add(tempA, tempA, tempB)            ' T result in tempA's buffer
+                gmp_lib.mpz_clears(tempB, Nothing)              ' tempB done; tempA IS newT
+#If LOGGING_DETAIL = 2 Then
+                WriteToLog($"[Combine] L{level} N{nodeIdx\2}: combine complete")
+#ElseIf LOGGING_DETAIL = 1 Then
+                If isLastLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: combine complete")
+#End If
+
+                ' ── Store result ─────────────────────────────────────────────
+                ' tempA holds the T result (renamed conceptually to newT below)
+                Dim resultNode As DiskNode
+                resultNode.FilePath = Nothing
+                resultNode.MemP = Nothing
+                resultNode.MemQ = Nothing
+                resultNode.MemT = Nothing
+                resultNode.Level = level
+                resultNode.Index = nextDiskNodes.Count
+                resultNode.IsInMemory = Not useDisk
+
+                If useDisk Then
+                    resultNode.FilePath = $"{DISK_CACHE_DIR}L{level}_N{resultNode.Index}.bin"
+                    SerializeNodeToDisk(newP, newQ, tempA, resultNode.FilePath, isLastLevel)
+                    gmp_lib.mpz_clears(newP, newQ, tempA, Nothing)
+                Else
+                    resultNode.MemP = newP
+                    resultNode.MemQ = newQ
+                    resultNode.MemT = tempA
+                End If
+
+                nextDiskNodes.Add(resultNode)
+
+                If nextDiskNodes.Count Mod 100 = 0 Then
+                    LogPhase($"  Processed {nextDiskNodes.Count:N0}/{nextSize:N0} node pairs")
+                End If
+
+                nodeIdx += 2
+            End While
+
+            ' Handle odd node — carry it forward unchanged
+            If diskNodes.Count Mod 2 = 1 Then
+                nextDiskNodes.Add(diskNodes(diskNodes.Count - 1))
+            End If
+
+            diskNodes = nextDiskNodes
+            currentSize = nextSize
+
+            ' Issue #7 fix: one GC.Collect per level (~17 total for 1 B digits).
+            ' The aggressive every-10-pairs GC was removed; it interfered with
+            ' compaction and added overhead without measurable benefit once the
+            ' pinned-array and LOH fragmentation sources were eliminated.
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, True, True)
+            GC.WaitForPendingFinalizers()
+
+            Dim memNow As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+            LogPhase($"Combine level {level}: {currentSize:N0} nodes remaining (RAM: {memNow:N0}MB)")
+        End While
+
+        ' ── Phase 3: load the single final node into memory ─────────────────
+        ' Issue #6: returns List(Of Result) — no Tuple allocations.
+        nodes = New List(Of Result)()
+        For i As Integer = 0 To diskNodes.Count - 1
+            If diskNodes(i).IsInMemory Then
+                Dim r As New Result With {
+                    .P = diskNodes(i).MemP,
+                    .Q = diskNodes(i).MemQ,
+                    .T = diskNodes(i).MemT
+                }
+                nodes.Add(r)
+            Else
+                Dim rP As mpz_t = Nothing
+                Dim rQ As mpz_t = Nothing
+                Dim rT As mpz_t = Nothing
+                LoadNodeFromDisk(diskNodes(i).FilePath, rP, rQ, rT)
+                nodes.Add(New Result With {.P = rP, .Q = rQ, .T = rT})
+                Try
+                    System.IO.File.Delete(diskNodes(i).FilePath)
+                Catch
+                End Try
+            End If
+        Next
+
+        LogPhase($"Final {nodes.Count} node(s) loaded into memory")
+    End Sub
+
+    ' ════════════════════════════════════════════════════════════════════════
+    '  Main computation entry point
+    ' ════════════════════════════════════════════════════════════════════════
+
+    Private Function ComputePiGMP(digits As Long, token As CancellationToken) As String
+
+        Dim gmpSqrtInput As New mpz_t()
+        Dim gmpSqrt As New mpz_t()
+        Dim gmpNumer As New mpz_t()
+        Dim gmpPi As New mpz_t()
+        Dim gmpOne As New mpz_t()
+        Dim gmpVariablesInitialized As Boolean = False
+
+        Try
+            Dim numTerms As Long = CLng(System.Math.Ceiling(digits / 14.18)) + 10
+
+            phaseStopWatch.Restart()
+            LogPhase($"Starting: {digits:N0} digits, {numTerms:N0} terms")
+
+            Dim memBefore As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+            LogPhase($"Memory before computation: {memBefore:N0}MB")
+
+            If token.IsCancellationRequested Then Return ""
+
+            ' Issue #6: BinarySplitGMP now returns List(Of Result) — no Tuple allocations.
+            Dim nodes As List(Of Result) = Nothing
+            BinarySplitGMP(numTerms, nodes)
+
+            LogPhase($"Binary Splitting complete ({nodes.Count} nodes)")
+
+            Dim memAfterSplit As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+            LogPhase($"Memory after split: {memAfterSplit:N0}MB")
+
+#If LOGGING_DETAIL >= 1 Then
+            ' Log sizes of the top-level node(s) to detect unexpectedly large intermediates
+            Try
+                For nodeIdx As Integer = 0 To nodes.Count - 1
+                    Dim nd As Result = nodes(nodeIdx)
+                    Dim pDigits As Long = CLng(gmp_lib.mpz_sizeinbase(nd.P, 10))
+                    Dim qDigits As Long = CLng(gmp_lib.mpz_sizeinbase(nd.Q, 10))
+                    Dim tDigits As Long = CLng(gmp_lib.mpz_sizeinbase(nd.T, 10))
+                    WriteToLog($"[Node {nodeIdx}] P~{pDigits:N0} digits  Q~{qDigits:N0} digits  T~{tDigits:N0} digits")
+                Next
+            Catch
+            End Try
+#End If
+
+            If token.IsCancellationRequested Then Return ""
+
+            ' ── Final in-memory combine (usually already 1 node from BinarySplitGMP) ─
+            ' Issue #6: uses Result struct instead of Tuple(Of mpz_t,mpz_t,mpz_t).
+            LogPhase($"Starting final combine of {nodes.Count} nodes...")
+            Dim combineIteration As Integer = 0
+
+            While nodes.Count > 1
+                combineIteration += 1
+                Dim memDuringCombine As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+                LogPhase($"Final combine iteration {combineIteration}: {nodes.Count} nodes → {(nodes.Count + 1) \ 2} nodes (RAM: {memDuringCombine:N0}MB)")
+
+                Dim nextNodes As New List(Of Result)()
+                Dim i As Integer = 0
+                While i < nodes.Count - 1
+                    If combineIteration <= 2 Then
+                        LogPhase($"  Combining nodes {i} and {i + 1}...")
+                    End If
+
+                    Dim left As Result = nodes(i)
+                    Dim right As Result = nodes(i + 1)
+
+                    Dim newP As New mpz_t()
+                    Dim newQ As New mpz_t()
+                    Dim tA As New mpz_t()
+                    Dim tB As New mpz_t()
+                    gmp_lib.mpz_inits(newP, newQ, tA, tB, Nothing)
+
+                    Try
+                        If combineIteration <= 2 Then
+                            Dim leftPSize As Long = CLng(gmp_lib.mpz_sizeinbase(left.P, 10))
+                            Dim rightPSize As Long = CLng(gmp_lib.mpz_sizeinbase(right.P, 10))
+                            LogPhase($"  P sizes: {leftPSize:N0} × {rightPSize:N0} digits")
+                        End If
+                    Catch
+                    End Try
+
+                    ' Same early-free + in-place-add pattern as the BinarySplitGMP combine loop.
+                    gmp_lib.mpz_mul(newP, left.P, right.P)
+                    gmp_lib.mpz_clears(right.P, Nothing)
+
+                    gmp_lib.mpz_mul(newQ, left.Q, right.Q)
+                    gmp_lib.mpz_clears(left.Q, Nothing)
+
+                    gmp_lib.mpz_mul(tA, left.T, right.Q)
+                    gmp_lib.mpz_clears(left.T, right.Q, Nothing)
+
+                    gmp_lib.mpz_mul(tB, left.P, right.T)
+                    gmp_lib.mpz_clears(left.P, right.T, Nothing)
+
+                    gmp_lib.mpz_add(tA, tA, tB)    ' in-place: T result in tA's buffer
+                    gmp_lib.mpz_clears(tB, Nothing) ' tA IS newT
+
+                    nextNodes.Add(New Result With {.P = newP, .Q = newQ, .T = tA})
+                    i += 2
+                End While
+
+                If nodes.Count Mod 2 = 1 Then
+                    nextNodes.Add(nodes(nodes.Count - 1))
+                End If
+
+                nodes = nextNodes
+            End While
+
+            LogPhase("Final combine complete - 1 node remaining")
+
+            Dim finalP As mpz_t = nodes(0).P
+            Dim finalQ As mpz_t = nodes(0).Q
+            Dim finalT As mpz_t = nodes(0).T
+
+            gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpNumer, gmpPi, gmpOne, Nothing)
+            gmpVariablesInitialized = True
+
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] mpz_ui_pow_ui: 10^{digits:N0}")
+#End If
+            gmp_lib.mpz_ui_pow_ui(gmpOne, 10UI, CUInt(digits))
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] mpz_mul: gmpSqrtInput = gmpOne^2")
+#End If
+            gmp_lib.mpz_mul(gmpSqrtInput, gmpOne, gmpOne)
+            ' gmpOne is no longer needed — free its ~208 MB buffer now so it is
+            ' not held alive through the sqrt, numerator multiply, and division.
+            ' Re-init to 0 so the Finally block can safely call mpz_clear on it.
+            gmp_lib.mpz_clear(gmpOne)
+            gmp_lib.mpz_init(gmpOne)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] gmpOne freed (early): RAM now lower before sqrt")
+            WriteToLog($"[ComputePi] mpz_mul_ui: gmpSqrtInput *= 10005")
+#End If
+            gmp_lib.mpz_mul_ui(gmpSqrtInput, gmpSqrtInput, 10005UI)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] mpz_sqrt: sqrt({CLng(gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10)):N0}-digit number)")
+#End If
+            gmp_lib.mpz_sqrt(gmpSqrt, gmpSqrtInput)
+            gmp_lib.mpz_clear(gmpSqrtInput)
+            LogPhase("Square root complete")
+
+            If token.IsCancellationRequested Then Return ""
+
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] mpz_mul_ui: gmpNumer = gmpSqrt * 426880")
+#End If
+            gmp_lib.mpz_mul_ui(gmpNumer, gmpSqrt, 426880UI)
+            ' gmpSqrt value is now encoded in gmpNumer — free its ~198 MB before
+            ' the large multiply.  finalP is also not used in the final formula
+            ' (pi = 426880·sqrt(10005)·Q / T), so free its ~340 MB too.
+            ' Combined saving: ~538 MB off the baseline before gmpNumer *= finalQ.
+            gmp_lib.mpz_clears(gmpSqrt, finalP, Nothing)
+
+            ' Spill finalT (~548 MB) to disk before the large gmpNumer *= finalQ
+            ' multiply.  Without this, the baseline is ~1,318 MB and GMP's FFT
+            ' multiply pushes the peak to ~2,310 MB (crashes).  By spilling we
+            ' drop the baseline to ~770 MB so the multiply peaks at ~1,762 MB.
+            ' finalT is reloaded immediately after finalQ is freed.
+            Dim finalT_spillPath As String = $"{DISK_CACHE_DIR}finalT_spill.bin"
+            Dim stagingT(65535) As Byte
+            Using fs As New FileStream(finalT_spillPath, FileMode.Create, FileAccess.Write)
+                Using bw As New BinaryWriter(fs)
+                    SerializeOneMpz(finalT, bw, stagingT)
+                End Using
+            End Using
+            gmp_lib.mpz_clear(finalT)   ' free ~548 MB; will be reloaded below
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] gmpSqrt+finalP freed + finalT spilled: RAM before big multiply")
+            WriteToLog($"[ComputePi] Three-pass multiply: splitting finalQ " &
+                       $"(Q~{CLng(gmp_lib.mpz_sizeinbase(finalQ, 10)):N0} digits)")
+#End If
+            ' gmpNumer *= finalQ in a single call peaks at ~2.3 GB — too large.
+            ' Split finalQ into three equal thirds (by bit position) and do three
+            ' smaller multiplies (~1.24 GB peak each), spilling between passes.
+            '
+            ' finalQ = Q2*2^(2k) + Q1*2^k + Q0   where k = bitlen(Q)/3
+            ' result  = r2*2^(2k) + r1*2^k + r0   where r_i = gmpNumer * Q_i
+            '
+            ' Passes 0–2 compute r0, r1 then r2 (in-place).
+            ' Combine:  gmpNumer = ((r2 << k) + r1) << k + r0
+
+            Dim totalBits As Long = CLng(gmp_lib.mpz_sizeinbase(finalQ, 2))
+            Dim thirdBits As Long = totalBits \ 3L
+            Dim k1 As New mp_bitcnt_t(CUInt(thirdBits))
+            Dim k2 As New mp_bitcnt_t(CUInt(thirdBits * 2L))
+
+            ' Shared staging buffer for all spill I/O (sequential, never concurrent).
+            Dim spillStaging(65535) As Byte
+
+            ' Extract Q2 = finalQ >> 2k  (~183 MB)
+            Dim mpQ2 As New mpz_t()
+            gmp_lib.mpz_init(mpQ2)
+            gmp_lib.mpz_tdiv_q_2exp(mpQ2, finalQ, k2)
+
+            ' Truncate finalQ to lower two-thirds: finalQ mod 2^(2k)
+            gmp_lib.mpz_tdiv_r_2exp(finalQ, finalQ, k2)
+
+            ' Extract Q1 = (finalQ mod 2^(2k)) >> k  (~183 MB, middle third)
+            Dim mpQ1 As New mpz_t()
+            gmp_lib.mpz_init(mpQ1)
+            gmp_lib.mpz_tdiv_q_2exp(mpQ1, finalQ, k1)
+
+            ' Truncate finalQ to lowest third: Q0 = finalQ mod 2^k  (~183 MB)
+            gmp_lib.mpz_tdiv_r_2exp(finalQ, finalQ, k1)
+
+            ' Spill Q2 and Q1; free them to clear the deck for Pass 0.
+            Dim Q2_path As String = $"{DISK_CACHE_DIR}Q2_spill.bin"
+            Dim Q1_path As String = $"{DISK_CACHE_DIR}Q1_spill.bin"
+            Using fsW As New FileStream(Q2_path, FileMode.Create, FileAccess.Write)
+                Using bwW As New BinaryWriter(fsW)
+                    SerializeOneMpz(mpQ2, bwW, spillStaging)
+                End Using
+            End Using
+            gmp_lib.mpz_clear(mpQ2)
+            Using fsW As New FileStream(Q1_path, FileMode.Create, FileAccess.Write)
+                Using bwW As New BinaryWriter(fsW)
+                    SerializeOneMpz(mpQ1, bwW, spillStaging)
+                End Using
+            End Using
+            gmp_lib.mpz_clear(mpQ1)
+#If LOGGING_DETAIL >= 1 Then
+            Dim ramSplit As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+            WriteToLog($"[ComputePi] Q split 3-way (k={thirdBits:N0} bits); Q1,Q2 spilled; RAM:{ramSplit:N0}MB")
+            WriteToLog($"[ComputePi] Pass 0: r0 = gmpNumer * Q0")
+#End If
+
+            ' ── Pass 0: r0 = gmpNumer * Q0  (finalQ is Q0 after truncations) ──
+            Dim mpR0 As New mpz_t()
+            gmp_lib.mpz_init(mpR0)
+            gmp_lib.mpz_mul(mpR0, gmpNumer, finalQ)
+            gmp_lib.mpz_clears(finalQ, Nothing)   ' Q0 done; ~183 MB buffer freed
+
+            Dim R0_path As String = $"{DISK_CACHE_DIR}R0_spill.bin"
+            Using fsW As New FileStream(R0_path, FileMode.Create, FileAccess.Write)
+                Using bwW As New BinaryWriter(fsW)
+                    SerializeOneMpz(mpR0, bwW, spillStaging)
+                End Using
+            End Using
+            gmp_lib.mpz_clear(mpR0)
+#If LOGGING_DETAIL >= 1 Then
+            Dim ramP0 As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+            WriteToLog($"[ComputePi] r0 spilled; RAM:{ramP0:N0}MB")
+#End If
+
+            ' ── Pass 1: r1 = gmpNumer * Q1 ──
+            gmp_lib.mpz_init(mpQ1)
+            Using fsR As New FileStream(Q1_path, FileMode.Open, FileAccess.Read)
+                Using brR As New BinaryReader(fsR)
+                    DeserializeOneMpz(mpQ1, brR, spillStaging)
+                End Using
+            End Using
+            Try : System.IO.File.Delete(Q1_path) : Catch : End Try
+#If LOGGING_DETAIL >= 1 Then
+            Dim ramP1 As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+            WriteToLog($"[ComputePi] Pass 1: r1 = gmpNumer * Q1  RAM:{ramP1:N0}MB")
+#End If
+            Dim mpR1 As New mpz_t()
+            gmp_lib.mpz_init(mpR1)
+            gmp_lib.mpz_mul(mpR1, gmpNumer, mpQ1)
+            gmp_lib.mpz_clear(mpQ1)
+
+            Dim R1_path As String = $"{DISK_CACHE_DIR}R1_spill.bin"
+            Using fsW As New FileStream(R1_path, FileMode.Create, FileAccess.Write)
+                Using bwW As New BinaryWriter(fsW)
+                    SerializeOneMpz(mpR1, bwW, spillStaging)
+                End Using
+            End Using
+            gmp_lib.mpz_clear(mpR1)
+#If LOGGING_DETAIL >= 1 Then
+            Dim ramP1b As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+            WriteToLog($"[ComputePi] r1 spilled; RAM:{ramP1b:N0}MB")
+#End If
+
+            ' ── Pass 2: r2 = gmpNumer * Q2  (separate output to avoid aliasing) ──
+            ' NOTE: mpz_t is a struct in GMP.NET, so passing gmpNumer as both dst and src
+            ' produces two different stack copies — GMP sees no alias, skips the temp-copy
+            ' guard, and corrupts the buffer it is still reading.  Always use a distinct
+            ' output variable when the destination would otherwise equal a source.
+            gmp_lib.mpz_init(mpQ2)
+            Using fsR As New FileStream(Q2_path, FileMode.Open, FileAccess.Read)
+                Using brR As New BinaryReader(fsR)
+                    DeserializeOneMpz(mpQ2, brR, spillStaging)
+                End Using
+            End Using
+            Try : System.IO.File.Delete(Q2_path) : Catch : End Try
+#If LOGGING_DETAIL >= 1 Then
+            Dim ramP2 As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+            WriteToLog($"[ComputePi] Pass 2: r2 = gmpNumer * Q2 (separate var)  RAM:{ramP2:N0}MB")
+#End If
+            Dim mpR2 As New mpz_t()
+            gmp_lib.mpz_init(mpR2)
+            gmp_lib.mpz_mul(mpR2, gmpNumer, mpQ2)
+            gmp_lib.mpz_clear(mpQ2)
+            ' Swap result into gmpNumer; clear frees the old ~208 MB gmpNumer buffer.
+            gmp_lib.mpz_swap(gmpNumer, mpR2)
+            gmp_lib.mpz_clear(mpR2)
+
+            ' ── Combine: gmpNumer = ((r2 << k) + r1) << k + r0 ──
+            ' Step A: gmpNumer = r2 << k
+            gmp_lib.mpz_mul_2exp(gmpNumer, gmpNumer, k1)
+            ' Step B: reload r1; add into gmpNumer
+            gmp_lib.mpz_init(mpR1)
+            Using fsR As New FileStream(R1_path, FileMode.Open, FileAccess.Read)
+                Using brR As New BinaryReader(fsR)
+                    DeserializeOneMpz(mpR1, brR, spillStaging)
+                End Using
+            End Using
+            Try : System.IO.File.Delete(R1_path) : Catch : End Try
+            gmp_lib.mpz_add(gmpNumer, gmpNumer, mpR1)
+            gmp_lib.mpz_clear(mpR1)
+            ' Step C: gmpNumer = (r2<<k + r1) << k
+            gmp_lib.mpz_mul_2exp(gmpNumer, gmpNumer, k1)
+            ' Step D: reload r0; add into gmpNumer
+            gmp_lib.mpz_init(mpR0)
+            Using fsR As New FileStream(R0_path, FileMode.Open, FileAccess.Read)
+                Using brR As New BinaryReader(fsR)
+                    DeserializeOneMpz(mpR0, brR, spillStaging)
+                End Using
+            End Using
+            Try : System.IO.File.Delete(R0_path) : Catch : End Try
+            gmp_lib.mpz_add(gmpNumer, gmpNumer, mpR0)
+            gmp_lib.mpz_clear(mpR0)
+
+            LogPhase("Numerator complete")
+
+            ' Reload finalT now that the large multiply is done
+            gmp_lib.mpz_init(finalT)    ' re-init the cleared mpz_t before import
+            Using fs As New FileStream(finalT_spillPath, FileMode.Open, FileAccess.Read)
+                Using br As New BinaryReader(fs)
+                    DeserializeOneMpz(finalT, br, stagingT)
+                End Using
+            End Using
+            Try
+                System.IO.File.Delete(finalT_spillPath)
+            Catch
+            End Try
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] finalT reloaded from spill file")
+            WriteToLog($"[ComputePi] mpz_tdiv_q: pi = numer / T  (numer~{CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 10)):N0} digits  T~{CLng(gmp_lib.mpz_sizeinbase(finalT, 10)):N0} digits)")
+#End If
+            gmp_lib.mpz_tdiv_q(gmpPi, gmpNumer, finalT)
+            gmp_lib.mpz_clears(gmpNumer, finalT, Nothing)
+            LogPhase("Division complete")
+
+            If token.IsCancellationRequested Then Return ""
+
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] mpz_get_str: converting result to string")
+#End If
+            Dim piCharPtr As char_ptr = gmp_lib.mpz_get_str(char_ptr.Zero, 10, gmpPi)
+            Dim piStr As String = piCharPtr.ToString()
+            gmp_lib.free(piCharPtr)
+            LogPhase("String conversion complete")
+
+            If piStr.Length > CInt(digits) + 1 Then
+                piStr = piStr.Substring(0, CInt(digits) + 1)
+            End If
+
+            LogPhase($"Done! {digits:N0} digits computed")
+            Return piStr(0) & "." & piStr.Substring(1)
+
+        Catch ex As Exception
+            WriteExceptionToLog("ComputePiGMP", ex)
+            MessageBox.Show("EXCEPTION: " & ex.Message & vbCrLf & ex.StackTrace)
+            Me.BeginInvoke(Sub()
+                               LblStatus.Text = "Error: " & ex.Message
+                               BtnCompute.Enabled = True
+                               BtnPause.Enabled = False
+                               Timer1.Stop()
+                           End Sub)
+            Return ""
+        Finally
+            Try
+                If gmpVariablesInitialized Then
+                    gmp_lib.mpz_clears(gmpPi, gmpOne, Nothing)
+                End If
+            Catch
+            End Try
+        End Try
+    End Function
+
+    ' ════════════════════════════════════════════════════════════════════════
+    '  Display helpers
+    ' ════════════════════════════════════════════════════════════════════════
+
+    Private Sub StreamPiToScreen(piString As String)
+        LstBoxPhases.Items.Add($"{stopWatch.Elapsed:hh\:mm\:ss\.ff} | Streaming started")
+        Try
+            System.IO.File.AppendAllText("c:\PiOutput\pi_phase_log.txt",
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") &
+                $" | Streaming started ({piString.Length:N0} digits)" & vbCrLf)
+        Catch
+        End Try
+        displayTimer.Enabled = False
+        RtbPiDigits.Clear()
+        LblDigitsDisplayed.Text = "0"
+        LblStatus.Text = $"Streaming {piString.Length:N0} digits..."
+        displayStr = piString
+        displayIdx = 0
+        displayTotal = 0
+        displayTimer.Enabled = True
+    End Sub
+
+    Private Sub DisplayTimer_Tick(sender As Object, e As EventArgs) Handles displayTimer.Tick
+        If displayIdx >= displayStr.Length Then
+            displayTimer.Enabled = False
+            LblStatus.Text = $"Done! {displayTotal:N0} digits displayed."
+            BtnCompute.Enabled = True
+            BtnPause.Enabled = False
+            Timer1.Stop()
+
+            LstBoxPhases.Items.Add($"{stopWatch.Elapsed:hh\:mm\:ss\.ff} | Streaming complete")
+            Try
+                System.IO.File.AppendAllText("c:\PiOutput\pi_phase_log.txt",
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") &
+                    " | Streaming complete" & vbCrLf)
+            Catch
+            End Try
+
+            If ChkboxWriteToFile.Checked Then
+                LblStatus.Text = "Writing to file..."
+                Try
+                    If Not System.IO.Directory.Exists(System.IO.Path.GetDirectoryName(outputFile)) Then
+                        System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(outputFile))
+                    End If
+                    System.IO.File.WriteAllText(outputFile, displayStr)
+                    LblStatus.Text = $"Done! Saved to {outputFile}"
+                Catch ex As Exception
+                    LblStatus.Text = "File save error: " & ex.Message
+                End Try
+            End If
+
+            ' Issue #8 fix: release the pi string immediately after it has been
+            ' fully displayed (and optionally written to file).
+            ' For 1 billion digits this is a ~2 GB LOH object; the LOH is not
+            ' compacted by default, so it blocks that address range until
+            ' explicitly released.  Setting to Nothing allows the next GC to
+            ' reclaim the slot.
+            displayStr = Nothing
+            WriteToLog("[DisplayTimer] displayStr released (LOH block freed)")
+            Return
+        End If
+
+        Dim chunkSize As Integer = 500
+        If Integer.TryParse(TxtChunkSize.Text, chunkSize) = False Then chunkSize = 500
+        If chunkSize < 1 Then chunkSize = 1
+        If chunkSize > 1000000 Then chunkSize = 1000000
+        Dim chunkEnd As Integer = System.Math.Min(displayIdx + chunkSize, displayStr.Length)
+
+        Dim chunk As New System.Text.StringBuilder()
+        While displayIdx < chunkEnd
+            Dim ch As Char = displayStr(displayIdx)
+            If Char.IsDigit(ch) OrElse ch = "."c Then
+                chunk.Append(ch)
+            End If
+            displayIdx += 1
+        End While
+
+        If chunk.Length > 0 Then
+            displayTotal += chunk.Length
+            RtbPiDigits.AppendText(chunk.ToString())
+            RtbPiDigits.SelectionStart = RtbPiDigits.TextLength
+            RtbPiDigits.ScrollToCaret()
+            LblDigitsDisplayed.Text = $"{displayTotal:N0}"
+        End If
+    End Sub
+
+    Private Sub Timer1_Tick(sender As Object, e As EventArgs) Handles Timer1.Tick
+        Dim span As TimeSpan = stopWatch.Elapsed
+        LblRunningTime.Text = Format(span.Days, "000") & "." &
+                              Format(span.Hours, "00") & ":" &
+                              Format(span.Minutes, "00") & ":" &
+                              Format(span.Seconds, "00") & "." &
+                              Format(span.Milliseconds, "000")
+    End Sub
+
+    Private Sub BtnTest_Click(sender As Object, e As EventArgs) Handles BtnTest.Click
+        Dim piText As String = RtbPiDigits.Text.Replace(".", "").Replace(vbCrLf, "")
+
+        Dim pos1 As Integer = piText.IndexOf("999999")
+        If pos1 >= 0 Then
+            MessageBox.Show($"Found '999999' at position {pos1}!" & vbCrLf &
+                           $"Expected position: 762" & vbCrLf &
+                           $"Correct: {pos1 = 762}")
+        Else
+            MessageBox.Show("999999 not found!")
+        End If
+
+        Dim pos2 As Integer = piText.IndexOf("777777777")
+        If pos2 >= 0 Then
+            MessageBox.Show($"Found '777777777' at position {pos2}!" & vbCrLf &
+                           $"Expected position: 24,658,601" & vbCrLf &
+                           $"Correct: {pos2 = 24658601}")
+        Else
+            MessageBox.Show("777777777 not found - may need more digits!")
+        End If
+
+        Dim pos3 As Integer = piText.IndexOf("27182818284")
+        If pos3 >= 0 Then
+            MessageBox.Show($"Found first digits of e '27182818284' at position {pos3}!")
+        Else
+            MessageBox.Show("First digits of e not found in first 250M digits!")
+        End If
+    End Sub
+
+    Private Sub TxtDigitsofPI_TextChanged(sender As Object, e As EventArgs) Handles TxtDigitsofPI.TextChanged
+        Dim cursorPos As Integer = TxtDigitsofPI.SelectionStart
+        Dim rawText As String = TxtDigitsofPI.Text.Replace(",", "")
+        Dim digits As Long
+        If Long.TryParse(rawText, digits) Then
+            Dim formatted As String = digits.ToString("N0")
+            If TxtDigitsofPI.Text <> formatted Then
+                TxtDigitsofPI.Text = formatted
+                Dim newPos As Integer = cursorPos + (formatted.Length - rawText.Length)
+                If newPos < 0 Then newPos = 0
+                If newPos > formatted.Length Then newPos = formatted.Length
+                TxtDigitsofPI.SelectionStart = newPos
+            End If
+        End If
+    End Sub
+
+End Class

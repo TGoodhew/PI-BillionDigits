@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "PI-BillionDigits": {
+      "commandName": "Project",
+      "nativeDebugging": true
+    }
+  }
+}
