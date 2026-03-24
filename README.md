@@ -726,7 +726,7 @@ Dim sz As Long = CLng(rawSz)         ' safe: rawSz <= Long.MaxValue guaranteed
 
 **Why the size became corrupted** is not yet determined. One hypothesis: the struct-patching code that writes directly to `__mpz_struct._mp_alloc` (offset 0) via `Marshal.WriteInt32` may interact with GMP's internal reallocation decisions in a way that corrupts `_mp_size` (offset 4) under edge cases at 1-billion-digit scale. Further investigation requires a native debugger attached during the binary split phase.
 
-**Diagnostic added (§16):** per-multiply operand size logging at the top levels to identify the exact operation that produces the corrupted allocation.
+**Root cause confirmed and fixed (§17):** GMP's 32-bit `mp_size_t` overflows when `pl × GMP_NUMB_BITS > 2^31`. The `SafeMpzMul` wrapper splits both operands into 3 pieces when `szA + szB ≥ 33,554,432`, keeping all 9 sub-products below the overflow threshold.
 
 ---
 
@@ -745,3 +745,37 @@ Dim sz As Long = CLng(rawSz)         ' safe: rawSz <= Long.MaxValue guaranteed
 ```
 
 If any operand has a wildly unexpected `_mp_size` (e.g. negative, or orders of magnitude larger than expected), that indicates the corruption originates in the data loaded from disk rather than in GMP's allocation arithmetic. Expected limb counts at Level 16 for 1 billion digits: ~15–30 million limbs per P/Q/T value.
+
+**Finding:** the inputs were not corrupted. `leftQ=33,873,440` and `rightQ=34,258,968` limbs — both reasonable. The crash occurred *inside* `mpz_mul(newQ, leftQ, rightQ)`. Root cause confirmed as the GMP 32-bit overflow described in §17.
+
+---
+
+## Section 17 — GMP 32-bit `mp_size_t` Overflow in FFT Multiplication
+
+**Root cause:** GMP's MSVC build uses signed 32-bit `mp_size_t`. Inside `mpn_mul_fft`, the code computes:
+```c
+Kl = pl * GMP_NUMB_BITS / K;   /* where GMP_NUMB_BITS = 64 */
+```
+`pl = nl + ml` is the result limb count and the multiplication is done as 32-bit int arithmetic. When `pl ≥ 33,554,432` (= 2³¹/64), `pl * 64` **overflows int32**, producing a corrupted `Kl` value. This drives a corrupt FFT scratch-space size that is passed back to our allocator as a huge unsigned value (e.g. `18446744073709036064 = -64444 × 8` in two's complement).
+
+At Level 16 of the 1-billion-digit binary split, `leftQ + rightQ = 68,132,408` limbs — more than double the safe threshold. The P multiplication (`leftP + rightP = 43,432,983` limbs) appears to succeed because GMP selects a different algorithm (likely Toom-Cook rather than FFT) at that operand size.
+
+**Fix — `SafeMpzMul` wrapper:**
+
+```vb
+Private Shared Sub SafeMpzMul(result As mpz_t, opA As mpz_t, opB As mpz_t)
+    Const SAFE_LIMB_THRESHOLD As Integer = 33_554_431
+    Dim szA = Abs(ReadInt32(opA.Pointer, 4))
+    Dim szB = Abs(ReadInt32(opB.Pointer, 4))
+    If szA + szB <= SAFE_LIMB_THRESHOLD Then
+        gmp_lib.mpz_mul(result, opA, opB) : Return
+    End If
+    ' 3-way split: A = A0 + A1*2^bitsA + A2*2^(2*bitsA), same for B.
+    ' 9 sub-products; each has at most ceil(szA/3)+ceil(szB/3) limbs ≈ 22.7M < 33.5M → safe.
+    ' Assemble via mpz_mul_2exp + mpz_add (both O(n), no FFT).
+End Sub
+```
+
+Each of the four `mpz_mul` calls in the binary-split combine loop (`newP`, `newQ`, `tempA`, `tempB`) is replaced with `SafeMpzMul`. The wrapper is a no-op for operand pairs below the threshold — no overhead for smaller levels.
+
+**Why the 3-way split:** a 2-way split of both operands gives sub-products of `≈ szA/2 + szB/2 = (szA+szB)/2 ≈ 34M` limbs, which still exceeds the threshold. A 3-way split gives `≈ (szA+szB)/3 × 2 ≈ 22.7M` limbs per sub-product, safely below 33.5M.

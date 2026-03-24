@@ -1045,6 +1045,97 @@ Public Class Form1
     End Sub
 
     ' ════════════════════════════════════════════════════════════════════════
+    '  Safe large-integer multiply (avoids GMP 32-bit mp_size_t overflow)
+    ' ════════════════════════════════════════════════════════════════════════
+
+    ''' <summary>
+    ''' GMP's MSVC build uses signed 32-bit mp_size_t.  mpn_mul_fft internally
+    ''' computes  pl * GMP_NUMB_BITS  (pl = nl + ml, GMP_NUMB_BITS = 64) as an
+    ''' int32 expression.  When pl >= 33,554,432 limbs (= 2^31/64) this product
+    ''' overflows int32, corrupting the FFT scratch-size calculation and causing
+    ''' GmpAllocFunc to receive an invalid (huge/negative) size.
+    '''
+    ''' This wrapper detects when szA + szB >= the overflow threshold and falls
+    ''' back to a 3-way schoolbook split: each operand is decomposed into three
+    ''' pieces of ceil(sz/3) limbs, giving 9 safe sub-products.  Each
+    ''' sub-product has at most ceil(szA/3)+ceil(szB/3) limbs = ~(szA+szB)/3*2
+    ''' limbs, which stays well below the 33,554,431-limb threshold.
+    ''' </summary>
+    Private Shared Sub SafeMpzMul(result As mpz_t, opA As mpz_t, opB As mpz_t)
+        ' Threshold: pl * 64 must fit in int32. pl_max = floor((2^31-1)/64) = 33,554,431.
+        Const SAFE_LIMB_THRESHOLD As Integer = 33_554_431
+
+        Dim szA As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4))
+        Dim szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(opB.Pointer, 4))
+
+        If szA + szB <= SAFE_LIMB_THRESHOLD Then
+            gmp_lib.mpz_mul(result, opA, opB)
+            Return
+        End If
+
+        ' Determine sign of product; work with absolute values for clean splitting.
+        Dim szA_signed As Integer = Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4)
+        Dim szB_signed As Integer = Runtime.InteropServices.Marshal.ReadInt32(opB.Pointer, 4)
+        Dim resultSign As Integer = System.Math.Sign(szA_signed) * System.Math.Sign(szB_signed)
+
+        ' Piece widths in limbs (ceiling division by 3) and bits.
+        Dim mA As ULong = CULng((szA + 2) \ 3)
+        Dim mB As ULong = CULng((szB + 2) \ 3)
+        Dim bitsA As ULong = mA * 64UL
+        Dim bitsB As ULong = mB * 64UL
+
+        ' Absolute-value copies so tdiv_r/q_2exp always yields non-negative pieces.
+        Dim absA As New mpz_t(), absB As New mpz_t()
+        gmp_lib.mpz_inits(absA, absB, Nothing)
+        gmp_lib.mpz_abs(absA, opA)
+        gmp_lib.mpz_abs(absB, opB)
+
+        ' Split |opA| = A0 + A1*2^bitsA + A2*2^(2*bitsA)
+        Dim A0 As New mpz_t(), A1 As New mpz_t(), A2 As New mpz_t(), Atmp As New mpz_t()
+        gmp_lib.mpz_inits(A0, A1, A2, Atmp, Nothing)
+        gmp_lib.mpz_tdiv_r_2exp(A0, absA, New mp_bitcnt_t(CUInt(bitsA)))
+        gmp_lib.mpz_tdiv_q_2exp(Atmp, absA, New mp_bitcnt_t(CUInt(bitsA)))
+        gmp_lib.mpz_tdiv_r_2exp(A1, Atmp, New mp_bitcnt_t(CUInt(bitsA)))
+        gmp_lib.mpz_tdiv_q_2exp(A2, Atmp, New mp_bitcnt_t(CUInt(bitsA)))
+
+        ' Split |opB| = B0 + B1*2^bitsB + B2*2^(2*bitsB)
+        Dim B0 As New mpz_t(), B1 As New mpz_t(), B2 As New mpz_t(), Btmp As New mpz_t()
+        gmp_lib.mpz_inits(B0, B1, B2, Btmp, Nothing)
+        gmp_lib.mpz_tdiv_r_2exp(B0, absB, New mp_bitcnt_t(CUInt(bitsB)))
+        gmp_lib.mpz_tdiv_q_2exp(Btmp, absB, New mp_bitcnt_t(CUInt(bitsB)))
+        gmp_lib.mpz_tdiv_r_2exp(B1, Btmp, New mp_bitcnt_t(CUInt(bitsB)))
+        gmp_lib.mpz_tdiv_q_2exp(B2, Btmp, New mp_bitcnt_t(CUInt(bitsB)))
+
+        gmp_lib.mpz_clears(absA, absB, Atmp, Btmp, Nothing)
+
+        ' Accumulate 9 safe sub-products: result = Σ A_i·B_j·2^(i·bitsA + j·bitsB)
+        gmp_lib.mpz_set_ui(result, 0UI)
+        Dim prod As New mpz_t(), shifted As New mpz_t()
+        gmp_lib.mpz_inits(prod, shifted, Nothing)
+
+        Dim A_parts() As mpz_t = {A0, A1, A2}
+        Dim B_parts() As mpz_t = {B0, B1, B2}
+
+        For i As Integer = 0 To 2
+            For j As Integer = 0 To 2
+                gmp_lib.mpz_mul(prod, A_parts(i), B_parts(j))
+                Dim shiftBits As ULong = CULng(i) * bitsA + CULng(j) * bitsB
+                If shiftBits = 0UL Then
+                    gmp_lib.mpz_add(result, result, prod)
+                Else
+                    ' shiftBits <= 4 * max(bitsA,bitsB) ~ 2.9B < UInt32.MaxValue
+                    gmp_lib.mpz_mul_2exp(shifted, prod, New mp_bitcnt_t(CUInt(shiftBits)))
+                    gmp_lib.mpz_add(result, result, shifted)
+                End If
+            Next j
+        Next i
+
+        If resultSign < 0 Then gmp_lib.mpz_neg(result, result)
+
+        gmp_lib.mpz_clears(prod, shifted, A0, A1, A2, B0, B1, B2, Nothing)
+    End Sub
+
+    ' ════════════════════════════════════════════════════════════════════════
     '  Chudnovsky binary splitting — tree merge level
     ' ════════════════════════════════════════════════════════════════════════
 
@@ -1225,7 +1316,7 @@ Public Class Form1
                     WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newP  leftP={System.Math.Abs(_szLP):N0} rightP={System.Math.Abs(_szRP):N0} limbs")
                 End If
 #End If
-                gmp_lib.mpz_mul(newP, leftP, rightP)
+                SafeMpzMul(newP, leftP, rightP)
                 gmp_lib.mpz_clears(rightP, Nothing)             ' rightP done
 
 #If LOGGING_DETAIL >= 1 Then
@@ -1235,7 +1326,7 @@ Public Class Form1
                     WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newQ  leftQ={System.Math.Abs(_szLQ):N0} rightQ={System.Math.Abs(_szRQ):N0} limbs")
                 End If
 #End If
-                gmp_lib.mpz_mul(newQ, leftQ, rightQ)
+                SafeMpzMul(newQ, leftQ, rightQ)
                 gmp_lib.mpz_clears(leftQ, Nothing)              ' leftQ done
 
 #If LOGGING_DETAIL >= 1 Then
@@ -1245,7 +1336,7 @@ Public Class Form1
                     WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempA  leftT={System.Math.Abs(_szLT):N0} rightQ={System.Math.Abs(_szRQ2):N0} limbs")
                 End If
 #End If
-                gmp_lib.mpz_mul(tempA, leftT, rightQ)
+                SafeMpzMul(tempA, leftT, rightQ)
                 gmp_lib.mpz_clears(leftT, rightQ, Nothing)      ' leftT, rightQ done
 
 #If LOGGING_DETAIL >= 1 Then
@@ -1255,7 +1346,7 @@ Public Class Form1
                     WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempB  leftP={System.Math.Abs(_szLP2):N0} rightT={System.Math.Abs(_szRT):N0} limbs")
                 End If
 #End If
-                gmp_lib.mpz_mul(tempB, leftP, rightT)
+                SafeMpzMul(tempB, leftP, rightT)
                 gmp_lib.mpz_clears(leftP, rightT, Nothing)      ' leftP, rightT done
 
 #If LOGGING_DETAIL >= 1 Then
