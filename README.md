@@ -662,3 +662,32 @@ The `Finally` block guarantees the timer is always disposed even if `mpz_get_str
 - **File write:** instead of `File.WriteAllText(outputFile, displayStr)`, a `FileStream` writes the native buffer in 1 MB chunks via `Marshal.Copy`, prepending "3." before the remaining digits.
 
 Peak memory during streaming: ~1.8 GB (native char buffer only). No managed string is ever created. The `displayStr` field remains `Nothing` for the lifetime of the native stream.
+
+---
+
+## Section 14 — Exception Handling Consolidation
+
+**Problem:** when running at 1 billion digits, two exception dialogs appeared but only one log entry was written. Execution also did not stop cleanly after the first dialog.
+
+**Root cause — two dialog sources:**
+1. `ComputePiGMP`'s own `Catch ex As Exception` block called `MessageBox.Show` directly from the background compute thread, then called `Me.BeginInvoke` to update the UI, then `Return ""`. This suppressed the exception — it never reached the outer handler in `BtnCompute_Click`. The `BeginInvoke` UI update and `Return ""` left the app in an indeterminate state.
+2. `GmpReallocFunc` and `GmpFreeFunc` had no exception handling. An `OverflowException` from `CLng(size)` (for a corrupted or extremely large allocation size) propagated back through the P/Invoke boundary from the GMP callback, surfacing as an unhandled exception caught by `ApplicationEvents.vb`'s `MyApplication_UnhandledException` handler — a second dialog at the framework level, with its own log format.
+
+**Fixes:**
+
+### 14.1 GmpReallocFunc — Try/Catch wrapper
+Wrapped the entire body in `Try … Catch ex As Exception`. On exception: logs `[GmpReallocFunc] EXCEPTION …` to the log file using `File.AppendAllText` (safe from a GMP callback context) and returns `New void_ptr(IntPtr.Zero)`. GMP will then abort, which is the correct behaviour — the native crash handler (§2.3) will record a log entry.
+
+### 14.2 GmpFreeFunc — safe size conversion + Try/Catch wrapper
+The original `CLng(size)` could throw `OverflowException` for a `size_t` value that exceeds `Long.MaxValue` (e.g. a corrupted pointer/size pair). Fixed with `CLng(CULng(size))` — `CULng` first converts the opaque `size_t` to `ULong` without sign-extension overflow, then `CLng` converts the `ULong` to `Long` (safe for all realistic allocation sizes). The entire body is also wrapped in `Try … Catch ex As Exception` so that any remaining exception is logged and the function returns without crashing, logging `[GmpFreeFunc] EXCEPTION …`.
+
+### 14.3 ComputePiGMP catch — log + re-throw
+The `Catch ex As Exception` in `ComputePiGMP` previously called `MessageBox.Show` and `Me.BeginInvoke` and then silently returned `""`. This was replaced with:
+```vb
+Catch ex As Exception
+    WriteExceptionToLog("ComputePiGMP", ex)
+    Throw
+```
+The `Throw` re-raises the exception to the outer `BtnCompute_Click` compute-thread handler, which is the **single** location that shows a dialog (`Me.Invoke` with `MessageBox.Show`) and restores the UI. The `Finally` block in `ComputePiGMP` still runs (GMP variable cleanup), so resources are released before the exception propagates.
+
+**Result:** exactly one log entry and one dialog per exception, execution stops cleanly, and the UI is correctly reset regardless of which exception type was thrown.

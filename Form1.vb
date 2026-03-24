@@ -212,6 +212,7 @@ Public Class Form1
     ' GMP's internal state (crash/NullReferenceException in BinarySplitChunk).
 
     Private Shared Function GmpAllocFunc(alloc_size As size_t) As void_ptr
+        Try
         Dim sz As Long = CLng(alloc_size)
         If sz >= GMP_LARGE_THRESHOLD Then
             Dim ptr As IntPtr = VirtualAlloc(IntPtr.Zero,
@@ -233,11 +234,17 @@ Public Class Form1
             Return New void_ptr(ptr)
         End If
         Return _savedGmpAlloc(alloc_size)
+        Catch ex As Exception
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[GmpAllocFunc] EXCEPTION ({ex.GetType().Name}): {ex.Message} — returning null{vbCrLf}")
+            Return New void_ptr(IntPtr.Zero)
+        End Try
     End Function
 
     Private Shared Function GmpReallocFunc(old_ptr As void_ptr,
                                             old_size As size_t,
                                             new_size As size_t) As void_ptr
+        Try
         Dim oldSz As Long = CLng(old_size)
         Dim newSz As Long = CLng(new_size)
 
@@ -318,16 +325,27 @@ Public Class Form1
         End If
 
         Return New void_ptr(newP)
+        Catch ex As Exception
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[GmpReallocFunc] EXCEPTION ({ex.GetType().Name}): {ex.Message} — returning null{vbCrLf}")
+            Return New void_ptr(IntPtr.Zero)
+        End Try
     End Function
 
     Private Shared Sub GmpFreeFunc(ptr As void_ptr, size As size_t)
+        Try
         Dim p As IntPtr = ptr.ToIntPtr()
         If p = IntPtr.Zero Then Return
-        If CLng(size) >= GMP_LARGE_THRESHOLD Then
+        Dim sz As Long = CLng(CULng(size))   ' CULng first avoids OverflowException for huge values
+        If sz >= GMP_LARGE_THRESHOLD Then
             VirtualFree(p, UIntPtr.Zero, MEM_RELEASE)
         Else
             _savedGmpFree(ptr, size)
         End If
+        Catch ex As Exception
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[GmpFreeFunc] EXCEPTION ({ex.GetType().Name}): {ex.Message} — leaking ptr{vbCrLf}")
+        End Try
     End Sub
 
     ' Direct P/Invoke to set GMP's native memory function table, bypassing the
@@ -1989,14 +2007,7 @@ Public Class Form1
 
         Catch ex As Exception
             WriteExceptionToLog("ComputePiGMP", ex)
-            MessageBox.Show("EXCEPTION: " & ex.Message & vbCrLf & ex.StackTrace)
-            Me.BeginInvoke(Sub()
-                               LblStatus.Text = "Error: " & ex.Message
-                               BtnCompute.Enabled = True
-                               BtnPause.Enabled = False
-                               Timer1.Stop()
-                           End Sub)
-            Return ""
+            Throw
         Finally
             Try
                 If gmpVariablesInitialized Then
