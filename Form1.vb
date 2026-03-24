@@ -236,16 +236,32 @@ Public Class Form1
         Dim newP As IntPtr = IntPtr.Zero
         Dim copyBytes As UIntPtr = New UIntPtr(CULng(System.Math.Min(oldSz, newSz)))
 
+        ' Step-level logging threshold: 400 MB — catches Combine-section reallocs
+        ' without flooding the log during binary-split smaller operations.
+        Const LOG_STEP_THRESHOLD As Long = 400L * 1024L * 1024L
+
         If oldSz >= GMP_LARGE_THRESHOLD AndAlso newSz >= GMP_LARGE_THRESHOLD Then
             ' large → large: new VirtualAlloc, copy, free old
+            If newSz >= LOG_STEP_THRESHOLD Then
+                System.IO.File.AppendAllText(LOG_FILE,
+                    $"[GmpRealloc] L→L enter: new={newSz:N0} old={oldSz:N0}{vbCrLf}")
+            End If
             newP = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(newSz)),
                                 MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             If newP <> IntPtr.Zero Then
-                If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
-                VirtualFree(oldP, UIntPtr.Zero, MEM_RELEASE)
-                If newSz >= 500L * 1024L * 1024L Then
+                If newSz >= LOG_STEP_THRESHOLD Then
                     System.IO.File.AppendAllText(LOG_FILE,
-                        $"[GmpRealloc] large→large VirtualAlloc({newSz:N0} bytes) OK{vbCrLf}")
+                        $"[GmpRealloc] L→L VA ok: newP={newP:X} copy={copyBytes.ToUInt64():N0}{vbCrLf}")
+                End If
+                If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
+                If newSz >= LOG_STEP_THRESHOLD Then
+                    System.IO.File.AppendAllText(LOG_FILE,
+                        $"[GmpRealloc] L→L copy done; about to VirtualFree oldP={oldP:X}{vbCrLf}")
+                End If
+                VirtualFree(oldP, UIntPtr.Zero, MEM_RELEASE)
+                If newSz >= LOG_STEP_THRESHOLD Then
+                    System.IO.File.AppendAllText(LOG_FILE,
+                        $"[GmpRealloc] L→L VirtualFree done → OK{vbCrLf}")
                 End If
             Else
                 System.IO.File.AppendAllText(LOG_FILE,
@@ -253,16 +269,22 @@ Public Class Form1
             End If
         ElseIf newSz >= GMP_LARGE_THRESHOLD Then
             ' small → large: VirtualAlloc for new, CRT-free for old
+            If newSz >= LOG_STEP_THRESHOLD Then
+                System.IO.File.AppendAllText(LOG_FILE,
+                    $"[GmpRealloc] S→L enter: new={newSz:N0} old={oldSz:N0}{vbCrLf}")
+            End If
             newP = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(newSz)),
                                 MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             If newP <> IntPtr.Zero Then
+                If newSz >= LOG_STEP_THRESHOLD Then
+                    System.IO.File.AppendAllText(LOG_FILE,
+                        $"[GmpRealloc] S→L VA ok: newP={newP:X} copy={copyBytes.ToUInt64():N0}{vbCrLf}")
+                End If
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
                 _savedGmpFree(old_ptr, old_size)
-                ' Confirm the realloc completed for any allocation >= 500 MB so we
-                ' can distinguish "realloc OK but shift crashed" from a silent failure.
-                If newSz >= 500L * 1024L * 1024L Then
+                If newSz >= LOG_STEP_THRESHOLD Then
                     System.IO.File.AppendAllText(LOG_FILE,
-                        $"[GmpRealloc] small→large VirtualAlloc({newSz:N0} bytes) OK{vbCrLf}")
+                        $"[GmpRealloc] S→L CRT-free done → OK{vbCrLf}")
                 End If
             Else
                 System.IO.File.AppendAllText(LOG_FILE,
@@ -1640,6 +1662,9 @@ Public Class Form1
             WriteToLog($"[ComputePi] Combine A: mpz_mul_2exp  k={CLng(k1):N0} bits  gmpNumer={CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits")
 #End If
             gmp_lib.mpz_mul_2exp(mpShiftA, gmpNumer, k1)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine A: mpz_mul_2exp returned OK")
+#End If
 #If LOGGING_DETAIL >= 1 Then
             WriteToLog($"[ComputePi] Combine A: mpz_swap")
 #End If

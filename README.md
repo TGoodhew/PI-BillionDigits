@@ -442,6 +442,19 @@ gmp_lib.mpz_init2(mpShiftA, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
 - `GmpReallocFunc` now logs a success line (`[GmpRealloc] large→large VirtualAlloc(N bytes) OK` / `small→large … OK`) for any allocation ≥ 500 MB, confirming the realloc completed before GMP begins the shift operation.
 - Combine A pre-call log now includes `gmpNumer=N bits` so the log confirms `gmpNumer` is valid immediately before `mpz_mul_2exp`.
 
+### 10.5 Combine A crash persists — add per-step GmpReallocFunc logging
+
+**Crash symptom (second run):** Still crashes in `mpz_mul_2exp(mpShiftA, gmpNumer, k1)` after the §10.4 changes. The `[GmpRealloc] large→large ... OK` success log does **not** appear, ruling out a crash in the actual shift operation. The `[GmpRealloc] ... FAILED` line also does not appear, ruling out a VirtualAlloc failure. The crash therefore occurs between VirtualAlloc returning a valid pointer and the success log write — i.e., inside `CopyMemory` or `VirtualFree`.
+
+**Diagnostic change:** the single post-VirtualFree success log was replaced by four per-step log lines (gated on new size ≥ 400 MB, covering the combine-phase reallocs):
+
+1. `[GmpRealloc] L→L enter: new=N old=M` — function entered for large→large
+2. `[GmpRealloc] L→L VA ok: newP=… copy=…` — VirtualAlloc succeeded
+3. `[GmpRealloc] L→L copy done; about to VirtualFree oldP=…` — CopyMemory done
+4. `[GmpRealloc] L→L VirtualFree done → OK` — VirtualFree done (= full success)
+
+The last line that appears in the log tells us which call crashes. The same four-step pattern was added for the small→large path (`S→L`). A `"Combine A: mpz_mul_2exp returned OK"` log line was also added immediately after the `mpz_mul_2exp` call, so if GmpReallocFunc completes but the actual shift crashes, this log line will be absent while the `VirtualFree done` line will be present.
+
 ---
 
 ## Section 9 — Summary of All Changed Locations
