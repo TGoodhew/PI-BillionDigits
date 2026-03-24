@@ -1968,13 +1968,17 @@ Public Class Form1
             Finally
                 _strConvTimer.Dispose()
             End Try
-            Dim piStr As String = piCharPtr.ToString()
+            ' Free gmpPi now (~744 MB native) before allocating the managed string,
+            ' then reinit to a 1-limb stub so the Finally mpz_clears stays safe.
+            gmp_lib.mpz_clear(gmpPi)
+            gmp_lib.mpz_init(gmpPi)
+            ' Read only digits+1 chars from the native buffer instead of the full
+            ' ~1.8 billion-char result.  piCharPtr.ToString() would call
+            ' Marshal.PtrToStringAnsi without a length, allocating ~3.6 GB managed.
+            Dim _take As Integer = CInt(digits) + 1
+            Dim piStr As String = Runtime.InteropServices.Marshal.PtrToStringAnsi(piCharPtr.Pointer, _take)
             gmp_lib.free(piCharPtr)
             LogPhase("String conversion complete")
-
-            If piStr.Length > CInt(digits) + 1 Then
-                piStr = piStr.Substring(0, CInt(digits) + 1)
-            End If
 
             LogPhase($"Done! {digits:N0} digits computed")
             Return piStr(0) & "." & piStr.Substring(1)

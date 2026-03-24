@@ -629,3 +629,19 @@ String conversion... 02:34 elapsed
 The timer is independent of the compute thread — it fires as long as the UI message loop is running (i.e., the process is alive and not deadlocked on the UI thread). The existing running-time counter already confirms the process is alive; the ticker adds confirmation that the string conversion step specifically is in progress and shows how long it has been running.
 
 The `Finally` block guarantees the timer is always disposed even if `mpz_get_str` throws, and `LogPhase("String conversion complete")` immediately overwrites the ticker message in `LblStatus` when the call returns.
+
+---
+
+## Section 12 — OutOfMemoryException in `piCharPtr.ToString()`
+
+**Exception:** `System.OutOfMemoryException` at `char_ptr.ToString()` → `Marshal.PtrToStringAnsi(IntPtr)` → `String.CreateStringForSByteConstructor`. RAM was 2,518 MB at the point of failure.
+
+**Root cause:** `mpz_get_str(char_ptr.Zero, 10, gmpPi)` allocates a native char buffer containing the complete decimal representation of the quotient. At 500 million target digits, the Chudnovsky binary-splitting intermediate result has ~1.793 billion decimal digits, so the native buffer is ~1.8 GB. `char_ptr.ToString()` calls `Marshal.PtrToStringAnsi(IntPtr)` **without a length**, which copies every character into a managed .NET `String`. A .NET `String` uses UTF-16 (2 bytes per char), so a 1.8-billion-char string requires ~3.6 GB of managed heap — causing OOM on top of the ~744 MB still held by `gmpPi` and the ~1.8 GB native char buffer.
+
+**Fix — two changes:**
+
+1. **Free `gmpPi` before the managed string allocation.** After `mpz_get_str` returns, `gmpPi` is no longer needed. `mpz_clear(gmpPi)` frees its ~744 MB native limb buffer immediately. `mpz_init(gmpPi)` reinitialises it to a 1-limb stub so the `Finally` block's `mpz_clears(gmpPi, …)` remains safe (no double-free).
+
+2. **Read only `digits + 1` characters.** `char_ptr` exposes a `.Pointer` property (`IntPtr`). `Marshal.PtrToStringAnsi(piCharPtr.Pointer, digits + 1)` reads exactly the needed characters from the native buffer, allocating a managed string of ~1 GB (500 M chars × 2 bytes) instead of ~3.6 GB. The native char buffer is freed immediately after via `gmp_lib.free(piCharPtr)`.
+
+Peak memory after fix: ~1.8 GB (native char buffer, still live during the managed copy) + ~1 GB (managed string) = ~2.8 GB — within the available address space. The previously-needed post-hoc `.Substring` truncation is also removed since the string is already the correct length.
