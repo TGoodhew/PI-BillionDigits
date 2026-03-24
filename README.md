@@ -605,7 +605,7 @@ The CRT-vs-VirtualAlloc distinction matters: the combine output variables were i
 | | |
 |---|---|
 | **Before** | Debug `MessageBox` calls throughout; `nodes` as `List(Of Tuple)`; combine loop: `newT` allocated fresh, all 6 inputs kept alive; `gmpOne` not freed early; `gmpSqrt` and `finalP` not freed before multiply; `finalT` not spilled; single `gmpNumer *= finalQ` multiply; catch block: `MessageBox` only, no log write |
-| **After** | Debug `MessageBox`es removed; `nodes` as `List(Of Result)`; combine loop: early-free + in-place `mpz_add` (§4); `gmpOne` freed after `gmpSqrtInput = gmpOne²` (§5.1); `gmpSqrt` + `finalP` freed before multiply (§5.2); `finalT` spilled to disk before multiply (§5.3); 3-way split multiply with Pass 2 aliasing fix (§7); combine section uses separate output vars + `mpz_swap` for all 4 operations (§10.2); catch block calls `WriteExceptionToLog`; all `[ComputePi]` `WriteToLog` calls gated on `LOGGING_DETAIL >= 1` |
+| **After** | Debug `MessageBox`es removed; `nodes` as `List(Of Result)`; combine loop: early-free + in-place `mpz_add` (§4); `gmpOne` freed after `gmpSqrtInput = gmpOne²` (§5.1); `gmpSqrt` + `finalP` freed before multiply (§5.2); `finalT` spilled to disk before multiply (§5.3); 3-way split multiply with Pass 2 aliasing fix (§7); combine section uses separate output vars + `mpz_swap` for all 4 operations (§10.2); catch block calls `WriteExceptionToLog`; all `[ComputePi]` `WriteToLog` calls gated on `LOGGING_DETAIL >= 1`; `mpz_get_str` wrapped with a per-second status ticker (§11) |
 
 ### Form1.vb — DisplayTimer_Tick
 
@@ -613,3 +613,19 @@ The CRT-vs-VirtualAlloc distinction matters: the combine output variables were i
 |---|---|
 | **Before** | `displayStr` never cleared after streaming completed |
 | **After** | `displayStr = Nothing` after streaming and optional file write complete |
+
+---
+
+## Section 11 — String Conversion Progress Ticker
+
+**Problem:** `mpz_get_str(char_ptr.Zero, 10, gmpPi)` is a single opaque GMP call that blocks the compute thread (T5) for several minutes at 1 billion digits. During this time the status label stays frozen at `"Division complete"`, giving no indication whether the thread is still working or has hung.
+
+**Fix:** a `System.Threading.Timer` is started immediately before `mpz_get_str` and disposed in a `Finally` block immediately after it returns. The timer fires every second on a threadpool thread and calls `Me.BeginInvoke` to update `LblStatus` with the elapsed conversion time:
+
+```
+String conversion... 02:34 elapsed
+```
+
+The timer is independent of the compute thread — it fires as long as the UI message loop is running (i.e., the process is alive and not deadlocked on the UI thread). The existing running-time counter already confirms the process is alive; the ticker adds confirmation that the string conversion step specifically is in progress and shows how long it has been running.
+
+The `Finally` block guarantees the timer is always disposed even if `mpz_get_str` throws, and `LogPhase("String conversion complete")` immediately overwrites the ticker message in `LblStatus` when the call returns.

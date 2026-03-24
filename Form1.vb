@@ -1954,7 +1954,20 @@ Public Class Form1
 #If LOGGING_DETAIL >= 1 Then
             WriteToLog($"[ComputePi] mpz_get_str: converting result to string")
 #End If
-            Dim piCharPtr As char_ptr = gmp_lib.mpz_get_str(char_ptr.Zero, 10, gmpPi)
+            Dim _strConvStart As DateTime = DateTime.Now
+            Dim _strConvTimer As New System.Threading.Timer(
+                Sub(state As Object)
+                    Dim elapsed As TimeSpan = DateTime.Now - _strConvStart
+                    Me.BeginInvoke(Sub()
+                                       LblStatus.Text = $"String conversion... {elapsed:mm\:ss} elapsed"
+                                   End Sub)
+                End Sub, Nothing, 1000, 1000)
+            Dim piCharPtr As char_ptr
+            Try
+                piCharPtr = gmp_lib.mpz_get_str(char_ptr.Zero, 10, gmpPi)
+            Finally
+                _strConvTimer.Dispose()
+            End Try
             Dim piStr As String = piCharPtr.ToString()
             gmp_lib.free(piCharPtr)
             LogPhase("String conversion complete")
