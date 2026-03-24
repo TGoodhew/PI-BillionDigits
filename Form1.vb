@@ -213,10 +213,18 @@ Public Class Form1
 
     Private Shared Function GmpAllocFunc(alloc_size As size_t) As void_ptr
         Try
-        Dim sz As Long = CLng(alloc_size)
+        Dim rawSz As ULong = CULng(alloc_size)
+        If rawSz > CULng(Long.MaxValue) Then
+            ' Size > 9.2 EB — clearly corrupted GMP internal state.
+            ' Return null so GMP will abort cleanly; native crash handler logs it.
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[GmpAllocFunc] CORRUPT SIZE ({rawSz}) — returning null{vbCrLf}")
+            Return New void_ptr(IntPtr.Zero)
+        End If
+        Dim sz As Long = CLng(rawSz)
         If sz >= GMP_LARGE_THRESHOLD Then
             Dim ptr As IntPtr = VirtualAlloc(IntPtr.Zero,
-                                             New UIntPtr(CULng(sz)),
+                                             New UIntPtr(rawSz),
                                              MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             ' Log VirtualAlloc calls in the 400 KB–2 MB range — these are the
             ' mpz_init2 seed allocations for combine output variables.  Logging
@@ -245,8 +253,15 @@ Public Class Form1
                                             old_size As size_t,
                                             new_size As size_t) As void_ptr
         Try
-        Dim oldSz As Long = CLng(old_size)
-        Dim newSz As Long = CLng(new_size)
+        Dim rawOld As ULong = CULng(old_size)
+        Dim rawNew As ULong = CULng(new_size)
+        If rawOld > CULng(Long.MaxValue) OrElse rawNew > CULng(Long.MaxValue) Then
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[GmpReallocFunc] CORRUPT SIZE (old={rawOld}, new={rawNew}) — returning null{vbCrLf}")
+            Return New void_ptr(IntPtr.Zero)
+        End If
+        Dim oldSz As Long = CLng(rawOld)
+        Dim newSz As Long = CLng(rawNew)
 
         If oldSz < GMP_LARGE_THRESHOLD AndAlso newSz < GMP_LARGE_THRESHOLD Then
             ' small → small: unchanged CRT behaviour
@@ -336,7 +351,14 @@ Public Class Form1
         Try
         Dim p As IntPtr = ptr.ToIntPtr()
         If p = IntPtr.Zero Then Return
-        Dim sz As Long = CLng(CULng(size))   ' CULng first avoids OverflowException for huge values
+        Dim rawSz As ULong = CULng(size)
+        If rawSz > CULng(Long.MaxValue) Then
+            ' Corrupted size — can't determine allocator; log and leak.
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[GmpFreeFunc] CORRUPT SIZE ({rawSz}) ptr={p:X} — leaking{vbCrLf}")
+            Return
+        End If
+        Dim sz As Long = CLng(rawSz)
         If sz >= GMP_LARGE_THRESHOLD Then
             VirtualFree(p, UIntPtr.Zero, MEM_RELEASE)
         Else

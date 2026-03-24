@@ -449,9 +449,9 @@ This removes the GC root, allowing the string to be collected at the next Gen2 s
 
 ---
 
-## Section 10 — Run-Time Crash Fixes (500-Million-Digit Testing)
+## Section 10 — Run-Time Crash Fixes (1-Billion-Digit Testing)
 
-These crashes were found only when running the 500-million-digit computation; smaller test runs of 250 million digits completed without triggering them.
+These crashes were found while running large-scale computations. The 500-million-digit run completed successfully; crashes described here were encountered during 1-billion-digit testing (250 million was the earlier smaller successful run).
 
 ### 10.1 Marshal.AllocHGlobal heap retention in spill I/O
 
@@ -691,3 +691,37 @@ Catch ex As Exception
 The `Throw` re-raises the exception to the outer `BtnCompute_Click` compute-thread handler, which is the **single** location that shows a dialog (`Me.Invoke` with `MessageBox.Show`) and restores the UI. The `Finally` block in `ComputePiGMP` still runs (GMP variable cleanup), so resources are released before the exception propagates.
 
 **Result:** exactly one log entry and one dialog per exception, execution stops cleanly, and the UI is correctly reset regardless of which exception type was thrown.
+
+---
+
+## Section 15 — Corrupted `size_t` in GMP Allocator Callbacks
+
+**Problem:** During the 1-billion-digit binary split at Level 16 (final top-level merge pass), `GmpAllocFunc` received an allocation request of `18446744073709036064` bytes (~18.4 EB). This is clearly a corrupted value — GMP's internal arithmetic produced an invalid size (likely from a corrupted `_mp_size` field in an `mpz_t` struct). The crash log showed:
+
+```
+[GmpAllocFunc] EXCEPTION (OverflowException): '18446744073709036064' is out of range of the Int64 data type. — returning null
+```
+
+**Root cause:** All three GMP memory callback functions (`GmpAllocFunc`, `GmpReallocFunc`, `GmpFreeFunc`) used `CLng(size_t)` to convert the native `size_t` value to a managed `Long`. `Math.Gmp.Native`'s `size_t.op_Explicit(size_t) As Long` throws `OverflowException` for any value exceeding `Long.MaxValue` (9.2 EB). The corrupted size exceeded this limit.
+
+The fix applied in §14 (try/catch in `GmpFreeFunc`: `CLng(CULng(size))`) was also incorrect — `CULng(size)` correctly extracts the raw `ULong` value, but the subsequent `CLng(ULong)` throws again if the `ULong` is > `Long.MaxValue`.
+
+**Fix:** In all three functions, replace `CLng(size_t)` with an explicit two-step conversion with a guard:
+
+```vb
+Dim rawSz As ULong = CULng(size)     ' safe: uses op_Explicit(size_t) As ULong, never throws
+If rawSz > CULng(Long.MaxValue) Then
+    ' Corrupted size — log and handle gracefully (return null / leak)
+    System.IO.File.AppendAllText(LOG_FILE, $"[...] CORRUPT SIZE ({rawSz}) ...")
+    Return ...
+End If
+Dim sz As Long = CLng(rawSz)         ' safe: rawSz <= Long.MaxValue guaranteed
+```
+
+**`GmpAllocFunc`:** logs `CORRUPT SIZE` and returns `void_ptr.Zero`. GMP receives null, calls `abort()`, and the native crash handler (§2.3) records the event. This is the correct behaviour — there is no way to satisfy a corrupt allocation request.
+
+**`GmpReallocFunc`:** guards both `old_size` and `new_size`. Returns `void_ptr.Zero` if either is corrupt, with the old buffer leaked (the process is about to abort anyway).
+
+**`GmpFreeFunc`:** if size is corrupt, the allocator (VirtualAlloc vs CRT) cannot be determined safely. The pointer is leaked and the corruption is logged. VirtualFree on a CRT pointer (or vice versa) could cause secondary heap corruption, so leaking is the safer choice when the size is untrustworthy.
+
+**Why the size became corrupted** is not yet determined. One hypothesis: the struct-patching code that writes directly to `__mpz_struct._mp_alloc` (offset 0) via `Marshal.WriteInt32` may interact with GMP's internal reallocation decisions in a way that corrupts `_mp_size` (offset 4) under edge cases at 1-billion-digit scale. Further investigation requires a native debugger attached during the binary split phase.
