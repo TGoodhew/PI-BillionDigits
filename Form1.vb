@@ -207,14 +207,23 @@ Public Class Form1
     ' GMP's internal state (crash/NullReferenceException in BinarySplitChunk).
 
     Private Shared Function GmpAllocFunc(alloc_size As size_t) As void_ptr
-        If CLng(alloc_size) >= GMP_LARGE_THRESHOLD Then
+        Dim sz As Long = CLng(alloc_size)
+        If sz >= GMP_LARGE_THRESHOLD Then
             Dim ptr As IntPtr = VirtualAlloc(IntPtr.Zero,
-                                             New UIntPtr(CULng(CLng(alloc_size))),
+                                             New UIntPtr(CULng(sz)),
                                              MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            ' Log VirtualAlloc calls in the 400 KB–2 MB range — these are the
+            ' mpz_init2 seed allocations for combine output variables.  Logging
+            ' them confirms (a) GmpAllocFunc is reached and (b) the allocation
+            ' size seen here, which sets _mp_alloc in the native GMP struct.
+            If sz >= 400L * 1024L AndAlso sz <= 2L * 1024L * 1024L Then
+                System.IO.File.AppendAllText(LOG_FILE,
+                    $"[GmpAlloc] VA: size={sz:N0} → ptr={ptr:X}{vbCrLf}")
+            End If
             If ptr = IntPtr.Zero Then
                 ' VirtualAlloc failed — log directly (WriteToLog is instance-only)
                 System.IO.File.AppendAllText(LOG_FILE,
-                    $"[GmpAlloc] VirtualAlloc({CLng(alloc_size):N0} bytes) FAILED — GMP will abort{vbCrLf}")
+                    $"[GmpAlloc] VirtualAlloc({sz:N0} bytes) FAILED — GMP will abort{vbCrLf}")
             End If
             Return New void_ptr(ptr)
         End If
@@ -1659,6 +1668,22 @@ Public Class Form1
             ' path (VirtualAlloc + VirtualFree), bypassing _savedGmpFree entirely.
             gmp_lib.mpz_init2(mpShiftA, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
 #If LOGGING_DETAIL >= 1 Then
+            ' Dump the native __mpz_struct that GMP will use as the destination of
+            ' mpz_mul_2exp.  Layout on Windows x64:
+            '   [0] int  _mp_alloc  (number of limbs allocated)
+            '   [4] int  _mp_size   (actual used limbs, signed)
+            '   [8] ptr  _mp_d      (pointer to limb array)
+            ' _mp_alloc should be 65537 (= 1 + GMP_LARGE_THRESHOLD*8 / 64 bits).
+            ' If it is a very large value GMP's MPZ_REALLOC macro will short-circuit
+            ' (skip our GmpReallocFunc) and write 546 MB into the 512 KB buffer.
+            If mpShiftA.Pointer <> IntPtr.Zero Then
+                Dim _mpA_alloc As Integer = Runtime.InteropServices.Marshal.ReadInt32(mpShiftA.Pointer, 0)
+                Dim _mpA_size  As Integer = Runtime.InteropServices.Marshal.ReadInt32(mpShiftA.Pointer, 4)
+                Dim _mpA_mpd   As Long    = Runtime.InteropServices.Marshal.ReadInt64(mpShiftA.Pointer, 8)
+                WriteToLog($"[ComputePi] Combine A mpShiftA native struct: ptr={mpShiftA.Pointer:X} _mp_alloc={_mpA_alloc} _mp_size={_mpA_size} _mp_d={_mpA_mpd:X}")
+            Else
+                WriteToLog("[ComputePi] Combine A mpShiftA.Pointer is NULL — init2 failed silently")
+            End If
             WriteToLog($"[ComputePi] Combine A: mpz_mul_2exp  k={CLng(k1):N0} bits  gmpNumer={CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits")
 #End If
             gmp_lib.mpz_mul_2exp(mpShiftA, gmpNumer, k1)

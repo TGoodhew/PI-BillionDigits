@@ -455,6 +455,22 @@ gmp_lib.mpz_init2(mpShiftA, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
 
 The last line that appears in the log tells us which call crashes. The same four-step pattern was added for the small→large path (`S→L`). A `"Combine A: mpz_mul_2exp returned OK"` log line was also added immediately after the `mpz_mul_2exp` call, so if GmpReallocFunc completes but the actual shift crashes, this log line will be absent while the `VirtualFree done` line will be present.
 
+### 10.6 Second crash run — GmpReallocFunc never entered; add native struct dump
+
+**Observation from second crash run (§10.5 diagnostics):** The `[GmpRealloc] L→L enter` line (the very first log in the large→large branch, written before `VirtualAlloc`) **never appeared** after the `mpz_mul_2exp` call. This rules out a crash inside `GmpReallocFunc`. GmpReallocFunc was never called at all.
+
+**Possible causes:**
+
+1. **MPZ_REALLOC macro short-circuits** — GMP's `MPZ_REALLOC(w, wsize)` macro expands to: `((wsize) <= (w)->_mp_alloc ? (w)->_mp_d : _mpz_realloc(w, wsize))`. If `_mp_alloc` in mpShiftA's native struct has been corrupted to a value ≥ 71,559,269 (the required limb count), the macro returns the existing 512 KB pointer without calling our realloc function. GMP then writes 546 MB into a 512 KB buffer → buffer overflow crash. Our `SetUnhandledExceptionFilter` may not fire if the overflow corrupts adjacent mapped memory rather than unmapped pages.
+
+2. **GMP crashes before MPZ_REALLOC** — Some GMP internal state is corrupted such that `mpz_mul_2exp` faults or calls `abort()` before reaching `MPZ_REALLOC`. `abort()` bypasses `SetUnhandledExceptionFilter`.
+
+**New diagnostics added:**
+
+- `GmpAllocFunc` now logs every VirtualAlloc call in the 400 KB–2 MB range (`[GmpAlloc] VA: size=N → ptr=P`). These are the `mpz_init2` seed allocations. The log confirms: (a) GmpAllocFunc was reached, and (b) the exact size passed by GMP — which determines `_mp_alloc` in the native struct.
+
+- Immediately after `mpz_init2(mpShiftA, ...)` in Combine A, the code reads the native `__mpz_struct` directly via `Marshal.ReadInt32/64` and logs all three fields: `_mp_alloc` (expected: 65537), `_mp_size` (expected: 0), `_mp_d` (expected: the pointer from GmpAllocFunc). If `_mp_alloc` reads as a large unexpected value, the MPZ_REALLOC short-circuit hypothesis is confirmed.
+
 ---
 
 ## Section 9 — Summary of All Changed Locations
