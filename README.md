@@ -471,6 +471,40 @@ The last line that appears in the log tells us which call crashes. The same four
 
 - Immediately after `mpz_init2(mpShiftA, ...)` in Combine A, the code reads the native `__mpz_struct` directly via `Marshal.ReadInt32/64` and logs all three fields: `_mp_alloc` (expected: 65537), `_mp_size` (expected: 0), `_mp_d` (expected: the pointer from GmpAllocFunc). If `_mp_alloc` reads as a large unexpected value, the MPZ_REALLOC short-circuit hypothesis is confirmed.
 
+### 10.7 Combine A crash persists — bypass GmpReallocFunc via native struct pre-allocation
+
+**Observation from fourth crash run (§10.6 diagnostics):** The native struct dump confirms `mpShiftA` was correctly initialized:
+
+```
+[GmpAlloc] VA: size=524,288 → ptr=1FE00000000
+mpShiftA: ptr=21E7214EED0  _mp_alloc=65536  _mp_size=0  _mp_d=1FE00000000
+mpz_mul_2exp  k=1,459,414,540 bits  gmpNumer=3,120,378,614 bits
+```
+
+`_mp_alloc = 65536` limbs = 512 KB. The required result size is `wsize = 48,755,916 + 22,803,352 + 1 = 71,559,269` limbs ≈ 546 MB. Since `71,559,269 > 65,536`, `MPZ_REALLOC` **must** call `_mpz_realloc`, which calls our `GmpReallocFunc`. Yet `[GmpRealloc] L→L enter` never appeared.
+
+**Root cause (confirmed):** `GmpReallocFunc` is a managed delegate called directly from native GMP code. In .NET 10, any managed exception that escapes from a native callback terminates the process **immediately** — the CLR does not let the exception propagate to any managed handler, does not invoke `AppDomain.UnhandledException`, and does not invoke `SetUnhandledExceptionFilter`. The very first operation in `GmpReallocFunc`'s large→large branch is a string-interpolated `File.AppendAllText` call (the `[GmpRealloc] L→L enter` log). If this call throws (e.g. a string-formatting exception on an unexpected argument, a race on the file handle, or any internal CLR issue), the process dies before writing the log line.
+
+**Fix:** pre-allocate the full result buffer before each GMP operation so `MPZ_REALLOC` short-circuits and `GmpReallocFunc` is never called. Immediately after each `mpz_init2` call in the combine section, the code:
+
+1. Reads `_mp_size` from the source operand(s) via `Marshal.ReadInt32(ptr, 4)` to compute the exact limb count needed.
+2. Calls `VirtualAlloc` for `(needed_limbs + 2) × 8` bytes.
+3. Calls `VirtualFree` on the old `_mp_d` pointer (the 512 KB seed buffer from `mpz_init2`).
+4. Writes the new pointer into `_mp_d` (`Marshal.WriteInt64(ptr, 8, …)`) and the new limb count into `_mp_alloc` (`Marshal.WriteInt32(ptr, 0, …)`).
+
+After this, `MPZ_REALLOC(rop, wsize)` sees `wsize ≤ _mp_alloc`, returns the existing `_mp_d`, and writes the result into the pre-allocated buffer. `GmpReallocFunc` is never invoked.
+
+**Applied to all four combine steps:**
+
+| Step | Operation | Limb formula |
+|------|-----------|-------------|
+| A | `mpz_mul_2exp(mpShiftA, gmpNumer, k1)` | `abs(_mp_size(gmpNumer)) + (k1 / 64) + 2` |
+| B | `mpz_add(mpAddB, gmpNumer, mpR1)` | `max(abs(_mp_size(gmpNumer)), abs(_mp_size(mpR1))) + 2` |
+| C | `mpz_mul_2exp(mpShiftC, gmpNumer, k1)` | `abs(_mp_size(gmpNumer)) + (k1 / 64) + 2` (updated gmpNumer from step B) |
+| D | `mpz_add(mpAddD, gmpNumer, mpR0)` | `max(abs(_mp_size(gmpNumer)), abs(_mp_size(mpR0))) + 2` |
+
+The `+2` margin covers GMP's internal `wsize = usize + cnt_limbs + 1` formula for shifts, and carry propagation for adds.
+
 ---
 
 ## Section 9 — Summary of All Changed Locations

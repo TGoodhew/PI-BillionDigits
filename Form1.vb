@@ -1667,6 +1667,26 @@ Public Class Form1
             ' mpz_mul_2exp later grows the buffer it takes the large→large realloc
             ' path (VirtualAlloc + VirtualFree), bypassing _savedGmpFree entirely.
             gmp_lib.mpz_init2(mpShiftA, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
+            ' Pre-allocate the full result buffer directly into the native __mpz_struct so
+            ' MPZ_REALLOC short-circuits and GmpReallocFunc is never called.
+            ' Root cause: GmpReallocFunc crashes silently when a managed exception escapes
+            ' a native callback — .NET 10 terminates immediately, no handlers run.
+            If mpShiftA.Pointer <> IntPtr.Zero AndAlso gmpNumer.Pointer <> IntPtr.Zero Then
+                Dim _numerAbsSzA As Long = CLng(Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
+                Dim _kBitsA As Long = CLng(k1)
+                Dim _shiftLimbs As Long = _numerAbsSzA + (_kBitsA \ 64L) + 2L
+                Dim _shiftBytesA As Long = _shiftLimbs * 8L
+                Dim _bigBufA As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_shiftBytesA)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                If _bigBufA <> IntPtr.Zero Then
+                    Dim _oldBufA As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpShiftA.Pointer, 8))
+                    VirtualFree(_oldBufA, UIntPtr.Zero, MEM_RELEASE)
+                    Runtime.InteropServices.Marshal.WriteInt32(mpShiftA.Pointer, 0, CInt(_shiftLimbs))
+                    Runtime.InteropServices.Marshal.WriteInt64(mpShiftA.Pointer, 8, _bigBufA.ToInt64())
+                    WriteToLog($"[ComputePi] Combine A: pre-alloc {_shiftLimbs:N0} limbs ({_shiftBytesA \ 1048576L:N0} MB) ptr={_bigBufA:X}")
+                Else
+                    WriteToLog($"[ComputePi] Combine A: pre-alloc VirtualAlloc FAILED for {_shiftBytesA \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+                End If
+            End If
 #If LOGGING_DETAIL >= 1 Then
             ' Dump the native __mpz_struct that GMP will use as the destination of
             ' mpz_mul_2exp.  Layout on Windows x64:
@@ -1733,6 +1753,23 @@ Public Class Form1
             WriteToLog($"[ComputePi] Combine B: mpz_init2(mpAddB)")
 #End If
             gmp_lib.mpz_init2(mpAddB, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
+            ' Pre-allocate the full result buffer directly into the native __mpz_struct.
+            If mpAddB.Pointer <> IntPtr.Zero AndAlso gmpNumer.Pointer <> IntPtr.Zero AndAlso mpR1.Pointer <> IntPtr.Zero Then
+                Dim _numerAbsSzB As Long = CLng(Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
+                Dim _r1AbsSzB As Long = CLng(Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(mpR1.Pointer, 4)))
+                Dim _addLimbs As Long = Math.Max(_numerAbsSzB, _r1AbsSzB) + 2L
+                Dim _addBytesB As Long = _addLimbs * 8L
+                Dim _bigBufB As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_addBytesB)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                If _bigBufB <> IntPtr.Zero Then
+                    Dim _oldBufB As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpAddB.Pointer, 8))
+                    VirtualFree(_oldBufB, UIntPtr.Zero, MEM_RELEASE)
+                    Runtime.InteropServices.Marshal.WriteInt32(mpAddB.Pointer, 0, CInt(_addLimbs))
+                    Runtime.InteropServices.Marshal.WriteInt64(mpAddB.Pointer, 8, _bigBufB.ToInt64())
+                    WriteToLog($"[ComputePi] Combine B: pre-alloc {_addLimbs:N0} limbs ({_addBytesB \ 1048576L:N0} MB) ptr={_bigBufB:X}")
+                Else
+                    WriteToLog($"[ComputePi] Combine B: pre-alloc VirtualAlloc FAILED for {_addBytesB \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+                End If
+            End If
 #If LOGGING_DETAIL >= 1 Then
             WriteToLog($"[ComputePi] Combine B: mpz_add")
 #End If
@@ -1765,6 +1802,23 @@ Public Class Form1
             WriteToLog($"[ComputePi] Combine C: mpz_init2(mpShiftC)")
 #End If
             gmp_lib.mpz_init2(mpShiftC, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
+            ' Pre-allocate the full result buffer directly into the native __mpz_struct.
+            If mpShiftC.Pointer <> IntPtr.Zero AndAlso gmpNumer.Pointer <> IntPtr.Zero Then
+                Dim _numerAbsSzC As Long = CLng(Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
+                Dim _kBitsC As Long = CLng(k1)
+                Dim _shiftLimbs As Long = _numerAbsSzC + (_kBitsC \ 64L) + 2L
+                Dim _shiftBytesC As Long = _shiftLimbs * 8L
+                Dim _bigBufC As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_shiftBytesC)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                If _bigBufC <> IntPtr.Zero Then
+                    Dim _oldBufC As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpShiftC.Pointer, 8))
+                    VirtualFree(_oldBufC, UIntPtr.Zero, MEM_RELEASE)
+                    Runtime.InteropServices.Marshal.WriteInt32(mpShiftC.Pointer, 0, CInt(_shiftLimbs))
+                    Runtime.InteropServices.Marshal.WriteInt64(mpShiftC.Pointer, 8, _bigBufC.ToInt64())
+                    WriteToLog($"[ComputePi] Combine C: pre-alloc {_shiftLimbs:N0} limbs ({_shiftBytesC \ 1048576L:N0} MB) ptr={_bigBufC:X}")
+                Else
+                    WriteToLog($"[ComputePi] Combine C: pre-alloc VirtualAlloc FAILED for {_shiftBytesC \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+                End If
+            End If
 #If LOGGING_DETAIL >= 1 Then
             WriteToLog($"[ComputePi] Combine C: mpz_mul_2exp  k={CLng(k1):N0} bits")
 #End If
@@ -1812,6 +1866,23 @@ Public Class Form1
             WriteToLog($"[ComputePi] Combine D: mpz_init2(mpAddD)")
 #End If
             gmp_lib.mpz_init2(mpAddD, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
+            ' Pre-allocate the full result buffer directly into the native __mpz_struct.
+            If mpAddD.Pointer <> IntPtr.Zero AndAlso gmpNumer.Pointer <> IntPtr.Zero AndAlso mpR0.Pointer <> IntPtr.Zero Then
+                Dim _numerAbsSzD As Long = CLng(Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
+                Dim _r0AbsSzD As Long = CLng(Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer, 4)))
+                Dim _addLimbs As Long = Math.Max(_numerAbsSzD, _r0AbsSzD) + 2L
+                Dim _addBytesD As Long = _addLimbs * 8L
+                Dim _bigBufD As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_addBytesD)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                If _bigBufD <> IntPtr.Zero Then
+                    Dim _oldBufD As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpAddD.Pointer, 8))
+                    VirtualFree(_oldBufD, UIntPtr.Zero, MEM_RELEASE)
+                    Runtime.InteropServices.Marshal.WriteInt32(mpAddD.Pointer, 0, CInt(_addLimbs))
+                    Runtime.InteropServices.Marshal.WriteInt64(mpAddD.Pointer, 8, _bigBufD.ToInt64())
+                    WriteToLog($"[ComputePi] Combine D: pre-alloc {_addLimbs:N0} limbs ({_addBytesD \ 1048576L:N0} MB) ptr={_bigBufD:X}")
+                Else
+                    WriteToLog($"[ComputePi] Combine D: pre-alloc VirtualAlloc FAILED for {_addBytesD \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+                End If
+            End If
 #If LOGGING_DETAIL >= 1 Then
             WriteToLog($"[ComputePi] Combine D: mpz_add")
 #End If
