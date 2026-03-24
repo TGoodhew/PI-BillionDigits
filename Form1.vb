@@ -243,6 +243,10 @@ Public Class Form1
             If newP <> IntPtr.Zero Then
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
                 VirtualFree(oldP, UIntPtr.Zero, MEM_RELEASE)
+                If newSz >= 500L * 1024L * 1024L Then
+                    System.IO.File.AppendAllText(LOG_FILE,
+                        $"[GmpRealloc] large→large VirtualAlloc({newSz:N0} bytes) OK{vbCrLf}")
+                End If
             Else
                 System.IO.File.AppendAllText(LOG_FILE,
                     $"[GmpRealloc] large→large VirtualAlloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
@@ -254,6 +258,12 @@ Public Class Form1
             If newP <> IntPtr.Zero Then
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
                 _savedGmpFree(old_ptr, old_size)
+                ' Confirm the realloc completed for any allocation >= 500 MB so we
+                ' can distinguish "realloc OK but shift crashed" from a silent failure.
+                If newSz >= 500L * 1024L * 1024L Then
+                    System.IO.File.AppendAllText(LOG_FILE,
+                        $"[GmpRealloc] small→large VirtualAlloc({newSz:N0} bytes) OK{vbCrLf}")
+                End If
             Else
                 System.IO.File.AppendAllText(LOG_FILE,
                     $"[GmpRealloc] small→large VirtualAlloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
@@ -1619,11 +1629,15 @@ Public Class Form1
 #End If
             Dim mpShiftA As New mpz_t()
 #If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine A: mpz_init(mpShiftA)")
+            WriteToLog($"[ComputePi] Combine A: mpz_init2(mpShiftA)")
 #End If
-            gmp_lib.mpz_init(mpShiftA)
+            ' Use mpz_init2 with a seed allocation >= GMP_LARGE_THRESHOLD so the
+            ' limb buffer comes from VirtualAlloc (not the CRT heap).  When
+            ' mpz_mul_2exp later grows the buffer it takes the large→large realloc
+            ' path (VirtualAlloc + VirtualFree), bypassing _savedGmpFree entirely.
+            gmp_lib.mpz_init2(mpShiftA, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
 #If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine A: mpz_mul_2exp  k={CLng(k1):N0} bits")
+            WriteToLog($"[ComputePi] Combine A: mpz_mul_2exp  k={CLng(k1):N0} bits  gmpNumer={CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits")
 #End If
             gmp_lib.mpz_mul_2exp(mpShiftA, gmpNumer, k1)
 #If LOGGING_DETAIL >= 1 Then
@@ -1666,9 +1680,9 @@ Public Class Form1
 #End If
             Dim mpAddB As New mpz_t()
 #If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine B: mpz_init(mpAddB)")
+            WriteToLog($"[ComputePi] Combine B: mpz_init2(mpAddB)")
 #End If
-            gmp_lib.mpz_init(mpAddB)
+            gmp_lib.mpz_init2(mpAddB, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
 #If LOGGING_DETAIL >= 1 Then
             WriteToLog($"[ComputePi] Combine B: mpz_add")
 #End If
@@ -1698,9 +1712,9 @@ Public Class Form1
 #End If
             Dim mpShiftC As New mpz_t()
 #If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine C: mpz_init(mpShiftC)")
+            WriteToLog($"[ComputePi] Combine C: mpz_init2(mpShiftC)")
 #End If
-            gmp_lib.mpz_init(mpShiftC)
+            gmp_lib.mpz_init2(mpShiftC, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
 #If LOGGING_DETAIL >= 1 Then
             WriteToLog($"[ComputePi] Combine C: mpz_mul_2exp  k={CLng(k1):N0} bits")
 #End If
@@ -1745,9 +1759,9 @@ Public Class Form1
 #End If
             Dim mpAddD As New mpz_t()
 #If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine D: mpz_init(mpAddD)")
+            WriteToLog($"[ComputePi] Combine D: mpz_init2(mpAddD)")
 #End If
-            gmp_lib.mpz_init(mpAddD)
+            gmp_lib.mpz_init2(mpAddD, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
 #If LOGGING_DETAIL >= 1 Then
             WriteToLog($"[ComputePi] Combine D: mpz_add")
 #End If

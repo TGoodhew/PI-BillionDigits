@@ -401,14 +401,14 @@ gmp_lib.mpz_add(gmpNumer, gmpNumer, mpR0)       ' aliased — crash
 ```vb
 ' Step A: gmpNumer = r2 << k
 Dim mpShiftA As New mpz_t()
-gmp_lib.mpz_init(mpShiftA)
+gmp_lib.mpz_init2(mpShiftA, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))  ' see §10.4
 gmp_lib.mpz_mul_2exp(mpShiftA, gmpNumer, k1)   ' dst ≠ src — no aliasing
 gmp_lib.mpz_swap(gmpNumer, mpShiftA)
 gmp_lib.mpz_clear(mpShiftA)
 
 ' Step B: gmpNumer += r1
 Dim mpAddB As New mpz_t()
-gmp_lib.mpz_init(mpAddB)
+gmp_lib.mpz_init2(mpAddB, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))    ' see §10.4
 gmp_lib.mpz_add(mpAddB, gmpNumer, mpR1)        ' dst ≠ src1,src2
 gmp_lib.mpz_swap(gmpNumer, mpAddB)
 gmp_lib.mpz_clear(mpAddB)
@@ -422,6 +422,25 @@ gmp_lib.mpz_clear(mpR1)
 **Motivation:** previous crashes produced no log entry explaining the failure — GMP called `abort()` immediately after receiving a `NULL` pointer back from the allocator. The log ended at the last `WriteToLog` call before the failing GMP operation, leaving the root cause ambiguous.
 
 **Fix:** all three paths in `GmpReallocFunc` (large→large, small→large, large→small) and `GmpAllocFunc` now call `System.IO.File.AppendAllText(LOG_FILE, …)` directly (bypassing the instance-only `WriteToLog`) when `VirtualAlloc` returns `IntPtr.Zero`. The resulting log line appears immediately before GMP's NULL-dereference crash, pinpointing both the allocation size that failed and which realloc path was taken.
+
+### 10.4 Crash in Combine A `mpz_mul_2exp` — force VirtualAlloc initial limb buffer
+
+**Crash symptom:** the process crashed inside `mpz_mul_2exp(mpShiftA, gmpNumer, k1)` (Combine Step A) after logging `"Combine A: mpz_mul_2exp  k=1,459,414,540 bits"`. No `[GmpRealloc] FAILED` line appeared, ruling out a VirtualAlloc failure.
+
+**Root cause hypothesis:** `mpz_init` allocates exactly 1 limb (8 bytes) for the new variable's limb buffer, using the saved GMP CRT allocator (`_savedGmpAlloc`). When `mpz_mul_2exp` later needs to grow `mpShiftA` from 8 bytes to ~563 MB, `GmpReallocFunc` takes the **small→large** realloc path: it calls `VirtualAlloc` for the new buffer, copies the data, then calls `_savedGmpFree(old_ptr, 8)` to free the original 8-byte CRT-heap block. If the CRT heap has been corrupted by a prior operation (or the CRT free triggers a heap-check assertion in debug mode), this call crashes inside `_savedGmpFree`.
+
+**Fix:** replaced `mpz_init` with `mpz_init2(x, GMP_LARGE_THRESHOLD × 8 bits)` for all four combine output variables (`mpShiftA`, `mpAddB`, `mpShiftC`, `mpAddD`):
+
+```vb
+gmp_lib.mpz_init2(mpShiftA, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
+```
+
+`GMP_LARGE_THRESHOLD` is 512 KB. Requesting `512 KB × 8 = 4,194,304 bits` forces the initial limb buffer allocation (512 KB) through `GmpAllocFunc` → `VirtualAlloc` rather than the CRT heap. When `mpz_mul_2exp` subsequently grows the buffer to 563 MB, `GmpReallocFunc` takes the **large→large** path: `VirtualAlloc` new buffer + `VirtualFree` old buffer — no `_savedGmpFree` call, no CRT heap involvement at all.
+
+**Additional diagnostics added in the same change:**
+
+- `GmpReallocFunc` now logs a success line (`[GmpRealloc] large→large VirtualAlloc(N bytes) OK` / `small→large … OK`) for any allocation ≥ 500 MB, confirming the realloc completed before GMP begins the shift operation.
+- Combine A pre-call log now includes `gmpNumer=N bits` so the log confirms `gmpNumer` is valid immediately before `mpz_mul_2exp`.
 
 ---
 
