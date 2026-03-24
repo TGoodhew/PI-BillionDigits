@@ -1672,7 +1672,7 @@ Public Class Form1
             ' Root cause: GmpReallocFunc crashes silently when a managed exception escapes
             ' a native callback — .NET 10 terminates immediately, no handlers run.
             If mpShiftA.Pointer <> IntPtr.Zero AndAlso gmpNumer.Pointer <> IntPtr.Zero Then
-                Dim _numerAbsSzA As Long = CLng(Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
+                Dim _numerAbsSzA As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
                 Dim _kBitsA As Long = CLng(k1)
                 Dim _shiftLimbs As Long = _numerAbsSzA + (_kBitsA \ 64L) + 2L
                 Dim _shiftBytesA As Long = _shiftLimbs * 8L
@@ -1755,9 +1755,9 @@ Public Class Form1
             gmp_lib.mpz_init2(mpAddB, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
             ' Pre-allocate the full result buffer directly into the native __mpz_struct.
             If mpAddB.Pointer <> IntPtr.Zero AndAlso gmpNumer.Pointer <> IntPtr.Zero AndAlso mpR1.Pointer <> IntPtr.Zero Then
-                Dim _numerAbsSzB As Long = CLng(Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
-                Dim _r1AbsSzB As Long = CLng(Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(mpR1.Pointer, 4)))
-                Dim _addLimbs As Long = Math.Max(_numerAbsSzB, _r1AbsSzB) + 2L
+                Dim _numerAbsSzB As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
+                Dim _r1AbsSzB As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(mpR1.Pointer, 4)))
+                Dim _addLimbs As Long = System.Math.Max(_numerAbsSzB, _r1AbsSzB) + 2L
                 Dim _addBytesB As Long = _addLimbs * 8L
                 Dim _bigBufB As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_addBytesB)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
                 If _bigBufB <> IntPtr.Zero Then
@@ -1804,7 +1804,7 @@ Public Class Form1
             gmp_lib.mpz_init2(mpShiftC, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
             ' Pre-allocate the full result buffer directly into the native __mpz_struct.
             If mpShiftC.Pointer <> IntPtr.Zero AndAlso gmpNumer.Pointer <> IntPtr.Zero Then
-                Dim _numerAbsSzC As Long = CLng(Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
+                Dim _numerAbsSzC As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
                 Dim _kBitsC As Long = CLng(k1)
                 Dim _shiftLimbs As Long = _numerAbsSzC + (_kBitsC \ 64L) + 2L
                 Dim _shiftBytesC As Long = _shiftLimbs * 8L
@@ -1868,9 +1868,9 @@ Public Class Form1
             gmp_lib.mpz_init2(mpAddD, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
             ' Pre-allocate the full result buffer directly into the native __mpz_struct.
             If mpAddD.Pointer <> IntPtr.Zero AndAlso gmpNumer.Pointer <> IntPtr.Zero AndAlso mpR0.Pointer <> IntPtr.Zero Then
-                Dim _numerAbsSzD As Long = CLng(Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
-                Dim _r0AbsSzD As Long = CLng(Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer, 4)))
-                Dim _addLimbs As Long = Math.Max(_numerAbsSzD, _r0AbsSzD) + 2L
+                Dim _numerAbsSzD As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
+                Dim _r0AbsSzD As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer, 4)))
+                Dim _addLimbs As Long = System.Math.Max(_numerAbsSzD, _r0AbsSzD) + 2L
                 Dim _addBytesD As Long = _addLimbs * 8L
                 Dim _bigBufD As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_addBytesD)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
                 If _bigBufD <> IntPtr.Zero Then
