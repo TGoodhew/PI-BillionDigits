@@ -1065,17 +1065,16 @@ Public Class Form1
         ' Threshold: pl * 64 must fit in int32. pl_max = floor((2^31-1)/64) = 33,554,431.
         Const SAFE_LIMB_THRESHOLD As Integer = 33_554_431
 
-        Dim szA As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4))
-        Dim szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(opB.Pointer, 4))
+        Dim szA_signed As Integer = Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4)
+        Dim szB_signed As Integer = Runtime.InteropServices.Marshal.ReadInt32(opB.Pointer, 4)
+        Dim szA As Integer = System.Math.Abs(szA_signed)
+        Dim szB As Integer = System.Math.Abs(szB_signed)
 
         If szA + szB <= SAFE_LIMB_THRESHOLD Then
             gmp_lib.mpz_mul(result, opA, opB)
             Return
         End If
 
-        ' Determine sign of product; work with absolute values for clean splitting.
-        Dim szA_signed As Integer = Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4)
-        Dim szB_signed As Integer = Runtime.InteropServices.Marshal.ReadInt32(opB.Pointer, 4)
         Dim resultSign As Integer = System.Math.Sign(szA_signed) * System.Math.Sign(szB_signed)
 
         ' Piece widths in limbs (ceiling division by 3) and bits.
@@ -1084,31 +1083,60 @@ Public Class Form1
         Dim bitsA As ULong = mA * 64UL
         Dim bitsB As ULong = mB * 64UL
 
-        ' Absolute-value copies so tdiv_r/q_2exp always yields non-negative pieces.
-        Dim absA As New mpz_t(), absB As New mpz_t()
-        gmp_lib.mpz_inits(absA, absB, Nothing)
-        gmp_lib.mpz_abs(absA, opA)
-        gmp_lib.mpz_abs(absB, opB)
+        ' Pre-allocate result to the full product size (szA+szB+2 limbs) using
+        ' VirtualAlloc before the accumulation loop.
+        '
+        ' Root cause of the crash (same class as §7/§10.2): mpz_add(result, result, x)
+        ' passes result as both rop and op1.  GMP.NET passes mpz_t by value, so GMP
+        ' receives two separate stack copies at different addresses.  GMP's aliasing
+        ' guard compares struct addresses (different), sees no alias, and skips the
+        ' temp-copy path.  If result's buffer needs to grow (MPZ_REALLOC is called),
+        ' GmpReallocFunc moves _mp_d to a new block and frees the old one — but the
+        ' stale op1 stack copy still holds the old (freed) _mp_d pointer.  mpn_add
+        ' then reads from that freed page → STATUS_ACCESS_VIOLATION, which the CLR
+        ' terminates immediately before SetUnhandledExceptionFilter runs.
+        '
+        ' Fix: pre-allocate result's buffer to the maximum size needed (szA+szB+2),
+        ' so MPZ_REALLOC always short-circuits and GmpReallocFunc is never called
+        ' during the accumulation loop.  Identical in principle to §10.7 / §10.8.
+        Dim _resultLimbs As Long = CLng(szA) + CLng(szB) + 2L
+        Dim _resultBytes As Long = _resultLimbs * 8L
+        Dim _oldResultAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(result.Pointer, 0))
+        Dim _oldResultPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8))
+        Dim _resultBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_resultBytes)),
+                                                MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+        If _resultBuf <> IntPtr.Zero Then
+            ' Free the existing 1-limb CRT buffer (_savedGmpAlloc allocated it via mpz_inits).
+            _savedGmpFree(New void_ptr(_oldResultPtr), New size_t(CULng(_oldResultAlloc) * 8UL))
+            Runtime.InteropServices.Marshal.WriteInt32(result.Pointer, 0, CInt(_resultLimbs))
+            Runtime.InteropServices.Marshal.WriteInt32(result.Pointer, 4, 0)  ' _mp_size = 0
+            Runtime.InteropServices.Marshal.WriteInt64(result.Pointer, 8, _resultBuf.ToInt64())
+        End If
+        ' If VirtualAlloc fails, fall through — GmpReallocFunc will be called during
+        ' the loop (which may crash), but that was the pre-existing behaviour.
 
-        ' Split |opA| = A0 + A1*2^bitsA + A2*2^(2*bitsA)
+        ' Split opA into three pieces: opA = A0 + A1*2^bitsA + A2*2^(2*bitsA)
+        ' opA and opB are Q/P values from Chudnovsky binary split, always non-negative,
+        ' so we work directly with opA/opB instead of making abs() copies (saves ~495 MB).
         Dim A0 As New mpz_t(), A1 As New mpz_t(), A2 As New mpz_t(), Atmp As New mpz_t()
         gmp_lib.mpz_inits(A0, A1, A2, Atmp, Nothing)
-        gmp_lib.mpz_tdiv_r_2exp(A0, absA, New mp_bitcnt_t(CUInt(bitsA)))
-        gmp_lib.mpz_tdiv_q_2exp(Atmp, absA, New mp_bitcnt_t(CUInt(bitsA)))
+        gmp_lib.mpz_tdiv_r_2exp(A0, opA, New mp_bitcnt_t(CUInt(bitsA)))
+        gmp_lib.mpz_tdiv_q_2exp(Atmp, opA, New mp_bitcnt_t(CUInt(bitsA)))
         gmp_lib.mpz_tdiv_r_2exp(A1, Atmp, New mp_bitcnt_t(CUInt(bitsA)))
         gmp_lib.mpz_tdiv_q_2exp(A2, Atmp, New mp_bitcnt_t(CUInt(bitsA)))
+        gmp_lib.mpz_clears(Atmp, Nothing)
 
-        ' Split |opB| = B0 + B1*2^bitsB + B2*2^(2*bitsB)
+        ' Split opB into three pieces: opB = B0 + B1*2^bitsB + B2*2^(2*bitsB)
         Dim B0 As New mpz_t(), B1 As New mpz_t(), B2 As New mpz_t(), Btmp As New mpz_t()
         gmp_lib.mpz_inits(B0, B1, B2, Btmp, Nothing)
-        gmp_lib.mpz_tdiv_r_2exp(B0, absB, New mp_bitcnt_t(CUInt(bitsB)))
-        gmp_lib.mpz_tdiv_q_2exp(Btmp, absB, New mp_bitcnt_t(CUInt(bitsB)))
+        gmp_lib.mpz_tdiv_r_2exp(B0, opB, New mp_bitcnt_t(CUInt(bitsB)))
+        gmp_lib.mpz_tdiv_q_2exp(Btmp, opB, New mp_bitcnt_t(CUInt(bitsB)))
         gmp_lib.mpz_tdiv_r_2exp(B1, Btmp, New mp_bitcnt_t(CUInt(bitsB)))
         gmp_lib.mpz_tdiv_q_2exp(B2, Btmp, New mp_bitcnt_t(CUInt(bitsB)))
-
-        gmp_lib.mpz_clears(absA, absB, Atmp, Btmp, Nothing)
+        gmp_lib.mpz_clears(Btmp, Nothing)
 
         ' Accumulate 9 safe sub-products: result = Σ A_i·B_j·2^(i·bitsA + j·bitsB)
+        ' A_i is freed after its row completes (all j done) to reduce peak memory.
         gmp_lib.mpz_set_ui(result, 0UI)
         Dim prod As New mpz_t(), shifted As New mpz_t()
         gmp_lib.mpz_inits(prod, shifted, Nothing)
@@ -1123,11 +1151,15 @@ Public Class Form1
                 If shiftBits = 0UL Then
                     gmp_lib.mpz_add(result, result, prod)
                 Else
-                    ' shiftBits <= 4 * max(bitsA,bitsB) ~ 2.9B < UInt32.MaxValue
+                    ' shiftBits <= 2*bitsA + 2*bitsB ~ 2.9B bits < UInt32.MaxValue — safe to CUInt
                     gmp_lib.mpz_mul_2exp(shifted, prod, New mp_bitcnt_t(CUInt(shiftBits)))
                     gmp_lib.mpz_add(result, result, shifted)
                 End If
             Next j
+            ' Free A_i's limb buffer after all j iterations for this i are done.
+            ' This reduces peak memory: at i=1 saves ~165 MB, at i=2 saves ~330 MB.
+            gmp_lib.mpz_clears(A_parts(i), Nothing)
+            gmp_lib.mpz_inits(A_parts(i), Nothing)  ' reinit so final mpz_clears is safe
         Next i
 
         If resultSign < 0 Then gmp_lib.mpz_neg(result, result)

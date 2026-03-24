@@ -779,3 +779,29 @@ End Sub
 Each of the four `mpz_mul` calls in the binary-split combine loop (`newP`, `newQ`, `tempA`, `tempB`) is replaced with `SafeMpzMul`. The wrapper is a no-op for operand pairs below the threshold — no overhead for smaller levels.
 
 **Why the 3-way split:** a 2-way split of both operands gives sub-products of `≈ szA/2 + szB/2 = (szA+szB)/2 ≈ 34M` limbs, which still exceeds the threshold. A 3-way split gives `≈ (szA+szB)/3 × 2 ≈ 22.7M` limbs per sub-product, safely below 33.5M.
+
+---
+
+## Section 18 — SafeMpzMul: Struct-Aliasing Crash in `mpz_add` Accumulation
+
+**Crash symptom:** the process crashed silently at Level 17 Node 0 during `SafeMpzMul(newQ, leftQ, rightQ)` (leftQ = 64,986,678 limbs, rightQ = 3,423,380 limbs). The log showed the GmpReallocFunc `S→L` entry for `absA` completing successfully, the two `L→L` reallocs for `shifted` completing successfully, and a repeating series of small FFT-scratch allocs — then abrupt termination with no error log and no native-crash-handler entry.
+
+**Root cause:** same class as §7 and §10.2. Inside `SafeMpzMul`, the accumulation loop calls:
+
+```vb
+gmp_lib.mpz_add(result, result, prod)     ' also: mpz_add(result, result, shifted)
+```
+
+`result` is passed as both `rop` and `op1`. GMP.NET passes `mpz_t` by value, so GMP receives **two separate stack copies** at different addresses but with the same internal `_mp_d` pointer. GMP's aliasing guard compares struct addresses (`&rop ≠ &op1`), sees no alias, and skips the temp-copy path.
+
+When `result`'s buffer needs to grow, `GmpReallocFunc` allocates a new block and calls `VirtualFree` on the old one. The new pointer is stored into the `rop` stack copy's `_mp_d`. The `op1` stack copy still holds the **old freed pointer**. `mpn_add` then reads from the freed VirtualAlloc region → `STATUS_ACCESS_VIOLATION`. The CLR's internal SEH handler calls `TerminateProcess` directly, bypassing both `AppDomain.UnhandledException` and `SetUnhandledExceptionFilter` — no log entry, no dialog.
+
+The crash appeared late (after several successful sub-products and two logged `L→L` reallocs) because the freed pages happened to still be physically backed immediately after release. The process silently accumulated corrupt state until the freed pages were reclaimed, at which point the fault became hard.
+
+**Fix:** pre-allocate `result`'s limb buffer to `szA + szB + 2` limbs via `VirtualAlloc` before the accumulation loop, patching the native `__mpz_struct` directly (same technique as §10.7 and §10.8). With `result._mp_alloc ≥ wsize` for all nine accumulation steps, `MPZ_REALLOC` always short-circuits and `GmpReallocFunc` is never called during the loop. The aliasing issue cannot fire.
+
+**Additional memory optimisations in the same change:**
+
+- **Eliminated `absA`/`absB` copies:** P and Q values in Chudnovsky splitting are always non-negative. `opA` and `opB` are used directly as the split sources instead of making 495 MB + 26 MB abs-copies. Saves ≈ 521 MB peak during the split phase.
+
+- **Free `A_i` after its row:** After all `j` iterations for a given `i`, `A_i` is freed immediately. At `i = 1` saves ≈ 165 MB; at `i = 2` saves ≈ 330 MB.
