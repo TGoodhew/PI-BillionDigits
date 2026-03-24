@@ -355,6 +355,76 @@ This removes the GC root, allowing the string to be collected at the next Gen2 s
 
 ---
 
+## Section 10 — Run-Time Crash Fixes (1-Billion-Digit Testing)
+
+These crashes were found only when running the full 1-billion-digit computation; smaller test runs completed without triggering them.
+
+### 10.1 Marshal.AllocHGlobal heap retention in spill I/O
+
+**Crash symptom:** Pass 2 multiply (gmpNumer × Q2) failed with a VirtualAlloc failure inside GmpReallocFunc. The committed-memory reading at the start of Pass 2 was only ~420 MB — well within what had worked earlier — yet the allocation still failed.
+
+**Root cause:** `SerializeOneMpz` and `DeserializeOneMpz` staged their I/O through `Marshal.AllocHGlobal` buffers sized to the mpz export size (~391 MB each for R0 and R1 at 1 billion digits). `Marshal.FreeHGlobal` calls the Windows heap `HeapFree`. For large allocations the Windows heap manager returns the block to its internal free-list rather than calling `VirtualFree` — the pages remain committed. After the R0 spill serialize (391 MB) and R1 spill serialize (391 MB) + their corresponding deserializes, ~782 MB of formerly-freed pages were still committed even though the managed code had released the handles. When Pass 2's GMP FFT scratch tried to grow, the system commit limit was already effectively exhausted.
+
+**Fix:** Both `SerializeOneMpz` and `DeserializeOneMpz` now use `VirtualAlloc`/`VirtualFree` for any staging buffer ≥ `GMP_LARGE_THRESHOLD` (512 KB), matching the same strategy used by the custom GMP allocator for limb buffers. `VirtualFree(MEM_RELEASE)` immediately decommits and releases the pages back to the OS; no free-list accumulation.
+
+```vb
+Dim useVA As Boolean = (capacity >= GMP_LARGE_THRESHOLD)
+If useVA Then
+    buf = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(capacity)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+    If buf = IntPtr.Zero Then Throw New OutOfMemoryException(...)
+Else
+    buf = Marshal.AllocHGlobal(New IntPtr(capacity))
+End If
+Try
+    ' ... export/import ...
+Finally
+    If useVA Then VirtualFree(buf, UIntPtr.Zero, MEM_RELEASE)
+    Else Marshal.FreeHGlobal(buf)
+End If
+```
+
+### 10.2 Combine section struct-aliasing (same root cause as §7 Pass 2 fix)
+
+**Crash symptom:** the process crashed after "Pass 2 multiply done; entering Combine" was logged. All four combine operations were using `gmpNumer` as both the destination and a source operand:
+
+```vb
+gmp_lib.mpz_mul_2exp(gmpNumer, gmpNumer, k1)   ' aliased — crash
+gmp_lib.mpz_add(gmpNumer, gmpNumer, mpR1)       ' aliased — crash
+gmp_lib.mpz_mul_2exp(gmpNumer, gmpNumer, k1)   ' aliased — crash
+gmp_lib.mpz_add(gmpNumer, gmpNumer, mpR0)       ' aliased — crash
+```
+
+**Root cause:** identical to the Pass 2 aliasing issue (§7): `mpz_t` is a value type in GMP.NET, so passing the same variable as both `rop` and `op` gives GMP two struct copies at different stack addresses sharing the same internal `_mp_d` pointer. GMP's aliasing guard sees `dst ≠ src` (different addresses), skips the temp-copy path, calls `MPZ_REALLOC(rop, …)` which frees and replaces `rop._mp_d`, then reads from `op._mp_d` — which now points to freed memory — crashing with a heap corruption or access violation.
+
+**Fix:** each combine step uses a separate output variable and `mpz_swap`, identical in structure to the Pass 2 fix:
+
+```vb
+' Step A: gmpNumer = r2 << k
+Dim mpShiftA As New mpz_t()
+gmp_lib.mpz_init(mpShiftA)
+gmp_lib.mpz_mul_2exp(mpShiftA, gmpNumer, k1)   ' dst ≠ src — no aliasing
+gmp_lib.mpz_swap(gmpNumer, mpShiftA)
+gmp_lib.mpz_clear(mpShiftA)
+
+' Step B: gmpNumer += r1
+Dim mpAddB As New mpz_t()
+gmp_lib.mpz_init(mpAddB)
+gmp_lib.mpz_add(mpAddB, gmpNumer, mpR1)        ' dst ≠ src1,src2
+gmp_lib.mpz_swap(gmpNumer, mpAddB)
+gmp_lib.mpz_clear(mpAddB)
+gmp_lib.mpz_clear(mpR1)
+
+' Steps C and D follow the same pattern for the second shift and r0 add.
+```
+
+### 10.3 VirtualAlloc failure logging in GmpAllocFunc / GmpReallocFunc
+
+**Motivation:** previous crashes produced no log entry explaining the failure — GMP called `abort()` immediately after receiving a `NULL` pointer back from the allocator. The log ended at the last `WriteToLog` call before the failing GMP operation, leaving the root cause ambiguous.
+
+**Fix:** all three paths in `GmpReallocFunc` (large→large, small→large, large→small) and `GmpAllocFunc` now call `System.IO.File.AppendAllText(LOG_FILE, …)` directly (bypassing the instance-only `WriteToLog`) when `VirtualAlloc` returns `IntPtr.Zero`. The resulting log line appears immediately before GMP's NULL-dereference crash, pinpointing both the allocation size that failed and which realloc path was taken.
+
+---
+
 ## Section 9 — Summary of All Changed Locations
 
 ### ApplicationEvents.vb
@@ -429,16 +499,16 @@ This removes the GC root, allowing the string to be collected at the next Gen2 s
 ### Form1.vb — new serialization helpers
 
 - **`SerializeNodeToDisk`** — 3 `mpz_t` parameters (not Tuple); 64 KB SOH staging buffer
-- **`SerializeOneMpz`** — walks GMP native buffer in 64 KB chunks; uses `Marshal.AllocHGlobal` for export buffer (no GMP-internal allocation)
+- **`SerializeOneMpz`** — walks GMP native buffer in 64 KB chunks; uses `Marshal.AllocHGlobal` for export buffer (no GMP-internal allocation); staging buffer ≥ 512 KB uses `VirtualAlloc`/`VirtualFree` instead of `Marshal.AllocHGlobal` (§10.1)
 - **`LoadNodeFromDisk`** — `ByRef` p/q/t output (not Tuple return); `Marshal.AllocHGlobal` for import buffer in `Finally` block (no pinned managed arrays)
-- **`DeserializeOneMpz`** — reads in 64 KB chunks via staging buffer
+- **`DeserializeOneMpz`** — reads in 64 KB chunks via staging buffer; staging buffer ≥ 512 KB uses `VirtualAlloc`/`VirtualFree` (§10.1)
 
 ### Form1.vb — ComputePiGMP
 
 | | |
 |---|---|
 | **Before** | Debug `MessageBox` calls throughout; `nodes` as `List(Of Tuple)`; combine loop: `newT` allocated fresh, all 6 inputs kept alive; `gmpOne` not freed early; `gmpSqrt` and `finalP` not freed before multiply; `finalT` not spilled; single `gmpNumer *= finalQ` multiply; catch block: `MessageBox` only, no log write |
-| **After** | Debug `MessageBox`es removed; `nodes` as `List(Of Result)`; combine loop: early-free + in-place `mpz_add` (§4); `gmpOne` freed after `gmpSqrtInput = gmpOne²` (§5.1); `gmpSqrt` + `finalP` freed before multiply (§5.2); `finalT` spilled to disk before multiply (§5.3); 3-way split multiply with Pass 2 aliasing fix (§7); catch block calls `WriteExceptionToLog`; all `[ComputePi]` `WriteToLog` calls gated on `LOGGING_DETAIL >= 1` |
+| **After** | Debug `MessageBox`es removed; `nodes` as `List(Of Result)`; combine loop: early-free + in-place `mpz_add` (§4); `gmpOne` freed after `gmpSqrtInput = gmpOne²` (§5.1); `gmpSqrt` + `finalP` freed before multiply (§5.2); `finalT` spilled to disk before multiply (§5.3); 3-way split multiply with Pass 2 aliasing fix (§7); combine section uses separate output vars + `mpz_swap` for all 4 operations (§10.2); catch block calls `WriteExceptionToLog`; all `[ComputePi]` `WriteToLog` calls gated on `LOGGING_DETAIL >= 1` |
 
 ### Form1.vb — DisplayTimer_Tick
 

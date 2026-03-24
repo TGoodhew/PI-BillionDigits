@@ -211,6 +211,11 @@ Public Class Form1
             Dim ptr As IntPtr = VirtualAlloc(IntPtr.Zero,
                                              New UIntPtr(CULng(CLng(alloc_size))),
                                              MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If ptr = IntPtr.Zero Then
+                ' VirtualAlloc failed — log directly (WriteToLog is instance-only)
+                System.IO.File.AppendAllText(LOG_FILE,
+                    $"[GmpAlloc] VirtualAlloc({CLng(alloc_size):N0} bytes) FAILED — GMP will abort{vbCrLf}")
+            End If
             Return New void_ptr(ptr)
         End If
         Return _savedGmpAlloc(alloc_size)
@@ -238,6 +243,9 @@ Public Class Form1
             If newP <> IntPtr.Zero Then
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
                 VirtualFree(oldP, UIntPtr.Zero, MEM_RELEASE)
+            Else
+                System.IO.File.AppendAllText(LOG_FILE,
+                    $"[GmpRealloc] large→large VirtualAlloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
             End If
         ElseIf newSz >= GMP_LARGE_THRESHOLD Then
             ' small → large: VirtualAlloc for new, CRT-free for old
@@ -246,6 +254,9 @@ Public Class Form1
             If newP <> IntPtr.Zero Then
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
                 _savedGmpFree(old_ptr, old_size)
+            Else
+                System.IO.File.AppendAllText(LOG_FILE,
+                    $"[GmpRealloc] small→large VirtualAlloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
             End If
         Else
             ' large → small: CRT-alloc for new, VirtualFree for old
@@ -254,6 +265,9 @@ Public Class Form1
             If newP <> IntPtr.Zero Then
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
                 VirtualFree(oldP, UIntPtr.Zero, MEM_RELEASE)
+            Else
+                System.IO.File.AppendAllText(LOG_FILE,
+                    $"[GmpRealloc] large→small CRT alloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
             End If
         End If
 
@@ -1604,9 +1618,21 @@ Public Class Form1
             WriteToLog($"[ComputePi] Combine A: shift r2 ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) left {CLng(k1):N0} bits → result≈{(CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) + CLng(k1)) \ 8388608:N0} MB")
 #End If
             Dim mpShiftA As New mpz_t()
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine A: mpz_init(mpShiftA)")
+#End If
             gmp_lib.mpz_init(mpShiftA)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine A: mpz_mul_2exp  k={CLng(k1):N0} bits")
+#End If
             gmp_lib.mpz_mul_2exp(mpShiftA, gmpNumer, k1)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine A: mpz_swap")
+#End If
             gmp_lib.mpz_swap(gmpNumer, mpShiftA)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine A: mpz_clear(mpShiftA)")
+#End If
             gmp_lib.mpz_clear(mpShiftA)     ' frees the old ~390 MB limb buffer
 #If LOGGING_DETAIL >= 1 Then
             Dim _procCA = Process.GetCurrentProcess()
@@ -1619,6 +1645,9 @@ Public Class Form1
 #End If
 
             ' Step B: reload r1; gmpNumer += r1  (~572 MB + ~390 MB → ~572 MB)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine B: mpz_init(mpR1) + deserialize")
+#End If
             gmp_lib.mpz_init(mpR1)
             Using fsR As New FileStream(R1_path, FileMode.Open, FileAccess.Read)
                 Using brR As New BinaryReader(fsR)
@@ -1636,9 +1665,21 @@ Public Class Form1
             WriteToLog($"[ComputePi] Combine B r1 loaded  RAM:{_ramCombBpre:N0}MB  Committed:{_vmCombBpre:N0}MB")
 #End If
             Dim mpAddB As New mpz_t()
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine B: mpz_init(mpAddB)")
+#End If
             gmp_lib.mpz_init(mpAddB)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine B: mpz_add")
+#End If
             gmp_lib.mpz_add(mpAddB, gmpNumer, mpR1)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine B: mpz_swap")
+#End If
             gmp_lib.mpz_swap(gmpNumer, mpAddB)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine B: mpz_clear(mpAddB) + mpz_clear(mpR1)")
+#End If
             gmp_lib.mpz_clear(mpAddB)
             gmp_lib.mpz_clear(mpR1)
 #If LOGGING_DETAIL >= 1 Then
@@ -1656,9 +1697,21 @@ Public Class Form1
             WriteToLog($"[ComputePi] Combine C: shift ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) left {CLng(k1):N0} bits → result≈{(CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) + CLng(k1)) \ 8388608:N0} MB")
 #End If
             Dim mpShiftC As New mpz_t()
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine C: mpz_init(mpShiftC)")
+#End If
             gmp_lib.mpz_init(mpShiftC)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine C: mpz_mul_2exp  k={CLng(k1):N0} bits")
+#End If
             gmp_lib.mpz_mul_2exp(mpShiftC, gmpNumer, k1)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine C: mpz_swap")
+#End If
             gmp_lib.mpz_swap(gmpNumer, mpShiftC)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine C: mpz_clear(mpShiftC)")
+#End If
             gmp_lib.mpz_clear(mpShiftC)
 #If LOGGING_DETAIL >= 1 Then
             Dim _procCC = Process.GetCurrentProcess()
@@ -1671,6 +1724,9 @@ Public Class Form1
 #End If
 
             ' Step D: reload r0; gmpNumer += r0  (~755 MB + ~390 MB → ~755 MB)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine D: mpz_init(mpR0) + deserialize")
+#End If
             gmp_lib.mpz_init(mpR0)
             Using fsR As New FileStream(R0_path, FileMode.Open, FileAccess.Read)
                 Using brR As New BinaryReader(fsR)
@@ -1688,9 +1744,21 @@ Public Class Form1
             WriteToLog($"[ComputePi] Combine D r0 loaded  RAM:{_ramCombDpre:N0}MB  Committed:{_vmCombDpre:N0}MB")
 #End If
             Dim mpAddD As New mpz_t()
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine D: mpz_init(mpAddD)")
+#End If
             gmp_lib.mpz_init(mpAddD)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine D: mpz_add")
+#End If
             gmp_lib.mpz_add(mpAddD, gmpNumer, mpR0)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine D: mpz_swap")
+#End If
             gmp_lib.mpz_swap(gmpNumer, mpAddD)
+#If LOGGING_DETAIL >= 1 Then
+            WriteToLog($"[ComputePi] Combine D: mpz_clear(mpAddD) + mpz_clear(mpR0)")
+#End If
             gmp_lib.mpz_clear(mpAddD)
             gmp_lib.mpz_clear(mpR0)
 #If LOGGING_DETAIL >= 1 Then
