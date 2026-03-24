@@ -33,6 +33,11 @@ Public Class Form1
     Private displayStr As String = ""
     Private displayIdx As Integer = 0
     Private displayTotal As Long = 0
+    ' Native streaming: pointer into the GMP-allocated char buffer + length.
+    ' When non-zero, DisplayTimer_Tick reads bytes directly via Marshal.ReadByte
+    ' instead of indexing displayStr, avoiding the ~1 GB managed string entirely.
+    Private _displayNativePtr As IntPtr = IntPtr.Zero
+    Private _displayNativeLen As Long = 0
     Private WithEvents displayTimer As New System.Windows.Forms.Timer()
     Private gmpC3Const As mpz_t = Nothing
 
@@ -590,7 +595,7 @@ Public Class Form1
             Sub()
                 Try
                     Dim result As String = ComputePiGMP(DIGITS, cts.Token)
-                    If result <> "" Then
+                    If _displayNativePtr <> IntPtr.Zero OrElse result <> "" Then
                         Me.Invoke(Sub() StreamPiToScreen(result))
                     End If
                 Catch oex As OutOfMemoryException
@@ -1968,20 +1973,19 @@ Public Class Form1
             Finally
                 _strConvTimer.Dispose()
             End Try
-            ' Free gmpPi now (~744 MB native) before allocating the managed string,
-            ' then reinit to a 1-limb stub so the Finally mpz_clears stays safe.
+            ' Free gmpPi now (~744 MB native); reinit 1-limb stub so Finally mpz_clears is safe.
             gmp_lib.mpz_clear(gmpPi)
             gmp_lib.mpz_init(gmpPi)
-            ' Read only digits+1 chars from the native buffer instead of the full
-            ' ~1.8 billion-char result.  piCharPtr.ToString() would call
-            ' Marshal.PtrToStringAnsi without a length, allocating ~3.6 GB managed.
-            Dim _take As Integer = CInt(digits) + 1
-            Dim piStr As String = Runtime.InteropServices.Marshal.PtrToStringAnsi(piCharPtr.Pointer, _take)
-            gmp_lib.free(piCharPtr)
+            ' Keep the native char buffer alive — the display timer will stream bytes
+            ' directly from it, avoiding any large managed string allocation.
+            ' The buffer is VirtualAlloc'd (>512 KB) and will be freed via VirtualFree
+            ' in DisplayTimer_Tick once display (and optional file write) is complete.
+            _displayNativePtr = piCharPtr.Pointer
+            _displayNativeLen = CLng(digits) + 1L
             LogPhase("String conversion complete")
 
             LogPhase($"Done! {digits:N0} digits computed")
-            Return piStr(0) & "." & piStr.Substring(1)
+            Return ""
 
         Catch ex As Exception
             WriteExceptionToLog("ComputePiGMP", ex)
@@ -2008,25 +2012,29 @@ Public Class Form1
     ' ════════════════════════════════════════════════════════════════════════
 
     Private Sub StreamPiToScreen(piString As String)
+        Dim digitCount As Long = If(_displayNativePtr <> IntPtr.Zero, _displayNativeLen, CLng(piString.Length))
         LstBoxPhases.Items.Add($"{stopWatch.Elapsed:hh\:mm\:ss\.ff} | Streaming started")
         Try
             System.IO.File.AppendAllText("c:\PiOutput\pi_phase_log.txt",
                 DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") &
-                $" | Streaming started ({piString.Length:N0} digits)" & vbCrLf)
+                $" | Streaming started ({digitCount:N0} digits)" & vbCrLf)
         Catch
         End Try
         displayTimer.Enabled = False
         RtbPiDigits.Clear()
         LblDigitsDisplayed.Text = "0"
-        LblStatus.Text = $"Streaming {piString.Length:N0} digits..."
-        displayStr = piString
+        LblStatus.Text = $"Streaming {digitCount:N0} digits..."
+        displayStr = piString   ' empty string in native mode — display reads from _displayNativePtr
         displayIdx = 0
         displayTotal = 0
         displayTimer.Enabled = True
     End Sub
 
     Private Sub DisplayTimer_Tick(sender As Object, e As EventArgs) Handles displayTimer.Tick
-        If displayIdx >= displayStr.Length Then
+        Dim useNative As Boolean = (_displayNativePtr <> IntPtr.Zero)
+        Dim totalLen As Integer = CInt(If(useNative, _displayNativeLen, CLng(displayStr.Length)))
+
+        If displayIdx >= totalLen Then
             displayTimer.Enabled = False
             LblStatus.Text = $"Done! {displayTotal:N0} digits displayed."
             BtnCompute.Enabled = True
@@ -2047,21 +2055,41 @@ Public Class Form1
                     If Not System.IO.Directory.Exists(System.IO.Path.GetDirectoryName(outputFile)) Then
                         System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(outputFile))
                     End If
-                    System.IO.File.WriteAllText(outputFile, displayStr)
+                    If useNative Then
+                        ' Stream the native char buffer to file in 1 MB chunks.
+                        ' Insert decimal point after the first digit ("3" → "3.").
+                        Using fs As New System.IO.FileStream(outputFile, System.IO.FileMode.Create, System.IO.FileAccess.Write)
+                            fs.WriteByte(Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, 0))
+                            fs.WriteByte(Asc("."c))
+                            Const FILE_CHUNK As Integer = 1024 * 1024
+                            Dim buf(FILE_CHUNK - 1) As Byte
+                            Dim written As Long = 1
+                            While written < _displayNativeLen
+                                Dim toWrite As Integer = CInt(System.Math.Min(FILE_CHUNK, _displayNativeLen - written))
+                                Runtime.InteropServices.Marshal.Copy(
+                                    New IntPtr(_displayNativePtr.ToInt64() + written), buf, 0, toWrite)
+                                fs.Write(buf, 0, toWrite)
+                                written += toWrite
+                            End While
+                        End Using
+                    Else
+                        System.IO.File.WriteAllText(outputFile, displayStr)
+                    End If
                     LblStatus.Text = $"Done! Saved to {outputFile}"
                 Catch ex As Exception
                     LblStatus.Text = "File save error: " & ex.Message
                 End Try
             End If
 
-            ' Issue #8 fix: release the pi string immediately after it has been
-            ' fully displayed (and optionally written to file).
-            ' For 1 billion digits this is a ~2 GB LOH object; the LOH is not
-            ' compacted by default, so it blocks that address range until
-            ' explicitly released.  Setting to Nothing allows the next GC to
-            ' reclaim the slot.
-            displayStr = Nothing
-            WriteToLog("[DisplayTimer] displayStr released (LOH block freed)")
+            If useNative Then
+                ' Free the GMP-allocated char buffer (VirtualAlloc'd, >512 KB).
+                VirtualFree(_displayNativePtr, UIntPtr.Zero, MEM_RELEASE)
+                _displayNativePtr = IntPtr.Zero
+                WriteToLog("[DisplayTimer] native pi buffer freed (VirtualFree)")
+            Else
+                displayStr = Nothing
+                WriteToLog("[DisplayTimer] displayStr released (LOH block freed)")
+            End If
             Return
         End If
 
@@ -2069,16 +2097,29 @@ Public Class Form1
         If Integer.TryParse(TxtChunkSize.Text, chunkSize) = False Then chunkSize = 500
         If chunkSize < 1 Then chunkSize = 1
         If chunkSize > 1000000 Then chunkSize = 1000000
-        Dim chunkEnd As Integer = System.Math.Min(displayIdx + chunkSize, displayStr.Length)
+        Dim chunkEnd As Integer = System.Math.Min(displayIdx + chunkSize, totalLen)
 
         Dim chunk As New System.Text.StringBuilder()
-        While displayIdx < chunkEnd
-            Dim ch As Char = displayStr(displayIdx)
-            If Char.IsDigit(ch) OrElse ch = "."c Then
-                chunk.Append(ch)
+        If useNative Then
+            ' First tick: prepend "3." before streaming the rest of the digits.
+            If displayIdx = 0 Then
+                chunk.Append(Chr(Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, 0)))
+                chunk.Append("."c)
+                displayIdx = 1
             End If
-            displayIdx += 1
-        End While
+            While displayIdx < chunkEnd
+                chunk.Append(Chr(Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, displayIdx)))
+                displayIdx += 1
+            End While
+        Else
+            While displayIdx < chunkEnd
+                Dim ch As Char = displayStr(displayIdx)
+                If Char.IsDigit(ch) OrElse ch = "."c Then
+                    chunk.Append(ch)
+                End If
+                displayIdx += 1
+            End While
+        End If
 
         If chunk.Length > 0 Then
             displayTotal += chunk.Length
