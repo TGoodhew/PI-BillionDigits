@@ -1141,6 +1141,10 @@ Public Class Form1
             ' True only for the final combine pass (2 nodes → 1).  Controls
             ' whether LOGGING_DETAIL=1 emits per-operation trace for this level.
             Dim isLastLevel As Boolean = (currentSize <= 2)
+            ' True for the top ~4 levels (≤16 nodes).  Enables per-multiply
+            ' operand-size logging so we can identify which mpz_mul produces a
+            ' corrupt allocation size at Level 16.
+            Dim isTopLevel As Boolean = (currentSize <= 16)
 
             If useDisk Then
                 LogPhase($"Level {level}: Processing {currentSize:N0} → {nextSize:N0} nodes (DISK mode)")
@@ -1214,49 +1218,57 @@ Public Class Form1
                 '   tempB are all still live, which was pushing peak RAM from
                 '   ~1,781 MB to ~2,215 MB and triggering a GMP abort().
                 '   After the add, tempB is freed and tempA holds the T result.
-#If LOGGING_DETAIL = 2 Then
-                WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newP")
-#ElseIf LOGGING_DETAIL = 1 Then
-                If isLastLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newP")
+#If LOGGING_DETAIL >= 1 Then
+                If isTopLevel Then
+                    Dim _szLP As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftP.Pointer, 4)
+                    Dim _szRP As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightP.Pointer, 4)
+                    WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newP  leftP={System.Math.Abs(_szLP):N0} rightP={System.Math.Abs(_szRP):N0} limbs")
+                End If
 #End If
                 gmp_lib.mpz_mul(newP, leftP, rightP)
                 gmp_lib.mpz_clears(rightP, Nothing)             ' rightP done
 
-#If LOGGING_DETAIL = 2 Then
-                WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newQ")
-#ElseIf LOGGING_DETAIL = 1 Then
-                If isLastLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newQ")
+#If LOGGING_DETAIL >= 1 Then
+                If isTopLevel Then
+                    Dim _szLQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftQ.Pointer, 4)
+                    Dim _szRQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightQ.Pointer, 4)
+                    WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newQ  leftQ={System.Math.Abs(_szLQ):N0} rightQ={System.Math.Abs(_szRQ):N0} limbs")
+                End If
 #End If
                 gmp_lib.mpz_mul(newQ, leftQ, rightQ)
                 gmp_lib.mpz_clears(leftQ, Nothing)              ' leftQ done
 
-#If LOGGING_DETAIL = 2 Then
-                WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempA")
-#ElseIf LOGGING_DETAIL = 1 Then
-                If isLastLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempA")
+#If LOGGING_DETAIL >= 1 Then
+                If isTopLevel Then
+                    Dim _szLT As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftT.Pointer, 4)
+                    Dim _szRQ2 As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightQ.Pointer, 4)
+                    WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempA  leftT={System.Math.Abs(_szLT):N0} rightQ={System.Math.Abs(_szRQ2):N0} limbs")
+                End If
 #End If
                 gmp_lib.mpz_mul(tempA, leftT, rightQ)
                 gmp_lib.mpz_clears(leftT, rightQ, Nothing)      ' leftT, rightQ done
 
-#If LOGGING_DETAIL = 2 Then
-                WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempB")
-#ElseIf LOGGING_DETAIL = 1 Then
-                If isLastLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempB")
+#If LOGGING_DETAIL >= 1 Then
+                If isTopLevel Then
+                    Dim _szLP2 As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftP.Pointer, 4)
+                    Dim _szRT As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightT.Pointer, 4)
+                    WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempB  leftP={System.Math.Abs(_szLP2):N0} rightT={System.Math.Abs(_szRT):N0} limbs")
+                End If
 #End If
                 gmp_lib.mpz_mul(tempB, leftP, rightT)
                 gmp_lib.mpz_clears(leftP, rightT, Nothing)      ' leftP, rightT done
 
-#If LOGGING_DETAIL = 2 Then
-                WriteToLog($"[Combine] L{level} N{nodeIdx\2}: add newT (in-place into tempA)")
-#ElseIf LOGGING_DETAIL = 1 Then
-                If isLastLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: add newT (in-place into tempA)")
+#If LOGGING_DETAIL >= 1 Then
+                If isTopLevel Then
+                    Dim _szTA As Integer = Runtime.InteropServices.Marshal.ReadInt32(tempA.Pointer, 4)
+                    Dim _szTB As Integer = Runtime.InteropServices.Marshal.ReadInt32(tempB.Pointer, 4)
+                    WriteToLog($"[Combine] L{level} N{nodeIdx\2}: add newT  tempA={System.Math.Abs(_szTA):N0} tempB={System.Math.Abs(_szTB):N0} limbs")
+                End If
 #End If
                 gmp_lib.mpz_add(tempA, tempA, tempB)            ' T result in tempA's buffer
                 gmp_lib.mpz_clears(tempB, Nothing)              ' tempB done; tempA IS newT
-#If LOGGING_DETAIL = 2 Then
-                WriteToLog($"[Combine] L{level} N{nodeIdx\2}: combine complete")
-#ElseIf LOGGING_DETAIL = 1 Then
-                If isLastLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: combine complete")
+#If LOGGING_DETAIL >= 1 Then
+                If isTopLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: combine complete")
 #End If
 
                 ' ── Store result ─────────────────────────────────────────────

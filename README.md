@@ -725,3 +725,23 @@ Dim sz As Long = CLng(rawSz)         ' safe: rawSz <= Long.MaxValue guaranteed
 **`GmpFreeFunc`:** if size is corrupt, the allocator (VirtualAlloc vs CRT) cannot be determined safely. The pointer is leaked and the corruption is logged. VirtualFree on a CRT pointer (or vice versa) could cause secondary heap corruption, so leaking is the safer choice when the size is untrustworthy.
 
 **Why the size became corrupted** is not yet determined. One hypothesis: the struct-patching code that writes directly to `__mpz_struct._mp_alloc` (offset 0) via `Marshal.WriteInt32` may interact with GMP's internal reallocation decisions in a way that corrupts `_mp_size` (offset 4) under edge cases at 1-billion-digit scale. Further investigation requires a native debugger attached during the binary split phase.
+
+**Diagnostic added (§16):** per-multiply operand size logging at the top levels to identify the exact operation that produces the corrupted allocation.
+
+---
+
+## Section 16 — Level-16 Crash Diagnostics: Operand Size Logging
+
+**Problem:** `[GmpAllocFunc] CORRUPT SIZE (18446744073709036064)` occurs reproducibly at the same point — Level 16 (5→3 nodes), always after the same sequence of GmpAlloc VA lines — but no log entry identifies WHICH of the four `mpz_mul` calls in the combine loop triggers it, or what `_mp_size` the operands had at that point.
+
+**Change:** Added an `isTopLevel` flag (`currentSize <= 16`, covering the top ~4 levels). Under `#If LOGGING_DETAIL >= 1`, before each `mpz_mul` and `mpz_add` in the combine loop, the `_mp_size` field of both operands is read directly from `__mpz_struct` offset 4 via `Marshal.ReadInt32` and written to the log:
+
+```
+[Combine] L16 N0: mul newP  leftP=27,523,104 rightP=27,523,104 limbs
+[Combine] L16 N0: mul newQ  leftQ=... rightQ=... limbs
+[Combine] L16 N0: mul tempA  leftT=... rightQ=... limbs
+[Combine] L16 N0: mul tempB  leftP=... rightT=... limbs
+[Combine] L16 N0: add newT  tempA=... tempB=... limbs
+```
+
+If any operand has a wildly unexpected `_mp_size` (e.g. negative, or orders of magnitude larger than expected), that indicates the corruption originates in the data loaded from disk rather than in GMP's allocation arithmetic. Expected limb counts at Level 16 for 1 billion digits: ~15–30 million limbs per P/Q/T value.
