@@ -618,7 +618,7 @@ The CRT-vs-VirtualAlloc distinction matters: the combine output variables were i
 
 ## Section 11 — String Conversion Progress Ticker
 
-**Problem:** `mpz_get_str(char_ptr.Zero, 10, gmpPi)` is a single opaque GMP call that blocks the compute thread (T5) for several minutes at 1 billion digits. During this time the status label stays frozen at `"Division complete"`, giving no indication whether the thread is still working or has hung.
+**Problem:** `mpz_get_str(char_ptr.Zero, 10, gmpPi)` is a single opaque GMP call that blocks the compute thread (T5) for a very long time at 500 million digits or more. During this time the status label stays frozen at `"Division complete"`, giving no indication whether the thread is still working or has hung.
 
 **Fix:** a `System.Threading.Timer` is started immediately before `mpz_get_str` and disposed in a `Finally` block immediately after it returns. The timer fires every second on a threadpool thread and calls `Me.BeginInvoke` to update `LblStatus` with the elapsed conversion time:
 
