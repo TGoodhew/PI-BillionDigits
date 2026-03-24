@@ -355,9 +355,103 @@ This removes the GC root, allowing the string to be collected at the next Gen2 s
 
 ---
 
-## Section 10 — Run-Time Crash Fixes (1-Billion-Digit Testing)
+## Section 9 — Summary of All Changed Locations
 
-These crashes were found only when running the full 1-billion-digit computation; smaller test runs completed without triggering them.
+### ApplicationEvents.vb
+
+| | |
+|---|---|
+| **Before** | `MyApplication` class body empty (comments only) |
+| **After** | `MyApplication_UnhandledException` implemented; writes full exception chain to log file before showing dialog |
+
+### Form1.vb — file header
+
+| | |
+|---|---|
+| **Before** | No compile-time constants; no `System.Diagnostics` import |
+| **After** | `#Const LOGGING_DETAIL = 1` with three-level description; `Imports System.Diagnostics` added |
+
+### Form1.vb — class-level declarations (all new)
+
+- `DiskNode` Structure (`FilePath`, `IsInMemory`, `MemP`, `MemQ`, `MemT`, `Level`, `Index`)
+- `LOG_FILE` constant (`c:\PiOutput\pi_phase_log.txt`)
+- `GMP_LARGE_THRESHOLD` constant (512 KB)
+- `VirtualAlloc`, `VirtualFree`, `CopyMemory` P/Invoke declarations
+- `GmpSetMemoryFunctionsNative` P/Invoke (direct to `__gmp_set_memory_functions`)
+- `MEM_COMMIT_RESERVE`, `MEM_RELEASE`, `VA_PAGE_READWRITE` constants
+- `_gmpAlloc`, `_gmpRealloc`, `_gmpFree` Shared fields (custom allocator delegates)
+- `_savedGmpAlloc`, `_savedGmpRealloc`, `_savedGmpFree` Shared fields (GMP originals)
+- `GmpAllocFunc`, `GmpReallocFunc`, `GmpFreeFunc` Shared methods
+- `InitGmpVirtualAllocFunctions()` method
+- `SetUnhandledExceptionFilter` P/Invoke declaration
+- `NativeCrashFilterCallback` delegate type
+- `_nativeCrashCallback` field (GC anchor for native crash filter)
+- `HandleNativeCrash` method
+- `WriteToLog` method
+- `WriteExceptionToLog` method
+- `OnAppDomainUnhandledException` method
+
+### Form1.vb — Form1_Load
+
+| | |
+|---|---|
+| **Before** | Dummy `mpz_t` init, `gmpC3Const` init, `MessageBox` |
+| **After** | `InitGmpVirtualAllocFunctions()` called first; `AppDomain.UnhandledException` subscription; `SetUnhandledExceptionFilter` registration; output directory and `DISK_CACHE_DIR` creation; GMP DLL path detection |
+
+### Form1.vb — LogPhase
+
+| | |
+|---|---|
+| **Before** | Wrote directly to log file and `BeginInvoke`'d the UI update |
+| **After** | Calls `WriteToLog` for the file write (gains timestamp/thread/RAM header), then `BeginInvoke`'s the UI update as before |
+
+### Form1.vb — BtnCompute_Click
+
+| | |
+|---|---|
+| **Before** | Single catch, no log write, log header had no mode info |
+| **After** | Three catch blocks (OOM, Overflow, generic), each calls `WriteExceptionToLog`; log header includes `LOGGING_DETAIL` mode string |
+
+### Form1.vb — BinarySplitChunk
+
+| | |
+|---|---|
+| **Before** | Unsized `Stack` and `Dictionary`; no error logging; no `Try/Catch` |
+| **After** | `Stack` pre-sized to `(maxDepth + 4)`; `Dictionary` pre-sized to `(b - a)`; `Try/Catch` logs failing `WorkItem` on exception; entry/exit `WriteToLog` calls (LOGGING_DETAIL = 2 only) |
+
+### Form1.vb — BinarySplitGMP (complete rewrite)
+
+| | |
+|---|---|
+| **Before** | `CHUNK_SIZE=1024`, `STOP_AT=4`; all chunks in three `mpz_t` arrays; no disk I/O; returns `List(Of Tuple(Of mpz_t, mpz_t, mpz_t))`; combine held all operands live; no `GC.Collect` between levels |
+| **After** | `CHUNK_SIZE=512`, `STOP_AT=1`; streaming to disk via `DiskNode` list; `SerializeNodeToDisk` / `LoadNodeFromDisk` helpers (no LOH, no pinning); returns `ByRef nodes As List(Of Result)`; early-free + in-place `mpz_add` in combine loop; `GC.Collect` between levels (~17 total per billion-digit run); `isLastLevel` flag gates LOGGING_DETAIL=1 per-op logging; chunk progress every 100 (was 1,000) |
+
+### Form1.vb — new serialization helpers
+
+- **`SerializeNodeToDisk`** — 3 `mpz_t` parameters (not Tuple); 64 KB SOH staging buffer
+- **`SerializeOneMpz`** — walks GMP native buffer in 64 KB chunks; uses `Marshal.AllocHGlobal` for export buffer (no GMP-internal allocation); staging buffer ≥ 512 KB uses `VirtualAlloc`/`VirtualFree` instead of `Marshal.AllocHGlobal` (§10.1)
+- **`LoadNodeFromDisk`** — `ByRef` p/q/t output (not Tuple return); `Marshal.AllocHGlobal` for import buffer in `Finally` block (no pinned managed arrays)
+- **`DeserializeOneMpz`** — reads in 64 KB chunks via staging buffer; staging buffer ≥ 512 KB uses `VirtualAlloc`/`VirtualFree` (§10.1)
+
+### Form1.vb — ComputePiGMP
+
+| | |
+|---|---|
+| **Before** | Debug `MessageBox` calls throughout; `nodes` as `List(Of Tuple)`; combine loop: `newT` allocated fresh, all 6 inputs kept alive; `gmpOne` not freed early; `gmpSqrt` and `finalP` not freed before multiply; `finalT` not spilled; single `gmpNumer *= finalQ` multiply; catch block: `MessageBox` only, no log write |
+| **After** | Debug `MessageBox`es removed; `nodes` as `List(Of Result)`; combine loop: early-free + in-place `mpz_add` (§4); `gmpOne` freed after `gmpSqrtInput = gmpOne²` (§5.1); `gmpSqrt` + `finalP` freed before multiply (§5.2); `finalT` spilled to disk before multiply (§5.3); 3-way split multiply with Pass 2 aliasing fix (§7); combine section uses separate output vars + `mpz_swap` for all 4 operations (§10.2); catch block calls `WriteExceptionToLog`; all `[ComputePi]` `WriteToLog` calls gated on `LOGGING_DETAIL >= 1`; `mpz_get_str` wrapped with a per-second status ticker (§11) |
+
+### Form1.vb — DisplayTimer_Tick
+
+| | |
+|---|---|
+| **Before** | `displayStr` never cleared after streaming completed |
+| **After** | `displayStr = Nothing` after streaming and optional file write complete |
+
+---
+
+## Section 10 — Run-Time Crash Fixes (500-Million-Digit Testing)
+
+These crashes were found only when running the 500-million-digit computation; smaller test runs of 250 million digits completed without triggering them.
 
 ### 10.1 Marshal.AllocHGlobal heap retention in spill I/O
 
@@ -519,100 +613,6 @@ The `+2` margin covers GMP's internal `wsize = usize + cnt_limbs + 1` formula fo
 4. Write new pointer and limb count into `gmpPi`'s native struct.
 
 The CRT-vs-VirtualAlloc distinction matters: the combine output variables were initialised via `mpz_init2` with a 512 KB seed, which routes through `GmpAllocFunc` → VirtualAlloc and must be freed with `VirtualFree`. The `gmpPi` variable was initialised via `mpz_inits` with a 1-limb seed, which routes through `_savedGmpAlloc` (CRT heap) and must be freed with `_savedGmpFree`.
-
----
-
-## Section 9 — Summary of All Changed Locations
-
-### ApplicationEvents.vb
-
-| | |
-|---|---|
-| **Before** | `MyApplication` class body empty (comments only) |
-| **After** | `MyApplication_UnhandledException` implemented; writes full exception chain to log file before showing dialog |
-
-### Form1.vb — file header
-
-| | |
-|---|---|
-| **Before** | No compile-time constants; no `System.Diagnostics` import |
-| **After** | `#Const LOGGING_DETAIL = 1` with three-level description; `Imports System.Diagnostics` added |
-
-### Form1.vb — class-level declarations (all new)
-
-- `DiskNode` Structure (`FilePath`, `IsInMemory`, `MemP`, `MemQ`, `MemT`, `Level`, `Index`)
-- `LOG_FILE` constant (`c:\PiOutput\pi_phase_log.txt`)
-- `GMP_LARGE_THRESHOLD` constant (512 KB)
-- `VirtualAlloc`, `VirtualFree`, `CopyMemory` P/Invoke declarations
-- `GmpSetMemoryFunctionsNative` P/Invoke (direct to `__gmp_set_memory_functions`)
-- `MEM_COMMIT_RESERVE`, `MEM_RELEASE`, `VA_PAGE_READWRITE` constants
-- `_gmpAlloc`, `_gmpRealloc`, `_gmpFree` Shared fields (custom allocator delegates)
-- `_savedGmpAlloc`, `_savedGmpRealloc`, `_savedGmpFree` Shared fields (GMP originals)
-- `GmpAllocFunc`, `GmpReallocFunc`, `GmpFreeFunc` Shared methods
-- `InitGmpVirtualAllocFunctions()` method
-- `SetUnhandledExceptionFilter` P/Invoke declaration
-- `NativeCrashFilterCallback` delegate type
-- `_nativeCrashCallback` field (GC anchor for native crash filter)
-- `HandleNativeCrash` method
-- `WriteToLog` method
-- `WriteExceptionToLog` method
-- `OnAppDomainUnhandledException` method
-
-### Form1.vb — Form1_Load
-
-| | |
-|---|---|
-| **Before** | Dummy `mpz_t` init, `gmpC3Const` init, `MessageBox` |
-| **After** | `InitGmpVirtualAllocFunctions()` called first; `AppDomain.UnhandledException` subscription; `SetUnhandledExceptionFilter` registration; output directory and `DISK_CACHE_DIR` creation; GMP DLL path detection |
-
-### Form1.vb — LogPhase
-
-| | |
-|---|---|
-| **Before** | Wrote directly to log file and `BeginInvoke`'d the UI update |
-| **After** | Calls `WriteToLog` for the file write (gains timestamp/thread/RAM header), then `BeginInvoke`'s the UI update as before |
-
-### Form1.vb — BtnCompute_Click
-
-| | |
-|---|---|
-| **Before** | Single catch, no log write, log header had no mode info |
-| **After** | Three catch blocks (OOM, Overflow, generic), each calls `WriteExceptionToLog`; log header includes `LOGGING_DETAIL` mode string |
-
-### Form1.vb — BinarySplitChunk
-
-| | |
-|---|---|
-| **Before** | Unsized `Stack` and `Dictionary`; no error logging; no `Try/Catch` |
-| **After** | `Stack` pre-sized to `(maxDepth + 4)`; `Dictionary` pre-sized to `(b - a)`; `Try/Catch` logs failing `WorkItem` on exception; entry/exit `WriteToLog` calls (LOGGING_DETAIL = 2 only) |
-
-### Form1.vb — BinarySplitGMP (complete rewrite)
-
-| | |
-|---|---|
-| **Before** | `CHUNK_SIZE=1024`, `STOP_AT=4`; all chunks in three `mpz_t` arrays; no disk I/O; returns `List(Of Tuple(Of mpz_t, mpz_t, mpz_t))`; combine held all operands live; no `GC.Collect` between levels |
-| **After** | `CHUNK_SIZE=512`, `STOP_AT=1`; streaming to disk via `DiskNode` list; `SerializeNodeToDisk` / `LoadNodeFromDisk` helpers (no LOH, no pinning); returns `ByRef nodes As List(Of Result)`; early-free + in-place `mpz_add` in combine loop; `GC.Collect` between levels (~17 total per billion-digit run); `isLastLevel` flag gates LOGGING_DETAIL=1 per-op logging; chunk progress every 100 (was 1,000) |
-
-### Form1.vb — new serialization helpers
-
-- **`SerializeNodeToDisk`** — 3 `mpz_t` parameters (not Tuple); 64 KB SOH staging buffer
-- **`SerializeOneMpz`** — walks GMP native buffer in 64 KB chunks; uses `Marshal.AllocHGlobal` for export buffer (no GMP-internal allocation); staging buffer ≥ 512 KB uses `VirtualAlloc`/`VirtualFree` instead of `Marshal.AllocHGlobal` (§10.1)
-- **`LoadNodeFromDisk`** — `ByRef` p/q/t output (not Tuple return); `Marshal.AllocHGlobal` for import buffer in `Finally` block (no pinned managed arrays)
-- **`DeserializeOneMpz`** — reads in 64 KB chunks via staging buffer; staging buffer ≥ 512 KB uses `VirtualAlloc`/`VirtualFree` (§10.1)
-
-### Form1.vb — ComputePiGMP
-
-| | |
-|---|---|
-| **Before** | Debug `MessageBox` calls throughout; `nodes` as `List(Of Tuple)`; combine loop: `newT` allocated fresh, all 6 inputs kept alive; `gmpOne` not freed early; `gmpSqrt` and `finalP` not freed before multiply; `finalT` not spilled; single `gmpNumer *= finalQ` multiply; catch block: `MessageBox` only, no log write |
-| **After** | Debug `MessageBox`es removed; `nodes` as `List(Of Result)`; combine loop: early-free + in-place `mpz_add` (§4); `gmpOne` freed after `gmpSqrtInput = gmpOne²` (§5.1); `gmpSqrt` + `finalP` freed before multiply (§5.2); `finalT` spilled to disk before multiply (§5.3); 3-way split multiply with Pass 2 aliasing fix (§7); combine section uses separate output vars + `mpz_swap` for all 4 operations (§10.2); catch block calls `WriteExceptionToLog`; all `[ComputePi]` `WriteToLog` calls gated on `LOGGING_DETAIL >= 1`; `mpz_get_str` wrapped with a per-second status ticker (§11) |
-
-### Form1.vb — DisplayTimer_Tick
-
-| | |
-|---|---|
-| **Before** | `displayStr` never cleared after streaming completed |
-| **After** | `displayStr = Nothing` after streaming and optional file write complete |
 
 ---
 
