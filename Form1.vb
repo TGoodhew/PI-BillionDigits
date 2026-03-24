@@ -1923,6 +1923,28 @@ Public Class Form1
             WriteToLog($"[ComputePi] finalT reloaded from spill file")
             WriteToLog($"[ComputePi] mpz_tdiv_q: pi = numer / T  (numer~{CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 10)):N0} digits  T~{CLng(gmp_lib.mpz_sizeinbase(finalT, 10)):N0} digits)")
 #End If
+            ' Pre-allocate gmpPi result buffer so MPZ_REALLOC short-circuits.
+            ' gmpPi was initialised via mpz_inits (1-limb CRT buffer); the quotient
+            ' is ~744 MB, so without pre-allocation GmpReallocFunc would be called.
+            If gmpPi.Pointer <> IntPtr.Zero AndAlso gmpNumer.Pointer <> IntPtr.Zero AndAlso finalT.Pointer <> IntPtr.Zero Then
+                Dim _numerSzDiv As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
+                Dim _denomSzDiv As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(finalT.Pointer, 4)))
+                Dim _quotLimbs As Long = System.Math.Max(_numerSzDiv - _denomSzDiv + 1L, 1L) + 2L
+                Dim _quotBytes As Long = _quotLimbs * 8L
+                Dim _bigBufPi As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_quotBytes)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                If _bigBufPi <> IntPtr.Zero Then
+                    Dim _oldAllocPi As Integer = Runtime.InteropServices.Marshal.ReadInt32(gmpPi.Pointer, 0)
+                    Dim _oldBufPi As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(gmpPi.Pointer, 8))
+                    ' The original buffer came from the CRT allocator (_savedGmpAlloc).
+                    ' Free it via the saved free function, not VirtualFree.
+                    _savedGmpFree(New void_ptr(_oldBufPi), New size_t(CULng(_oldAllocPi) * 8UL))
+                    Runtime.InteropServices.Marshal.WriteInt32(gmpPi.Pointer, 0, CInt(_quotLimbs))
+                    Runtime.InteropServices.Marshal.WriteInt64(gmpPi.Pointer, 8, _bigBufPi.ToInt64())
+                    WriteToLog($"[ComputePi] Division: pre-alloc gmpPi {_quotLimbs:N0} limbs ({_quotBytes \ 1048576L:N0} MB) ptr={_bigBufPi:X}")
+                Else
+                    WriteToLog($"[ComputePi] Division: pre-alloc VirtualAlloc FAILED for {_quotBytes \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+                End If
+            End If
             gmp_lib.mpz_tdiv_q(gmpPi, gmpNumer, finalT)
             gmp_lib.mpz_clears(gmpNumer, finalT, Nothing)
             LogPhase("Division complete")

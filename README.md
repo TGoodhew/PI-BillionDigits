@@ -505,6 +505,21 @@ After this, `MPZ_REALLOC(rop, wsize)` sees `wsize ≤ _mp_alloc`, returns the ex
 
 The `+2` margin covers GMP's internal `wsize = usize + cnt_limbs + 1` formula for shifts, and carry propagation for adds.
 
+### 10.8 Crash in `mpz_tdiv_q` — pre-allocate `gmpPi` quotient buffer
+
+**Crash symptom:** the process crashed immediately after logging `"mpz_tdiv_q: pi = numer / T  (numer~1,817,982,666 digits  T~25,068,680 digits)"`. The combine steps A–D all completed successfully (§10.7 pre-allocation fix worked). Crash is now in the final division operation.
+
+**Root cause:** `gmpPi` was initialised via `mpz_inits` (1-limb CRT heap buffer, 8 bytes). The division quotient is ~1.793 billion digits ≈ 93 million limbs ≈ 744 MB. `mpz_tdiv_q` calls `MPZ_REALLOC(gmpPi, 93M)`, which sees `_mp_alloc=1 < 93M` and calls `_mpz_realloc` → `GmpReallocFunc`. As established in §10.7, `GmpReallocFunc` crashes silently in .NET 10 when a managed exception escapes the native callback boundary.
+
+**Fix:** same pre-allocation pattern as §10.7 applied to `gmpPi` before `mpz_tdiv_q`:
+
+1. Read `_mp_size` from `gmpNumer` and `finalT` to compute `quotient_limbs = max(numer_limbs − denom_limbs + 1, 1) + 2`.
+2. `VirtualAlloc` the full quotient buffer.
+3. Read `_mp_alloc` from the existing `gmpPi` struct, then free the old CRT buffer via `_savedGmpFree(old_ptr, old_alloc × 8)` — **not** `VirtualFree`, because `mpz_inits` allocates via `_savedGmpAlloc` (CRT heap), not VirtualAlloc.
+4. Write new pointer and limb count into `gmpPi`'s native struct.
+
+The CRT-vs-VirtualAlloc distinction matters: the combine output variables were initialised via `mpz_init2` with a 512 KB seed, which routes through `GmpAllocFunc` → VirtualAlloc and must be freed with `VirtualFree`. The `gmpPi` variable was initialised via `mpz_inits` with a 1-limb seed, which routes through `_savedGmpAlloc` (CRT heap) and must be freed with `_savedGmpFree`.
+
 ---
 
 ## Section 9 — Summary of All Changed Locations
