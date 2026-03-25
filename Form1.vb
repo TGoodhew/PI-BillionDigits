@@ -607,6 +607,12 @@ Public Class Form1
     ' ════════════════════════════════════════════════════════════════════════
 
     Private Sub BtnCompute_Click(sender As Object, e As EventArgs) Handles BtnCompute.Click
+        ' Free any retained Pi buffer from the previous run before starting a new one.
+        If _displayNativePtr <> IntPtr.Zero Then
+            VirtualFree(_displayNativePtr, UIntPtr.Zero, MEM_RELEASE)
+            _displayNativePtr = IntPtr.Zero
+            WriteToLog("[BtnCompute] retained native pi buffer freed before new computation")
+        End If
         BtnCompute.Enabled = False
         BtnPause.Enabled = True
         DIGITS = CLng(TxtDigitsofPI.Text.Replace(",", ""))
@@ -2336,10 +2342,9 @@ Public Class Form1
             End If
 
             If useNative Then
-                ' Free the GMP-allocated char buffer (VirtualAlloc'd, >512 KB).
-                VirtualFree(_displayNativePtr, UIntPtr.Zero, MEM_RELEASE)
-                _displayNativePtr = IntPtr.Zero
-                WriteToLog("[DisplayTimer] native pi buffer freed (VirtualFree)")
+                ' Leave _displayNativePtr alive so BtnTest_Click can search it directly.
+                ' The buffer will be freed when the user clicks Test or Compute.
+                WriteToLog("[DisplayTimer] streaming complete — native pi buffer retained for Test button")
             Else
                 displayStr = Nothing
                 WriteToLog("[DisplayTimer] displayStr released (LOH block freed)")
@@ -2394,7 +2399,22 @@ Public Class Form1
     End Sub
 
     Private Sub BtnTest_Click(sender As Object, e As EventArgs) Handles BtnTest.Click
-        Dim piText As String = RtbPiDigits.Text.Replace(".", "").Replace(vbCrLf, "")
+        ' Search the full native buffer when available (complete digits regardless of
+        ' how far the display timer has streamed); fall back to the text box otherwise.
+        Dim piText As String
+        Dim usingNativeBuffer As Boolean = (_displayNativePtr <> IntPtr.Zero)
+        If usingNativeBuffer Then
+            ' Marshal the entire native string (null-terminated ASCII) into a managed string.
+            ' This is ~1 GB for a billion-digit run; it will briefly double memory usage but
+            ' lets IndexOf work normally.
+            piText = Runtime.InteropServices.Marshal.PtrToStringAnsi(_displayNativePtr)
+            ' Buffer no longer needed — free it now.
+            VirtualFree(_displayNativePtr, UIntPtr.Zero, MEM_RELEASE)
+            _displayNativePtr = IntPtr.Zero
+            WriteToLog("[BtnTest] native pi buffer searched and freed (VirtualFree)")
+        Else
+            piText = RtbPiDigits.Text.Replace(".", "").Replace(vbCrLf, "")
+        End If
 
         Dim pos1 As Integer = piText.IndexOf("999999")
         If pos1 >= 0 Then
@@ -2418,7 +2438,7 @@ Public Class Form1
         If pos3 >= 0 Then
             MessageBox.Show($"Found first digits of e '27182818284' at position {pos3}!")
         Else
-            MessageBox.Show("First digits of e not found in first 250M digits!")
+            MessageBox.Show("First digits of e not found in current digits!")
         End If
     End Sub
 
