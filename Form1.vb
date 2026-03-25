@@ -1111,9 +1111,13 @@ Public Class Form1
             Runtime.InteropServices.Marshal.WriteInt32(result.Pointer, 0, CInt(_resultLimbs))
             Runtime.InteropServices.Marshal.WriteInt32(result.Pointer, 4, 0)  ' _mp_size = 0
             Runtime.InteropServices.Marshal.WriteInt64(result.Pointer, 8, _resultBuf.ToInt64())
+            WriteToLog($"[SafeMpzMul] result pre-alloc OK: {_resultLimbs:N0} limbs ({_resultBytes \ 1048576L:N0} MB)")
+        Else
+            ' VirtualAlloc failed — mpz_add(result,result,x) aliasing will crash if result
+            ' needs to grow.  Log and throw so the caller records the failure cleanly.
+            WriteToLog($"[SafeMpzMul] result pre-alloc FAILED for {_resultBytes \ 1048576L:N0} MB — throwing OOM")
+            Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for result buffer ({_resultBytes \ 1048576L} MB)")
         End If
-        ' If VirtualAlloc fails, fall through — GmpReallocFunc will be called during
-        ' the loop (which may crash), but that was the pre-existing behaviour.
 
         ' Split opA into three pieces: opA = A0 + A1*2^bitsA + A2*2^(2*bitsA)
         ' opA and opB are Q/P values from Chudnovsky binary split, always non-negative,
@@ -1136,7 +1140,6 @@ Public Class Form1
         gmp_lib.mpz_clears(Btmp, Nothing)
 
         ' Accumulate 9 safe sub-products: result = Σ A_i·B_j·2^(i·bitsA + j·bitsB)
-        ' A_i is freed after its row completes (all j done) to reduce peak memory.
         gmp_lib.mpz_set_ui(result, 0UI)
         Dim prod As New mpz_t(), shifted As New mpz_t()
         gmp_lib.mpz_inits(prod, shifted, Nothing)
@@ -1156,10 +1159,6 @@ Public Class Form1
                     gmp_lib.mpz_add(result, result, shifted)
                 End If
             Next j
-            ' Free A_i's limb buffer after all j iterations for this i are done.
-            ' This reduces peak memory: at i=1 saves ~165 MB, at i=2 saves ~330 MB.
-            gmp_lib.mpz_clears(A_parts(i), Nothing)
-            gmp_lib.mpz_inits(A_parts(i), Nothing)  ' reinit so final mpz_clears is safe
         Next i
 
         If resultSign < 0 Then gmp_lib.mpz_neg(result, result)

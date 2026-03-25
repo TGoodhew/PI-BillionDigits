@@ -804,4 +804,6 @@ The crash appeared late (after several successful sub-products and two logged `L
 
 - **Eliminated `absA`/`absB` copies:** P and Q values in Chudnovsky splitting are always non-negative. `opA` and `opB` are used directly as the split sources instead of making 495 MB + 26 MB abs-copies. Saves ≈ 521 MB peak during the split phase.
 
-- **Free `A_i` after its row:** After all `j` iterations for a given `i`, `A_i` is freed immediately. At `i = 1` saves ≈ 165 MB; at `i = 2` saves ≈ 330 MB.
+- **Pre-allocation logs and OOM guard:** `WriteToLog` records the pre-allocation result (`[SafeMpzMul] result pre-alloc OK/FAILED`). If `VirtualAlloc` fails, an `OutOfMemoryException` is thrown immediately rather than silently falling through to the aliasing-unsafe loop.
+
+- **`A_i` early-freeing removed (was §18 rev 1):** An earlier revision freed each `A_parts(i)` piece after its row via `mpz_clears(A_parts(i)) + mpz_inits(A_parts(i))`. This was unsafe: `A_parts(i)` is a struct copy — `mpz_clears` frees `_mp_d` through the copy's `Pointer` field, but `_mp_d` is left as a dangling (non-NULL) pointer in the native struct. If `mpz_inits` on the copy then allocates a *new* native struct and updates the copy's `Pointer`, the original named variable (`A0`/`A1`/`A2`) still holds the old `Pointer` with the dangling `_mp_d`. The final `mpz_clears(A0, A1, A2)` would call `GmpFreeFunc` on that dangling pointer → heap corruption. The optimization was removed; `A0`/`A1`/`A2` are freed together at the end of the function.
