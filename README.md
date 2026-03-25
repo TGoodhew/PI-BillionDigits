@@ -807,3 +807,15 @@ The crash appeared late (after several successful sub-products and two logged `L
 - **Pre-allocation logs and OOM guard:** `WriteToLog` records the pre-allocation result (`[SafeMpzMul] result pre-alloc OK/FAILED`). If `VirtualAlloc` fails, an `OutOfMemoryException` is thrown immediately rather than silently falling through to the aliasing-unsafe loop.
 
 - **`A_i` early-freeing removed (was §18 rev 1):** An earlier revision freed each `A_parts(i)` piece after its row via `mpz_clears(A_parts(i)) + mpz_inits(A_parts(i))`. This was unsafe: `A_parts(i)` is a struct copy — `mpz_clears` frees `_mp_d` through the copy's `Pointer` field, but `_mp_d` is left as a dangling (non-NULL) pointer in the native struct. If `mpz_inits` on the copy then allocates a *new* native struct and updates the copy's `Pointer`, the original named variable (`A0`/`A1`/`A2`) still holds the old `Pointer` with the dangling `_mp_d`. The final `mpz_clears(A0, A1, A2)` would call `GmpFreeFunc` on that dangling pointer → heap corruption. The optimization was removed; `A0`/`A1`/`A2` are freed together at the end of the function.
+
+---
+
+## Section 19 — SafeMpzMul: `shifted` Buffer Realloc Crash in `mpz_mul_2exp`
+
+**Crash symptom:** after the §18 fix, the process crashed silently at Level 16 Node 1 during `SafeMpzMul(newQ, leftQ, rightQ)` (leftQ = 33,873,440 limbs, rightQ = 34,258,968 limbs). Per-step diagnostic logging added to the accumulation loop identified the failure point exactly: `i=2 j=2: before mpz_mul_2exp shift=2906982784` — the log entry was written but no "after mpz_mul_2exp" entry followed. All eight earlier sub-products (i=0..2, j=0..1 and i=0..1, j=2) completed successfully.
+
+**Root cause:** `mpz_mul_2exp(shifted, prod, 2,906,982,784)` at the final sub-product (i=2, j=2) needed to grow `shifted`'s buffer from ~455 MB (56,841,263 limbs, last grown at i=1,j=2) to ~545 MB (68,132,414 limbs). This triggered `GmpReallocFunc` (L→L path). The new 545 MB buffer was allocated and the old buffer freed — but the old buffer's address was still live as the source pointer inside the GMP `mpz_mul_2exp` call. Reading from the freed `VirtualAlloc` region → `STATUS_ACCESS_VIOLATION`. The CLR terminates immediately, explaining why no GmpRealloc log entry appears.
+
+**Fix:** pre-allocate `shifted`'s limb buffer to `szA + szB + 2` limbs via `VirtualAlloc` immediately after `mpz_inits(prod, shifted, Nothing)`, patching the native `__mpz_struct` directly (same technique as §18 for `result`). With `shifted._mp_alloc` large enough to hold any sub-product at any shift, `MPZ_REALLOC` always short-circuits and `GmpReallocFunc` is never called for `shifted` during the loop.
+
+The bound `szA + szB + 2` is tight: the worst case is i=2,j=2 with shift = 2·bitsA + 2·bitsB bits, which gives a result of at most ⌈(szA/3 + szB/3)⌉ + ⌈(2·mA + 2·mB)⌉ + 1 ≈ szA + szB + 2 limbs — the same upper bound already used for `result`.

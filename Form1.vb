@@ -1146,19 +1146,59 @@ Public Class Form1
         Dim prod As New mpz_t(), shifted As New mpz_t()
         gmp_lib.mpz_inits(prod, shifted, Nothing)
 
+        ' Pre-allocate shifted to the maximum size it can ever reach during the loop.
+        ' The largest case is i=2,j=2: shifted = A2*B2 << (2*bitsA + 2*bitsB), which
+        ' needs at most szA+szB+2 limbs — same upper bound as result.
+        '
+        ' Without this, mpz_mul_2exp(shifted, prod, N) triggers GmpReallocFunc when
+        ' shifted's buffer is too small.  GMP's realloc frees the old buffer; but
+        ' shifted is a local managed struct and the realloc may interact with other
+        ' in-flight state, causing an access violation that CLR terminates immediately.
+        '
+        ' Fix: pre-allocate via VirtualAlloc so MPZ_REALLOC always short-circuits
+        ' (same principle as the result pre-allocation above).
+        Dim _shiftedLimbs As Long = _resultLimbs  ' same upper bound: szA+szB+2
+        Dim _shiftedBytes As Long = _shiftedLimbs * 8L
+        Dim _oldShiftedAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(shifted.Pointer, 0))
+        Dim _oldShiftedPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8))
+        Dim _shiftedBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_shiftedBytes)),
+                                                  MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+        If _shiftedBuf <> IntPtr.Zero Then
+            _savedGmpFree(New void_ptr(_oldShiftedPtr), New size_t(CULng(_oldShiftedAlloc) * 8UL))
+            Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 0, CInt(_shiftedLimbs))
+            Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 4, 0)
+            Runtime.InteropServices.Marshal.WriteInt64(shifted.Pointer, 8, _shiftedBuf.ToInt64())
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[SafeMpzMul] shifted pre-alloc OK: {_shiftedLimbs:N0} limbs ({_shiftedBytes \ 1048576L:N0} MB){vbCrLf}")
+        Else
+            ' Clean up result buffer we already allocated before throwing.
+            VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8)),
+                        UIntPtr.Zero, MEM_RELEASE)
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[SafeMpzMul] shifted pre-alloc FAILED for {_shiftedBytes \ 1048576L:N0} MB — throwing OOM{vbCrLf}")
+            Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shifted buffer ({_shiftedBytes \ 1048576L} MB)")
+        End If
+
         Dim A_parts() As mpz_t = {A0, A1, A2}
         Dim B_parts() As mpz_t = {B0, B1, B2}
 
         For i As Integer = 0 To 2
             For j As Integer = 0 To 2
+                System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mpz_mul{vbCrLf}")
                 gmp_lib.mpz_mul(prod, A_parts(i), B_parts(j))
+                System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after mpz_mul{vbCrLf}")
                 Dim shiftBits As ULong = CULng(i) * bitsA + CULng(j) * bitsB
                 If shiftBits = 0UL Then
+                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mpz_add (no shift){vbCrLf}")
                     gmp_lib.mpz_add(result, result, prod)
+                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after mpz_add (no shift){vbCrLf}")
                 Else
                     ' shiftBits <= 2*bitsA + 2*bitsB ~ 2.9B bits < UInt32.MaxValue — safe to CUInt
+                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mpz_mul_2exp shift={shiftBits}{vbCrLf}")
                     gmp_lib.mpz_mul_2exp(shifted, prod, New mp_bitcnt_t(CUInt(shiftBits)))
+                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after mpz_mul_2exp, before mpz_add{vbCrLf}")
                     gmp_lib.mpz_add(result, result, shifted)
+                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after mpz_add{vbCrLf}")
                 End If
             Next j
         Next i
