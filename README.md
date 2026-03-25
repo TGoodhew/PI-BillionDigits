@@ -853,3 +853,38 @@ The bound `szA + szB + 2` is tight: the worst case is i=2,j=2 with shift = 2·bi
 **Root cause:** the Combine A/B/C/D pre-alloc blocks call `VirtualAlloc` to create a result buffer sized to `ceil(sourceSize + k/64 + 2) × 8` bytes, then patch it directly into the `__mpz_struct`. When the source numbers are small (e.g. a test with few digits where `thirdBits = 0` and `gmpNumer` has 1 bit), the computed buffer size is only a few bytes — far below `GMP_LARGE_THRESHOLD` (512 KB). After `mpz_swap`, that tiny VirtualAlloc buffer ends up inside the mpz_t that is later passed to `mpz_clear`. `GmpFreeFunc` sees `size < GMP_LARGE_THRESHOLD` → routes to `_savedGmpFree` (CRT free) → CRT freeing a `VirtualAlloc` pointer → native heap corruption → `STATUS_ACCESS_VIOLATION` with no log.
 
 **Fix:** each Combine A/B/C/D pre-alloc block now guards with `If _shiftBytes >= GMP_LARGE_THRESHOLD Then`. For small numbers the `mpz_init2` buffer (512 KB, already a `VirtualAlloc` allocation) is sufficient and correct — GMP's normal `GmpReallocFunc` handles any growth, and since the source and destination mpz_t variables in the Combine steps are always different (no aliasing), the realloc use-after-free issue cannot occur.
+
+---
+
+## Section 22 — SafeMpzMul: `mp_bitcnt_t` Overflow for Large Equal-Size Operands
+
+**Symptom:** after all previous fixes, the computation ran to completion but produced `gmpNumer ≈ 1 decimal digit` (near-zero), causing `gmpPi = gmpNumer / T = 0`. The last crash was then in `mpz_clear(gmpPi)` after `mpz_get_str` (Section 23 covers that separately).
+
+**Root cause:** `mp_bitcnt_t` on Windows is 32-bit (maximum shift = 4,294,967,295 bits). In `SafeMpzMul`'s 3×3 schoolbook accumulation loop, the shift amount for piece (i,j) is `shiftBits = i×bitsA + j×bitsB`. For the top-level call `SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)` with `gmpOne = 10^(1B)` (≈ 52 M limbs), `mA = mB ≈ 17.3 M` and `bitsA = bitsB ≈ 1.109 B bits`. The (i=2, j=2) piece requires `shiftBits = 4 × 1.109 B ≈ 4.436 B bits > 4.295 B = UInt32.MaxValue`. The `CUInt(shiftBits)` cast silently wrapped to ≈ 142 M bits, placing the A₂×B₂ product ≈ 4.3 B bits too low. The schoolbook sum was thus completely wrong, and `gmpSqrtInput` (and hence every subsequent value) came out nearly zero.
+
+**Fix:** in the accumulation loop, compare `shiftBits` to `UInt32.MaxValue` before constructing `mp_bitcnt_t`. When `shiftBits > UInt32.MaxValue`, split into two shifts each ≤ UInt32.MaxValue:
+
+```vb
+If shiftBits <= CULng(UInt32.MaxValue) Then
+    gmp_lib.mpz_mul_2exp(shifted, prod, New mp_bitcnt_t(CUInt(shiftBits)))
+Else
+    Dim _shift1 As ULong = shiftBits \ 2UL
+    Dim _shift2 As ULong = shiftBits - _shift1
+    gmp_lib.mpz_mul_2exp(shifted, prod, New mp_bitcnt_t(CUInt(_shift1)))
+    gmp_lib.mpz_mul_2exp(shifted, shifted, New mp_bitcnt_t(CUInt(_shift2)))
+End If
+```
+
+The second call passes `shifted` as both rop and op1. `MPZ_REALLOC` short-circuits (shifted is pre-allocated to `szA+szB+2` limbs, large enough for the fully-shifted result), so no buffer is freed or reallocated — the in-place left shift is safe.
+
+**Affected calls:** only `SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)` hits the overflow for a 1B-digit computation; the three-pass multiply and recursive inner calls have smaller piece sizes whose maximum shift stays below 4.295 B bits.
+
+---
+
+## Section 23 — Division Pre-Alloc Guard: Small VirtualAlloc Buffer for `gmpPi`
+
+**Symptom:** after the Section 22 fix was needed (but before it was applied), the computation produced `gmpNumer ≈ 1 digit` and `T ≈ 930 M digits`, giving `gmpPi = 0` (integer division). The pre-alloc code computed `_quotLimbs = 3`, `_quotBytes = 24 bytes`, called `VirtualAlloc(24)`, then later `mpz_clear(gmpPi)` called `GmpFreeFunc` with `size = 24 < GMP_LARGE_THRESHOLD` → `_savedGmpFree` on a VirtualAlloc pointer → crash. The log showed `[ComputePi] mpz_get_str: converting result to string` as the final entry (the crash happened immediately after in `mpz_clear`).
+
+**Root cause:** same class of bug as Section 21 (Combine A-D). The `gmpPi` pre-alloc unconditionally called `VirtualAlloc` regardless of buffer size, so tiny quotients (from wrong/test inputs) produced dangerously small VirtualAlloc blocks.
+
+**Fix:** wrap the `VirtualAlloc` call in `If _quotBytes >= GMP_LARGE_THRESHOLD Then`. For small quotients, `gmpPi` retains its 1-limb CRT buffer from `mpz_inits`; GMP's normal realloc handles any growth without the allocator mismatch.
