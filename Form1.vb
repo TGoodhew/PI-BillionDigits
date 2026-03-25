@@ -1910,15 +1910,22 @@ Public Class Form1
                 Dim _kBitsA As Long = CLng(k1)
                 Dim _shiftLimbs As Long = _numerAbsSzA + (_kBitsA \ 64L) + 2L
                 Dim _shiftBytesA As Long = _shiftLimbs * 8L
-                Dim _bigBufA As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_shiftBytesA)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
-                If _bigBufA <> IntPtr.Zero Then
-                    Dim _oldBufA As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpShiftA.Pointer, 8))
-                    VirtualFree(_oldBufA, UIntPtr.Zero, MEM_RELEASE)
-                    Runtime.InteropServices.Marshal.WriteInt32(mpShiftA.Pointer, 0, CInt(_shiftLimbs))
-                    Runtime.InteropServices.Marshal.WriteInt64(mpShiftA.Pointer, 8, _bigBufA.ToInt64())
-                    WriteToLog($"[ComputePi] Combine A: pre-alloc {_shiftLimbs:N0} limbs ({_shiftBytesA \ 1048576L:N0} MB) ptr={_bigBufA:X}")
-                Else
-                    WriteToLog($"[ComputePi] Combine A: pre-alloc VirtualAlloc FAILED for {_shiftBytesA \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+                ' Only pre-alloc if result will be large (>= GMP_LARGE_THRESHOLD).
+                ' For small numbers the mpz_init2 buffer (512 KB) is sufficient and
+                ' normal GmpReallocFunc L→L handles growth correctly.  A small
+                ' VirtualAlloc buffer would be freed by GmpFreeFunc via _savedGmpFree
+                ' (size < threshold) which is wrong for VirtualAlloc memory → crash.
+                If _shiftBytesA >= GMP_LARGE_THRESHOLD Then
+                    Dim _bigBufA As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_shiftBytesA)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                    If _bigBufA <> IntPtr.Zero Then
+                        Dim _oldBufA As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpShiftA.Pointer, 8))
+                        VirtualFree(_oldBufA, UIntPtr.Zero, MEM_RELEASE)
+                        Runtime.InteropServices.Marshal.WriteInt32(mpShiftA.Pointer, 0, CInt(_shiftLimbs))
+                        Runtime.InteropServices.Marshal.WriteInt64(mpShiftA.Pointer, 8, _bigBufA.ToInt64())
+                        WriteToLog($"[ComputePi] Combine A: pre-alloc {_shiftLimbs:N0} limbs ({_shiftBytesA \ 1048576L:N0} MB) ptr={_bigBufA:X}")
+                    Else
+                        WriteToLog($"[ComputePi] Combine A: pre-alloc VirtualAlloc FAILED for {_shiftBytesA \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+                    End If
                 End If
             End If
 #If LOGGING_DETAIL >= 1 Then
@@ -1993,15 +2000,17 @@ Public Class Form1
                 Dim _r1AbsSzB As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(mpR1.Pointer, 4)))
                 Dim _addLimbs As Long = System.Math.Max(_numerAbsSzB, _r1AbsSzB) + 2L
                 Dim _addBytesB As Long = _addLimbs * 8L
-                Dim _bigBufB As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_addBytesB)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
-                If _bigBufB <> IntPtr.Zero Then
-                    Dim _oldBufB As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpAddB.Pointer, 8))
-                    VirtualFree(_oldBufB, UIntPtr.Zero, MEM_RELEASE)
-                    Runtime.InteropServices.Marshal.WriteInt32(mpAddB.Pointer, 0, CInt(_addLimbs))
-                    Runtime.InteropServices.Marshal.WriteInt64(mpAddB.Pointer, 8, _bigBufB.ToInt64())
-                    WriteToLog($"[ComputePi] Combine B: pre-alloc {_addLimbs:N0} limbs ({_addBytesB \ 1048576L:N0} MB) ptr={_bigBufB:X}")
-                Else
-                    WriteToLog($"[ComputePi] Combine B: pre-alloc VirtualAlloc FAILED for {_addBytesB \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+                If _addBytesB >= GMP_LARGE_THRESHOLD Then
+                    Dim _bigBufB As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_addBytesB)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                    If _bigBufB <> IntPtr.Zero Then
+                        Dim _oldBufB As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpAddB.Pointer, 8))
+                        VirtualFree(_oldBufB, UIntPtr.Zero, MEM_RELEASE)
+                        Runtime.InteropServices.Marshal.WriteInt32(mpAddB.Pointer, 0, CInt(_addLimbs))
+                        Runtime.InteropServices.Marshal.WriteInt64(mpAddB.Pointer, 8, _bigBufB.ToInt64())
+                        WriteToLog($"[ComputePi] Combine B: pre-alloc {_addLimbs:N0} limbs ({_addBytesB \ 1048576L:N0} MB) ptr={_bigBufB:X}")
+                    Else
+                        WriteToLog($"[ComputePi] Combine B: pre-alloc VirtualAlloc FAILED for {_addBytesB \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+                    End If
                 End If
             End If
 #If LOGGING_DETAIL >= 1 Then
@@ -2042,15 +2051,17 @@ Public Class Form1
                 Dim _kBitsC As Long = CLng(k1)
                 Dim _shiftLimbs As Long = _numerAbsSzC + (_kBitsC \ 64L) + 2L
                 Dim _shiftBytesC As Long = _shiftLimbs * 8L
-                Dim _bigBufC As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_shiftBytesC)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
-                If _bigBufC <> IntPtr.Zero Then
-                    Dim _oldBufC As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpShiftC.Pointer, 8))
-                    VirtualFree(_oldBufC, UIntPtr.Zero, MEM_RELEASE)
-                    Runtime.InteropServices.Marshal.WriteInt32(mpShiftC.Pointer, 0, CInt(_shiftLimbs))
-                    Runtime.InteropServices.Marshal.WriteInt64(mpShiftC.Pointer, 8, _bigBufC.ToInt64())
-                    WriteToLog($"[ComputePi] Combine C: pre-alloc {_shiftLimbs:N0} limbs ({_shiftBytesC \ 1048576L:N0} MB) ptr={_bigBufC:X}")
-                Else
-                    WriteToLog($"[ComputePi] Combine C: pre-alloc VirtualAlloc FAILED for {_shiftBytesC \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+                If _shiftBytesC >= GMP_LARGE_THRESHOLD Then
+                    Dim _bigBufC As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_shiftBytesC)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                    If _bigBufC <> IntPtr.Zero Then
+                        Dim _oldBufC As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpShiftC.Pointer, 8))
+                        VirtualFree(_oldBufC, UIntPtr.Zero, MEM_RELEASE)
+                        Runtime.InteropServices.Marshal.WriteInt32(mpShiftC.Pointer, 0, CInt(_shiftLimbs))
+                        Runtime.InteropServices.Marshal.WriteInt64(mpShiftC.Pointer, 8, _bigBufC.ToInt64())
+                        WriteToLog($"[ComputePi] Combine C: pre-alloc {_shiftLimbs:N0} limbs ({_shiftBytesC \ 1048576L:N0} MB) ptr={_bigBufC:X}")
+                    Else
+                        WriteToLog($"[ComputePi] Combine C: pre-alloc VirtualAlloc FAILED for {_shiftBytesC \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+                    End If
                 End If
             End If
 #If LOGGING_DETAIL >= 1 Then
@@ -2106,15 +2117,17 @@ Public Class Form1
                 Dim _r0AbsSzD As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer, 4)))
                 Dim _addLimbs As Long = System.Math.Max(_numerAbsSzD, _r0AbsSzD) + 2L
                 Dim _addBytesD As Long = _addLimbs * 8L
-                Dim _bigBufD As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_addBytesD)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
-                If _bigBufD <> IntPtr.Zero Then
-                    Dim _oldBufD As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpAddD.Pointer, 8))
-                    VirtualFree(_oldBufD, UIntPtr.Zero, MEM_RELEASE)
-                    Runtime.InteropServices.Marshal.WriteInt32(mpAddD.Pointer, 0, CInt(_addLimbs))
-                    Runtime.InteropServices.Marshal.WriteInt64(mpAddD.Pointer, 8, _bigBufD.ToInt64())
-                    WriteToLog($"[ComputePi] Combine D: pre-alloc {_addLimbs:N0} limbs ({_addBytesD \ 1048576L:N0} MB) ptr={_bigBufD:X}")
-                Else
-                    WriteToLog($"[ComputePi] Combine D: pre-alloc VirtualAlloc FAILED for {_addBytesD \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+                If _addBytesD >= GMP_LARGE_THRESHOLD Then
+                    Dim _bigBufD As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_addBytesD)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                    If _bigBufD <> IntPtr.Zero Then
+                        Dim _oldBufD As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpAddD.Pointer, 8))
+                        VirtualFree(_oldBufD, UIntPtr.Zero, MEM_RELEASE)
+                        Runtime.InteropServices.Marshal.WriteInt32(mpAddD.Pointer, 0, CInt(_addLimbs))
+                        Runtime.InteropServices.Marshal.WriteInt64(mpAddD.Pointer, 8, _bigBufD.ToInt64())
+                        WriteToLog($"[ComputePi] Combine D: pre-alloc {_addLimbs:N0} limbs ({_addBytesD \ 1048576L:N0} MB) ptr={_bigBufD:X}")
+                    Else
+                        WriteToLog($"[ComputePi] Combine D: pre-alloc VirtualAlloc FAILED for {_addBytesD \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+                    End If
                 End If
             End If
 #If LOGGING_DETAIL >= 1 Then

@@ -843,3 +843,13 @@ The bound `szA + szB + 2` is tight: the worst case is i=2,j=2 with shift = 2·bi
 - `gmp_lib.mpz_mul(gmpSqrtInput, gmpOne, gmpOne)` changed to `SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)`.
 
 - Three-pass numerator multiplications `gmp_lib.mpz_mul(mpR0/mpR1/mpR2, gmpNumer, Q0/Q1/Q2)` changed to `SafeMpzMul`. The 26 M + 21 M = 47 M pieces split to 8.7 M + 7 M = 15.7 M < threshold, so one level of SafeMpzMul suffices with no recursion.
+
+---
+
+## Section 21 — Combine-Step Pre-Alloc Guard: Small VirtualAlloc Buffers Freed via CRT
+
+**Crash symptom:** after all SafeMpzMul fixes, the process crashed in `mpz_clear(mpAddB)` (Combine B) with no log entry after `[ComputePi] Combine B: mpz_clear(mpAddB) + mpz_clear(mpR1)`. The crash was silent (no managed exception, no GmpFreeFunc log).
+
+**Root cause:** the Combine A/B/C/D pre-alloc blocks call `VirtualAlloc` to create a result buffer sized to `ceil(sourceSize + k/64 + 2) × 8` bytes, then patch it directly into the `__mpz_struct`. When the source numbers are small (e.g. a test with few digits where `thirdBits = 0` and `gmpNumer` has 1 bit), the computed buffer size is only a few bytes — far below `GMP_LARGE_THRESHOLD` (512 KB). After `mpz_swap`, that tiny VirtualAlloc buffer ends up inside the mpz_t that is later passed to `mpz_clear`. `GmpFreeFunc` sees `size < GMP_LARGE_THRESHOLD` → routes to `_savedGmpFree` (CRT free) → CRT freeing a `VirtualAlloc` pointer → native heap corruption → `STATUS_ACCESS_VIOLATION` with no log.
+
+**Fix:** each Combine A/B/C/D pre-alloc block now guards with `If _shiftBytes >= GMP_LARGE_THRESHOLD Then`. For small numbers the `mpz_init2` buffer (512 KB, already a `VirtualAlloc` allocation) is sufficient and correct — GMP's normal `GmpReallocFunc` handles any growth, and since the source and destination mpz_t variables in the Combine steps are always different (no aliasing), the realloc use-after-free issue cannot occur.
