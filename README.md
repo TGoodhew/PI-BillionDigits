@@ -888,3 +888,19 @@ The second call passes `shifted` as both rop and op1. `MPZ_REALLOC` short-circui
 **Root cause:** same class of bug as Section 21 (Combine A-D). The `gmpPi` pre-alloc unconditionally called `VirtualAlloc` regardless of buffer size, so tiny quotients (from wrong/test inputs) produced dangerously small VirtualAlloc blocks.
 
 **Fix:** wrap the `VirtualAlloc` call in `If _quotBytes >= GMP_LARGE_THRESHOLD Then`. For small quotients, `gmpPi` retains its 1-limb CRT buffer from `mpz_inits`; GMP's normal realloc handles any growth without the allocator mismatch.
+
+---
+
+## Section 24 — `Chr()` Encoding 1252 Not Available on .NET Core
+
+**Symptom:** computation completed successfully (1 billion digits in ~70 minutes), but crashed immediately on entering the display stage:
+
+```
+System.NotSupportedException: No data is available for encoding 1252.
+   at Microsoft.VisualBasic.Strings.Chr(Int32 CharCode)
+   at PI_BillionDigits.Form1.DisplayTimer_Tick
+```
+
+**Root cause:** `Microsoft.VisualBasic.Strings.Chr()` is documented as converting an ANSI code point (Windows-1252) to a `Char`. On .NET Core / .NET 5+, Windows-1252 is not loaded by default — `Encoding.RegisterProvider(CodePagesEncodingProvider.Instance)` is required before `Chr()` can be called, even for values 0–127. The display timer was reading raw bytes from the native Pi string (all ASCII digits 48–57) and converting them with `Chr()`, which threw on every byte.
+
+**Fix:** replace `Chr(...)` with `ChrW(...)` in both byte-reading calls in `DisplayTimer_Tick`. `ChrW` maps directly to a Unicode code point with no encoding dependency; for ASCII (0–127) the result is identical.

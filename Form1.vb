@@ -2357,12 +2357,12 @@ Public Class Form1
         If useNative Then
             ' First tick: prepend "3." before streaming the rest of the digits.
             If displayIdx = 0 Then
-                chunk.Append(Chr(Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, 0)))
+                chunk.Append(ChrW(Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, 0)))
                 chunk.Append("."c)
                 displayIdx = 1
             End If
             While displayIdx < chunkEnd
-                chunk.Append(Chr(Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, displayIdx)))
+                chunk.Append(ChrW(Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, displayIdx)))
                 displayIdx += 1
             End While
         Else
