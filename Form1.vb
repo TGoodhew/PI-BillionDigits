@@ -1111,11 +1111,13 @@ Public Class Form1
             Runtime.InteropServices.Marshal.WriteInt32(result.Pointer, 0, CInt(_resultLimbs))
             Runtime.InteropServices.Marshal.WriteInt32(result.Pointer, 4, 0)  ' _mp_size = 0
             Runtime.InteropServices.Marshal.WriteInt64(result.Pointer, 8, _resultBuf.ToInt64())
-            WriteToLog($"[SafeMpzMul] result pre-alloc OK: {_resultLimbs:N0} limbs ({_resultBytes \ 1048576L:N0} MB)")
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[SafeMpzMul] result pre-alloc OK: {_resultLimbs:N0} limbs ({_resultBytes \ 1048576L:N0} MB){vbCrLf}")
         Else
             ' VirtualAlloc failed — mpz_add(result,result,x) aliasing will crash if result
             ' needs to grow.  Log and throw so the caller records the failure cleanly.
-            WriteToLog($"[SafeMpzMul] result pre-alloc FAILED for {_resultBytes \ 1048576L:N0} MB — throwing OOM")
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[SafeMpzMul] result pre-alloc FAILED for {_resultBytes \ 1048576L:N0} MB — throwing OOM{vbCrLf}")
             Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for result buffer ({_resultBytes \ 1048576L} MB)")
         End If
 
