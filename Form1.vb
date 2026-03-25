@@ -38,6 +38,7 @@ Public Class Form1
     ' instead of indexing displayStr, avoiding the ~1 GB managed string entirely.
     Private _displayNativePtr As IntPtr = IntPtr.Zero
     Private _displayNativeLen As Long = 0
+    Private _displayNativeBufSize As Long = 0   ' GmpAllocFunc alloc size; >= GMP_LARGE_THRESHOLD → VirtualAlloc'd
     Private WithEvents displayTimer As New System.Windows.Forms.Timer()
     Private gmpC3Const As mpz_t = Nothing
 
@@ -609,7 +610,11 @@ Public Class Form1
     Private Sub BtnCompute_Click(sender As Object, e As EventArgs) Handles BtnCompute.Click
         ' Free any retained Pi buffer from the previous run before starting a new one.
         If _displayNativePtr <> IntPtr.Zero Then
-            VirtualFree(_displayNativePtr, UIntPtr.Zero, MEM_RELEASE)
+            If _displayNativeBufSize >= GMP_LARGE_THRESHOLD Then
+                VirtualFree(_displayNativePtr, UIntPtr.Zero, MEM_RELEASE)
+            Else
+                _savedGmpFree(New void_ptr(_displayNativePtr), New size_t(CULng(_displayNativeBufSize)))
+            End If
             _displayNativePtr = IntPtr.Zero
             WriteToLog("[BtnCompute] retained native pi buffer freed before new computation")
         End If
@@ -2240,15 +2245,19 @@ Public Class Form1
             Finally
                 _strConvTimer.Dispose()
             End Try
+            ' Capture the actual digit count BEFORE clearing gmpPi.
+            ' mpz_sizeinbase returns an estimate within +1; add 2 to match GMP's internal
+            ' alloc of (sizeinbase + 2) bytes.  Used to set _displayNativeLen correctly and
+            ' to decide whether to free the buffer via VirtualFree or _savedGmpFree.
+            Dim _piDigits As Long = CLng(gmp_lib.mpz_sizeinbase(gmpPi, 10))
+            _displayNativeBufSize = _piDigits + 2L   ' mirrors GmpAllocFunc's received size
             ' Free gmpPi now (~744 MB native); reinit 1-limb stub so Finally mpz_clears is safe.
             gmp_lib.mpz_clear(gmpPi)
             gmp_lib.mpz_init(gmpPi)
             ' Keep the native char buffer alive — the display timer will stream bytes
             ' directly from it, avoiding any large managed string allocation.
-            ' The buffer is VirtualAlloc'd (>512 KB) and will be freed via VirtualFree
-            ' in DisplayTimer_Tick once display (and optional file write) is complete.
             _displayNativePtr = piCharPtr.Pointer
-            _displayNativeLen = CLng(digits) + 1L
+            _displayNativeLen = _piDigits + 1L   ' digits + null terminator position
             LogPhase("String conversion complete")
 
             LogPhase($"Done! {digits:N0} digits computed")
@@ -2367,7 +2376,12 @@ Public Class Form1
                 displayIdx = 1
             End If
             While displayIdx < chunkEnd
-                chunk.Append(ChrW(Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, displayIdx)))
+                Dim b As Byte = Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, displayIdx)
+                If b = 0 Then
+                    displayIdx = totalLen   ' null terminator reached — signal completion
+                    Exit While
+                End If
+                chunk.Append(ChrW(b))
                 displayIdx += 1
             End While
         Else
@@ -2408,10 +2422,15 @@ Public Class Form1
             ' This is ~1 GB for a billion-digit run; it will briefly double memory usage but
             ' lets IndexOf work normally.
             piText = Runtime.InteropServices.Marshal.PtrToStringAnsi(_displayNativePtr)
-            ' Buffer no longer needed — free it now.
-            VirtualFree(_displayNativePtr, UIntPtr.Zero, MEM_RELEASE)
+            ' Free via the same allocator that GmpAllocFunc used: VirtualFree for large
+            ' buffers (>= 512 KB), _savedGmpFree for small ones (wrong result / test runs).
+            If _displayNativeBufSize >= GMP_LARGE_THRESHOLD Then
+                VirtualFree(_displayNativePtr, UIntPtr.Zero, MEM_RELEASE)
+            Else
+                _savedGmpFree(New void_ptr(_displayNativePtr), New size_t(CULng(_displayNativeBufSize)))
+            End If
             _displayNativePtr = IntPtr.Zero
-            WriteToLog("[BtnTest] native pi buffer searched and freed (VirtualFree)")
+            WriteToLog("[BtnTest] native pi buffer searched and freed")
         Else
             piText = RtbPiDigits.Text.Replace(".", "").Replace(vbCrLf, "")
         End If

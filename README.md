@@ -916,3 +916,18 @@ System.NotSupportedException: No data is available for encoding 1252.
 The buffer is also freed at the top of `BtnCompute_Click` so that starting a new computation always releases any buffer held from the previous run.
 
 If `_displayNativePtr` is zero (buffer already freed, or a run that used the managed-string path), the Test button falls back to searching `RtbPiDigits.Text` as before.
+
+---
+
+## Section 26 — Defensive Fixes for Wrong-Result Pi Buffer
+
+**Symptom:** when `gmpNumer` comes out near-zero (e.g. due to the Section 22 shift bug not being compiled in), `gmpPi = 0` and `mpz_get_str` allocates a 3-byte CRT-malloc buffer (`"0\0"`). Three separate crashes followed:
+
+1. **Streaming buffer overrun** — `_displayNativeLen` was set to `digits + 1` (1,000,000,001) but the actual buffer was 2 bytes. The streaming loop read a billion bytes past the end → access violation.
+2. **Wrong free in `BtnTest_Click`** — `VirtualFree` was called unconditionally on the CRT-malloc pointer → heap corruption.
+3. **Wrong free in `BtnCompute_Click`** — same unconditional `VirtualFree` on the retained pointer from the previous run.
+
+**Fixes:**
+- Added `_displayNativeBufSize As Long` field. Before clearing `gmpPi`, `mpz_sizeinbase(gmpPi, 10) + 2` is captured (mirrors the size GmpAllocFunc receives); `_displayNativeLen` is now derived from this actual digit count rather than assuming `digits + 1`.
+- Streaming loop now checks for the null terminator byte-by-byte and stops early if hit, preventing any overrun regardless of buffer size.
+- `BtnTest_Click` and `BtnCompute_Click` now dispatch on `_displayNativeBufSize >= GMP_LARGE_THRESHOLD` to choose between `VirtualFree` (large, VirtualAlloc'd buffer) and `_savedGmpFree` (small, CRT-malloc'd buffer).
