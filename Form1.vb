@@ -1106,8 +1106,16 @@ Public Class Form1
         Dim _resultBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_resultBytes)),
                                                 MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
         If _resultBuf <> IntPtr.Zero Then
-            ' Free the existing 1-limb CRT buffer (_savedGmpAlloc allocated it via mpz_inits).
-            _savedGmpFree(New void_ptr(_oldResultPtr), New size_t(CULng(_oldResultAlloc) * 8UL))
+            ' Free the existing buffer.  On a non-recursive first call result holds a
+            ' 1-limb CRT buffer (from mpz_inits) → use _savedGmpFree.  On a recursive
+            ' call (e.g. SafeMpzMul(prod, ...) where prod is being reused across loop
+            ' iterations), result already holds a large VirtualAlloc buffer → use VirtualFree.
+            Dim _oldResultSz As Long = CLng(_oldResultAlloc) * 8L
+            If _oldResultSz >= GMP_LARGE_THRESHOLD Then
+                VirtualFree(_oldResultPtr, UIntPtr.Zero, MEM_RELEASE)
+            Else
+                _savedGmpFree(New void_ptr(_oldResultPtr), New size_t(CULng(_oldResultSz)))
+            End If
             Runtime.InteropServices.Marshal.WriteInt32(result.Pointer, 0, CInt(_resultLimbs))
             Runtime.InteropServices.Marshal.WriteInt32(result.Pointer, 4, 0)  ' _mp_size = 0
             Runtime.InteropServices.Marshal.WriteInt64(result.Pointer, 8, _resultBuf.ToInt64())
@@ -1164,7 +1172,12 @@ Public Class Form1
         Dim _shiftedBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_shiftedBytes)),
                                                   MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
         If _shiftedBuf <> IntPtr.Zero Then
-            _savedGmpFree(New void_ptr(_oldShiftedPtr), New size_t(CULng(_oldShiftedAlloc) * 8UL))
+            Dim _oldShiftedSz As Long = CLng(_oldShiftedAlloc) * 8L
+            If _oldShiftedSz >= GMP_LARGE_THRESHOLD Then
+                VirtualFree(_oldShiftedPtr, UIntPtr.Zero, MEM_RELEASE)
+            Else
+                _savedGmpFree(New void_ptr(_oldShiftedPtr), New size_t(CULng(_oldShiftedSz)))
+            End If
             Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 0, CInt(_shiftedLimbs))
             Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 4, 0)
             Runtime.InteropServices.Marshal.WriteInt64(shifted.Pointer, 8, _shiftedBuf.ToInt64())
@@ -1184,9 +1197,9 @@ Public Class Form1
 
         For i As Integer = 0 To 2
             For j As Integer = 0 To 2
-                System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mpz_mul{vbCrLf}")
-                gmp_lib.mpz_mul(prod, A_parts(i), B_parts(j))
-                System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after mpz_mul{vbCrLf}")
+                System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mul{vbCrLf}")
+                SafeMpzMul(prod, A_parts(i), B_parts(j))
+                System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after mul{vbCrLf}")
                 Dim shiftBits As ULong = CULng(i) * bitsA + CULng(j) * bitsB
                 If shiftBits = 0UL Then
                     System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mpz_add (no shift){vbCrLf}")
@@ -1638,7 +1651,7 @@ Public Class Form1
 #If LOGGING_DETAIL >= 1 Then
             WriteToLog($"[ComputePi] mpz_mul: gmpSqrtInput = gmpOne^2")
 #End If
-            gmp_lib.mpz_mul(gmpSqrtInput, gmpOne, gmpOne)
+            SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)
             ' gmpOne is no longer needed — free its ~208 MB buffer now so it is
             ' not held alive through the sqrt, numerator multiply, and division.
             ' Re-init to 0 so the Finally block can safely call mpz_clear on it.
@@ -1753,7 +1766,7 @@ Public Class Form1
             ' ── Pass 0: r0 = gmpNumer * Q0  (finalQ is Q0 after truncations) ──
             Dim mpR0 As New mpz_t()
             gmp_lib.mpz_init(mpR0)
-            gmp_lib.mpz_mul(mpR0, gmpNumer, finalQ)
+            SafeMpzMul(mpR0, gmpNumer, finalQ)
             gmp_lib.mpz_clears(finalQ, Nothing)   ' Q0 done; ~183 MB buffer freed
 #If LOGGING_DETAIL >= 1 Then
             Dim _procP0a = Process.GetCurrentProcess()
@@ -1800,7 +1813,7 @@ Public Class Form1
 #End If
             Dim mpR1 As New mpz_t()
             gmp_lib.mpz_init(mpR1)
-            gmp_lib.mpz_mul(mpR1, gmpNumer, mpQ1)
+            SafeMpzMul(mpR1, gmpNumer, mpQ1)
             gmp_lib.mpz_clear(mpQ1)
 #If LOGGING_DETAIL >= 1 Then
             Dim _procP1b = Process.GetCurrentProcess()
@@ -1851,7 +1864,7 @@ Public Class Form1
 #End If
             Dim mpR2 As New mpz_t()
             gmp_lib.mpz_init(mpR2)
-            gmp_lib.mpz_mul(mpR2, gmpNumer, mpQ2)
+            SafeMpzMul(mpR2, gmpNumer, mpQ2)
             gmp_lib.mpz_clear(mpQ2)
             ' Swap result into gmpNumer; clear frees the old ~208 MB gmpNumer buffer.
             gmp_lib.mpz_swap(gmpNumer, mpR2)

@@ -819,3 +819,27 @@ The crash appeared late (after several successful sub-products and two logged `L
 **Fix:** pre-allocate `shifted`'s limb buffer to `szA + szB + 2` limbs via `VirtualAlloc` immediately after `mpz_inits(prod, shifted, Nothing)`, patching the native `__mpz_struct` directly (same technique as §18 for `result`). With `shifted._mp_alloc` large enough to hold any sub-product at any shift, `MPZ_REALLOC` always short-circuits and `GmpReallocFunc` is never called for `shifted` during the loop.
 
 The bound `szA + szB + 2` is tight: the worst case is i=2,j=2 with shift = 2·bitsA + 2·bitsB bits, which gives a result of at most ⌈(szA/3 + szB/3)⌉ + ⌈(2·mA + 2·mB)⌉ + 1 ≈ szA + szB + 2 limbs — the same upper bound already used for `result`.
+
+---
+
+## Section 20 — SafeMpzMul Recursion and Post-Combine Large Multiplications
+
+**Crash symptom:** after the §18/§19 combine-phase fixes, the process crashed in `ComputePiGMP` at the first post-combine multiplication: `gmpSqrtInput = gmpOne^2`. The log showed `[ComputePi] mpz_mul: gmpSqrtInput = gmpOne^2` followed immediately by repeating FFT scratch allocs and then `[GmpAllocFunc] CORRUPT SIZE (18446744073709315104)` — the same corrupt-size symptom as §17, but now inside the post-combine finalisation code.
+
+**Root cause — two issues:**
+
+1. **Direct `gmp_lib.mpz_mul` calls in post-combine code.** `gmpOne = 10^1,000,000,000` has ≈52 M limbs. `gmpOne × gmpOne` has szA + szB ≈ 104 M >> 33,554,431 threshold and was called via `gmp_lib.mpz_mul` directly (not through `SafeMpzMul`). Similarly, the three-pass numerator multiplications (`gmpNumer × Q0/Q1/Q2` where gmpNumer ≈ 26 M limbs and each Q third ≈ 21 M limbs, sum ≈ 47 M) used direct `gmp_lib.mpz_mul`.
+
+2. **SafeMpzMul was not recursive — inner products also exceeded the threshold.** For `gmpOne × gmpOne` (52 M + 52 M), SafeMpzMul splits each operand into three pieces of ≈17.3 M limbs. The inner products (17.3 M + 17.3 M = 34.6 M) still exceeded the 33,554,431 threshold. The inner loop called `gmp_lib.mpz_mul` directly on these pieces, which would crash the same way.
+
+3. **Pre-allocation free logic did not handle large existing buffers.** The result pre-alloc code always called `_savedGmpFree` to free the old buffer. On a recursive call (inner-loop iteration 2+), `prod` already holds a large `VirtualAlloc` buffer from the previous iteration; `_savedGmpFree` (CRT free) on a `VirtualAlloc` buffer corrupts the heap.
+
+**Fixes:**
+
+- `SafeMpzMul` inner loop changed from `gmp_lib.mpz_mul(prod, A_parts(i), B_parts(j))` to `SafeMpzMul(prod, A_parts(i), B_parts(j))`. This makes SafeMpzMul recursive: for the `gmpOne^2` case the pieces (17.3 M each) also exceed the threshold and are handled by a second level of SafeMpzMul; each second-level piece (17.3 M/3 ≈ 5.77 M, product 11.5 M) is safely below the threshold.
+
+- Result and shifted pre-alloc free logic updated to dispatch on size: if `_oldAlloc × 8 ≥ GMP_LARGE_THRESHOLD` use `VirtualFree`; otherwise use `_savedGmpFree`. This ensures correct deallocation whether the buffer was created by the CRT (first call, from `mpz_inits`) or by a prior `SafeMpzMul` pre-allocation.
+
+- `gmp_lib.mpz_mul(gmpSqrtInput, gmpOne, gmpOne)` changed to `SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)`.
+
+- Three-pass numerator multiplications `gmp_lib.mpz_mul(mpR0/mpR1/mpR2, gmpNumer, Q0/Q1/Q2)` changed to `SafeMpzMul`. The 26 M + 21 M = 47 M pieces split to 8.7 M + 7 M = 15.7 M < threshold, so one level of SafeMpzMul suffices with no recursion.
