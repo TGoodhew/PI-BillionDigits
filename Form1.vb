@@ -196,6 +196,45 @@ Public Class Form1
     Private Const MEM_RELEASE As UInteger = &H8000UI
     Private Const VA_PAGE_READWRITE As UInteger = &H4UI
 
+    ' ── Power throttling — prevent Windows from routing this process to E-cores ──
+    ' On hybrid CPUs (Intel 12th gen+) Windows Efficiency Mode moves backgrounded
+    ' processes to efficiency cores and halves their scheduler quota.  Opting out
+    ' via SetProcessInformation keeps the compute thread on P-cores at full boost.
+    Private Const PROCESS_POWER_THROTTLING_CURRENT_VERSION As UInteger = 1UI
+    Private Const PROCESS_POWER_THROTTLING_EXECUTION_SPEED As UInteger = 1UI
+    Private Const ProcessPowerThrottling As Integer = 9  ' PROCESS_INFORMATION_CLASS
+
+    <StructLayout(LayoutKind.Sequential)>
+    Private Structure PROCESS_POWER_THROTTLING_STATE
+        Public Version As UInteger
+        Public ControlMask As UInteger
+        Public StateMask As UInteger
+    End Structure
+
+    <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Shared Function SetProcessInformation(
+        hProcess As IntPtr,
+        ProcessInformationClass As Integer,
+        ByRef ProcessInformation As PROCESS_POWER_THROTTLING_STATE,
+        ProcessInformationSize As UInteger) As Boolean
+    End Function
+
+    <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Shared Function GetCurrentProcess() As IntPtr
+    End Function
+
+    Private Shared Sub DisablePowerThrottling()
+        Dim state As New PROCESS_POWER_THROTTLING_STATE With {
+            .Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            .ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            .StateMask = 0UI   ' 0 = disable throttling (1 would enable it)
+        }
+        SetProcessInformation(GetCurrentProcess(),
+                              ProcessPowerThrottling,
+                              state,
+                              CUInt(Runtime.InteropServices.Marshal.SizeOf(state)))
+    End Sub
+
     ' GC-anchor ALL six delegates — collected delegates crash the process.
     ' Shared so the Shared callback methods can reach the saved defaults.
     Private Shared _gmpAlloc As allocate_function
@@ -479,6 +518,11 @@ Public Class Form1
         _nativeCrashCallback = New NativeCrashFilterCallback(AddressOf HandleNativeCrash)
         SetUnhandledExceptionFilter(_nativeCrashCallback)
 
+        ' Opt the process out of Windows power throttling (EcoQoS / Efficiency Mode).
+        ' On hybrid CPUs this prevents the scheduler from routing background threads
+        ' to E-cores and halving their CPU quota.
+        DisablePowerThrottling()
+
         ' Install VirtualAlloc/VirtualFree custom GMP allocator so large limb
         ' buffers are immediately decommitted on free, preventing commit-charge
         ' accumulation that caused abort() in multi-pass multiply.
@@ -679,6 +723,7 @@ Public Class Form1
                 End Try
             End Sub, 256 * 1024 * 1024)
         computeThread.IsBackground = True
+        computeThread.Priority = Threading.ThreadPriority.AboveNormal
         computeThread.Start()
     End Sub
 

@@ -856,6 +856,21 @@ The bound `szA + szB + 2` is tight: the worst case is i=2,j=2 with shift = 2·bi
 
 ---
 
+## Section 27 — Compute Thread Priority and Power Throttling
+
+**Problem:** when the application window is in the background on a modern Windows 11 system with a hybrid CPU (Intel 12th gen+ with P-cores and E-cores), two independent mechanisms slow the compute thread:
+
+1. **Windows Efficiency Mode / EcoQoS** — Windows automatically opts background processes into power throttling, routing their threads to E-cores and halving their scheduler time quota. This is independent of thread priority and cannot be overridden by `.Priority` alone.
+2. **Scheduler priority** — the UI message-pump thread competes with the compute thread for time slices on whichever cores are assigned.
+
+**Fix — two changes:**
+
+1. `DisablePowerThrottling()` is called from `Form1_Load`. It P/Invokes `SetProcessInformation` with `PROCESS_POWER_THROTTLING_STATE { ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED, StateMask = 0 }` — setting `StateMask = 0` explicitly opts the process *out* of execution-speed throttling, overriding Windows' automatic backgrounding policy. This keeps threads on P-cores at full boost frequency for the lifetime of the process.
+
+2. `computeThread.Priority = ThreadPriority.AboveNormal` is set before `computeThread.Start()`. This tells the scheduler to prefer the compute thread over normal-priority threads (including the UI pump), reducing preemption during the ~70-minute computation.
+
+---
+
 ## Section 22 — SafeMpzMul: `mp_bitcnt_t` Overflow for Large Equal-Size Operands
 
 **Symptom:** after all previous fixes, the computation ran to completion but produced `gmpNumer ≈ 1 decimal digit` (near-zero), causing `gmpPi = gmpNumer / T = 0`. The last crash was then in `mpz_clear(gmpPi)` after `mpz_get_str` (Section 23 covers that separately).
