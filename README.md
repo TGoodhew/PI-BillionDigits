@@ -946,3 +946,33 @@ If `_displayNativePtr` is zero (buffer already freed, or a run that used the man
 - Added `_displayNativeBufSize As Long` field. Before clearing `gmpPi`, `mpz_sizeinbase(gmpPi, 10) + 2` is captured (mirrors the size GmpAllocFunc receives); `_displayNativeLen` is now derived from this actual digit count rather than assuming `digits + 1`.
 - Streaming loop now checks for the null terminator byte-by-byte and stops early if hit, preventing any overrun regardless of buffer size.
 - `BtnTest_Click` and `BtnCompute_Click` now dispatch on `_displayNativeBufSize >= GMP_LARGE_THRESHOLD` to choose between `VirtualFree` (large, VirtualAlloc'd buffer) and `_savedGmpFree` (small, CRT-malloc'd buffer).
+
+---
+
+## Section 28 — Diagnostic Logging: SafeMpzMul Verbosity Reduction
+
+**Problem:** The `[SafeMpzMul] loop i=X j=Y: before/after ...` log entries were emitted unconditionally for every iteration of the 9-sub-product loop. With two levels of SafeMpzMul recursion (outer: 52M-limb × 52M-limb; inner: 17M × 17M), each top-level call generates ~91 "done" entries plus hundreds of "before/after" entries. This flooded the log file so completely that the key diagnostic line `[ComputePi] mpz_sqrt: sqrt(X-digit number)` — which immediately shows whether `SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)` produced the correct result — was unreachable in the output.
+
+**Fixes:**
+
+1. **Gated verbose loop entries** — all per-iteration `before mul / after mul / before shift / after shift` entries inside `SafeMpzMul` are now compiled only when `LOGGING_DETAIL >= 2`. At the default `LOGGING_DETAIL = 1` they are silent.
+
+2. **TWO-STEP confirmation** — when `shiftBits > UInt32.MaxValue` and the two-step shift path is taken (the §22 fix), a single concise line is written at `LOGGING_DETAIL >= 1`:
+   ```
+   [SafeMpzMul] TWO-STEP i=2 j=2: shiftBits=4429237504 shift1=... shift2=...
+   ```
+   This confirms the overflow path is actually being entered.
+
+3. **Result-size summary** — after the 9-sub-product accumulation loop, a single line is written at `LOGGING_DETAIL >= 1`:
+   ```
+   [SafeMpzMul] done: szA=51,905,127 szB=51,905,127 → 2,000,000,009 digits
+   ```
+   This shows the output size of every SafeMpzMul call that took the split path, making it possible to verify correctness without examining individual sub-products.
+
+4. **Direct post-call diagnostic** — an unconditional line is written immediately after `SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)`:
+   ```
+   [DIAG] gmpSqrtInput after SafeMpzMul(gmpOne^2): 2,000,000,009 digits
+   ```
+   If this shows `1 digits`, `SafeMpzMul` is producing near-zero for this call and the §22 two-step shift fix needs further investigation. If it shows ~2B digits, the bug is downstream (three-pass multiply or division).
+
+**Why:** With LOGGING_DETAIL = 1, the log now progresses clearly through the post-binary-split pipeline and shows exactly at which step the computed value first goes wrong, instead of being dominated by hundreds of sub-product trace lines that obscure the diagnostic signal.

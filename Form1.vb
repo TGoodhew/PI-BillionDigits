@@ -1175,8 +1175,10 @@ Public Class Form1
             Runtime.InteropServices.Marshal.WriteInt32(result.Pointer, 0, CInt(_resultLimbs))
             Runtime.InteropServices.Marshal.WriteInt32(result.Pointer, 4, 0)  ' _mp_size = 0
             Runtime.InteropServices.Marshal.WriteInt64(result.Pointer, 8, _resultBuf.ToInt64())
+#If LOGGING_DETAIL >= 2 Then
             System.IO.File.AppendAllText(LOG_FILE,
                 $"[SafeMpzMul] result pre-alloc OK: {_resultLimbs:N0} limbs ({_resultBytes \ 1048576L:N0} MB){vbCrLf}")
+#End If
         Else
             ' VirtualAlloc failed — mpz_add(result,result,x) aliasing will crash if result
             ' needs to grow.  Log and throw so the caller records the failure cleanly.
@@ -1237,8 +1239,10 @@ Public Class Form1
             Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 0, CInt(_shiftedLimbs))
             Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 4, 0)
             Runtime.InteropServices.Marshal.WriteInt64(shifted.Pointer, 8, _shiftedBuf.ToInt64())
+#If LOGGING_DETAIL >= 2 Then
             System.IO.File.AppendAllText(LOG_FILE,
                 $"[SafeMpzMul] shifted pre-alloc OK: {_shiftedLimbs:N0} limbs ({_shiftedBytes \ 1048576L:N0} MB){vbCrLf}")
+#End If
         Else
             ' Clean up result buffer we already allocated before throwing.
             VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8)),
@@ -1253,16 +1257,17 @@ Public Class Form1
 
         For i As Integer = 0 To 2
             For j As Integer = 0 To 2
+#If LOGGING_DETAIL >= 2 Then
                 System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mul{vbCrLf}")
+#End If
                 SafeMpzMul(prod, A_parts(i), B_parts(j))
+#If LOGGING_DETAIL >= 2 Then
                 System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after mul{vbCrLf}")
+#End If
                 Dim shiftBits As ULong = CULng(i) * bitsA + CULng(j) * bitsB
                 If shiftBits = 0UL Then
-                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mpz_add (no shift){vbCrLf}")
                     gmp_lib.mpz_add(result, result, prod)
-                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after mpz_add (no shift){vbCrLf}")
                 Else
-                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mpz_mul_2exp shift={shiftBits}{vbCrLf}")
                     ' shiftBits may exceed UInt32.MaxValue (4,294,967,295) when szA and szB are
                     ' both large (e.g. gmpOne^2 with ~52M limbs each): max shift = 4*mA*64 ≈ 4.44B bits.
                     ' mp_bitcnt_t on Windows is 32-bit, so CUInt would overflow and place A2*B2 in
@@ -1275,15 +1280,25 @@ Public Class Form1
                     Else
                         Dim _shift1 As ULong = shiftBits \ 2UL
                         Dim _shift2 As ULong = shiftBits - _shift1   ' both halves ≤ MAX32
+#If LOGGING_DETAIL >= 1 Then
+                        System.IO.File.AppendAllText(LOG_FILE,
+                            $"[SafeMpzMul] TWO-STEP i={i} j={j}: shiftBits={shiftBits} shift1={_shift1} shift2={_shift2}{vbCrLf}")
+#End If
                         gmp_lib.mpz_mul_2exp(shifted, prod, New mp_bitcnt_t(CUInt(_shift1)))
                         gmp_lib.mpz_mul_2exp(shifted, shifted, New mp_bitcnt_t(CUInt(_shift2)))
                     End If
-                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after mpz_mul_2exp, before mpz_add{vbCrLf}")
+#If LOGGING_DETAIL >= 2 Then
+                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after shift, before mpz_add{vbCrLf}")
+#End If
                     gmp_lib.mpz_add(result, result, shifted)
-                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after mpz_add{vbCrLf}")
                 End If
             Next j
         Next i
+
+#If LOGGING_DETAIL >= 1 Then
+        System.IO.File.AppendAllText(LOG_FILE,
+            $"[SafeMpzMul] done: szA={szA:N0} szB={szB:N0} → {gmp_lib.mpz_sizeinbase(result, 10):N0} digits{vbCrLf}")
+#End If
 
         If resultSign < 0 Then gmp_lib.mpz_neg(result, result)
 
@@ -1721,6 +1736,8 @@ Public Class Form1
             WriteToLog($"[ComputePi] mpz_mul: gmpSqrtInput = gmpOne^2")
 #End If
             SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[DIAG] gmpSqrtInput after SafeMpzMul(gmpOne^2): {gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10):N0} digits{vbCrLf}")
             ' gmpOne is no longer needed — free its ~208 MB buffer now so it is
             ' not held alive through the sqrt, numerator multiply, and division.
             ' Re-init to 0 so the Finally block can safely call mpz_clear on it.
