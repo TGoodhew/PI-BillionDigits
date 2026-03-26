@@ -976,3 +976,34 @@ If `_displayNativePtr` is zero (buffer already freed, or a run that used the man
    If this shows `1 digits`, `SafeMpzMul` is producing near-zero for this call and the §22 two-step shift fix needs further investigation. If it shows ~2B digits, the bug is downstream (three-pass multiply or division).
 
 **Why:** With LOGGING_DETAIL = 1, the log now progresses clearly through the post-binary-split pipeline and shows exactly at which step the computed value first goes wrong, instead of being dominated by hundreds of sub-product trace lines that obscure the diagnostic signal.
+
+---
+
+## Section 29 — SafeMpzMul `_shiftedLimbs` Buffer Too Small for Large Asymmetric Operands
+
+**Problem:** `SafeMpzMul` pre-allocates the `shifted` accumulator with `_shiftedLimbs = szA+szB+2` — the same upper bound used for the `result` buffer. This is correct for the result (a product fits in szA+szB limbs), but not for the shifted accumulator.
+
+The largest shifted value arises at i=2, j=2: `A2*B2 << (2*bitsA + 2*bitsB)`. The product `A2*B2` fits in `(mA+mB)` limbs; the shift then adds `2*mA+2*mB` more limbs, giving `3*(mA+mB)` total. Because `mA = ceil(szA/3)` and `mB = ceil(szB/3)` use ceiling division, `3*mA` can be up to `szA+2` and `3*mB` up to `szB+2`, so `3*(mA+mB)` can reach `szA+szB+4` — up to 4 limbs larger than `_resultLimbs`.
+
+For the final BinarySplitGMP combine (szA≈68 M limbs, szB≈72 M limbs), `3*(mA+mB)+1 = 140,083,427` while `szA+szB+2 = 140,083,426`. That single missing limb means the second `mpz_mul_2exp` in the two-step shift path (§22) triggers `GmpReallocFunc`, which frees the old buffer mid-operation and causes the shifted value — and therefore `newQ` — to come out as zero.
+
+**Symptom observed:**
+```
+[SafeMpzMul] done: szA=51,905,127 szB=0 → 1 digits   (×3, for Q passes 0/1/2)
+[ComputePi] Three-pass multiply: splitting finalQ (Q~1 digits)
+```
+`finalQ` arrived at the three-pass multiply as zero because BinarySplitGMP's combine produced `newQ=0`.
+
+**Fix (line ~1226 in `SafeMpzMul`):**
+
+```vb
+' Before:
+Dim _shiftedLimbs As Long = _resultLimbs  ' same upper bound: szA+szB+2
+
+' After:
+Dim _shiftedLimbs As Long = 3L * (CLng(mA) + CLng(mB)) + 2L
+```
+
+This sizes the shifted buffer to the true worst-case maximum, so `MPZ_REALLOC` always short-circuits and `GmpReallocFunc` is never called during the shift accumulation.
+
+**Why:** The root cause was confirmed by diagnostic log showing `[SafeMpzMul] done: szA=51,905,127 szB=0 → 1 digits`, which proved `finalQ=0` before the three-pass multiply. Tracing back, the only path that could produce zero for a non-zero input was `GmpReallocFunc` firing mid-shift on the insufficiently-sized `_shiftedLimbs` buffer.

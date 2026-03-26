@@ -1213,17 +1213,15 @@ Public Class Form1
         gmp_lib.mpz_inits(prod, shifted, Nothing)
 
         ' Pre-allocate shifted to the maximum size it can ever reach during the loop.
-        ' The largest case is i=2,j=2: shifted = A2*B2 << (2*bitsA + 2*bitsB), which
-        ' needs at most szA+szB+2 limbs — same upper bound as result.
+        ' The largest case is i=2,j=2: shifted = A2*B2 << (2*bitsA + 2*bitsB).
+        ' A2*B2 fits in (mA+mB) limbs; the shift adds 2*mA+2*mB limbs = 3*(mA+mB) total.
+        ' Because mA=ceil(szA/3) and mB=ceil(szB/3) use ceiling division, 3*(mA+mB) can
+        ' be up to szA+szB+4 — larger than _resultLimbs (szA+szB+2).  Using _resultLimbs
+        ' here leaves the buffer 1–4 limbs short, triggering GmpReallocFunc mid-shift in
+        ' the two-step branch, which corrupts the result (producing 0 for large operands).
         '
-        ' Without this, mpz_mul_2exp(shifted, prod, N) triggers GmpReallocFunc when
-        ' shifted's buffer is too small.  GMP's realloc frees the old buffer; but
-        ' shifted is a local managed struct and the realloc may interact with other
-        ' in-flight state, causing an access violation that CLR terminates immediately.
-        '
-        ' Fix: pre-allocate via VirtualAlloc so MPZ_REALLOC always short-circuits
-        ' (same principle as the result pre-allocation above).
-        Dim _shiftedLimbs As Long = _resultLimbs  ' same upper bound: szA+szB+2
+        ' Fix: size the shifted buffer to 3*(mA+mB)+2 so MPZ_REALLOC always short-circuits.
+        Dim _shiftedLimbs As Long = 3L * (CLng(mA) + CLng(mB)) + 2L
         Dim _shiftedBytes As Long = _shiftedLimbs * 8L
         Dim _oldShiftedAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(shifted.Pointer, 0))
         Dim _oldShiftedPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8))
