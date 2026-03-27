@@ -997,7 +997,7 @@ Public Class Form1
                 Dim offset As Long = 0L
                 While remaining > 0
                     Dim chunkSize As Integer = CInt(System.Math.Min(remaining, CLng(staging.Length)))
-                    Marshal.Copy(IntPtr.Add(buf, New IntPtr(offset)), staging, 0, chunkSize)
+                    Marshal.Copy(IntPtr.Add(buf, CInt(offset)), staging, 0, chunkSize)
                     bw.Write(staging, 0, chunkSize)
                     offset += chunkSize
                     remaining -= chunkSize
