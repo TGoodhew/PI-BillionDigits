@@ -962,6 +962,11 @@ Public Class Form1
         ' that VirtualAlloc fails during Pass 2's mpz_mul FFT scratch allocation.
         Dim bitCount As Long = CLng(gmp_lib.mpz_sizeinbase(val, 2))
         Dim capacity As Long = (bitCount + 7) \ 8L + 1L
+        Dim _preExportMpSize As Integer = Runtime.InteropServices.Marshal.ReadInt32(val.Pointer, 4)
+        If capacity > 400L * 1024L * 1024L Then
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[SerializeOneMpz] large: _mp_size={_preExportMpSize:N0} bitCount={bitCount:N0} capacity={capacity:N0}{vbCrLf}")
+        End If
         Dim buf As IntPtr
         Dim useVA As Boolean = (capacity >= GMP_LARGE_THRESHOLD)
         If useVA Then
@@ -974,15 +979,25 @@ Public Class Form1
         End If
         Try
             Dim count As size_t = New size_t(0)
-            gmp_lib.mpz_export(New void_ptr(buf), count, 1, New size_t(1), 0, New size_t(0), val)
-            Dim byteLen As Integer = CInt(CLng(count))
-            bw.Write(byteLen)
+            ' Issue #12 fix: use size=8 (one 64-bit GMP limb per word) to avoid GMP's
+            ' internal 32-bit overflow in mpz_export when _mp_size > 67,108,864 limbs
+            ' (i.e., > 2^32 bits total).  With size=1, GMP computes bit-count as
+            ' _mp_size*64 in a 32-bit int, which overflows for large numbers (e.g.
+            ' L16 N1's Q with _mp_size=68,132,407 wraps to ~8 MB instead of ~545 MB).
+            ' With size=8, count ≈ _mp_size (≤ ~130M), safely within 32-bit range.
+            gmp_lib.mpz_export(New void_ptr(buf), count, 1, New size_t(8), 0, New size_t(0), val)
+            Dim byteLen As Long = CLng(count) * 8L
+            If capacity > 400L * 1024L * 1024L Then
+                System.IO.File.AppendAllText(LOG_FILE,
+                    $"[SerializeOneMpz] large post-export: byteLen={byteLen:N0}{vbCrLf}")
+            End If
+            bw.Write(CInt(byteLen))
             If byteLen > 0 Then
-                Dim remaining As Integer = byteLen
-                Dim offset As Integer = 0
+                Dim remaining As Long = byteLen
+                Dim offset As Long = 0L
                 While remaining > 0
-                    Dim chunkSize As Integer = System.Math.Min(remaining, staging.Length)
-                    Marshal.Copy(IntPtr.Add(buf, offset), staging, 0, chunkSize)
+                    Dim chunkSize As Integer = CInt(System.Math.Min(remaining, CLng(staging.Length)))
+                    Marshal.Copy(IntPtr.Add(buf, New IntPtr(offset)), staging, 0, chunkSize)
                     bw.Write(staging, 0, chunkSize)
                     offset += chunkSize
                     remaining -= chunkSize
@@ -1090,7 +1105,9 @@ Public Class Form1
                 offset += bytesRead
                 remaining -= bytesRead
             End While
-            gmp_lib.mpz_import(val, New size_t(CULng(byteLen)), 1, New size_t(1), 0, New size_t(0), New void_ptr(unmanaged))
+            ' Issue #12 fix: match the size=8 used in SerializeOneMpz — byteLen is
+            ' always a multiple of 8 (one 64-bit limb per word), so word count = byteLen\8.
+            gmp_lib.mpz_import(val, New size_t(CULng(byteLen \ 8)), 1, New size_t(8), 0, New size_t(0), New void_ptr(unmanaged))
         Finally
             If useVA Then
                 VirtualFree(unmanaged, UIntPtr.Zero, MEM_RELEASE)
@@ -1543,6 +1560,12 @@ Public Class Form1
 
                 If useDisk Then
                     resultNode.FilePath = $"{DISK_CACHE_DIR}L{level}_N{resultNode.Index}.bin"
+#If LOGGING_DETAIL >= 1 Then
+                    If isTopLevel Then
+                        Dim _preSerNewQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(newQ.Pointer, 4)
+                        WriteToLog($"[Combine] L{level} N{nodeIdx\2}: pre-serialize newQ._mp_size={_preSerNewQ:N0}")
+                    End If
+#End If
                     SerializeNodeToDisk(newP, newQ, tempA, resultNode.FilePath, isLastLevel)
                     gmp_lib.mpz_clears(newP, newQ, tempA, Nothing)
                 Else

@@ -1007,3 +1007,47 @@ Dim _shiftedLimbs As Long = 3L * (CLng(mA) + CLng(mB)) + 2L
 This sizes the shifted buffer to the true worst-case maximum, so `MPZ_REALLOC` always short-circuits and `GmpReallocFunc` is never called during the shift accumulation.
 
 **Why:** The root cause was confirmed by diagnostic log showing `[SafeMpzMul] done: szA=51,905,127 szB=0 → 1 digits`, which proved `finalQ=0` before the three-pass multiply. Tracing back, the only path that could produce zero for a non-zero input was `GmpReallocFunc` firing mid-shift on the insufficiently-sized `_shiftedLimbs` buffer.
+
+---
+
+## Section 30 — GMP `mpz_export` 32-bit Overflow for Large mpz_t (Issue #12)
+
+**Problem:** `SerializeOneMpz` called `mpz_export` with `size=1` (1 byte per word). Internally, Math.Gmp.Native 2.0.6's MSVC build computes the output byte count as `_mp_size * bits_per_limb` in a **32-bit integer**. When `_mp_size > 67,108,864` limbs (i.e., the number exceeds 2^32 bits), this multiplication overflows:
+
+```
+_mp_size = 68,132,407
+68,132,407 × 64 = 4,360,474,048  →  overflows 32-bit
+4,360,474,048 − 4,294,967,296 = 65,506,752 bits → 8,188,344 bytes  (wraps!)
+```
+
+So `mpz_export` returned `count = 8,188,344` instead of the correct `~545,059,255`, writing only ~8 MB of the ~545 MB number to disk. On reload, the Q value was reconstructed from truncated/wrong data — producing an incorrect (effectively zero) value for Q at level 16 node 1.
+
+**Symptom observed (diagnostic logs):**
+```
+[Combine] L16 N1: pre-serialize newQ._mp_size=68,132,407   ← correct before serialize
+[SerializeOneMpz] large: _mp_size=68,132,407 bitCount=4,360,474,036 capacity=545,059,256
+[SerializeOneMpz] large post-export: byteLen=8,188,343      ← should be ~545,059,255
+```
+L16 N0's Q (`_mp_size=64,986,678 < 67,108,864`) was below the overflow threshold and serialized correctly, explaining why L17 N0 had `leftQ` correct but `rightQ=0`.
+
+**Fix (`SerializeOneMpz` and `DeserializeOneMpz`):**
+
+Use `size=8` (one 64-bit GMP limb per word) instead of `size=1`. With `size=8`, the word count equals `_mp_size` (≤ ~130M for 1B-digit Pi), which fits safely in a 32-bit value. The actual byte length is `count * 8`.
+
+```vb
+' SerializeOneMpz — Before:
+gmp_lib.mpz_export(New void_ptr(buf), count, 1, New size_t(1), 0, New size_t(0), val)
+Dim byteLen As Integer = CInt(CLng(count))
+
+' SerializeOneMpz — After:
+gmp_lib.mpz_export(New void_ptr(buf), count, 1, New size_t(8), 0, New size_t(0), val)
+Dim byteLen As Long = CLng(count) * 8L   ' byteLen written as CInt(byteLen) to disk
+
+' DeserializeOneMpz — Before:
+gmp_lib.mpz_import(val, New size_t(CULng(byteLen)), 1, New size_t(1), 0, New size_t(0), New void_ptr(unmanaged))
+
+' DeserializeOneMpz — After:
+gmp_lib.mpz_import(val, New size_t(CULng(byteLen \ 8)), 1, New size_t(8), 0, New size_t(0), New void_ptr(unmanaged))
+```
+
+**Why:** The threshold for overflow is exactly `2^26 = 67,108,864` limbs (since `67,108,864 × 64 = 2^32`). For 1B-digit Pi, the largest intermediate Q values at level 16 cross this threshold. Switching to `size=8` keeps the word count ≈ `_mp_size`, safely within 32-bit range for all values arising in this computation.
