@@ -1213,18 +1213,8 @@ Public Class Form1
             Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for result buffer ({_resultBytes \ 1048576L} MB)")
         End If
 
-        ' Split opA into three pieces: opA = A0 + A1*2^bitsA + A2*2^(2*bitsA)
-        ' opA and opB are Q/P values from Chudnovsky binary split, always non-negative,
-        ' so we work directly with opA/opB instead of making abs() copies (saves ~495 MB).
-        Dim A0 As New mpz_t(), A1 As New mpz_t(), A2 As New mpz_t(), Atmp As New mpz_t()
-        gmp_lib.mpz_inits(A0, A1, A2, Atmp, Nothing)
-        gmp_lib.mpz_tdiv_r_2exp(A0, opA, New mp_bitcnt_t(CUInt(bitsA)))
-        gmp_lib.mpz_tdiv_q_2exp(Atmp, opA, New mp_bitcnt_t(CUInt(bitsA)))
-        gmp_lib.mpz_tdiv_r_2exp(A1, Atmp, New mp_bitcnt_t(CUInt(bitsA)))
-        gmp_lib.mpz_tdiv_q_2exp(A2, Atmp, New mp_bitcnt_t(CUInt(bitsA)))
-        gmp_lib.mpz_clears(Atmp, Nothing)
-
-        ' Split opB into three pieces: opB = B0 + B1*2^bitsB + B2*2^(2*bitsB)
+        ' Split opB into three pieces upfront: opB is small so all three pieces coexist cheaply.
+        ' opA and opB are Q/P values from Chudnovsky binary split, always non-negative.
         Dim B0 As New mpz_t(), B1 As New mpz_t(), B2 As New mpz_t(), Btmp As New mpz_t()
         gmp_lib.mpz_inits(B0, B1, B2, Btmp, Nothing)
         gmp_lib.mpz_tdiv_r_2exp(B0, opB, New mp_bitcnt_t(CUInt(bitsB)))
@@ -1276,15 +1266,36 @@ Public Class Form1
             Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shifted buffer ({_shiftedBytes \ 1048576L} MB)")
         End If
 
-        Dim A_parts() As mpz_t = {A0, A1, A2}
         Dim B_parts() As mpz_t = {B0, B1, B2}
 
+        ' A pieces are large (~355 MB each at L18) — create lazily, one per outer iteration.
+        Dim A_part As New mpz_t()
+        gmp_lib.mpz_inits(A_part, Nothing)
+
         For i As Integer = 0 To 2
+            ' Compute A_i for this iteration only; free any Atmp immediately after.
+            Select Case i
+                Case 0
+                    gmp_lib.mpz_tdiv_r_2exp(A_part, opA, New mp_bitcnt_t(CUInt(bitsA)))
+                Case 1
+                    Dim Atmp1 As New mpz_t()
+                    gmp_lib.mpz_inits(Atmp1, Nothing)
+                    gmp_lib.mpz_tdiv_q_2exp(Atmp1, opA, New mp_bitcnt_t(CUInt(bitsA)))
+                    gmp_lib.mpz_tdiv_r_2exp(A_part, Atmp1, New mp_bitcnt_t(CUInt(bitsA)))
+                    gmp_lib.mpz_clears(Atmp1, Nothing)
+                Case 2
+                    Dim Atmp2 As New mpz_t()
+                    gmp_lib.mpz_inits(Atmp2, Nothing)
+                    gmp_lib.mpz_tdiv_q_2exp(Atmp2, opA, New mp_bitcnt_t(CUInt(bitsA)))
+                    gmp_lib.mpz_tdiv_q_2exp(A_part, Atmp2, New mp_bitcnt_t(CUInt(bitsA)))
+                    gmp_lib.mpz_clears(Atmp2, Nothing)
+            End Select
+
             For j As Integer = 0 To 2
 #If LOGGING_DETAIL >= 2 Then
                 System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mul{vbCrLf}")
 #End If
-                SafeMpzMul(prod, A_parts(i), B_parts(j))
+                SafeMpzMul(prod, A_part, B_parts(j))
 #If LOGGING_DETAIL >= 2 Then
                 System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after mul{vbCrLf}")
 #End If
@@ -1326,7 +1337,7 @@ Public Class Form1
 
         If resultSign < 0 Then gmp_lib.mpz_neg(result, result)
 
-        gmp_lib.mpz_clears(prod, shifted, A0, A1, A2, B0, B1, B2, Nothing)
+        gmp_lib.mpz_clears(prod, shifted, A_part, B0, B1, B2, Nothing)
     End Sub
 
     ' ════════════════════════════════════════════════════════════════════════

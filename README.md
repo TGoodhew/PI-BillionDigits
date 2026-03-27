@@ -1045,3 +1045,24 @@ Changing `size=1` to `size=8` in `mpz_export`/`mpz_import` was tried, but the ov
 **Disk format change:** header is now `_mp_size` (Int32, signed — encodes sign of the number) rather than `byteLen`. Body is `|_mp_size| * 8` bytes of raw GMP limb data in native (little-endian) byte order.
 
 **Why:** The overflow is in GMP's C code in `mpz/export.c`: `(mp_size_t)(bits_per_limb * abs_size)` where `bits_per_limb = 64` and `abs_size` is `_mp_size`. On MSVC Windows, `unsigned long` is 32-bit, so this overflows for `_mp_size ≥ 67,108,864`. Bypassing the API entirely is the only fix that works regardless of GMP's internal word-size assumptions.
+
+---
+
+## Section 31 — `SafeMpzMul` Lazy A-Piece Creation to Reduce Peak Memory (OOM at Level 18)
+
+**Problem:** `SafeMpzMul` was called for the Level 18 combine with `leftQ` having 133,119,085 limbs (~1.07 GB) and `rightQ` having 7,006,723 limbs (~54 MB). The 3-way schoolbook split path decomposed `opA` (leftQ, the large operand) into three pieces A0, A1, A2 — each ~44,373,362 limbs (~355 MB) — all allocated before the inner loop started. Together with the temporary `Atmp` (710 MB) needed to compute A1 and A2, peak memory for A-pieces alone was:
+
+- A0: 355 MB
+- Atmp: 710 MB (used to compute A1 and A2 via successive right-shifts)
+- A1: 355 MB
+- A2: 355 MB
+- Total: **1,775 MB** — on top of the result (~1.07 GB) and shifted (~1.07 GB) pre-allocations, plus baseline compute RAM of ~3.5 GB. Total peak ≈ 7.5 GB, triggering `VirtualAlloc` failure inside `GmpReallocFunc`, which caused a silent process termination (FailFast).
+
+**Fix:** Create A-pieces lazily — one per outer loop iteration. A_part is a single `mpz_t` reused across iterations; each Case computes the appropriate slice and frees any intermediate Atmp immediately:
+- `i=0`: `A_part = opA mod 2^bitsA` (no Atmp needed)
+- `i=1`: `Atmp1 = opA >> bitsA`, then `A_part = Atmp1 mod 2^bitsA`, then `mpz_clears(Atmp1)`
+- `i=2`: `Atmp2 = opA >> bitsA`, then `A_part = Atmp2 >> bitsA`, then `mpz_clears(Atmp2)`
+
+Peak A-piece memory is now Atmp (710 MB) + A_part (355 MB) = **1,065 MB** — a saving of 710 MB — bringing total peak below 7 GB and allowing `VirtualAlloc` to succeed.
+
+**Why the B-pieces are kept upfront:** `opB` is the small operand (7,006,723 limbs, ~54 MB); its three pieces (B0, B1, B2 ≈ 18 MB each) are cheap to coexist and there is no benefit to lazifying them.
