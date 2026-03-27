@@ -1117,3 +1117,23 @@ Peak A-piece memory is now Atmp (710 MB) + A_part (355 MB) = **1,065 MB** — a 
 2. `[SafeMpzMul] loop i=X j=Y: inner returned` — written (at LOGGING_DETAIL >= 1) after each inner `SafeMpzMul(prod, A_part, B_parts(j))` returns and before the shift/add. If this is absent after the `cleared` line, the crash is in the outer loop's `mpz_mul_2exp` or `mpz_add`.
 
 **Why:** The crash is silent — no managed handler fires — suggesting a corrupted-state exception (e.g., `VirtualFree` called on a bad pointer, or double-free). These two log points will identify which phase (cleanup vs. shift/add) triggers it, enabling a targeted fix.
+
+## Section 33 — Fine-Grained Logging to Pinpoint Crash After `loop i=0 j=2: inner returned`
+
+**Problem:** With Section 32 logs in place, the last lines before the crash are:
+```
+[SafeMpzMul] cleared: szA=44,373,029 szB=2,335,573
+[SafeMpzMul] loop i=0 j=2: inner returned
+```
+This tells us the inner Level-1 `SafeMpzMul(44M×2.3M)` completed and cleaned up, and the outer Level-0 loop returned from the Level-1 call for `(i=0, j=2)`. The crash is in one of three subsequent operations in the outer Level-0 call (`SafeMpzMul(133M×7M)`):
+1. The single-step `mpz_mul_2exp(shifted, prod, shiftBits)` for `(i=0, j=2)`
+2. The `mpz_add(result, result, shifted)` for `(i=0, j=2)`
+3. The `Case 1` block starting `i=1`: creating `Atmp1` and calling `mpz_tdiv_q_2exp(Atmp1, opA, bitsA)`
+
+**Change:** Added four new diagnostic log lines all at `LOGGING_DETAIL >= 1`:
+1. `[SafeMpzMul] loop i=X j=Y: single-step shift=N` — written before `mpz_mul_2exp` in the single-step branch. If absent after `inner returned`, crash is inside `mpz_mul_2exp`.
+2. `[SafeMpzMul] loop i=X j=Y: after shift, before mpz_add` — elevated from `LOGGING_DETAIL >= 2` to `LOGGING_DETAIL >= 1`. If absent after `single-step shift`, crash is inside `mpz_mul_2exp`. If present but no `done`, crash is inside `mpz_add`.
+3. `[SafeMpzMul] Case 1: Atmp1 alloc start` — written unconditionally at Case 1 entry, before `mpz_inits(Atmp1)`. If absent after all `(i=0,j=0..2)` entries, crash is inside `mpz_add` for `j=2`.
+4. `[SafeMpzMul] Case 2: Atmp2 alloc start` — analogous for Case 2.
+
+**Why:** Memory analysis shows ~7 GB peak during the outer `SafeMpzMul(newQ, 133M, 7M)` call. The crash likely reflects OOM inside `mpz_mul_2exp` (which internally calls `mpz_realloc2` → GmpReallocFunc → VirtualAlloc). These logs will identify which exact GMP call is the last one reached, narrowing the fix to either memory reduction or VirtualAlloc failure handling.

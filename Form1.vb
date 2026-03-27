@@ -1278,12 +1278,14 @@ Public Class Form1
                 Case 0
                     gmp_lib.mpz_tdiv_r_2exp(A_part, opA, New mp_bitcnt_t(CUInt(bitsA)))
                 Case 1
+                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] Case 1: Atmp1 alloc start{vbCrLf}")
                     Dim Atmp1 As New mpz_t()
                     gmp_lib.mpz_inits(Atmp1, Nothing)
                     gmp_lib.mpz_tdiv_q_2exp(Atmp1, opA, New mp_bitcnt_t(CUInt(bitsA)))
                     gmp_lib.mpz_tdiv_r_2exp(A_part, Atmp1, New mp_bitcnt_t(CUInt(bitsA)))
                     gmp_lib.mpz_clears(Atmp1, Nothing)
                 Case 2
+                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] Case 2: Atmp2 alloc start{vbCrLf}")
                     Dim Atmp2 As New mpz_t()
                     gmp_lib.mpz_inits(Atmp2, Nothing)
                     gmp_lib.mpz_tdiv_q_2exp(Atmp2, opA, New mp_bitcnt_t(CUInt(bitsA)))
@@ -1311,6 +1313,9 @@ Public Class Form1
                     ' passes shifted as both rop and op1; MPZ_REALLOC short-circuits because
                     ' shifted is pre-allocated, so the in-place shift is safe.
                     If shiftBits <= CULng(UInt32.MaxValue) Then
+#If LOGGING_DETAIL >= 1 Then
+                        System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: single-step shift={shiftBits}{vbCrLf}")
+#End If
                         gmp_lib.mpz_mul_2exp(shifted, prod, New mp_bitcnt_t(CUInt(shiftBits)))
                     Else
                         Dim _shift1 As ULong = shiftBits \ 2UL
@@ -1322,7 +1327,7 @@ Public Class Form1
                         gmp_lib.mpz_mul_2exp(shifted, prod, New mp_bitcnt_t(CUInt(_shift1)))
                         gmp_lib.mpz_mul_2exp(shifted, shifted, New mp_bitcnt_t(CUInt(_shift2)))
                     End If
-#If LOGGING_DETAIL >= 2 Then
+#If LOGGING_DETAIL >= 1 Then
                     System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after shift, before mpz_add{vbCrLf}")
 #End If
                     gmp_lib.mpz_add(result, result, shifted)
