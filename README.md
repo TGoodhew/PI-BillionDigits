@@ -1030,24 +1030,18 @@ So `mpz_export` returned `count = 8,188,344` instead of the correct `~545,059,25
 ```
 L16 N0's Q (`_mp_size=64,986,678 < 67,108,864`) was below the overflow threshold and serialized correctly, explaining why L17 N0 had `leftQ` correct but `rightQ=0`.
 
-**Fix (`SerializeOneMpz` and `DeserializeOneMpz`):**
+**First attempted fix (size=8) — did not work:**
 
-Use `size=8` (one 64-bit GMP limb per word) instead of `size=1`. With `size=8`, the word count equals `_mp_size` (≤ ~130M for 1B-digit Pi), which fits safely in a 32-bit value. The actual byte length is `count * 8`.
+Changing `size=1` to `size=8` in `mpz_export`/`mpz_import` was tried, but the overflow is *upstream* of the word-size division. GMP computes `_mp_size * GMP_NUMB_BITS` (= `68M * 64 = 4.36B`) as a 32-bit `unsigned long` (MSVC on Windows) before dividing by anything. With `size=8` the divided result is `4.36B / 64 = 68M` word count — but the 32-bit overflow has already happened, so the overflowed bit count `65,506,752` is divided instead: `65,506,752 / 64 = 1,023,543` words → `1,023,543 * 8 = 8,188,344 bytes`. Same wrong answer.
 
-```vb
-' SerializeOneMpz — Before:
-gmp_lib.mpz_export(New void_ptr(buf), count, 1, New size_t(1), 0, New size_t(0), val)
-Dim byteLen As Integer = CInt(CLng(count))
+**Final fix — bypass `mpz_export`/`mpz_import` entirely:**
 
-' SerializeOneMpz — After:
-gmp_lib.mpz_export(New void_ptr(buf), count, 1, New size_t(8), 0, New size_t(0), val)
-Dim byteLen As Long = CLng(count) * 8L   ' byteLen written as CInt(byteLen) to disk
+`SerializeOneMpz` now reads `_mp_size` and `_mp_d` directly from the native `__mpz_struct` (via `Marshal.ReadInt32`/`Marshal.ReadIntPtr`) and streams the raw limb bytes in 64 KB chunks. No intermediate buffer or `mpz_export` call.
 
-' DeserializeOneMpz — Before:
-gmp_lib.mpz_import(val, New size_t(CULng(byteLen)), 1, New size_t(1), 0, New size_t(0), New void_ptr(unmanaged))
+`DeserializeOneMpz` has two paths:
+- **limbCount < 67,108,864** (bit count fits in 32-bit): use `mpz_realloc2` to let GMP manage the allocation, read raw limbs into `_mp_d`, then set `_mp_size`.
+- **limbCount ≥ 67,108,864**: call `mpz_clear` to free GMP's existing allocation, `VirtualAlloc` a new limb buffer, write `_mp_alloc`/`_mp_size`/`_mp_d` directly to the struct, then read raw limbs. GmpFreeFunc will call `VirtualFree` when the mpz is later cleared (size ≥ GMP_LARGE_THRESHOLD).
 
-' DeserializeOneMpz — After:
-gmp_lib.mpz_import(val, New size_t(CULng(byteLen \ 8)), 1, New size_t(8), 0, New size_t(0), New void_ptr(unmanaged))
-```
+**Disk format change:** header is now `_mp_size` (Int32, signed — encodes sign of the number) rather than `byteLen`. Body is `|_mp_size| * 8` bytes of raw GMP limb data in native (little-endian) byte order.
 
-**Why:** The threshold for overflow is exactly `2^26 = 67,108,864` limbs (since `67,108,864 × 64 = 2^32`). For 1B-digit Pi, the largest intermediate Q values at level 16 cross this threshold. Switching to `size=8` keeps the word count ≈ `_mp_size`, safely within 32-bit range for all values arising in this computation.
+**Why:** The overflow is in GMP's C code in `mpz/export.c`: `(mp_size_t)(bits_per_limb * abs_size)` where `bits_per_limb = 64` and `abs_size` is `_mp_size`. On MSVC Windows, `unsigned long` is 32-bit, so this overflows for `_mp_size ≥ 67,108,864`. Bypassing the API entirely is the only fix that works regardless of GMP's internal word-size assumptions.

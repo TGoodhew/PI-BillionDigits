@@ -943,73 +943,48 @@ Public Class Form1
     End Sub
 
     ''' <summary>
-    ''' Streams one mpz_t from GMP's native buffer into the BinaryWriter without
-    ''' allocating a managed byte array for the full number.  GMP's mpz_export
-    ''' returns a native heap pointer; we walk it in 64 KB chunks through the
-    ''' SOH staging buffer and write each chunk directly to the stream.
+    ''' Streams one mpz_t's raw GMP limb data into the BinaryWriter without any
+    ''' intermediate allocation.  Reads _mp_size and _mp_d directly from the
+    ''' native __mpz_struct, bypassing mpz_export entirely.
     ''' </summary>
+    ''' <remarks>
+    ''' Issue #12 fix: mpz_export has a 32-bit overflow for numbers with
+    ''' |_mp_size| > 67,108,864 limbs.  GMP's MSVC build computes the bit count
+    ''' as _mp_size * GMP_NUMB_BITS using unsigned long (32-bit on Windows), which
+    ''' overflows for L16 N1's Q (_mp_size=68,132,407).  The workaround is to
+    ''' bypass mpz_export and read the limb array (_mp_d) directly.
+    '''
+    ''' Disk format: Int32 _mp_size (signed — encodes both limb count and sign of
+    ''' the number), followed by |_mp_size| * 8 bytes of raw limb data in the
+    ''' platform-native byte order (little-endian on x64 Windows).
+    ''' </remarks>
     Private Sub SerializeOneMpz(val As mpz_t, bw As BinaryWriter, staging As Byte())
-        ' Pre-allocate a buffer so mpz_export writes into our memory rather than
-        ' allocating via GMP's allocator.  After installing the VirtualAlloc custom
-        ' allocator, gmp_lib.free on a GMP-allocated export buffer would call CRT
-        ' free() on a VirtualAlloc'd pointer — undefined behaviour / crash.
-        '
-        ' Issue #11 fix: use VirtualAlloc/VirtualFree instead of Marshal.AllocHGlobal
-        ' for large export buffers.  HeapFree on the process heap does NOT decommit
-        ' pages for large allocations — Windows keeps them in the heap free list.
-        ' After serialising mpR0 and mpR1 (~391 MB each), ~782 MB of "freed" heap
-        ' pages remain committed, pushing the committed-memory baseline high enough
-        ' that VirtualAlloc fails during Pass 2's mpz_mul FFT scratch allocation.
-        Dim bitCount As Long = CLng(gmp_lib.mpz_sizeinbase(val, 2))
-        Dim capacity As Long = (bitCount + 7) \ 8L + 1L
-        Dim _preExportMpSize As Integer = Runtime.InteropServices.Marshal.ReadInt32(val.Pointer, 4)
-        If capacity > 400L * 1024L * 1024L Then
+        ' Read _mp_size from the native __mpz_struct (Int32 at byte offset 4).
+        ' Positive = positive number, negative = negative number.
+        Dim mpSize As Integer = Marshal.ReadInt32(val.Pointer, 4)
+        bw.Write(mpSize)
+        If mpSize = 0 Then Return
+        Dim limbCount As Long = CLng(System.Math.Abs(mpSize))
+        Dim byteCount As Long = limbCount * 8L
+        ' Read _mp_d (pointer to the limb array) at byte offset 8.
+        Dim mpD As IntPtr = Marshal.ReadIntPtr(val.Pointer, 8)
+#If LOGGING_DETAIL >= 1 Then
+        If byteCount > 400L * 1024L * 1024L Then
             System.IO.File.AppendAllText(LOG_FILE,
-                $"[SerializeOneMpz] large: _mp_size={_preExportMpSize:N0} bitCount={bitCount:N0} capacity={capacity:N0}{vbCrLf}")
+                $"[SerializeOneMpz] large: _mp_size={mpSize:N0} byteCount={byteCount:N0}{vbCrLf}")
         End If
-        Dim buf As IntPtr
-        Dim useVA As Boolean = (capacity >= GMP_LARGE_THRESHOLD)
-        If useVA Then
-            buf = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(capacity)),
-                               MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
-            If buf = IntPtr.Zero Then _
-                Throw New OutOfMemoryException($"VirtualAlloc({capacity:N0}) failed in SerializeOneMpz")
-        Else
-            buf = Marshal.AllocHGlobal(New IntPtr(capacity))
-        End If
-        Try
-            Dim count As size_t = New size_t(0)
-            ' Issue #12 fix: use size=8 (one 64-bit GMP limb per word) to avoid GMP's
-            ' internal 32-bit overflow in mpz_export when _mp_size > 67,108,864 limbs
-            ' (i.e., > 2^32 bits total).  With size=1, GMP computes bit-count as
-            ' _mp_size*64 in a 32-bit int, which overflows for large numbers (e.g.
-            ' L16 N1's Q with _mp_size=68,132,407 wraps to ~8 MB instead of ~545 MB).
-            ' With size=8, count ≈ _mp_size (≤ ~130M), safely within 32-bit range.
-            gmp_lib.mpz_export(New void_ptr(buf), count, 1, New size_t(8), 0, New size_t(0), val)
-            Dim byteLen As Long = CLng(count) * 8L
-            If capacity > 400L * 1024L * 1024L Then
-                System.IO.File.AppendAllText(LOG_FILE,
-                    $"[SerializeOneMpz] large post-export: byteLen={byteLen:N0}{vbCrLf}")
-            End If
-            bw.Write(CInt(byteLen))
-            If byteLen > 0 Then
-                Dim remaining As Long = byteLen
-                Dim offset As Long = 0L
-                While remaining > 0
-                    Dim chunkSize As Integer = CInt(System.Math.Min(remaining, CLng(staging.Length)))
-                    Marshal.Copy(IntPtr.Add(buf, CInt(offset)), staging, 0, chunkSize)
-                    bw.Write(staging, 0, chunkSize)
-                    offset += chunkSize
-                    remaining -= chunkSize
-                End While
-            End If
-        Finally
-            If useVA Then
-                VirtualFree(buf, UIntPtr.Zero, MEM_RELEASE)
-            Else
-                Marshal.FreeHGlobal(buf)
-            End If
-        End Try
+#End If
+        ' Stream raw limb bytes in 64 KB chunks using the SOH staging buffer.
+        ' No intermediate allocation needed — data is read straight from _mp_d.
+        Dim remaining As Long = byteCount
+        Dim offset As Long = 0L
+        While remaining > 0
+            Dim chunkSize As Integer = CInt(System.Math.Min(remaining, CLng(staging.Length)))
+            Marshal.Copy(IntPtr.Add(mpD, CInt(offset)), staging, 0, chunkSize)
+            bw.Write(staging, 0, chunkSize)
+            offset += chunkSize
+            remaining -= chunkSize
+        End While
     End Sub
 
     ' Issue #1 fix: replaced GCHandle.Alloc(Pinned) with Marshal.AllocHGlobal.
@@ -1070,51 +1045,81 @@ Public Class Form1
     End Sub
 
     ''' <summary>
-    ''' Reads one serialized mpz_t from the BinaryReader into unmanaged memory,
-    ''' then calls mpz_import.  The unmanaged buffer uses VirtualAlloc for large
-    ''' allocations (>= 512 KB) and Marshal.AllocHGlobal for small ones; freed in
-    ''' a Finally block so it cannot leak on exceptions.
+    ''' Reads one serialized mpz_t from the BinaryReader directly into GMP's limb
+    ''' array, bypassing mpz_import entirely.
     ''' </summary>
+    ''' <remarks>
+    ''' Issue #12 fix: mpz_import has the same 32-bit overflow as mpz_export for
+    ''' numbers with |_mp_size| > 67,108,864 limbs.  The workaround is to allocate
+    ''' the limb buffer and write to the GMP struct directly.
+    '''
+    ''' For numbers with limbCount &lt; 67,108,864 (bit count fits in 32 bits), we
+    ''' use mpz_realloc2 to let GMP manage the allocation normally.  For larger
+    ''' numbers we call mpz_clear to free GMP's existing allocation, VirtualAlloc
+    ''' our own limb buffer, and write _mp_alloc/_mp_size/_mp_d directly into the
+    ''' native __mpz_struct.  When the number is later cleared via mpz_clear, GMP
+    ''' calls GmpFreeFunc with (limbs, limbCount*8); since limbCount*8 &gt;
+    ''' GMP_LARGE_THRESHOLD, GmpFreeFunc calls VirtualFree — matching the alloc.
+    '''
+    ''' Disk format: Int32 _mp_size (signed), followed by |_mp_size| * 8 bytes of
+    ''' raw limb data in the platform-native byte order (little-endian on x64).
+    ''' </remarks>
     Private Sub DeserializeOneMpz(val As mpz_t, br As BinaryReader, staging As Byte())
-        Dim byteLen As Integer = br.ReadInt32()
-        If byteLen <= 0 Then Return
-        ' Issue #11 fix: same VirtualAlloc/VirtualFree approach as SerializeOneMpz —
-        ' see comment there for the reason.  The import buffer is the same size as the
-        ' export buffer and causes the same committed-memory accumulation when freed
-        ' via HeapFree.
-        Dim useVA As Boolean = (byteLen >= GMP_LARGE_THRESHOLD)
-        Dim unmanaged As IntPtr
-        If useVA Then
-            unmanaged = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(byteLen)),
-                                     MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
-            If unmanaged = IntPtr.Zero Then _
-                Throw New OutOfMemoryException($"VirtualAlloc({byteLen:N0}) failed in DeserializeOneMpz")
-        Else
-            unmanaged = Marshal.AllocHGlobal(byteLen)
-        End If
-        Try
-            Dim remaining As Integer = byteLen
-            Dim offset As Integer = 0
+        Dim mpSize As Integer = br.ReadInt32()
+        If mpSize = 0 Then Return
+        Dim limbCount As Long = CLng(System.Math.Abs(mpSize))
+        Dim byteCount As Long = limbCount * 8L
+        ' Numbers with limbCount < 67,108,864 have bit count < 2^32, so mpz_realloc2
+        ' is safe (no 32-bit overflow in GMP's internal bit-count arithmetic).
+        ' Numbers at or above this threshold use direct struct manipulation instead.
+        Const REALLOC2_SAFE_LIMIT As Long = 67_108_864L
+        If limbCount < REALLOC2_SAFE_LIMIT Then
+            ' Let GMP manage the allocation via mpz_realloc2.
+            ' limbCount < 67,108,864 here, so limbCount * 64 ≤ 4,294,967,232 — fits in UInt32.
+            gmp_lib.mpz_realloc2(val, New mp_bitcnt_t(CUInt(limbCount * 64L)))
+            Dim mpD As IntPtr = Marshal.ReadIntPtr(val.Pointer, 8)
+            Dim remaining As Long = byteCount
+            Dim offset As Long = 0L
             While remaining > 0
-                Dim toRead As Integer = System.Math.Min(remaining, staging.Length)
+                Dim toRead As Integer = CInt(System.Math.Min(remaining, CLng(staging.Length)))
                 Dim bytesRead As Integer = br.Read(staging, 0, toRead)
-                If bytesRead <= 0 Then
-                    Throw New EndOfStreamException($"Unexpected end of stream (wanted {toRead}, got {bytesRead})")
-                End If
-                Marshal.Copy(staging, 0, IntPtr.Add(unmanaged, offset), bytesRead)
+                If bytesRead <= 0 Then _
+                    Throw New EndOfStreamException($"Unexpected end of stream in DeserializeOneMpz (small)")
+                Marshal.Copy(staging, 0, IntPtr.Add(mpD, CInt(offset)), bytesRead)
                 offset += bytesRead
                 remaining -= bytesRead
             End While
-            ' Issue #12 fix: match the size=8 used in SerializeOneMpz — byteLen is
-            ' always a multiple of 8 (one 64-bit limb per word), so word count = byteLen\8.
-            gmp_lib.mpz_import(val, New size_t(CULng(byteLen \ 8)), 1, New size_t(8), 0, New size_t(0), New void_ptr(unmanaged))
-        Finally
-            If useVA Then
-                VirtualFree(unmanaged, UIntPtr.Zero, MEM_RELEASE)
-            Else
-                Marshal.FreeHGlobal(unmanaged)
-            End If
-        End Try
+            Marshal.WriteInt32(val.Pointer, 4, mpSize)   ' set _mp_size (encodes sign)
+        Else
+            ' Large number: mpz_realloc2 would overflow GMP's 32-bit bit-count.
+            ' Free GMP's existing limb buffer, then VirtualAlloc our own.
+            ' byteCount >= 67M * 8 = ~536 MB >> GMP_LARGE_THRESHOLD, so when
+            ' mpz_clear is later called, GmpFreeFunc will see size >= GMP_LARGE_THRESHOLD
+            ' and call VirtualFree — matching this VirtualAlloc.
+            gmp_lib.mpz_clear(val)   ' frees GMP's current _mp_d allocation
+            Dim limbs As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(byteCount)),
+                                               MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If limbs = IntPtr.Zero Then _
+                Throw New OutOfMemoryException($"VirtualAlloc({byteCount:N0}) failed in DeserializeOneMpz")
+            ' Write the struct immediately so val is in a consistent (zero-valued) state
+            ' before we start reading.  If an exception escapes during the read, the
+            ' caller can safely call mpz_clear and GmpFreeFunc will VirtualFree the buffer.
+            Marshal.WriteInt32(val.Pointer, 0, CInt(limbCount))  ' _mp_alloc
+            Marshal.WriteInt32(val.Pointer, 4, 0)                ' _mp_size = 0 (safe interim)
+            Marshal.WriteIntPtr(val.Pointer, 8, limbs)            ' _mp_d
+            Dim remaining As Long = byteCount
+            Dim offset As Long = 0L
+            While remaining > 0
+                Dim toRead As Integer = CInt(System.Math.Min(remaining, CLng(staging.Length)))
+                Dim bytesRead As Integer = br.Read(staging, 0, toRead)
+                If bytesRead <= 0 Then _
+                    Throw New EndOfStreamException($"Unexpected end of stream in DeserializeOneMpz (large)")
+                Marshal.Copy(staging, 0, IntPtr.Add(limbs, CInt(offset)), bytesRead)
+                offset += bytesRead
+                remaining -= bytesRead
+            End While
+            Marshal.WriteInt32(val.Pointer, 4, mpSize)   ' set _mp_size now data is valid
+        End If
     End Sub
 
     ' ════════════════════════════════════════════════════════════════════════
