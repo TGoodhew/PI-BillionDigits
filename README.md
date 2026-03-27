@@ -1,4 +1,43 @@
-# PI-BillionDigits — Change Log
+# PI-BillionDigits
+
+## What it is
+
+PI-BillionDigits is a Windows Forms application that computes Pi to an arbitrary number of decimal digits — up to and including one billion — and displays the result. It is written in VB.NET targeting .NET 10 and uses the [Math.Gmp.Native](https://www.nuget.org/packages/Math.Gmp.Native.NET/) wrapper around the GNU Multiple Precision Arithmetic Library (GMP) for all big-integer arithmetic.
+
+## How it works
+
+The computation uses the **Chudnovsky algorithm** with **binary splitting**, which is the standard approach for computing billions of digits of Pi efficiently.
+
+**Chudnovsky series:** The algorithm sums a rapidly-converging series discovered by the Chudnovsky brothers. Each term adds roughly 14.18 decimal digits of Pi precision, so about 70.5 million terms are needed for one billion digits.
+
+**Binary splitting:** Rather than computing each term individually, binary splitting recursively divides the range of terms in half, computes three integer partial products (P, Q, T) for each half, then combines pairs of halves by multiplying across. This transforms the computation into a binary tree of big-integer multiplications. The leaves (individual terms) have small integers; the root holds exact rational numerator and denominator integers that are hundreds of millions of digits long. Final division and square root at the root give Pi.
+
+**Disk-based tree:** For large digit counts the intermediate P, Q, T values at each tree level become gigabytes in size and cannot all fit in RAM simultaneously. The app serializes nodes to disk (`C:\PiOutput\NodeCache\`) and loads them one pair at a time during the combine (bottom-up merge) phase. A single final in-memory combine produces the root values.
+
+**GMP for arithmetic:** All big-integer arithmetic (multiply, divide, square root, base-10 conversion) is delegated to GMP's native C library via P/Invoke, which uses asymptotically fast algorithms (Toom-Cook, Schönhage-Strassen FFT) for the enormous integers involved.
+
+**Output:** After the root rational is computed, GMP converts the result to a decimal string which is streamed character-by-character into the display via a timer tick, keeping the UI responsive during the transfer.
+
+## UI controls
+
+| Control | What it does |
+|---------|-------------|
+| **Digits of Pi** text box | Number of decimal digits to compute. Accepts values like `1,000,000` or `1000000000`. Auto-formatted with commas as you type. Default: 1,000,000. |
+| **Start** button | Begins the computation on a high-priority background thread (256 MB stack). Disabled while a run is in progress. |
+| **Pause** button | Cancels the current run via a cancellation token. If "Write to File" is checked, the digits computed so far are saved before stopping. |
+| **Display** checkbox | When checked, the computed digits are streamed into the output panel after computation completes. Unchecking this is useful when only the file output matters, since displaying a billion digits takes significant time. |
+| **Write to File** checkbox | When checked, the full digit string is saved to `C:\PiOutput\pi_digits.txt` after computation. |
+| **Chunk Size** text box | Number of characters pushed into the display per timer tick during streaming. Higher values stream faster but may make the UI less responsive. Default: 500. Range: 1–1,000,000. |
+| **Test** button | Searches the computed digits for three known substrings and reports whether they appear at the correct positions: `999999` (expected at position 762, the Feynman point), `777777777` (expected at position 24,658,601), and `27182818284` (first digits of e). Searches the full native buffer when available, otherwise searches the display text box. |
+| **Status** bar | Shows the current phase (e.g., "Streaming 1,000,000,000 digits...") or any error message. |
+| **Running Time** label | Elapsed wall-clock time since Start was clicked, updated every second. |
+| **Digits Displayed** label | Running count of digits streamed to the output panel so far. |
+| **Phase log** list box | Timestamped log of major computation phases (chunk processing, combine levels, string conversion, streaming). Each entry shows elapsed time since Start. |
+| **Output panel** | Black-background, green-text RichTextBox showing the Pi digits as they are streamed in. Displays `3.` followed by the decimal digits. |
+
+---
+
+## Change Log
 
 Differences between the original implementation and the current code, with explanations of why each change was made.
 
