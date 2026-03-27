@@ -1296,8 +1296,8 @@ Public Class Form1
                 System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mul{vbCrLf}")
 #End If
                 SafeMpzMul(prod, A_part, B_parts(j))
-#If LOGGING_DETAIL >= 2 Then
-                System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after mul{vbCrLf}")
+#If LOGGING_DETAIL >= 1 Then
+                System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: inner returned{vbCrLf}")
 #End If
                 Dim shiftBits As ULong = CULng(i) * bitsA + CULng(j) * bitsB
                 If shiftBits = 0UL Then
@@ -1338,6 +1338,8 @@ Public Class Form1
         If resultSign < 0 Then gmp_lib.mpz_neg(result, result)
 
         gmp_lib.mpz_clears(prod, shifted, A_part, B0, B1, B2, Nothing)
+        System.IO.File.AppendAllText(LOG_FILE,
+            $"[SafeMpzMul] cleared: szA={szA:N0} szB={szB:N0}{vbCrLf}")
     End Sub
 
     ' ════════════════════════════════════════════════════════════════════════

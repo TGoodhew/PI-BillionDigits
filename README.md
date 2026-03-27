@@ -1066,3 +1066,15 @@ Changing `size=1` to `size=8` in `mpz_export`/`mpz_import` was tried, but the ov
 Peak A-piece memory is now Atmp (710 MB) + A_part (355 MB) = **1,065 MB** — a saving of 710 MB — bringing total peak below 7 GB and allowing `VirtualAlloc` to succeed.
 
 **Why the B-pieces are kept upfront:** `opB` is the small operand (7,006,723 limbs, ~54 MB); its three pieces (B0, B1, B2 ≈ 18 MB each) are cheap to coexist and there is no benefit to lazifying them.
+
+---
+
+## Section 32 — Diagnostic Logging to Bisect Post-`done` Crash in `SafeMpzMul`
+
+**Problem:** After the lazy A-piece fix (Section 31), the app still crashes at Level 18. The last log line is `[SafeMpzMul] done: szA=44,373,029 szB=2,335,573 → 899884175 digits` — an inner recursive call completing — but no output follows. The crash is silent (no managed exception, no native crash handler output), indicating it occurs either inside `mpz_clears` (where a corrupted-state exception would bypass `Try/Catch`) or immediately after the inner SafeMpzMul returns in the outer loop's shift/add path.
+
+**Change:** Added two unconditional diagnostic log lines to bisect the crash point:
+1. `[SafeMpzMul] cleared: szA=... szB=...` — written after `mpz_clears(prod, shifted, A_part, B0, B1, B2, Nothing)` completes. If this is absent after a `done` line, the crash is inside `mpz_clears`.
+2. `[SafeMpzMul] loop i=X j=Y: inner returned` — written (at LOGGING_DETAIL >= 1) after each inner `SafeMpzMul(prod, A_part, B_parts(j))` returns and before the shift/add. If this is absent after the `cleared` line, the crash is in the outer loop's `mpz_mul_2exp` or `mpz_add`.
+
+**Why:** The crash is silent — no managed handler fires — suggesting a corrupted-state exception (e.g., `VirtualFree` called on a bad pointer, or double-free). These two log points will identify which phase (cleanup vs. shift/add) triggers it, enabling a targeted fix.
