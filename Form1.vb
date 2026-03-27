@@ -1092,11 +1092,15 @@ Public Class Form1
             Marshal.WriteInt32(val.Pointer, 4, mpSize)   ' set _mp_size (encodes sign)
         Else
             ' Large number: mpz_realloc2 would overflow GMP's 32-bit bit-count.
-            ' Free GMP's existing limb buffer, then VirtualAlloc our own.
+            ' VirtualAlloc our own limb buffer and write directly to the struct.
+            ' We do NOT call mpz_clear first — doing so can leave the managed
+            ' Math.Gmp.Native wrapper in an inconsistent state, causing a crash
+            ' on the next native call.  The initial 8-byte CRT allocation from
+            ' mpz_init is simply overwritten (trivial leak).
             ' byteCount >= 67M * 8 = ~536 MB >> GMP_LARGE_THRESHOLD, so when
-            ' mpz_clear is later called, GmpFreeFunc will see size >= GMP_LARGE_THRESHOLD
-            ' and call VirtualFree — matching this VirtualAlloc.
-            gmp_lib.mpz_clear(val)   ' frees GMP's current _mp_d allocation
+            ' mpz_clear is later called (during computation cleanup), GmpFreeFunc
+            ' will see size >= GMP_LARGE_THRESHOLD and call VirtualFree —
+            ' matching this VirtualAlloc.
             Dim limbs As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(byteCount)),
                                                MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             If limbs = IntPtr.Zero Then _
