@@ -1137,3 +1137,23 @@ This tells us the inner Level-1 `SafeMpzMul(44M×2.3M)` completed and cleaned up
 4. `[SafeMpzMul] Case 2: Atmp2 alloc start` — analogous for Case 2.
 
 **Why:** Memory analysis shows ~7 GB peak during the outer `SafeMpzMul(newQ, 133M, 7M)` call. The crash likely reflects OOM inside `mpz_mul_2exp` (which internally calls `mpz_realloc2` → GmpReallocFunc → VirtualAlloc). These logs will identify which exact GMP call is the last one reached, narrowing the fix to either memory reduction or VirtualAlloc failure handling.
+
+## Section 34 — `SafeMpzMul`: Defer `shifted` Pre-Allocation to Inside i-Loop to Reduce Peak Memory
+
+**Problem:** Section 33 logs confirmed the crash is in `mpz_tdiv_q_2exp(Atmp1, opA, bitsA)` at the start of the `i=1` iteration. This call needs to grow `Atmp1` from a tiny CRT buffer to ~710 MB (88.6M limbs × 8 bytes). At that point, `shifted` (pre-allocated to 1.12 GB before the i-loop) and `prod` (374 MB, holding `A0×B2` from the last inner call) were both live, pushing peak to ~7.6 GB and exhausting available physical RAM + page file. The crash is silent because VirtualAlloc can succeed (committing virtual address space) but the subsequent page fault cannot be satisfied when RAM+pagefile are full — the resulting access violation inside native GMP bypasses managed exception handling entirely.
+
+**Change:** Moved `shifted`'s pre-allocation from before the i-loop to inside the i-loop, after the A-piece (`Atmp1`/`Atmp2`) computation and just before the j-loop. After the j-loop completes, `shifted` and `prod` are freed (`mpz_clear` → GmpFreeFunc → `VirtualFree`) and re-initialized to tiny 1-limb CRT buffers (`mpz_init`). On the next i-iteration, the pre-alloc only competes with the tiny re-initialized buffers.
+
+**Memory comparison during `Atmp1` allocation at `i=1` entry:**
+| Component | Before (§31–33) | After (§34) |
+|---|---|---|
+| Caller variables (newP, leftP, leftT, rightT, leftQ, rightQ) | 3,900 MB | 3,900 MB |
+| `result` pre-alloc | 1,120 MB | 1,120 MB |
+| `shifted` pre-alloc | 1,120 MB | 0 MB (freed after i=0) |
+| `prod` (A0×B2 from last inner call) | 374 MB | 0 MB (freed after i=0) |
+| `A_part` (A0, about to be replaced) | 355 MB | 355 MB |
+| `B`-pieces | 56 MB | 56 MB |
+| `Atmp1` being allocated | +710 MB | +710 MB |
+| **Peak total** | **~7,635 MB** | **~6,141 MB** |
+
+**Why:** The 1,494 MB reduction is sufficient to keep peak within available RAM+page file. The pre-allocated `shifted` buffer is safe to defer because no j-loop operations run while the A-piece Atmp is live — the allocations are strictly sequential.
