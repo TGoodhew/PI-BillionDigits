@@ -1304,3 +1304,36 @@ Because `result.Pointer` now pointed to the old `prod` struct (pre-alloc'd to 44
 2. After each `SafeMpzMul(prod, ...)` call (inside the j-loop): `result.Pointer = savedResultPtr`
 3. After the per-i cleanup `mpz_init(prod)`: `result.Pointer = savedResultPtr`
 4. Before `mpz_sizeinbase(result, ...)` and `mpz_neg(result, result)`: `result.Pointer = savedResultPtr`
+
+---
+
+## Section 40 — `SafeMpzMul` Struct-Contents Corruption: Separate Accumulator Object
+
+**Problem:** Section 39's restore of `result.Pointer = savedResultPtr` ran correctly (confirmed by log showing `accum_ptr` staying stable), but `after direct add` still showed `res_alloc=44,373,031 res_sz=0`. The accumulation produced zero for all nine sub-products.
+
+Diagnostic evidence:
+
+```
+INIT: res_ptr=2F7B8220140  prod_ptr=2F7B8220440  res_alloc=133,119,087
+j=0 inner returned: res_ptr=2F7B8220440  prod_ptr=2F7B3E08EC0  res_alloc=44,373,031
+j=0 after direct add: res_alloc=44,373,031  res_sz=0
+```
+
+The "after direct add" log reads from `result.Pointer` AFTER restoring `result.Pointer = savedResultPtr = 0x2F7B8220140`. Yet it still shows `_mp_alloc=44,373,031`. This proves the native `__mpz_struct` at address `0x2F7B8220140` was itself overwritten during the inner call — not just the `Pointer` field, but the 16-byte struct contents at that address. The inner pre-alloc value of 44,373,031 was written to `0x2F7B8220140 + 0`, replacing the outer's 133,119,087.
+
+**Root cause (deepened):** The inner SafeMpzMul call corrupts both:
+1. `result.Pointer` (the managed field) — changed from `0x2F7B8220140` to `0x2F7B8220440`, via the same Math.Gmp.Native side effect as §39.
+2. The contents of the native struct AT `0x2F7B8220140` — `_mp_alloc` at that address is overwritten with 44,373,031 (the inner's result pre-alloc size). The mechanism is not fully understood but likely involves the inner call's `mpz_init`/`mpz_clear` operations freeing and reusing the struct at `savedResultPtr` as part of the inner's local variable lifecycle.
+
+Restoring `result.Pointer` (§39) fixes symptom 1 but not symptom 2. After the restore, GMP reads from the correct address but the struct there has been clobbered.
+
+**Fix (§40):** Accumulate into a completely separate `accum` mpz_t object that is **never** passed to any inner SafeMpzMul call.
+
+- `accum` is allocated with `mpz_init` (giving it a 1-limb CRT buffer) immediately after the pre-alloc.
+- Its 1-limb CRT buffer is freed with `_savedGmpFree` and replaced with a fresh VirtualAlloc buffer of `_resultLimbs` capacity.
+- All nine sub-product accumulations use `accum` instead of `result` (`mpz_set_ui(accum, 0)`, `mpz_add(accum, accum, ...)`).
+- `result`'s struct at `savedResultPtr` is **blanked** (all three fields zeroed) after freeing its old limb buffer. This ensures the inner calls find nothing useful at that address and cannot inadvertently corrupt a live buffer pointer.
+- After all nine sub-products are accumulated, `accum`'s three struct fields (`_mp_alloc`, `_mp_size`, `_mp_d`) are copied directly to `savedResultPtr` using Marshal writes, and `result.Pointer = savedResultPtr` is restored.
+- `accum`'s struct is then zeroed so that `mpz_clear(accum)` (in the final `mpz_clears`) calls native GMP `mpz_clear` with `_mp_alloc=0` (no limb buffer freed — GMP skips the free when `_mp_alloc == 0`) and frees only the 16-byte `__mpz_struct` allocated by the initial `mpz_init(accum)`. The VirtualAlloc buffer is now owned by `result` and will be freed by the caller's eventual `mpz_clear(result)`.
+
+Since `accum` is never passed to any inner SafeMpzMul call, inner calls have no reference to it and cannot modify its `Pointer` field or its native struct contents, regardless of the corruption mechanism.
