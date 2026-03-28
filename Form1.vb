@@ -1343,15 +1343,26 @@ Public Class Form1
                         gmp_lib.mpz_mul_2exp(shifted, shifted, New mp_bitcnt_t(CUInt(_shift2)))
                     End If
 #If LOGGING_DETAIL >= 1 Then
-                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after shift, before mpz_add{vbCrLf}")
+                    System.IO.File.AppendAllText(LOG_FILE,
+                        $"[SafeMpzMul] loop i={i} j={j}: after shift, before mpz_add | " &
+                        $"res_alloc={Runtime.InteropServices.Marshal.ReadInt32(result.Pointer, 0):N0} " &
+                        $"res_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(result.Pointer, 4)):N0} " &
+                        $"shi_alloc={Runtime.InteropServices.Marshal.ReadInt32(shifted.Pointer, 0):N0} " &
+                        $"shi_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(shifted.Pointer, 4)):N0}{vbCrLf}")
 #End If
                     gmp_lib.mpz_add(result, result, shifted)
+#If LOGGING_DETAIL >= 1 Then
+                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: mpz_add done{vbCrLf}")
+#End If
 
                     ' Free shifted immediately — don't hold the large buffer during the next
                     ' j-iteration's inner call.  Reset to tiny so the next pre-alloc above
                     ' takes the CRT-free path (not VirtualFree) for the old buffer.
                     VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8)), UIntPtr.Zero, MEM_RELEASE)
                     gmp_lib.mpz_init(shifted)
+#If LOGGING_DETAIL >= 1 Then
+                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: shifted freed{vbCrLf}")
+#End If
                 End If
             Next j
 
