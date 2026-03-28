@@ -1189,3 +1189,22 @@ No `Atmp` mpz_t is created. No GMP memory allocation occurs during Cases 1 or 2 
 | **Peak** | **~7,635 MB** | **~6,141 MB** | **~5,431 MB** |
 
 After the A-piece extraction, `shifted` is pre-allocated (1.12 GB) just before the j-loop, bringing the working set to ~6.55 GB for the actual multiplication phase. This is the irreducible minimum for the i=1 iteration at Level 18.
+
+## Section 36 — `SafeMpzMul` Conditional `shifted` Pre-Alloc (Only When Two-Step Shifts Exist)
+
+**Problem:** After Sections 34 and 35 fixed the Level-18 `SafeMpzMul(133M×7M)` crash, the app crashed at Level 17 (`SafeMpzMul(64.9M×68.1M)`, nearly symmetric operands). The log RAM counter showed 3,084 MB before the call; total peak inside SafeMpzMul was ~8 GB. The bottleneck was `shifted` being pre-allocated to 1.06 GB **for every i-iteration** (0, 1, 2), even though only i=2 can ever trigger two-step aliased shifts at Level 17.
+
+**Root cause of unconditional pre-alloc:** The pre-alloc prevents MPZ_REALLOC from firing during the two-step aliased shift `mpz_mul_2exp(shifted, shifted, shift2)` (where shifted is both rop and op1). If MPZ_REALLOC fires here, GmpReallocFunc moves `_mp_d` to a new block and frees the old one, but the stale op1 copy inside GMP still holds the freed pointer → corruption. However, for **single-step** shifts (`mpz_mul_2exp(shifted, prod, shiftBits)`), `shifted` is rop and `prod` is op1 — they are different variables, so MPZ_REALLOC on `shifted` is completely safe.
+
+**Key insight:** Two-step shifts occur only when `shiftBits = i*bitsA + j*bitsB > UInt32.MaxValue`. The worst case per i-iteration is j=2, so a two-step shift exists for this i if and only if `i*bitsA + 2*bitsB > UInt32.MaxValue`. For Level 17 (`bitsA=1.386B, bitsB=1.453B`): only i=2 satisfies this (2×1.386+2×1.453 = 5.68B > 4.29B). For Level 1 inner calls (`bitsA=0.462B, bitsB=0.484B`): max shift = 1.89B < 4.29B — **no pre-alloc ever needed**.
+
+**Change:** Wrapped the shifted pre-alloc block in `If CULng(i)*bitsA + 2UL*bitsB > CULng(UInt32.MaxValue) Then`. When this condition is False, `shifted` starts as a tiny mpz_init buffer and grows organically via GmpReallocFunc as each single-step shift requires it. At end of j-loop, `shifted` is freed (mpz_clear+mpz_init) regardless.
+
+**Memory savings at Level 17 during inner Level-1 calls:**
+| Phase | Before §36 | After §36 |
+|---|---|---|
+| Level-0 (L17) i=0 j-loop: shifted_L0 | 1,066 MB pre-alloc | tiny → organic growth (max ~718 MB at j=2 shift, transient) |
+| Level-1 (inner): shifted_L1 | 355 MB pre-alloc | tiny → organic growth (max ~239 MB) |
+| Peak during L1 call at i=0 j=2 | ~8,000 MB | ~6,355 MB |
+| Transient peak during L0 i=0 j=2 shift | ~8,000 MB | ~6,477 MB |
+| Peak during L0 i=2 j-loop (pre-alloc needed) | same | ~6,884 MB |

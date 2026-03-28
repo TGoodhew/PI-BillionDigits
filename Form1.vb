@@ -1283,28 +1283,41 @@ Public Class Form1
                     Runtime.InteropServices.Marshal.WriteInt32(A_part.Pointer, 4, _A2_sz)
             End Select
 
-            ' Pre-allocate shifted now that the A-piece is ready and before the j-loop starts.
-            ' At this point shifted holds only a tiny 1-limb CRT buffer (fresh from mpz_init,
-            ' or re-initialized at the end of the previous i-iteration), so freeing the old
-            ' buffer is cheap and the VirtualAlloc peaks alone, not on top of the prior buffer.
-            _shiftedBuf = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_shiftedBytes)),
-                                       MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
-            If _shiftedBuf <> IntPtr.Zero Then
-                Dim _shiOldSz As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(shifted.Pointer, 0)) * 8L
-                If _shiOldSz >= GMP_LARGE_THRESHOLD Then
-                    VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8)), UIntPtr.Zero, MEM_RELEASE)
+            ' Pre-allocate shifted only when this i-iteration has two-step shifts.
+            '
+            ' Two-step shifts arise when shiftBits = i*bitsA + j*bitsB exceeds UInt32.MaxValue
+            ' (mp_bitcnt_t is 32-bit on Windows).  The worst case per iteration is j=2, so
+            ' a two-step shift exists iff i*bitsA + 2*bitsB > UInt32.MaxValue.
+            '
+            ' The pre-alloc is ONLY needed for two-step aliased shifts:
+            '   mpz_mul_2exp(shifted, shifted, shift2)   ← shifted is rop AND op1
+            ' If MPZ_REALLOC fires here, GmpReallocFunc moves _mp_d to a new block and frees
+            ' the old one, but the stale op1 still references the freed pointer → corruption.
+            ' Pre-allocating to the maximum size for this iteration prevents any realloc.
+            '
+            ' For single-step shifts: shifted is rop, prod is op1 (different variables).
+            ' MPZ_REALLOC on shifted is safe — prod is unaffected.  No pre-alloc needed;
+            ' shifted grows organically via GmpReallocFunc and is freed at end of j-loop.
+            If CULng(i) * bitsA + 2UL * bitsB > CULng(UInt32.MaxValue) Then
+                _shiftedBuf = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_shiftedBytes)),
+                                           MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                If _shiftedBuf <> IntPtr.Zero Then
+                    Dim _shiOldSz As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(shifted.Pointer, 0)) * 8L
+                    If _shiOldSz >= GMP_LARGE_THRESHOLD Then
+                        VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8)), UIntPtr.Zero, MEM_RELEASE)
+                    Else
+                        _savedGmpFree(New void_ptr(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8))),
+                                      New size_t(CULng(_shiOldSz)))
+                    End If
+                    Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 0, CInt(_shiftedLimbs))
+                    Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 4, 0)
+                    Runtime.InteropServices.Marshal.WriteInt64(shifted.Pointer, 8, _shiftedBuf.ToInt64())
                 Else
-                    _savedGmpFree(New void_ptr(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8))),
-                                  New size_t(CULng(_shiOldSz)))
+                    VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8)), UIntPtr.Zero, MEM_RELEASE)
+                    System.IO.File.AppendAllText(LOG_FILE,
+                        $"[SafeMpzMul] shifted pre-alloc FAILED for {_shiftedBytes \ 1048576L:N0} MB at i={i} — throwing OOM{vbCrLf}")
+                    Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shifted buffer ({_shiftedBytes \ 1048576L} MB)")
                 End If
-                Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 0, CInt(_shiftedLimbs))
-                Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 4, 0)
-                Runtime.InteropServices.Marshal.WriteInt64(shifted.Pointer, 8, _shiftedBuf.ToInt64())
-            Else
-                VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8)), UIntPtr.Zero, MEM_RELEASE)
-                System.IO.File.AppendAllText(LOG_FILE,
-                    $"[SafeMpzMul] shifted pre-alloc FAILED for {_shiftedBytes \ 1048576L:N0} MB at i={i} — throwing OOM{vbCrLf}")
-                Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shifted buffer ({_shiftedBytes \ 1048576L} MB)")
             End If
 
             For j As Integer = 0 To 2
