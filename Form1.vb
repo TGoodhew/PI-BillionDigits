@@ -1228,9 +1228,6 @@ Public Class Form1
         Dim prod As New mpz_t(), shifted As New mpz_t()
         gmp_lib.mpz_inits(prod, shifted, Nothing)
 
-        ' shifted is pre-allocated unconditionally per iteration (Section 37).
-        Dim _shiftedBuf As IntPtr   ' assigned inside i-loop before each j-loop
-
         Dim B_parts() As mpz_t = {B0, B1, B2}
 
         ' A pieces are large (~355 MB each at L18) — create lazily, one per outer iteration.
@@ -1274,42 +1271,6 @@ Public Class Form1
                     Runtime.InteropServices.Marshal.WriteInt32(A_part.Pointer, 4, _A2_sz)
             End Select
 
-            ' Pre-allocate shifted unconditionally to the per-iteration maximum size.
-            '
-            ' The maximum shifted size for iteration i across all j in [0,2] is:
-            '   prod_limbs + shiftLimbs = (mA + mB) + (i*mA + 2*mB) = (i+1)*mA + 3*mB limbs.
-            ' Add 2 for GMP internal rounding.
-            '
-            ' This eliminates ALL organic L→L reallocations inside mpz_mul_2exp regardless of
-            ' whether the shift is single-step or two-step.  Organic L→L reallocs via
-            ' GmpReallocFunc call VirtualAlloc, commit the new pages, then GMP immediately
-            ' writes to them; if RAM+pagefile are exhausted the page fault cannot be satisfied
-            ' → AV inside native GMP → CLR FailFast with no managed logging.
-            '
-            ' Per-iteration sizing keeps allocations smaller than the global maximum for i=0,1:
-            '   i=0: mA+3*mB  i=1: 2*mA+3*mB  i=2: 3*(mA+mB)  (global = 3*(mA+mB))
-            Dim _sLimbs As Long = (CLng(i) + 1L) * CLng(mA) + 3L * CLng(mB) + 2L
-            Dim _sBytes As Long = _sLimbs * 8L
-            _shiftedBuf = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_sBytes)),
-                                       MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
-            If _shiftedBuf <> IntPtr.Zero Then
-                Dim _shiOldSz As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(shifted.Pointer, 0)) * 8L
-                If _shiOldSz >= GMP_LARGE_THRESHOLD Then
-                    VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8)), UIntPtr.Zero, MEM_RELEASE)
-                Else
-                    _savedGmpFree(New void_ptr(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8))),
-                                  New size_t(CULng(_shiOldSz)))
-                End If
-                Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 0, CInt(_sLimbs))
-                Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 4, 0)
-                Runtime.InteropServices.Marshal.WriteInt64(shifted.Pointer, 8, _shiftedBuf.ToInt64())
-            Else
-                VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8)), UIntPtr.Zero, MEM_RELEASE)
-                System.IO.File.AppendAllText(LOG_FILE,
-                    $"[SafeMpzMul] shifted pre-alloc FAILED for {_sBytes \ 1048576L:N0} MB at i={i} — throwing OOM{vbCrLf}")
-                Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shifted buffer ({_sBytes \ 1048576L} MB)")
-            End If
-
             For j As Integer = 0 To 2
 #If LOGGING_DETAIL >= 2 Then
                 System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mul{vbCrLf}")
@@ -1322,13 +1283,50 @@ Public Class Form1
                 If shiftBits = 0UL Then
                     gmp_lib.mpz_add(result, result, prod)
                 Else
+                    ' Pre-allocate shifted to the EXACT size needed for this j-iteration, after
+                    ' the inner call has returned.  This keeps shifted un-allocated during all inner
+                    ' SafeMpzMul calls, eliminating it as a source of memory pressure there.
+                    '
+                    ' Sizing: shifted = prod << shiftBits requires szProd + shiftBits/64 + 3 limbs.
+                    ' (+1 for ceiling division, +2 for GMP internal rounding.)
+                    '
+                    ' For two-step shifts (shiftBits > UInt32.Max): the second mpz_mul_2exp call
+                    ' passes shifted as both rop and op1.  MPZ_REALLOC short-circuits because the
+                    ' pre-alloc covers the FINAL size, so no realloc occurs during the aliased step.
+                    ' For single-step shifts: shifted is rop, prod is op1 — no aliasing concern, but
+                    ' we still pre-alloc to prevent organic L→L realloc inside mpz_mul_2exp (which
+                    ' VirtualAllocs new pages that GMP writes to immediately; if those page faults
+                    ' can't be satisfied → silent AV inside native GMP → CLR FailFast).
+                    '
+                    ' After mpz_add, shifted is freed immediately so it is not live during the
+                    ' next j-iteration's inner SafeMpzMul call.
+                    Dim _szProd As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prod.Pointer, 4)))
+                    Dim _shiftLimbs As Long = CLng(shiftBits) \ 64L + 1L
+                    Dim _neededLimbs As Long = _szProd + _shiftLimbs + 2L
+                    Dim _sj_buf As IntPtr = VirtualAlloc(IntPtr.Zero,
+                                                         New UIntPtr(CULng(_neededLimbs * 8L)),
+                                                         MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                    If _sj_buf = IntPtr.Zero Then
+                        VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8)), UIntPtr.Zero, MEM_RELEASE)
+                        System.IO.File.AppendAllText(LOG_FILE,
+                            $"[SafeMpzMul] shifted pre-alloc FAILED for {_neededLimbs * 8L \ 1048576L:N0} MB at i={i} j={j} — throwing OOM{vbCrLf}")
+                        Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shifted ({_neededLimbs * 8L \ 1048576L} MB)")
+                    End If
+                    Dim _sjOldBytes As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(shifted.Pointer, 0)) * 8L
+                    If _sjOldBytes >= GMP_LARGE_THRESHOLD Then
+                        VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8)), UIntPtr.Zero, MEM_RELEASE)
+                    Else
+                        _savedGmpFree(New void_ptr(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8))),
+                                      New size_t(CULng(_sjOldBytes)))
+                    End If
+                    Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 0, CInt(_neededLimbs))
+                    Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 4, 0)
+                    Runtime.InteropServices.Marshal.WriteInt64(shifted.Pointer, 8, _sj_buf.ToInt64())
+
                     ' shiftBits may exceed UInt32.MaxValue (4,294,967,295) when szA and szB are
-                    ' both large (e.g. gmpOne^2 with ~52M limbs each): max shift = 4*mA*64 ≈ 4.44B bits.
-                    ' mp_bitcnt_t on Windows is 32-bit, so CUInt would overflow and place A2*B2 in
-                    ' the wrong position, silently producing a near-zero result.
-                    ' Fix: split into two shifts each ≤ UInt32.MaxValue.  The second call
-                    ' passes shifted as both rop and op1; MPZ_REALLOC short-circuits because
-                    ' shifted is pre-allocated, so the in-place shift is safe.
+                    ' both large: max shift = 2*bitsA + 2*bitsB.  mp_bitcnt_t on Windows is 32-bit,
+                    ' so CUInt would overflow and place A2*B2 in the wrong position.
+                    ' Fix: split into two shifts each ≤ UInt32.MaxValue.
                     If shiftBits <= CULng(UInt32.MaxValue) Then
 #If LOGGING_DETAIL >= 1 Then
                         System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: single-step shift={shiftBits}{vbCrLf}")
@@ -1348,13 +1346,19 @@ Public Class Form1
                     System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: after shift, before mpz_add{vbCrLf}")
 #End If
                     gmp_lib.mpz_add(result, result, shifted)
+
+                    ' Free shifted immediately — don't hold the large buffer during the next
+                    ' j-iteration's inner call.  Reset to tiny so the next pre-alloc above
+                    ' takes the CRT-free path (not VirtualFree) for the old buffer.
+                    VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8)), UIntPtr.Zero, MEM_RELEASE)
+                    gmp_lib.mpz_init(shifted)
                 End If
             Next j
 
-            ' Free shifted and prod after this i-iteration's j-loop so they are not live
-            ' during the next A-piece computation (Atmp1/Atmp2 at i=1 and i=2).
-            ' mpz_clear → GmpFreeFunc → VirtualFree; mpz_init → tiny 1-limb CRT buffer.
-            ' The next i-iteration's pre-alloc above will replace that tiny buffer cheaply.
+            ' Free prod after this i-iteration's j-loop so it is not live during the
+            ' next A-piece computation.  shifted is already tiny (mpz_init'd after each
+            ' per-j VirtualFree above, or still tiny from mpz_inits if j=0 was shiftBits=0).
+            ' Clearing shifted here frees that tiny CRT buffer; mpz_init re-creates it.
             gmp_lib.mpz_clear(shifted)
             gmp_lib.mpz_init(shifted)
             gmp_lib.mpz_clear(prod)

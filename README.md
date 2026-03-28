@@ -1240,3 +1240,37 @@ This guarantees no realloc during any `mpz_mul_2exp` call in the j-loop — neit
 The organic 453 MB → 545 MB L→L realloc at i=2 j=2 is eliminated. The i=2 pre-alloc (545 MB) is also smaller than the §36 global pre-alloc (812 MB), reducing peak for two-step iterations as well.
 
 **Removed variables:** `_shiftedLimbs` and `_shiftedBytes` (global pre-alloc sizing vars declared before the i-loop) are no longer needed; replaced by `_sLimbs` and `_sBytes` declared inline before each pre-alloc.
+
+---
+
+## Section 38 — `SafeMpzMul` Per-j `shifted` Allocation: Allocate After Inner Returns, Free After Add
+
+**Problem:** After Section 37 fixed the Level-16 crash by pre-allocating `shifted` unconditionally for all three i-iterations, the app crashed at Level 17 N0 (`SafeMpzMul(64.9M×68.1M)`) with the last log line `loop i=0 j=2: after shift, before mpz_add`. Section 37 added a 718 MB `shifted` pre-alloc for outer i=0 that did not exist in Section 36. This pre-alloc was live throughout the outer j-loop, including during all three inner Level-1 SafeMpzMul calls (~21.7M×22.7M). The inner calls added ~1,066 MB of their own allocations (result_L1=355, B_pieces_L1=180, A_part_L1=58, shifted_L1_i2=355, prod_L1=118), pushing the total peak from ~5,884 MB (Section 36) to ~6,602 MB (Section 37). The crash at `mpz_add` with ~5,891 MB live is a deferred consequence of the system being stressed to 6,602 MB during the inner calls immediately before.
+
+**Key insight:** `shifted` does not need to be live during inner calls. It is only used for:
+1. `mpz_mul_2exp(shifted, prod, ...)` — rop is `shifted`, op1 is `prod` (different variables)
+2. `mpz_mul_2exp(shifted, shifted, ...)` — two-step only, where shifted is both rop and op1 (requires pre-alloc to prevent MPZ_REALLOC aliasing corruption)
+3. `mpz_add(result, result, shifted)` — source operand
+
+All three operations occur AFTER the inner SafeMpzMul returns. So `shifted` can be allocated after the inner call and freed immediately after `mpz_add`. This ensures it is never live during any inner call.
+
+**Change:** Remove the per-i shifted pre-alloc block. Inside the j-loop, after the inner SafeMpzMul returns:
+1. Compute `_neededLimbs = szProd + shiftBits/64 + 3` (exact size for this j's shift)
+2. VirtualAlloc a `_neededLimbs`-limb buffer and install it as `shifted`'s backing store
+3. Perform the single-step or two-step shift into `shifted`
+4. Call `mpz_add(result, result, shifted)`
+5. VirtualFree `shifted`'s buffer and call `mpz_init(shifted)` to reset it to a tiny CRT buffer
+
+This eliminates shifted as a source of memory pressure during inner calls for all i-iterations. The sizing uses the actual `prod._mp_size` (from the just-returned inner call) for exact fit rather than a conservative per-iteration maximum.
+
+**Memory analysis at Level 17 (`szA=64.9M, szB=68.1M`):**
+
+| Scenario | Peak during inner calls | Peak during shift+add | Overall peak |
+|---|---|---|---|
+| §36 (conditional pre-alloc, i=2 only) | 6,948 MB (at i=2) | 6,237 MB | 6,948 MB |
+| §37 (unconditional per-i pre-alloc) | 6,948 MB (at i=2) + new peaks 6,602/6,776 at i=0/i=1 | — | 6,948 MB |
+| §38 (per-j, allocated after inner) | 5,884 MB (no shifted live during inner) | 6,237 MB (i=2 j=2 two-step) | **6,237 MB** |
+
+Section 38 saves ~711 MB vs Sections 36/37 (6,237 vs 6,948 MB).
+
+**Why Section 37 crashed while Section 36 did not (at L17):** Section 36 succeeded at L17 with a peak of 6,948 MB at i=2. Section 37 also has a 6,948 MB peak at i=2, but additionally introduces NEW peaks of 6,602 MB at i=0 and 6,776 MB at i=1 that did not exist in Section 36. Repeated high-pressure episodes (all three i-iterations, not just i=2) appear to push the system past its sustainable limit, leading to a crash in the subsequent mpz_add even after the inner call returns.
