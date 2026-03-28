@@ -1252,19 +1252,35 @@ Public Class Form1
                 Case 0
                     gmp_lib.mpz_tdiv_r_2exp(A_part, opA, New mp_bitcnt_t(CUInt(bitsA)))
                 Case 1
-                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] Case 1: Atmp1 alloc start{vbCrLf}")
-                    Dim Atmp1 As New mpz_t()
-                    gmp_lib.mpz_inits(Atmp1, Nothing)
-                    gmp_lib.mpz_tdiv_q_2exp(Atmp1, opA, New mp_bitcnt_t(CUInt(bitsA)))
-                    gmp_lib.mpz_tdiv_r_2exp(A_part, Atmp1, New mp_bitcnt_t(CUInt(bitsA)))
-                    gmp_lib.mpz_clears(Atmp1, Nothing)
+                    ' Direct limb extraction: A1 = opA's limbs [mA, 2*mA).
+                    ' bitsA = mA*64 is always limb-aligned, so no bit-masking is needed —
+                    ' the piece boundaries fall exactly on limb boundaries.  Copying directly
+                    ' from opA's limb array into A_part's existing buffer (allocated in Case 0
+                    ' to hold mA limbs) avoids the 710 MB Atmp1 temporary entirely.
+                    Dim _opA_d1 As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
+                    Dim _A1_src As IntPtr = New IntPtr(_opA_d1 + CLng(mA) * 8L)
+                    Dim _A1_dst As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(A_part.Pointer, 8))
+                    CopyMemory(_A1_dst, _A1_src, New UIntPtr(CULng(mA) * 8UL))
+                    Dim _A1_sz As Integer = CInt(mA)
+                    Dim _A1_dstL As Long = _A1_dst.ToInt64()
+                    While _A1_sz > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_A1_dstL + CLng(_A1_sz - 1) * 8L)) = 0L
+                        _A1_sz -= 1
+                    End While
+                    Runtime.InteropServices.Marshal.WriteInt32(A_part.Pointer, 4, _A1_sz)
                 Case 2
-                    System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] Case 2: Atmp2 alloc start{vbCrLf}")
-                    Dim Atmp2 As New mpz_t()
-                    gmp_lib.mpz_inits(Atmp2, Nothing)
-                    gmp_lib.mpz_tdiv_q_2exp(Atmp2, opA, New mp_bitcnt_t(CUInt(bitsA)))
-                    gmp_lib.mpz_tdiv_q_2exp(A_part, Atmp2, New mp_bitcnt_t(CUInt(bitsA)))
-                    gmp_lib.mpz_clears(Atmp2, Nothing)
+                    ' Direct limb extraction: A2 = opA's limbs [2*mA, szA).
+                    ' A2 has szA - 2*mA limbs (≤ mA), which fits in A_part's existing buffer.
+                    Dim _opA_d2 As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
+                    Dim _A2_limbs As Long = CLng(szA) - 2L * CLng(mA)
+                    Dim _A2_src As IntPtr = New IntPtr(_opA_d2 + 2L * CLng(mA) * 8L)
+                    Dim _A2_dst As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(A_part.Pointer, 8))
+                    CopyMemory(_A2_dst, _A2_src, New UIntPtr(CULng(_A2_limbs) * 8UL))
+                    Dim _A2_sz As Integer = CInt(_A2_limbs)
+                    Dim _A2_dstL As Long = _A2_dst.ToInt64()
+                    While _A2_sz > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_A2_dstL + CLng(_A2_sz - 1) * 8L)) = 0L
+                        _A2_sz -= 1
+                    End While
+                    Runtime.InteropServices.Marshal.WriteInt32(A_part.Pointer, 4, _A2_sz)
             End Select
 
             ' Pre-allocate shifted now that the A-piece is ready and before the j-loop starts.

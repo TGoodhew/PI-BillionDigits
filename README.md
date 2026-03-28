@@ -1157,3 +1157,35 @@ This tells us the inner Level-1 `SafeMpzMul(44M×2.3M)` completed and cleaned up
 | **Peak total** | **~7,635 MB** | **~6,141 MB** |
 
 **Why:** The 1,494 MB reduction is sufficient to keep peak within available RAM+page file. The pre-allocated `shifted` buffer is safe to defer because no j-loop operations run while the A-piece Atmp is live — the allocations are strictly sequential.
+
+## Section 35 — `SafeMpzMul` A-Piece Direct Limb Extraction to Eliminate Atmp Allocations
+
+**Problem:** Section 34 reduced the peak from ~7.6 GB to ~6.1 GB by freeing `shifted` and `prod` between i-iterations. However, the crash continued at the same point (`Case 1: Atmp1 alloc start`), indicating even 6.1 GB exceeds available physical RAM + page file. The `Atmp1` and `Atmp2` allocations (each ~710 MB) are still the peak driver: at the moment they are allocated, `result` (1.12 GB) + `A_part` (355 MB) + caller variables (3.9 GB) + `Atmp1` (710 MB) = ~6.1 GB committed.
+
+**Key observation:** `bitsA = mA * 64` is always a multiple of 64 bits (= 1 GMP limb = 8 bytes), so the three A-pieces fall on exact limb boundaries:
+- A0 = `opA` limbs `[0, mA)` — already computed correctly by `mpz_tdiv_r_2exp` in Case 0
+- A1 = `opA` limbs `[mA, 2*mA)` — previously needed an 88.6M-limb (710 MB) temporary `Atmp1`
+- A2 = `opA` limbs `[2*mA, szA)` — previously needed an 88.6M-limb (710 MB) temporary `Atmp2`
+
+Since the boundaries are limb-aligned, extracting A1/A2 is just a `CopyMemory` from `opA`'s native limb array at the right byte offset, directly into `A_part`'s existing buffer (which was allocated to hold `mA` limbs in Case 0). No temporary is needed.
+
+**Change:** Replaced `mpz_tdiv_q_2exp`/`mpz_tdiv_r_2exp` + `Atmp` in Cases 1 and 2 with direct limb extraction:
+1. Read `opA._mp_d` (the native limb array pointer) via `Marshal.ReadInt64(opA.Pointer, 8)`
+2. `CopyMemory` `mA` limbs from offset `mA` (Case 1) or `2*mA` (Case 2) into `A_part._mp_d`
+3. Scan backwards to find the highest non-zero limb and write the result to `A_part._mp_size`
+
+No `Atmp` mpz_t is created. No GMP memory allocation occurs during Cases 1 or 2 — only a memcpy of 355 MB within already-committed memory.
+
+**Memory comparison at `i=1` Case entry:**
+| Component | §31–33 | §34 | §35 |
+|---|---|---|---|
+| Caller variables | 3,900 MB | 3,900 MB | 3,900 MB |
+| `result` | 1,120 MB | 1,120 MB | 1,120 MB |
+| `shifted` | 1,120 MB | 0 MB | 0 MB |
+| `prod` | 374 MB | 0 MB | 0 MB |
+| `A_part` | 355 MB | 355 MB | 355 MB |
+| `B`-pieces | 56 MB | 56 MB | 56 MB |
+| `Atmp1` | +710 MB | +710 MB | **0 MB** |
+| **Peak** | **~7,635 MB** | **~6,141 MB** | **~5,431 MB** |
+
+After the A-piece extraction, `shifted` is pre-allocated (1.12 GB) just before the j-loop, bringing the working set to ~6.55 GB for the actual multiplication phase. This is the irreducible minimum for the i=1 iteration at Level 18.
