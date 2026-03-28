@@ -1208,3 +1208,35 @@ After the A-piece extraction, `shifted` is pre-allocated (1.12 GB) just before t
 | Peak during L1 call at i=0 j=2 | ~8,000 MB | ~6,355 MB |
 | Transient peak during L0 i=0 j=2 shift | ~8,000 MB | ~6,477 MB |
 | Peak during L0 i=2 j-loop (pre-alloc needed) | same | ~6,884 MB |
+
+---
+
+## Section 37 — `SafeMpzMul` Unconditional Per-Iteration `shifted` Pre-Alloc to Eliminate Organic L→L Reallocs
+
+**Problem:** After Section 36 fixed the Level-17 crash, the app crashed at Level 16 (`SafeMpzMul(33.9M×34.3M)`). The log showed all 9 sub-products completing; the last log line was `loop i=2 j=2: single-step shift=2906982784`. Crash happened inside `mpz_mul_2exp(shifted, prod, 2906982784)` where `shifted` (~453 MB, grown organically from i=2 j=1) needed to grow to ~545 MB via GmpReallocFunc's L→L path. Despite the expected "L→L enter" log being unconditional, it never appeared. The app died silently.
+
+**Root cause — silent organic L→L crash:** GmpReallocFunc's L→L path calls `VirtualAlloc` for the new 545 MB buffer. VirtualAlloc succeeds (commits virtual address space backed by page file). GmpReallocFunc returns the new pointer to GMP. GMP's shift kernel immediately starts writing to the new pages (reading from `prod`, writing to `shifted`). When Windows tries to back those pages with physical RAM, the page file is exhausted — the page fault cannot be satisfied → access violation **inside native GMP** → CLR FailFast before any managed exception handler or logging code runs. This is why "L→L enter" never appeared: the crash happened after `VirtualAlloc` returned but before the next managed log write could execute.
+
+**Why Section 36's conditional approach was insufficient:** Section 36 correctly identified that single-step shifts don't cause aliased-pointer corruption, so pre-alloc was conditional on two-step shifts. However, `mpz_mul_2exp(shifted, prod, shiftBits)` with a single-step shift still calls `MPZ_REALLOC(shifted, needed_limbs)` when `shifted` is undersized. This triggers `GmpReallocFunc` → `VirtualAlloc` for a large new buffer → immediate write → page fault → silent crash. The aliasing safety was correct, but the organic-growth-crashes-on-write problem remained.
+
+**Fix — unconditional per-iteration pre-alloc:** Pre-allocate `shifted` unconditionally before each j-loop, sized to the **per-iteration maximum** across all j in [0,2]:
+
+```
+max shifted size for iteration i = prod_limbs + max_shift_limbs
+                                 = (mA + mB) + (i·mA + 2·mB)
+                                 = (i+1)·mA + 3·mB   [+ 2 for safety]
+```
+
+This guarantees no realloc during any `mpz_mul_2exp` call in the j-loop — neither for two-step aliased shifts nor for large single-step shifts. Per-iteration sizing is strictly smaller than the global maximum for i=0 and i=1, reducing peak committed memory vs. pre-allocating to the global max for all iterations.
+
+**Memory at Level 16 N1 (`szA=33.9M, szB=34.3M, mA=11.3M, mB=11.4M`):**
+
+| Iteration | Pre-alloc size (§36) | Pre-alloc size (§37) |
+|---|---|---|
+| i=0 | none (single-step only) | `1×11.3M + 3×11.4M + 2 = 45.5M limbs = 364 MB` |
+| i=1 | none (single-step only) | `2×11.3M + 3×11.4M + 2 = 56.8M limbs = 454 MB` |
+| i=2 | 101.5M limbs = 812 MB (global max) | `3×11.3M + 3×11.4M + 2 = 68.1M limbs = 545 MB` |
+
+The organic 453 MB → 545 MB L→L realloc at i=2 j=2 is eliminated. The i=2 pre-alloc (545 MB) is also smaller than the §36 global pre-alloc (812 MB), reducing peak for two-step iterations as well.
+
+**Removed variables:** `_shiftedLimbs` and `_shiftedBytes` (global pre-alloc sizing vars declared before the i-loop) are no longer needed; replaced by `_sLimbs` and `_sBytes` declared inline before each pre-alloc.
