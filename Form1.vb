@@ -1212,6 +1212,14 @@ Public Class Form1
                 $"[SafeMpzMul] result pre-alloc FAILED for {_resultBytes \ 1048576L:N0} MB — throwing OOM{vbCrLf}")
             Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for result buffer ({_resultBytes \ 1048576L} MB)")
         End If
+        ' §39 — save the native-struct address before any inner call can corrupt it.
+        ' Inner SafeMpzMul calls are observed to overwrite result.Pointer (the managed
+        ' mpz_t.Pointer field) via a Math.Gmp.Native side effect: mpz_init/mpz_clear on
+        ' inner local variables appears to swap or reuse native struct addresses, causing
+        ' the outer result's Pointer field to change.  savedResultPtr is a plain IntPtr
+        ' local that cannot be modified externally, so it always holds the address of the
+        ' correct native struct.  We restore result.Pointer after every inner call.
+        Dim savedResultPtr As IntPtr = result.Pointer
 
         ' Split opB into three pieces upfront: opB is small so all three pieces coexist cheaply.
         ' opA and opB are Q/P values from Chudnovsky binary split, always non-negative.
@@ -1233,6 +1241,14 @@ Public Class Form1
         ' A pieces are large (~355 MB each at L18) — create lazily, one per outer iteration.
         Dim A_part As New mpz_t()
         gmp_lib.mpz_inits(A_part, Nothing)
+#If LOGGING_DETAIL >= 1 Then
+        If CLng(szA) + CLng(szB) > 50_000_000L Then
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[SafeMpzMul] INIT szA={szA:N0} szB={szB:N0} | " &
+                $"res_ptr={result.Pointer.ToInt64():X} prod_ptr={prod.Pointer.ToInt64():X} " &
+                $"res_alloc={Runtime.InteropServices.Marshal.ReadInt32(result.Pointer, 0):N0}{vbCrLf}")
+        End If
+#End If
 
         For i As Integer = 0 To 2
             ' Compute A_i for this iteration only; free any Atmp immediately after.
@@ -1277,11 +1293,23 @@ Public Class Form1
 #End If
                 SafeMpzMul(prod, A_part, B_parts(j))
 #If LOGGING_DETAIL >= 1 Then
-                System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: inner returned{vbCrLf}")
+                System.IO.File.AppendAllText(LOG_FILE,
+                    $"[SafeMpzMul] loop i={i} j={j}: inner returned | " &
+                    $"res_alloc={Runtime.InteropServices.Marshal.ReadInt32(result.Pointer, 0):N0} " &
+                    $"res_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(result.Pointer, 4)):N0} " &
+                    $"res_ptr={result.Pointer.ToInt64():X} prod_ptr={prod.Pointer.ToInt64():X}{vbCrLf}")
 #End If
+                ' §39: restore result.Pointer — inner call overwrites it as a side effect.
+                result.Pointer = savedResultPtr
                 Dim shiftBits As ULong = CULng(i) * bitsA + CULng(j) * bitsB
                 If shiftBits = 0UL Then
                     gmp_lib.mpz_add(result, result, prod)
+#If LOGGING_DETAIL >= 1 Then
+                    System.IO.File.AppendAllText(LOG_FILE,
+                        $"[SafeMpzMul] loop i={i} j={j}: after direct add | " &
+                        $"res_alloc={Runtime.InteropServices.Marshal.ReadInt32(result.Pointer, 0):N0} " &
+                        $"res_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(result.Pointer, 4)):N0}{vbCrLf}")
+#End If
                 Else
                     ' Pre-allocate shifted to the EXACT size needed for this j-iteration, after
                     ' the inner call has returned.  This keeps shifted un-allocated during all inner
@@ -1374,8 +1402,12 @@ Public Class Form1
             gmp_lib.mpz_init(shifted)
             gmp_lib.mpz_clear(prod)
             gmp_lib.mpz_init(prod)
+            ' §39: per-i cleanup may also corrupt result.Pointer; restore.
+            result.Pointer = savedResultPtr
         Next i
 
+        ' §39: ensure result.Pointer is correct for final log, mpz_neg, and the caller.
+        result.Pointer = savedResultPtr
 #If LOGGING_DETAIL >= 1 Then
         System.IO.File.AppendAllText(LOG_FILE,
             $"[SafeMpzMul] done: szA={szA:N0} szB={szB:N0} → {gmp_lib.mpz_sizeinbase(result, 10):N0} digits{vbCrLf}")

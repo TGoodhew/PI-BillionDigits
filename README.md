@@ -1274,3 +1274,33 @@ This eliminates shifted as a source of memory pressure during inner calls for al
 Section 38 saves ~711 MB vs Sections 36/37 (6,237 vs 6,948 MB).
 
 **Why Section 37 crashed while Section 36 did not (at L17):** Section 36 succeeded at L17 with a peak of 6,948 MB at i=2. Section 37 also has a 6,948 MB peak at i=2, but additionally introduces NEW peaks of 6,602 MB at i=0 and 6,776 MB at i=1 that did not exist in Section 36. Repeated high-pressure episodes (all three i-iterations, not just i=2) appear to push the system past its sustainable limit, leading to a crash in the subsequent mpz_add even after the inner call returns.
+
+## Section 39 — `SafeMpzMul` `result.Pointer` Corruption: Save and Restore Native Struct Address
+
+**Problem:** Section 38 produced correct memory behaviour but the accumulated result was always zero. Diagnostic logs at Section 38 showed:
+- `res_alloc=44,373,031` (inner's pre-alloc size) instead of `133,119,087` (outer's pre-alloc)
+- `res_sz=0` (no accumulation) for all j-iterations
+- `shi_sz=0` (shifted was zero because `prod._mp_size=0` was read from the wrong struct)
+- `mpz_add` succeeded (adding zeros) and "shifted freed" was logged, then crash in cleanup
+
+Adding pointer-address logging to the "inner returned" message and an INIT log revealed:
+
+```
+INIT: res_ptr=1C4CDCFC610  prod_ptr=1C4CDCFC380  res_alloc=133,119,087
+j=0 inner returned: res_ptr=1C4CDCFC380  prod_ptr=1C4CDCFC870  res_alloc=44,373,031
+j=1 inner returned: res_ptr=1C4CDCFC380  prod_ptr=1C4CDCFC870  res_alloc=44,373,031
+```
+
+**Root cause:** `result.Pointer` (the public `IntPtr` field in `Math.Gmp.Native.mpz_t` that holds the address of the native GMP struct) changed from `0x1C4CDCFC610` to `0x1C4CDCFC380` (the old `prod.Pointer`) during the j=0 inner SafeMpzMul call. `prod.Pointer` simultaneously changed to a new address `0x1C4CDCFC870`.
+
+Confirmed by PowerShell reflection: `mpz_clear(x)` sets `x.Pointer = IntPtr.Zero` and `mpz_init(x)` sets `x.Pointer = new_native_struct_address`. The inner SafeMpzMul's calls to `mpz_clear`/`mpz_init` on its own local variables (inner `prod`, `shifted`, etc.) appear to cause a side effect — via an unknown Math.Gmp.Native bookkeeping mechanism — that reuses or swaps native struct addresses in a way that overwrites the outer caller's `result.Pointer` field.
+
+Because `result.Pointer` now pointed to the old `prod` struct (pre-alloc'd to 44M limbs with `_mp_size=0`), all subsequent `Marshal.ReadInt32(result.Pointer, ...)` and `gmp_lib.mpz_add(result, ...)` operated on the wrong struct. The 133M-limb result struct (at the original `savedResultPtr`) was never written to, so the caller received a zeroed result and crashed shortly after.
+
+**Fix:** Save `result.Pointer` as a plain `IntPtr` local variable (`savedResultPtr`) immediately after the pre-alloc — before any inner call can corrupt it. A plain `IntPtr` cannot be modified externally. After each inner `SafeMpzMul(prod, ...)` call, restore `result.Pointer = savedResultPtr`. Also restore after the per-i cleanup (`mpz_clear(prod)`/`mpz_init(prod)`) and before the final `mpz_sizeinbase`/`mpz_neg` operations. This ensures all GMP operations and Marshal reads/writes use the correct native struct throughout.
+
+**Restore points:**
+1. After pre-alloc: `Dim savedResultPtr As IntPtr = result.Pointer`
+2. After each `SafeMpzMul(prod, ...)` call (inside the j-loop): `result.Pointer = savedResultPtr`
+3. After the per-i cleanup `mpz_init(prod)`: `result.Pointer = savedResultPtr`
+4. Before `mpz_sizeinbase(result, ...)` and `mpz_neg(result, result)`: `result.Pointer = savedResultPtr`
