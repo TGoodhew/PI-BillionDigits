@@ -1262,8 +1262,9 @@ Public Class Form1
         If CLng(szA) + CLng(szB) > 50_000_000L Then
             System.IO.File.AppendAllText(LOG_FILE,
                 $"[SafeMpzMul] INIT szA={szA:N0} szB={szB:N0} | " &
-                $"accumPtr={accumPtr.ToInt64():X} prod_ptr={prod.Pointer.ToInt64():X} " &
-                $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0):N0}{vbCrLf}")
+                $"result.Ptr={result.Pointer.ToInt64():X} stash@+8={Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8):X} " &
+                $"accumPtr(local)={accumPtr.ToInt64():X} prod_ptr={prod.Pointer.ToInt64():X} " &
+                $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8)), 0):N0}{vbCrLf}")
         End If
 #End If
 
@@ -1314,8 +1315,13 @@ Public Class Form1
                 ' call returns we read from _sv_prod (not prod.Pointer) to get the result.
                 Dim _sv_prod As IntPtr = prod.Pointer
                 Dim _sv_shifted As IntPtr = shifted.Pointer
-#If LOGGING_DETAIL >= 2 Then
-                System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mul{vbCrLf}")
+#If LOGGING_DETAIL >= 1 Then
+                ' §44 diagnostic: log result.Pointer, prod.Pointer, and stash before the inner call.
+                ' If result.Pointer == prod.Pointer, the inner call will overwrite our stash.
+                System.IO.File.AppendAllText(LOG_FILE,
+                    $"[SafeMpzMul] loop i={i} j={j}: before inner | " &
+                    $"result.Ptr={result.Pointer.ToInt64():X} prod.Ptr={_sv_prod.ToInt64():X} " &
+                    $"stash@+8={Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8):X}{vbCrLf}")
 #End If
                 SafeMpzMul(prod, A_part, B_parts(j))
                 ' §44: native GMP may corrupt the outer managed stack frame during the inner call.
@@ -1328,6 +1334,7 @@ Public Class Form1
 #If LOGGING_DETAIL >= 1 Then
                 System.IO.File.AppendAllText(LOG_FILE,
                     $"[SafeMpzMul] loop i={i} j={j}: inner returned | " &
+                    $"result.Ptr={result.Pointer.ToInt64():X} stash@+8={Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8):X} " &
                     $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0):N0} " &
                     $"accum_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4)):N0} " &
                     $"accumPtr={accumPtr.ToInt64():X} _sv_prod={_sv_prod.ToInt64():X}{vbCrLf}")
