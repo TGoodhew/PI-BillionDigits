@@ -1337,3 +1337,21 @@ Restoring `result.Pointer` (§39) fixes symptom 1 but not symptom 2. After the r
 - `accum`'s struct is then zeroed so that `mpz_clear(accum)` (in the final `mpz_clears`) calls native GMP `mpz_clear` with `_mp_alloc=0` (no limb buffer freed — GMP skips the free when `_mp_alloc == 0`) and frees only the 16-byte `__mpz_struct` allocated by the initial `mpz_init(accum)`. The VirtualAlloc buffer is now owned by `result` and will be freed by the caller's eventual `mpz_clear(result)`.
 
 Since `accum` is never passed to any inner SafeMpzMul call, inner calls have no reference to it and cannot modify its `Pointer` field or its native struct contents, regardless of the corruption mechanism.
+
+---
+
+## Section 41 — `SafeMpzMul` Pointer Corruption Extends to All Outer `mpz_t` Objects
+
+**Problem:** Section 40's `accum` isolation still failed. Log showed:
+
+```
+INIT: accum_ptr=166C79478A0  prod_ptr=166C7947400  accum_alloc=133,119,087
+j=0 inner returned: accum_alloc=44,373,031 accum_sz=0 accum_ptr=166C79473A0  prod_ptr=166C79475E0
+j=0 after direct add: accum_alloc=44,373,031 accum_sz=0
+```
+
+`accum.Pointer` changed from `166C79478A0` to `166C79473A0` even though `accum` was never passed to the inner call. `prod.Pointer` also changed from `166C7947400` to `166C79475E0`. The Math.Gmp.Native side effect corrupts the `Pointer` fields of **all** outer `mpz_t` locals during inner SafeMpzMul calls, not just the one passed as `result`.
+
+**Key insight:** The struct at the original `_sv_accum` address (`166C79478A0`) is **intact** — the inner call never writes there. The corruption is in the `Pointer` field of the managed object (pointing to a different address), not in the struct contents at the saved address. Similarly, the inner call's §40 logic writes the multiplication result to the struct at the original `_sv_prod` address (`166C7947400`). Those structs are correct; only the Pointer fields are wrong.
+
+**Fix (§41):** Save `accum.Pointer`, `prod.Pointer`, and `shifted.Pointer` as plain `IntPtr` locals before each inner `SafeMpzMul` call, and restore all three after. Plain `IntPtr` locals cannot be externally modified. After restoration, all subsequent Marshal reads and GMP calls use the correct struct addresses — `accum`'s at the correct 133M-limb buffer and `prod`'s at the struct the inner call deposited its result into.

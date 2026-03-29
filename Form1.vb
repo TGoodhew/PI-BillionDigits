@@ -1279,10 +1279,21 @@ Public Class Form1
             End Select
 
             For j As Integer = 0 To 2
+                ' §41: Math.Gmp.Native corrupts the Pointer fields of ALL outer mpz_t objects
+                ' during inner SafeMpzMul calls (not just the result parameter).  The structs at
+                ' the saved addresses are intact — the inner call never writes to them — so saving
+                ' the three Pointer values before the call and restoring them after is sufficient.
+                Dim _sv_accum As IntPtr = accum.Pointer
+                Dim _sv_prod As IntPtr = prod.Pointer
+                Dim _sv_shifted As IntPtr = shifted.Pointer
 #If LOGGING_DETAIL >= 2 Then
                 System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mul{vbCrLf}")
 #End If
                 SafeMpzMul(prod, A_part, B_parts(j))
+                ' §41: restore all three Pointer fields.
+                accum.Pointer = _sv_accum
+                prod.Pointer = _sv_prod
+                shifted.Pointer = _sv_shifted
 #If LOGGING_DETAIL >= 1 Then
                 System.IO.File.AppendAllText(LOG_FILE,
                     $"[SafeMpzMul] loop i={i} j={j}: inner returned | " &
