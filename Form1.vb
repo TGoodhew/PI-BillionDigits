@@ -428,6 +428,31 @@ Public Class Form1
         freeFn As IntPtr)
     End Sub
 
+    ' §42: Raw P/Invoke to libgmp-10.dll — bypass mpz_t wrapper entirely for accumulation.
+    ' Math.Gmp.Native corrupts mpz_t.Pointer for locally-scoped mpz_t objects during
+    ' recursive SafeMpzMul calls, even for objects not passed to inner calls.  Using plain
+    ' IntPtr (Marshal.AllocHGlobal) for the accumulator and saved _sv_xxx IntPtrs for
+    ' product/shifted avoids the corruption entirely.
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_add",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_add(rop As IntPtr, op1 As IntPtr, op2 As IntPtr)
+    End Sub
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_mul_2exp",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_mul_2exp(rop As IntPtr, op1 As IntPtr, op2 As UInteger)
+    End Sub
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_neg",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_neg(rop As IntPtr, op As IntPtr)
+    End Sub
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_sizeinbase",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Function GmpRaw_sizeinbase(op As IntPtr, base As Integer) As ULong
+    End Function
+
     Private Sub InitGmpVirtualAllocFunctions()
         ' Step 1: Force gmp_lib's static initializer to run NOW, while the native
         ' GMP table still points to the default CRT malloc/realloc/free.
@@ -1191,7 +1216,9 @@ Public Class Form1
         Runtime.InteropServices.Marshal.WriteInt32(savedResultPtr, 4, 0)
         Runtime.InteropServices.Marshal.WriteInt64(savedResultPtr, 8, 0L)
 
-        ' Allocate the large accumulation buffer and wire it into accum.
+        ' §42: Allocate the large accumulation buffer and wire it into a raw accumPtr struct.
+        ' Using Marshal.AllocHGlobal(16) for the struct header bypasses mpz_t wrapper
+        ' corruption: Math.Gmp.Native cannot modify a plain IntPtr.
         Dim accumBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_resultBytes)),
                                               MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
         If accumBuf = IntPtr.Zero Then
@@ -1199,14 +1226,10 @@ Public Class Form1
                 $"[SafeMpzMul] accum pre-alloc FAILED for {_resultBytes \ 1048576L:N0} MB — throwing OOM{vbCrLf}")
             Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for accum buffer ({_resultBytes \ 1048576L} MB)")
         End If
-        Dim accum As New mpz_t()
-        gmp_lib.mpz_init(accum)      ' gives accum a 1-limb CRT buffer; we replace it below
-        Dim _accumOldSz As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(accum.Pointer, 0)) * 8L
-        Dim _accumOldPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(accum.Pointer, 8))
-        _savedGmpFree(New void_ptr(_accumOldPtr), New size_t(CULng(_accumOldSz)))
-        Runtime.InteropServices.Marshal.WriteInt32(accum.Pointer, 0, CInt(_resultLimbs))
-        Runtime.InteropServices.Marshal.WriteInt32(accum.Pointer, 4, 0)
-        Runtime.InteropServices.Marshal.WriteInt64(accum.Pointer, 8, accumBuf.ToInt64())
+        Dim accumPtr As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+        Runtime.InteropServices.Marshal.WriteInt32(accumPtr, 0, CInt(_resultLimbs)) ' _mp_alloc
+        Runtime.InteropServices.Marshal.WriteInt32(accumPtr, 4, 0)                  ' _mp_size = 0
+        Runtime.InteropServices.Marshal.WriteInt64(accumPtr, 8, accumBuf.ToInt64()) ' _mp_d
 #If LOGGING_DETAIL >= 2 Then
         System.IO.File.AppendAllText(LOG_FILE,
             $"[SafeMpzMul] accum pre-alloc OK: {_resultLimbs:N0} limbs ({_resultBytes \ 1048576L:N0} MB){vbCrLf}")
@@ -1223,7 +1246,7 @@ Public Class Form1
         gmp_lib.mpz_clears(Btmp, Nothing)
 
         ' Accumulate 9 safe sub-products: accum = Σ A_i·B_j·2^(i·bitsA + j·bitsB)
-        gmp_lib.mpz_set_ui(accum, 0UI)
+        ' (accumPtr._mp_size = 0 already set above; accumBuf is VirtualAlloc-zero-committed.)
         Dim prod As New mpz_t(), shifted As New mpz_t()
         gmp_lib.mpz_inits(prod, shifted, Nothing)
 
@@ -1236,8 +1259,8 @@ Public Class Form1
         If CLng(szA) + CLng(szB) > 50_000_000L Then
             System.IO.File.AppendAllText(LOG_FILE,
                 $"[SafeMpzMul] INIT szA={szA:N0} szB={szB:N0} | " &
-                $"accum_ptr={accum.Pointer.ToInt64():X} prod_ptr={prod.Pointer.ToInt64():X} " &
-                $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(accum.Pointer, 0):N0}{vbCrLf}")
+                $"accumPtr={accumPtr.ToInt64():X} prod_ptr={prod.Pointer.ToInt64():X} " &
+                $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0):N0}{vbCrLf}")
         End If
 #End If
 
@@ -1279,36 +1302,35 @@ Public Class Form1
             End Select
 
             For j As Integer = 0 To 2
-                ' §41: Math.Gmp.Native corrupts the Pointer fields of ALL outer mpz_t objects
-                ' during inner SafeMpzMul calls (not just the result parameter).  The structs at
-                ' the saved addresses are intact — the inner call never writes to them — so saving
-                ' the three Pointer values before the call and restoring them after is sufficient.
-                Dim _sv_accum As IntPtr = accum.Pointer
+                ' §42: Save prod and shifted struct addresses as plain IntPtr before the inner
+                ' call.  Math.Gmp.Native corrupts mpz_t.Pointer for locally-scoped objects during
+                ' recursive SafeMpzMul calls, making the property unreliable after return.
+                ' Using the saved IntPtrs directly in raw GMP P/Invoke calls bypasses this.
+                ' The inner call writes its result to whatever result.Pointer (= prod.Pointer)
+                ' is at the START of the inner call — which equals _sv_prod.  After the inner
+                ' call returns we read from _sv_prod (not prod.Pointer) to get the result.
                 Dim _sv_prod As IntPtr = prod.Pointer
                 Dim _sv_shifted As IntPtr = shifted.Pointer
 #If LOGGING_DETAIL >= 2 Then
                 System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mul{vbCrLf}")
 #End If
                 SafeMpzMul(prod, A_part, B_parts(j))
-                ' §41: restore all three Pointer fields.
-                accum.Pointer = _sv_accum
-                prod.Pointer = _sv_prod
-                shifted.Pointer = _sv_shifted
+                ' No Pointer restore needed — accumulation uses _sv_prod / _sv_shifted directly.
 #If LOGGING_DETAIL >= 1 Then
                 System.IO.File.AppendAllText(LOG_FILE,
                     $"[SafeMpzMul] loop i={i} j={j}: inner returned | " &
-                    $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(accum.Pointer, 0):N0} " &
-                    $"accum_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accum.Pointer, 4)):N0} " &
-                    $"accum_ptr={accum.Pointer.ToInt64():X} prod_ptr={prod.Pointer.ToInt64():X}{vbCrLf}")
+                    $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0):N0} " &
+                    $"accum_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4)):N0} " &
+                    $"accumPtr={accumPtr.ToInt64():X} _sv_prod={_sv_prod.ToInt64():X}{vbCrLf}")
 #End If
                 Dim shiftBits As ULong = CULng(i) * bitsA + CULng(j) * bitsB
                 If shiftBits = 0UL Then
-                    gmp_lib.mpz_add(accum, accum, prod)
+                    GmpRaw_add(accumPtr, accumPtr, _sv_prod)
 #If LOGGING_DETAIL >= 1 Then
                     System.IO.File.AppendAllText(LOG_FILE,
                         $"[SafeMpzMul] loop i={i} j={j}: after direct add | " &
-                        $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(accum.Pointer, 0):N0} " &
-                        $"accum_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accum.Pointer, 4)):N0}{vbCrLf}")
+                        $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0):N0} " &
+                        $"accum_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4)):N0}{vbCrLf}")
 #End If
                 Else
                     ' Pre-allocate shifted to the EXACT size needed for this j-iteration, after
@@ -1328,7 +1350,8 @@ Public Class Form1
                     '
                     ' After mpz_add, shifted is freed immediately so it is not live during the
                     ' next j-iteration's inner SafeMpzMul call.
-                    Dim _szProd As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prod.Pointer, 4)))
+                    ' §42: Use _sv_prod (not prod.Pointer) and _sv_shifted (not shifted.Pointer).
+                    Dim _szProd As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_prod, 4)))
                     Dim _shiftLimbs As Long = CLng(shiftBits) \ 64L + 1L
                     Dim _neededLimbs As Long = _szProd + _shiftLimbs + 2L
                     Dim _sj_buf As IntPtr = VirtualAlloc(IntPtr.Zero,
@@ -1336,30 +1359,32 @@ Public Class Form1
                                                          MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
                     If _sj_buf = IntPtr.Zero Then
                         VirtualFree(accumBuf, UIntPtr.Zero, MEM_RELEASE)
+                        Runtime.InteropServices.Marshal.FreeHGlobal(accumPtr)
                         System.IO.File.AppendAllText(LOG_FILE,
                             $"[SafeMpzMul] shifted pre-alloc FAILED for {_neededLimbs * 8L \ 1048576L:N0} MB at i={i} j={j} — throwing OOM{vbCrLf}")
                         Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shifted ({_neededLimbs * 8L \ 1048576L} MB)")
                     End If
-                    Dim _sjOldBytes As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(shifted.Pointer, 0)) * 8L
+                    Dim _sjOldBytes As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted, 0)) * 8L
                     If _sjOldBytes >= GMP_LARGE_THRESHOLD Then
-                        VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8)), UIntPtr.Zero, MEM_RELEASE)
+                        VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_shifted, 8)), UIntPtr.Zero, MEM_RELEASE)
                     Else
-                        _savedGmpFree(New void_ptr(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8))),
+                        _savedGmpFree(New void_ptr(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_shifted, 8))),
                                       New size_t(CULng(_sjOldBytes)))
                     End If
-                    Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 0, CInt(_neededLimbs))
-                    Runtime.InteropServices.Marshal.WriteInt32(shifted.Pointer, 4, 0)
-                    Runtime.InteropServices.Marshal.WriteInt64(shifted.Pointer, 8, _sj_buf.ToInt64())
+                    Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted, 0, CInt(_neededLimbs))
+                    Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted, 4, 0)
+                    Runtime.InteropServices.Marshal.WriteInt64(_sv_shifted, 8, _sj_buf.ToInt64())
 
                     ' shiftBits may exceed UInt32.MaxValue (4,294,967,295) when szA and szB are
                     ' both large: max shift = 2*bitsA + 2*bitsB.  mp_bitcnt_t on Windows is 32-bit,
                     ' so CUInt would overflow and place A2*B2 in the wrong position.
                     ' Fix: split into two shifts each ≤ UInt32.MaxValue.
+                    ' §42: use raw P/Invoke with _sv_shifted/_sv_prod to bypass mpz_t corruption.
                     If shiftBits <= CULng(UInt32.MaxValue) Then
 #If LOGGING_DETAIL >= 1 Then
                         System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: single-step shift={shiftBits}{vbCrLf}")
 #End If
-                        gmp_lib.mpz_mul_2exp(shifted, prod, New mp_bitcnt_t(CUInt(shiftBits)))
+                        GmpRaw_mul_2exp(_sv_shifted, _sv_prod, CUInt(shiftBits))
                     Else
                         Dim _shift1 As ULong = shiftBits \ 2UL
                         Dim _shift2 As ULong = shiftBits - _shift1   ' both halves ≤ MAX32
@@ -1367,27 +1392,29 @@ Public Class Form1
                         System.IO.File.AppendAllText(LOG_FILE,
                             $"[SafeMpzMul] TWO-STEP i={i} j={j}: shiftBits={shiftBits} shift1={_shift1} shift2={_shift2}{vbCrLf}")
 #End If
-                        gmp_lib.mpz_mul_2exp(shifted, prod, New mp_bitcnt_t(CUInt(_shift1)))
-                        gmp_lib.mpz_mul_2exp(shifted, shifted, New mp_bitcnt_t(CUInt(_shift2)))
+                        GmpRaw_mul_2exp(_sv_shifted, _sv_prod, CUInt(_shift1))
+                        GmpRaw_mul_2exp(_sv_shifted, _sv_shifted, CUInt(_shift2))
                     End If
 #If LOGGING_DETAIL >= 1 Then
                     System.IO.File.AppendAllText(LOG_FILE,
-                        $"[SafeMpzMul] loop i={i} j={j}: after shift, before mpz_add | " &
-                        $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(accum.Pointer, 0):N0} " &
-                        $"accum_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accum.Pointer, 4)):N0} " &
-                        $"shi_alloc={Runtime.InteropServices.Marshal.ReadInt32(shifted.Pointer, 0):N0} " &
-                        $"shi_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(shifted.Pointer, 4)):N0}{vbCrLf}")
+                        $"[SafeMpzMul] loop i={i} j={j}: after shift, before add | " &
+                        $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0):N0} " &
+                        $"accum_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4)):N0} " &
+                        $"shi_alloc={Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted, 0):N0} " &
+                        $"shi_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted, 4)):N0}{vbCrLf}")
 #End If
-                    gmp_lib.mpz_add(accum, accum, shifted)
+                    GmpRaw_add(accumPtr, accumPtr, _sv_shifted)
 #If LOGGING_DETAIL >= 1 Then
                     System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: mpz_add done{vbCrLf}")
 #End If
 
-                    ' Free shifted immediately — don't hold the large buffer during the next
-                    ' j-iteration's inner call.  Reset to tiny so the next pre-alloc above
-                    ' takes the CRT-free path (not VirtualFree) for the old buffer.
-                    VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(shifted.Pointer, 8)), UIntPtr.Zero, MEM_RELEASE)
-                    gmp_lib.mpz_init(shifted)
+                    ' §42: Free shifted's VirtualAlloc'd limb buffer immediately (via _sv_shifted).
+                    ' Then reinit shifted so shifted.Pointer is a fresh small CRT-backed struct
+                    ' for the next j-iteration's pre-alloc and end-of-i cleanup paths.
+                    VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_shifted, 8)), UIntPtr.Zero, MEM_RELEASE)
+                    Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted, 4, 0)   ' zero _mp_size
+                    Runtime.InteropServices.Marshal.WriteInt64(_sv_shifted, 8, 0L)  ' zero _mp_d (freed)
+                    gmp_lib.mpz_init(shifted)   ' give shifted a fresh small CRT struct for next iter
 #If LOGGING_DETAIL >= 1 Then
                     System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: shifted freed{vbCrLf}")
 #End If
@@ -1404,23 +1431,24 @@ Public Class Form1
             gmp_lib.mpz_init(prod)
         Next i
 
-        ' §40: copy accum's struct to savedResultPtr, then zero accum's struct before
-        ' clearing so mpz_clear(accum) does not free the buffer we just moved to result.
-        Runtime.InteropServices.Marshal.WriteInt32(savedResultPtr, 0, Runtime.InteropServices.Marshal.ReadInt32(accum.Pointer, 0))
-        Runtime.InteropServices.Marshal.WriteInt32(savedResultPtr, 4, Runtime.InteropServices.Marshal.ReadInt32(accum.Pointer, 4))
-        Runtime.InteropServices.Marshal.WriteInt64(savedResultPtr, 8, Runtime.InteropServices.Marshal.ReadInt64(accum.Pointer, 8))
+        ' §42: copy accumPtr struct to savedResultPtr, then free the 16-byte accumPtr header.
+        ' accumBuf ownership transfers to result (via savedResultPtr._mp_d); do NOT free it here.
+        Runtime.InteropServices.Marshal.WriteInt32(savedResultPtr, 0, Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0))
+        Runtime.InteropServices.Marshal.WriteInt32(savedResultPtr, 4, Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
+        Runtime.InteropServices.Marshal.WriteInt64(savedResultPtr, 8, Runtime.InteropServices.Marshal.ReadInt64(accumPtr, 8))
         result.Pointer = savedResultPtr
-        Runtime.InteropServices.Marshal.WriteInt32(accum.Pointer, 0, 0)
-        Runtime.InteropServices.Marshal.WriteInt32(accum.Pointer, 4, 0)
-        Runtime.InteropServices.Marshal.WriteInt64(accum.Pointer, 8, 0L)
+        Runtime.InteropServices.Marshal.FreeHGlobal(accumPtr)
+        accumPtr = IntPtr.Zero
 #If LOGGING_DETAIL >= 1 Then
         System.IO.File.AppendAllText(LOG_FILE,
-            $"[SafeMpzMul] done: szA={szA:N0} szB={szB:N0} → {gmp_lib.mpz_sizeinbase(result, 10):N0} digits{vbCrLf}")
+            $"[SafeMpzMul] done: szA={szA:N0} szB={szB:N0} → {GmpRaw_sizeinbase(savedResultPtr, 10):N0} digits{vbCrLf}")
 #End If
 
-        If resultSign < 0 Then gmp_lib.mpz_neg(result, result)
+        ' §42: negate via raw P/Invoke so result.Pointer corruption cannot affect the call.
+        If resultSign < 0 Then GmpRaw_neg(savedResultPtr, savedResultPtr)
 
-        gmp_lib.mpz_clears(accum, prod, shifted, A_part, B0, B1, B2, Nothing)
+        ' §42: accum is now a raw accumPtr (already freed above) — remove it from mpz_clears.
+        gmp_lib.mpz_clears(prod, shifted, A_part, B0, B1, B2, Nothing)
         System.IO.File.AppendAllText(LOG_FILE,
             $"[SafeMpzMul] cleared: szA={szA:N0} szB={szB:N0}{vbCrLf}")
     End Sub

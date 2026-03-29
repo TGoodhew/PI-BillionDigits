@@ -1355,3 +1355,28 @@ j=0 after direct add: accum_alloc=44,373,031 accum_sz=0
 **Key insight:** The struct at the original `_sv_accum` address (`166C79478A0`) is **intact** — the inner call never writes there. The corruption is in the `Pointer` field of the managed object (pointing to a different address), not in the struct contents at the saved address. Similarly, the inner call's §40 logic writes the multiplication result to the struct at the original `_sv_prod` address (`166C7947400`). Those structs are correct; only the Pointer fields are wrong.
 
 **Fix (§41):** Save `accum.Pointer`, `prod.Pointer`, and `shifted.Pointer` as plain `IntPtr` locals before each inner `SafeMpzMul` call, and restore all three after. Plain `IntPtr` locals cannot be externally modified. After restoration, all subsequent Marshal reads and GMP calls use the correct struct addresses — `accum`'s at the correct 133M-limb buffer and `prod`'s at the struct the inner call deposited its result into.
+
+## Section 42 — `SafeMpzMul` `mpz_t.Pointer` Assignment Does Not Persist; Bypass Wrapper Entirely
+
+**Problem:** Section 41's restore (`accum.Pointer = _sv_accum`) did not persist. Immediately after the assignment, reading `accum.Pointer` returned the corrupted value instead of `_sv_accum`. Log:
+
+```
+INIT: accum_ptr=22280FAC110  prod_ptr=22280BBE880  accum_alloc=133,119,087
+j=0 inner returned: accum_alloc=44,373,031 accum_sz=0  accum_ptr=22280BBE860  prod_ptr=222C9D4E260
+```
+
+`accum.Pointer = _sv_accum` ran (confirmed by placement), yet `accum.Pointer` still showed `22280BBE860` (the inner call's allocated address). ILSpy analysis confirmed `mpz_t.Pointer` is a plain `public IntPtr` field on `mp_base` — no backing store or property interceptor. The root cause remains unclear (possible JIT interaction with Math.Gmp.Native's allocator callbacks during inner calls), but the practical consequence is: **`mpz_t.Pointer` cannot be reliably read after an inner SafeMpzMul call returns**.
+
+**Root cause analysis:** Reflection on `Math.Gmp.Native.dll` revealed that `mpz_t.Initializing()` allocates the native `__mpz_struct` header via `gmp_lib.allocate(16)` and stores the pointer in `this.Pointer`; `mpz_t.Clear()` frees the header and zeros `this.Pointer`. No other Math.Gmp.Native code writes to `x.Pointer` for an arbitrary `x`. Yet empirically, `Pointer` changes for locally-scoped `mpz_t` objects during inner recursive calls.
+
+**Fix (§42):**
+
+1. **Replace managed `accum` with raw `accumPtr`**: Allocate the 16-byte `__mpz_struct` header with `Marshal.AllocHGlobal(16)`, initialize it directly with `Marshal.WriteInt32/WriteInt64`, and use the resulting `IntPtr` everywhere. `Marshal.AllocHGlobal` is entirely outside Math.Gmp.Native's allocator; the pointer cannot be corrupted by any GMP operation.
+
+2. **Add raw P/Invoke declarations** for `libgmp-10.dll`: `GmpRaw_add`, `GmpRaw_mul_2exp`, `GmpRaw_neg`, `GmpRaw_sizeinbase` — bypassing the `mpz_t` wrapper entirely for all accumulation operations.
+
+3. **Use `_sv_prod` and `_sv_shifted`** (plain `IntPtr` saved before each inner call) as raw pointers in the P/Invoke calls. The inner call writes its result to wherever `result.Pointer` pointed at the **start** of the inner call (= `_sv_prod`), so `_sv_prod` always refers to the current sub-product regardless of post-call Pointer corruption.
+
+4. **Free `accumPtr` header** with `Marshal.FreeHGlobal(accumPtr)` at the end (the limb buffer ownership transfers to `result` via `savedResultPtr`).
+
+5. **Remove `accum`** from the final `mpz_clears` call.
