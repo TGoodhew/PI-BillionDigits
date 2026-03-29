@@ -1410,3 +1410,29 @@ j=0 inner returned: accum_alloc=44,373,031 accum_sz=0  accumPtr=182C9B4E5B0  _sv
 4. **Pop after `Next i`:** `_accumPtrStack.Pop()` releases the entry for this invocation.
 
 This ensures `accumPtr`, `_sv_prod`, and `_sv_shifted` always hold correct values when used in `GmpRaw_add`/`GmpRaw_mul_2exp`, even if native GMP overwrote their managed stack slots during the inner call.
+
+## Section 44 — `SafeMpzMul` Stash accumPtr in result's Native Struct, Not a Managed Stack
+
+**Problem (§43 crash):** The `_accumPtrStack` (a `Shared Stack(Of Long)` on the managed GC heap) also produced wrong values after the inner call. `_accumPtrStack.Peek()` returned `1DD6C26EC00` (the inner call's `accumPtr` address, `_mp_alloc=44,373,031`) instead of the outer call's `1DD6C26E7C0`. Log:
+
+```
+INIT: accumPtr=1DD6C26E7C0  accum_alloc=133,119,087
+j=0 inner returned: accum_alloc=44,373,031 accum_sz=0  accumPtr=1DD6C26EC00  _sv_prod=1DD6C0FB980
+j=1 inner returned: accum_alloc=44,373,031 accum_sz=0  accumPtr=1DD6C26EC00  _sv_prod=1DD6C0FB980
+j=2 inner returned: accum_alloc=44,373,031 accum_sz=0  accumPtr=1DD6C26EC00  _sv_prod=1DD6C0FB980
+```
+
+The `Peek()` value is wrong for all three j-iterations, meaning either the Push stored the wrong value, the Stack's internal array was corrupted by native GMP, or the inner call's Pop did not execute. All three lead to the same symptom: the outer call uses the inner call's (already-freed) accumPtr struct, producing a zero result.
+
+**Root cause:** Both the managed stack and managed GC heap are susceptible to overwrite by native GMP's stack overflow. No managed-heap object is safe.
+
+**Fix (§44):** Stash `accumPtr.ToInt64()` in the **native CRT-heap struct at `result.Pointer + 8`** (`_mp_d` offset). Key properties that make this safe:
+
+1. `result.Pointer` holds the native CRT address of result's `__mpz_struct` (set at function entry, untouched thereafter by our own code).
+2. `result` is the outer call's result parameter. Inner calls receive `prod` as their `result` — they write to `prod.Pointer`'s struct, never to outer `result.Pointer`'s struct.
+3. `result.Pointer` is a field of a managed-heap `mpz_t` object — reading it via `result.Pointer` always gives the correct CRT address, because managed-heap fields are not corrupted by native GMP stack overflows (managed heap ≠ native stack).
+4. We blank `_mp_alloc` and `_mp_size` (offsets 0 and 4) as before, but write `accumPtr.ToInt64()` to `_mp_d` (offset 8) instead of 0 — this slot is not used by any GMP function during the accumulation phase.
+
+**Recovery:** After each inner `SafeMpzMul` call: `accumPtr = New IntPtr(Marshal.ReadInt64(result.Pointer, 8))`. After `Next i`: re-read both `savedResultPtr = result.Pointer` and `accumPtr = New IntPtr(Marshal.ReadInt64(savedResultPtr, 8))` to ensure both locals are correct before the final struct copy.
+
+The stash is overwritten at the very end when the final `Marshal.WriteInt64(savedResultPtr, 8, ...)` copies the real `_mp_d` (accumBuf pointer) into the result struct — which is the correct final value.

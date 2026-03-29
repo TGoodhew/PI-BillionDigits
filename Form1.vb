@@ -243,8 +243,6 @@ Public Class Form1
     Private Shared _savedGmpAlloc As allocate_function   ' GMP's original CRT alloc
     Private Shared _savedGmpRealloc As reallocate_function
     Private Shared _savedGmpFree As free_function
-    ' §43: accumPtr stash for SafeMpzMul recursion (stack frame may be corrupted by native GMP).
-    Private Shared _accumPtrStack As New System.Collections.Generic.Stack(Of Long)()
 
     ' Large allocations (>= 512 KB) use VirtualAlloc so VirtualFree immediately
     ' decommits the pages.  Small allocations delegate to GMP's own default CRT
@@ -1213,10 +1211,9 @@ Public Class Form1
         Else
             _savedGmpFree(New void_ptr(_oldResultPtr), New size_t(CULng(_oldResultSz)))
         End If
-        ' Blank result's struct — result is not used during accumulation (accum is).
+        ' Blank result's struct _mp_alloc and _mp_size; _mp_d will hold the accumPtr stash (§44).
         Runtime.InteropServices.Marshal.WriteInt32(savedResultPtr, 0, 0)
         Runtime.InteropServices.Marshal.WriteInt32(savedResultPtr, 4, 0)
-        Runtime.InteropServices.Marshal.WriteInt64(savedResultPtr, 8, 0L)
 
         ' §42: Allocate the large accumulation buffer and wire it into a raw accumPtr struct.
         ' Using Marshal.AllocHGlobal(16) for the struct header bypasses mpz_t wrapper
@@ -1232,8 +1229,10 @@ Public Class Form1
         Runtime.InteropServices.Marshal.WriteInt32(accumPtr, 0, CInt(_resultLimbs)) ' _mp_alloc
         Runtime.InteropServices.Marshal.WriteInt32(accumPtr, 4, 0)                  ' _mp_size = 0
         Runtime.InteropServices.Marshal.WriteInt64(accumPtr, 8, accumBuf.ToInt64()) ' _mp_d
-        ' §43: stash accumPtr on managed heap so it survives native-GMP stack-frame corruption.
-        _accumPtrStack.Push(accumPtr.ToInt64())
+        ' §44: stash accumPtr in result's own native CRT struct (_mp_d slot, offset +8).
+        ' Inner calls use `prod` as their result — they never touch outer result's struct.
+        ' This slot survives all native GMP calls and managed-stack corruption.
+        Runtime.InteropServices.Marshal.WriteInt64(savedResultPtr, 8, accumPtr.ToInt64())
 #If LOGGING_DETAIL >= 2 Then
         System.IO.File.AppendAllText(LOG_FILE,
             $"[SafeMpzMul] accum pre-alloc OK: {_resultLimbs:N0} limbs ({_resultBytes \ 1048576L:N0} MB){vbCrLf}")
@@ -1319,10 +1318,11 @@ Public Class Form1
                 System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mul{vbCrLf}")
 #End If
                 SafeMpzMul(prod, A_part, B_parts(j))
-                ' §43: native GMP may corrupt the outer managed stack frame during the inner call.
-                ' Restore accumPtr from the heap-resident stack; re-read prod/shifted Pointer
-                ' fields from their managed-heap mpz_t objects (the inner call restores them).
-                accumPtr = New IntPtr(_accumPtrStack.Peek())
+                ' §44: native GMP may corrupt the outer managed stack frame during the inner call.
+                ' Recover accumPtr from result's native CRT struct (_mp_d slot), which inner calls
+                ' never touch (they write only to prod's struct).  Re-read _sv_prod/_sv_shifted
+                ' from their mpz_t managed-heap fields (inner call restores result.Pointer).
+                accumPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8))
                 _sv_prod = prod.Pointer
                 _sv_shifted = shifted.Pointer
 #If LOGGING_DETAIL >= 1 Then
@@ -1439,10 +1439,13 @@ Public Class Form1
             gmp_lib.mpz_clear(prod)
             gmp_lib.mpz_init(prod)
         Next i
-        ' §43: done with this invocation's accumPtr stash.
-        _accumPtrStack.Pop()
+        ' §44: recover accumPtr and savedResultPtr after the i/j loops (locals may be corrupted).
+        ' result.Pointer is a managed-heap field — always correct.
+        ' result.Pointer._mp_d (offset +8) holds the stashed accumPtr.
+        savedResultPtr = result.Pointer
+        accumPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(savedResultPtr, 8))
 
-        ' §42: copy accumPtr struct to savedResultPtr, then free the 16-byte accumPtr header.
+        ' Copy accumPtr struct to savedResultPtr, then free the 16-byte accumPtr header.
         ' accumBuf ownership transfers to result (via savedResultPtr._mp_d); do NOT free it here.
         Runtime.InteropServices.Marshal.WriteInt32(savedResultPtr, 0, Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0))
         Runtime.InteropServices.Marshal.WriteInt32(savedResultPtr, 4, Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
