@@ -1380,3 +1380,33 @@ j=0 inner returned: accum_alloc=44,373,031 accum_sz=0  accum_ptr=22280BBE860  pr
 4. **Free `accumPtr` header** with `Marshal.FreeHGlobal(accumPtr)` at the end (the limb buffer ownership transfers to `result` via `savedResultPtr`).
 
 5. **Remove `accum`** from the final `mpz_clears` call.
+
+## Section 43 — `SafeMpzMul` Managed Stack Frame Corruption by Native GMP
+
+**Problem (§42 crash):** The §42 fix replaced managed `mpz_t accum` with a raw `Marshal.AllocHGlobal(16)` header stored in `Dim accumPtr As IntPtr`. This was expected to be immune to Math.Gmp.Native corruption — but the crash recurred. Log:
+
+```
+j=0 inner returned: accum_alloc=44,373,031 accum_sz=0  accumPtr=182C9B4E5B0  _sv_prod=182CA9ED5B0
+```
+
+`accumPtr` had been `182C9B4E550` before the inner call (changed by +0x60 = 96 bytes). `_sv_prod` (also a plain `Dim … As IntPtr` local) changed similarly. Both are on the managed stack frame. The heap memory at the original `accumPtr` address was unmodified — only the stack-local **variable** (holding the address) was overwritten.
+
+**Root cause:** On Windows x64 the managed JIT stack and the native P/Invoke stack share the same physical stack. During a deep sub-multiplication inside the inner `SafeMpzMul` call chain (ultimately calling `libgmp-10.dll` FFT at ~33 M × 33 M limbs), native GMP writes beyond the bounds of one of its stack-allocated temporaries, overwriting the outer call's managed stack frame. The outer frame's local `IntPtr` variables happen to sit at the overwritten addresses.
+
+**Fix (§43):** Move `accumPtr` off the managed stack for the duration of inner calls.
+
+1. **Add `Private Shared _accumPtrStack As New Stack(Of Long)()`** — a managed-heap-resident stack that survives native stack writes.
+
+2. **Push before loops:** Immediately after initialising the accumPtr struct, push `accumPtr.ToInt64()` onto `_accumPtrStack`. The push writes to the Stack's internal heap array, not to any stack slot.
+
+3. **Restore after each inner call:** Immediately after `SafeMpzMul(prod, A_part, B_parts(j))` returns, execute:
+   ```vb
+   accumPtr    = New IntPtr(_accumPtrStack.Peek())  ' from heap, never stack-corrupted
+   _sv_prod    = prod.Pointer                        ' inner call restored this to pre-call value
+   _sv_shifted = shifted.Pointer                     ' same — inner call doesn't modify shifted
+   ```
+   The inner `SafeMpzMul` always ends with `result.Pointer = savedResultPtr`, so `prod.Pointer` is correctly restored to the pre-call struct address regardless of any corruption that happened to the outer frame's `_sv_prod` local.
+
+4. **Pop after `Next i`:** `_accumPtrStack.Pop()` releases the entry for this invocation.
+
+This ensures `accumPtr`, `_sv_prod`, and `_sv_shifted` always hold correct values when used in `GmpRaw_add`/`GmpRaw_mul_2exp`, even if native GMP overwrote their managed stack slots during the inner call.

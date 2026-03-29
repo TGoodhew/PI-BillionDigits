@@ -243,6 +243,8 @@ Public Class Form1
     Private Shared _savedGmpAlloc As allocate_function   ' GMP's original CRT alloc
     Private Shared _savedGmpRealloc As reallocate_function
     Private Shared _savedGmpFree As free_function
+    ' §43: accumPtr stash for SafeMpzMul recursion (stack frame may be corrupted by native GMP).
+    Private Shared _accumPtrStack As New System.Collections.Generic.Stack(Of Long)()
 
     ' Large allocations (>= 512 KB) use VirtualAlloc so VirtualFree immediately
     ' decommits the pages.  Small allocations delegate to GMP's own default CRT
@@ -1230,6 +1232,8 @@ Public Class Form1
         Runtime.InteropServices.Marshal.WriteInt32(accumPtr, 0, CInt(_resultLimbs)) ' _mp_alloc
         Runtime.InteropServices.Marshal.WriteInt32(accumPtr, 4, 0)                  ' _mp_size = 0
         Runtime.InteropServices.Marshal.WriteInt64(accumPtr, 8, accumBuf.ToInt64()) ' _mp_d
+        ' §43: stash accumPtr on managed heap so it survives native-GMP stack-frame corruption.
+        _accumPtrStack.Push(accumPtr.ToInt64())
 #If LOGGING_DETAIL >= 2 Then
         System.IO.File.AppendAllText(LOG_FILE,
             $"[SafeMpzMul] accum pre-alloc OK: {_resultLimbs:N0} limbs ({_resultBytes \ 1048576L:N0} MB){vbCrLf}")
@@ -1315,7 +1319,12 @@ Public Class Form1
                 System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] loop i={i} j={j}: before mul{vbCrLf}")
 #End If
                 SafeMpzMul(prod, A_part, B_parts(j))
-                ' No Pointer restore needed — accumulation uses _sv_prod / _sv_shifted directly.
+                ' §43: native GMP may corrupt the outer managed stack frame during the inner call.
+                ' Restore accumPtr from the heap-resident stack; re-read prod/shifted Pointer
+                ' fields from their managed-heap mpz_t objects (the inner call restores them).
+                accumPtr = New IntPtr(_accumPtrStack.Peek())
+                _sv_prod = prod.Pointer
+                _sv_shifted = shifted.Pointer
 #If LOGGING_DETAIL >= 1 Then
                 System.IO.File.AppendAllText(LOG_FILE,
                     $"[SafeMpzMul] loop i={i} j={j}: inner returned | " &
@@ -1430,6 +1439,8 @@ Public Class Form1
             gmp_lib.mpz_clear(prod)
             gmp_lib.mpz_init(prod)
         Next i
+        ' §43: done with this invocation's accumPtr stash.
+        _accumPtrStack.Pop()
 
         ' §42: copy accumPtr struct to savedResultPtr, then free the 16-byte accumPtr header.
         ' accumBuf ownership transfers to result (via savedResultPtr._mp_d); do NOT free it here.
