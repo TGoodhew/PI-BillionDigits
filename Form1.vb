@@ -1178,7 +1178,22 @@ Public Class Form1
         Dim szB As Integer = System.Math.Abs(szB_signed)
 
         If szA + szB <= SAFE_LIMB_THRESHOLD Then
+#If LOGGING_DETAIL >= 1 Then
+            If CLng(szA) + CLng(szB) > 10_000_000L Then
+                System.IO.File.AppendAllText(LOG_FILE,
+                    $"[SafeMpzMul] FAST-PRE  szA={szA:N0} szB={szB:N0} | " &
+                    $"opA.Ptr={opA.Pointer.ToInt64():X} opA_sz={szA_signed:N0} opA_d={Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8):X} " &
+                    $"opB.Ptr={opB.Pointer.ToInt64():X} opB_sz={szB_signed:N0}{vbCrLf}")
+            End If
+#End If
             gmp_lib.mpz_mul(result, opA, opB)
+#If LOGGING_DETAIL >= 1 Then
+            If CLng(szA) + CLng(szB) > 10_000_000L Then
+                System.IO.File.AppendAllText(LOG_FILE,
+                    $"[SafeMpzMul] FAST-POST result.Ptr={result.Pointer.ToInt64():X} result_sz={Runtime.InteropServices.Marshal.ReadInt32(result.Pointer, 4):N0} " &
+                    $"result_d={Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8):X}{vbCrLf}")
+            End If
+#End If
             Return
         End If
 
@@ -1337,7 +1352,7 @@ Public Class Form1
                     $"result.Ptr={result.Pointer.ToInt64():X} stash@+8={Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8):X} " &
                     $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0):N0} " &
                     $"accum_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4)):N0} " &
-                    $"accumPtr={accumPtr.ToInt64():X} _sv_prod={_sv_prod.ToInt64():X}{vbCrLf}")
+                    $"accumPtr={accumPtr.ToInt64():X} prod_sz={Runtime.InteropServices.Marshal.ReadInt32(_sv_prod, 4):N0} _sv_prod={_sv_prod.ToInt64():X}{vbCrLf}")
 #End If
                 Dim shiftBits As ULong = CULng(i) * bitsA + CULng(j) * bitsB
                 If shiftBits = 0UL Then
