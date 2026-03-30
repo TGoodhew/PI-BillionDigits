@@ -1179,7 +1179,7 @@ Public Class Form1
 
         If szA + szB <= SAFE_LIMB_THRESHOLD Then
 #If LOGGING_DETAIL >= 1 Then
-            If CLng(szA) + CLng(szB) > 10_000_000L Then
+            If CLng(szA) + CLng(szB) > 5_000_000L Then
                 System.IO.File.AppendAllText(LOG_FILE,
                     $"[SafeMpzMul] FAST-PRE  szA={szA:N0} szB={szB:N0} | " &
                     $"opA.Ptr={opA.Pointer.ToInt64():X} opA_sz={szA_signed:N0} opA_d={Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8):X} " &
@@ -1188,7 +1188,7 @@ Public Class Form1
 #End If
             gmp_lib.mpz_mul(result, opA, opB)
 #If LOGGING_DETAIL >= 1 Then
-            If CLng(szA) + CLng(szB) > 10_000_000L Then
+            If CLng(szA) + CLng(szB) > 5_000_000L Then
                 System.IO.File.AppendAllText(LOG_FILE,
                     $"[SafeMpzMul] FAST-POST result.Ptr={result.Pointer.ToInt64():X} result_sz={Runtime.InteropServices.Marshal.ReadInt32(result.Pointer, 4):N0} " &
                     $"result_d={Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8):X}{vbCrLf}")
@@ -1262,6 +1262,15 @@ Public Class Form1
         gmp_lib.mpz_tdiv_r_2exp(B1, Btmp, New mp_bitcnt_t(CUInt(bitsB)))
         gmp_lib.mpz_tdiv_q_2exp(B2, Btmp, New mp_bitcnt_t(CUInt(bitsB)))
         gmp_lib.mpz_clears(Btmp, Nothing)
+#If LOGGING_DETAIL >= 1 Then
+        If CLng(szA) + CLng(szB) > 10_000_000L Then
+            System.IO.File.AppendAllText(LOG_FILE,
+                $"[SafeMpzMul] B-pieces | " &
+                $"B0.Ptr={B0.Pointer.ToInt64():X} B0_sz={Runtime.InteropServices.Marshal.ReadInt32(B0.Pointer, 4):N0} " &
+                $"B1.Ptr={B1.Pointer.ToInt64():X} B1_sz={Runtime.InteropServices.Marshal.ReadInt32(B1.Pointer, 4):N0} " &
+                $"B2.Ptr={B2.Pointer.ToInt64():X} B2_sz={Runtime.InteropServices.Marshal.ReadInt32(B2.Pointer, 4):N0}{vbCrLf}")
+        End If
+#End If
 
         ' Accumulate 9 safe sub-products: accum = Σ A_i·B_j·2^(i·bitsA + j·bitsB)
         ' (accumPtr._mp_size = 0 already set above; accumBuf is VirtualAlloc-zero-committed.)
@@ -1271,8 +1280,12 @@ Public Class Form1
         Dim B_parts() As mpz_t = {B0, B1, B2}
 
         ' A pieces are large (~355 MB each at L18) — create lazily, one per outer iteration.
+        ' Pre-allocate A_part to hold exactly mA limbs (= bitsA bits).  This is required because
+        ' mpz_tdiv_r_2exp does NOT grow the buffer when the result normalises to 0 (it just sets
+        ' _mp_size=0 and leaves _mp_alloc=1).  Case 1 and Case 2 both CopyMemory mA limbs into
+        ' A_part._mp_d; they depend on _mp_alloc >= mA to avoid a silent heap overflow.
         Dim A_part As New mpz_t()
-        gmp_lib.mpz_inits(A_part, Nothing)
+        gmp_lib.mpz_init2(A_part, New mp_bitcnt_t(CUInt(bitsA)))
 #If LOGGING_DETAIL >= 1 Then
         If CLng(szA) + CLng(szB) > 50_000_000L Then
             System.IO.File.AppendAllText(LOG_FILE,
@@ -1288,6 +1301,20 @@ Public Class Form1
             Select Case i
                 Case 0
                     gmp_lib.mpz_tdiv_r_2exp(A_part, opA, New mp_bitcnt_t(CUInt(bitsA)))
+#If LOGGING_DETAIL >= 1 Then
+                    If CLng(szA) + CLng(szB) > 10_000_000L Then
+                        Dim _opA_d_ptr As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
+                        Dim _opA_d0 As Long = If(_opA_d_ptr <> 0L AndAlso Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4) > 0,
+                                                Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_opA_d_ptr), 0), -1L)
+                        System.IO.File.AppendAllText(LOG_FILE,
+                            $"[SafeMpzMul] Case0 post-tdiv | " &
+                            $"A_part.Ptr={A_part.Pointer.ToInt64():X} A_part_alloc={Runtime.InteropServices.Marshal.ReadInt32(A_part.Pointer, 0):N0} " &
+                            $"A_part_sz={Runtime.InteropServices.Marshal.ReadInt32(A_part.Pointer, 4):N0} " &
+                            $"A_part_d={Runtime.InteropServices.Marshal.ReadInt64(A_part.Pointer, 8):X} " &
+                            $"opA.Ptr={opA.Pointer.ToInt64():X} opA_sz={Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4):N0} " &
+                            $"opA_d={_opA_d_ptr:X} opA_d[0]={_opA_d0:X}{vbCrLf}")
+                    End If
+#End If
                 Case 1
                     ' Direct limb extraction: A1 = opA's limbs [mA, 2*mA).
                     ' bitsA = mA*64 is always limb-aligned, so no bit-masking is needed —
@@ -1297,7 +1324,19 @@ Public Class Form1
                     Dim _opA_d1 As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
                     Dim _A1_src As IntPtr = New IntPtr(_opA_d1 + CLng(mA) * 8L)
                     Dim _A1_dst As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(A_part.Pointer, 8))
+#If LOGGING_DETAIL >= 1 Then
+                    If CLng(szA) + CLng(szB) > 10_000_000L Then
+                        System.IO.File.AppendAllText(LOG_FILE,
+                            $"[SafeMpzMul] Case1 pre-copy | A_part_alloc={Runtime.InteropServices.Marshal.ReadInt32(A_part.Pointer, 0):N0} " &
+                            $"A_part_d={_A1_dst.ToInt64():X} A1_src={_A1_src.ToInt64():X} mA={mA:N0}{vbCrLf}")
+                    End If
+#End If
                     CopyMemory(_A1_dst, _A1_src, New UIntPtr(CULng(mA) * 8UL))
+#If LOGGING_DETAIL >= 1 Then
+                    If CLng(szA) + CLng(szB) > 10_000_000L Then
+                        System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] Case1 post-copy{vbCrLf}")
+                    End If
+#End If
                     Dim _A1_sz As Integer = CInt(mA)
                     Dim _A1_dstL As Long = _A1_dst.ToInt64()
                     While _A1_sz > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_A1_dstL + CLng(_A1_sz - 1) * 8L)) = 0L
@@ -1336,6 +1375,7 @@ Public Class Form1
                 System.IO.File.AppendAllText(LOG_FILE,
                     $"[SafeMpzMul] loop i={i} j={j}: before inner | " &
                     $"result.Ptr={result.Pointer.ToInt64():X} prod.Ptr={_sv_prod.ToInt64():X} " &
+                    $"A_part.Ptr={A_part.Pointer.ToInt64():X} A_part_sz={Runtime.InteropServices.Marshal.ReadInt32(A_part.Pointer, 4):N0} " &
                     $"stash@+8={Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8):X}{vbCrLf}")
 #End If
                 SafeMpzMul(prod, A_part, B_parts(j))
@@ -1456,10 +1496,20 @@ Public Class Form1
             ' next A-piece computation.  shifted is already tiny (mpz_init'd after each
             ' per-j VirtualFree above, or still tiny from mpz_inits if j=0 was shiftBits=0).
             ' Clearing shifted here frees that tiny CRT buffer; mpz_init re-creates it.
+#If LOGGING_DETAIL >= 1 Then
+            If CLng(szA) + CLng(szB) > 10_000_000L Then
+                System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] i={i} post-j: clearing prod/shifted{vbCrLf}")
+            End If
+#End If
             gmp_lib.mpz_clear(shifted)
             gmp_lib.mpz_init(shifted)
             gmp_lib.mpz_clear(prod)
             gmp_lib.mpz_init(prod)
+#If LOGGING_DETAIL >= 1 Then
+            If CLng(szA) + CLng(szB) > 10_000_000L Then
+                System.IO.File.AppendAllText(LOG_FILE, $"[SafeMpzMul] i={i} post-j: cleared{vbCrLf}")
+            End If
+#End If
         Next i
         ' §44: recover accumPtr and savedResultPtr after the i/j loops (locals may be corrupted).
         ' result.Pointer is a managed-heap field — always correct.
@@ -1987,27 +2037,29 @@ Public Class Form1
 
             Dim totalBits As Long = CLng(gmp_lib.mpz_sizeinbase(finalQ, 2))
             Dim thirdBits As Long = totalBits \ 3L
+            ' mp_bitcnt_t is 32-bit on Windows (MSVC unsigned long).  thirdBits ≈ 3 billion
+            ' which fits in UInt32 (max 4.29 billion).  2*thirdBits would overflow UInt32, so
+            ' all shifts use k1 only and are done in two single-k1 steps instead.
             Dim k1 As New mp_bitcnt_t(CUInt(thirdBits))
-            Dim k2 As New mp_bitcnt_t(CUInt(thirdBits * 2L))
 
             ' Shared staging buffer for all spill I/O (sequential, never concurrent).
             Dim spillStaging(65535) As Byte
 
-            ' Extract Q2 = finalQ >> 2k  (~183 MB)
-            Dim mpQ2 As New mpz_t()
-            gmp_lib.mpz_init(mpQ2)
-            gmp_lib.mpz_tdiv_q_2exp(mpQ2, finalQ, k2)
+            ' Extract Q0 = finalQ mod 2^k (low third) and shift finalQ to hold Q2*2^k + Q1.
+            ' Using only k1-sized shifts avoids the 2k overflow in mp_bitcnt_t.
+            Dim tmpHigh As New mpz_t()
+            gmp_lib.mpz_init(tmpHigh)
+            gmp_lib.mpz_tdiv_q_2exp(tmpHigh, finalQ, k1)  ' tmpHigh = Q2*2^k + Q1
+            gmp_lib.mpz_tdiv_r_2exp(finalQ, finalQ, k1)   ' finalQ  = Q0
 
-            ' Truncate finalQ to lower two-thirds: finalQ mod 2^(2k)
-            gmp_lib.mpz_tdiv_r_2exp(finalQ, finalQ, k2)
-
-            ' Extract Q1 = (finalQ mod 2^(2k)) >> k  (~183 MB, middle third)
+            ' Extract Q1 and Q2 from tmpHigh with another k1-sized shift.
             Dim mpQ1 As New mpz_t()
             gmp_lib.mpz_init(mpQ1)
-            gmp_lib.mpz_tdiv_q_2exp(mpQ1, finalQ, k1)
-
-            ' Truncate finalQ to lowest third: Q0 = finalQ mod 2^k  (~183 MB)
-            gmp_lib.mpz_tdiv_r_2exp(finalQ, finalQ, k1)
+            Dim mpQ2 As New mpz_t()
+            gmp_lib.mpz_init(mpQ2)
+            gmp_lib.mpz_tdiv_r_2exp(mpQ1, tmpHigh, k1)   ' mpQ1 = Q1
+            gmp_lib.mpz_tdiv_q_2exp(mpQ2, tmpHigh, k1)   ' mpQ2 = Q2
+            gmp_lib.mpz_clear(tmpHigh)
 
             ' Spill Q2 and Q1; free them to clear the deck for Pass 0.
             Dim Q2_path As String = $"{DISK_CACHE_DIR}Q2_spill.bin"

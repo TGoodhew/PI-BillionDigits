@@ -1436,3 +1436,75 @@ The `Peek()` value is wrong for all three j-iterations, meaning either the Push 
 **Recovery:** After each inner `SafeMpzMul` call: `accumPtr = New IntPtr(Marshal.ReadInt64(result.Pointer, 8))`. After `Next i`: re-read both `savedResultPtr = result.Pointer` and `accumPtr = New IntPtr(Marshal.ReadInt64(savedResultPtr, 8))` to ensure both locals are correct before the final struct copy.
 
 The stash is overwritten at the very end when the final `Marshal.WriteInt64(savedResultPtr, 8, ...)` copies the real `_mp_d` (accumBuf pointer) into the result struct — which is the correct final value.
+
+---
+
+## Section 45 — `SafeMpzMul` Case 1 Heap Overflow: `mpz_inits` → `mpz_init2` for A_part
+
+**Crash symptom:** silent process termination during Level 17 Node 0 `SafeMpzMul(newQ, leftQ, rightQ)` (outer call: szA=64,986,678 limbs, szB=3,423,380 limbs; inner call: szA=21,662,226 limbs, szB=22,713,467 limbs). The crash was in the inner call's Case 1 at `CopyMemory(_A1_dst, _A1_src, 57.8 MB)`. A native heap corruption occurred, with no managed exception and no native-crash-handler output.
+
+**Root cause:** `A_part` was initialised with `gmp_lib.mpz_inits(A_part, Nothing)`, which allocates exactly one limb (8 bytes) for the native `__mpz_struct._mp_d` buffer (`_mp_alloc = 1`). For the inner call, `bitsA = mA × 64` where `mA = 7,220,742` limbs. Before `CopyMemory` in Case 1, Case 0 first called `mpz_tdiv_r_2exp(A_part, opA, bitsA)` to extract the low `mA` limbs. The outer `opA` at this recursion level is the outer call's `A_part`, whose low `7,220,742` limbs are all zero (Q accumulates enormous powers of 2 in the Chudnovsky formula; at Level 17 the outer A_part has ~462 million zero low-order bits = ~7.2 million zero low limbs).
+
+When `mpz_tdiv_r_2exp` produces a mathematically-zero result, GMP does **not** call `MPZ_REALLOC` to grow the destination buffer — it simply sets `_mp_size = 0` and returns, leaving `_mp_alloc = 1` (the initial 1-limb allocation). Case 1 then called `CopyMemory(A_part._mp_d, src, mA × 8)` = `CopyMemory(8-byte-buffer, src, 57.8 MB)` → silent heap overflow → crash.
+
+**Why A_part = 0 is expected:** In the Chudnovsky binary split, Q accumulates factors of 2 from every term ((6k+2), (6k+4), (6k+6) each contribute at least one factor of 2). For N ≈ 350M terms (1B digits), Q has approximately 1.05 billion factors of 2 in its prime factorisation. The outer A_part (= outer `opA mod 2^(outer_bitsA)`) with its low 462M bits all zero means outer `opA` is divisible by `2^462M` — the zero result from `tdiv_r_2exp` is mathematically correct.
+
+**Diagnostic path:** Multiple rounds of logging identified the bug:
+1. FAST-PRE/POST threshold lowered from `10M` to `5M` limbs to capture inner calls where `szA ≈ 0` but `szB ≈ 7.57M`.
+2. Case 0 post-tdiv log added: exposed `A_part_alloc = 1` (expected: `mA = 7,220,742`).
+3. Case 1 pre-copy log added: confirmed `A_part_alloc = 1` and `mA = 7,220,742` — the 57.8 MB copy target was a 1-limb buffer.
+
+**Fix:** Replace `gmp_lib.mpz_inits(A_part, Nothing)` with `gmp_lib.mpz_init2(A_part, New mp_bitcnt_t(CUInt(bitsA)))`. `mpz_init2` pre-allocates `ceil(bitsA / 64) = mA` limbs before `mpz_tdiv_r_2exp` is called. Even if `tdiv_r_2exp` produces zero and skips `MPZ_REALLOC`, `_mp_alloc ≥ mA` is already guaranteed. Both Case 1 (`CopyMemory mA limbs`) and Case 2 (`CopyMemory mA limbs`) are safe.
+
+```vb
+' Before:
+Dim A_part As New mpz_t()
+gmp_lib.mpz_inits(A_part, Nothing)
+
+' After:
+Dim A_part As New mpz_t()
+gmp_lib.mpz_init2(A_part, New mp_bitcnt_t(CUInt(bitsA)))
+```
+
+---
+
+## Section 46 — Three-Pass Multiply: `mp_bitcnt_t` Overflow for `k2 = 2 × thirdBits`
+
+**Crash symptom:** `System.OverflowException` immediately after logging `"[ComputePi] Three-pass multiply: splitting finalQ (Q~2,699,652,552 digits)"`. The stack trace pointed to the `k2` construction in the three-pass multiply setup code.
+
+**Root cause:** `mp_bitcnt_t` is defined in GMP's `gmp.h` as `unsigned long`. On Windows 64-bit with MSVC, `unsigned long` is 32 bits, so `mp_bitcnt_t` can only hold values up to `UInt32.MaxValue = 4,294,967,295` bits.
+
+`finalQ` at 1-billion-digit scale has ~8.97 billion bits, so `thirdBits = totalBits / 3 ≈ 2,990,693,808` bits — this fits in `UInt32` (max 4.29 billion). But the original code then computed:
+
+```vb
+Dim k2 As New mp_bitcnt_t(CUInt(thirdBits * 2L))  ' 2 × 2.99B ≈ 5.98B → UInt32 overflow
+```
+
+`thirdBits * 2L ≈ 5,981,387,616 > 4,294,967,295 = UInt32.MaxValue`. VB.NET's `CUInt` in checked context throws `OverflowException` → crash.
+
+**Fix:** Remove `k2` entirely. Replace the two `k2`-based extraction calls with sequential `k1`-only operations using a temporary `tmpHigh`:
+
+```vb
+' Before — crashes:
+Dim k2 As New mp_bitcnt_t(CUInt(thirdBits * 2L))
+gmp_lib.mpz_tdiv_q_2exp(mpQ2, finalQ, k2)    ' finalQ >> 2k  → Q2
+gmp_lib.mpz_tdiv_r_2exp(finalQ, finalQ, k2)  ' finalQ mod 2^2k → Q1*2^k + Q0
+gmp_lib.mpz_tdiv_q_2exp(mpQ1, finalQ, k1)    ' >> k → Q1
+gmp_lib.mpz_tdiv_r_2exp(finalQ, finalQ, k1)  ' mod 2^k → Q0
+
+' After — no UInt32 overflow:
+Dim tmpHigh As New mpz_t()
+gmp_lib.mpz_init(tmpHigh)
+gmp_lib.mpz_tdiv_q_2exp(tmpHigh, finalQ, k1)  ' tmpHigh = Q2*2^k + Q1
+gmp_lib.mpz_tdiv_r_2exp(finalQ, finalQ, k1)   ' finalQ  = Q0
+
+Dim mpQ1 As New mpz_t()
+gmp_lib.mpz_init(mpQ1)
+Dim mpQ2 As New mpz_t()
+gmp_lib.mpz_init(mpQ2)
+gmp_lib.mpz_tdiv_r_2exp(mpQ1, tmpHigh, k1)   ' mpQ1 = Q1
+gmp_lib.mpz_tdiv_q_2exp(mpQ2, tmpHigh, k1)   ' mpQ2 = Q2
+gmp_lib.mpz_clear(tmpHigh)
+```
+
+All shift operations use `k1` (≈ 2.99 billion bits), which fits in `UInt32`. Two sequential k1-sized shifts replace the single k2-sized shift, with a temporary holding the upper two-thirds of `finalQ` between them.
