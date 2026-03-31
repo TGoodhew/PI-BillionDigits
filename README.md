@@ -1597,3 +1597,28 @@ gmp_lib.mpz_tdiv_q_2exp(tmpHigh, finalQ, k1)   ' MPZ_REALLOC short-circuits → 
 ```
 
 Sizes: `tmpHigh` = `finalQ._mp_size - k1/64 + 2` limbs ≈ 747 MB; `mpQ1` = `mpQ2` = `k1/64 + 2` limbs ≈ 373 MB each.
+
+---
+
+## Section 48 — Thread-Safe GMP Allocator Callbacks (`AppendLog` helper)
+
+**Branch:** PerfWork
+
+**Change:** Added a `_logLock As New Object()` shared field and an `AppendLog(message)` static helper that wraps `File.AppendAllText` in `SyncLock _logLock`. All `System.IO.File.AppendAllText(LOG_FILE, ...)` calls inside `GmpAllocFunc`, `GmpReallocFunc`, and `GmpFreeFunc` were replaced with `AppendLog(...)`.
+
+**Why:** The underlying memory operations in the three allocator callbacks — `VirtualAlloc`, `VirtualFree`, MSVC CRT `malloc`/`realloc`/`free` — are all intrinsically thread-safe Win32/CRT APIs. The only non-thread-safe element was the `File.AppendAllText` log writes: concurrent calls from multiple worker threads can race on the log file and either lose entries or throw `IOException` (silently swallowed by the `Try/Catch`). The lock ensures log entries are never interleaved or dropped under parallel load.
+
+---
+
+## Section 49 — Parallel Phase 1: `Parallel.For` over 137,700 Independent Chunks
+
+**Branch:** PerfWork
+
+**Change:** Replaced the serial `For i As Long = 0 To numChunks - 1` loop in `BinarySplitGMP` Phase 1 with `Parallel.For(0L, numChunks, Sub(i) ...)`. Results are written into a pre-sized `DiskNode()` array by index (no locking needed — each index is written exactly once by exactly one thread). After the parallel section, `diskNodes.AddRange(chunkResults)` populates the list in order. Progress is tracked with `Interlocked.Increment` and logged every 5,000 completions. Per-chunk `SerializeNodeToDisk` log entries are suppressed (`detailLog:=False`) to avoid 137K concurrent log writes.
+
+**Why:** The 137,700 Level-0 chunks are fully independent. Each `BinarySplitChunk` invocation:
+- uses only thread-local `mpz_t` variables (no shared mutable GMP state)
+- reads `gmpC3Const` as a constant (concurrent GMP reads of an unmodified integer are safe)
+- writes to a uniquely named file `L0_N{i}.bin` (no file contention)
+
+On a 16-core / 24-logical-processor machine, distributing the work across all cores reduces Phase 1 from ~O(N) sequential chunk time to ~O(N/24) wall time. With `CHUNK_SIZE = 512` and ~70.5M Chudnovsky terms for 1B digits, each chunk takes roughly equal time, so load is well balanced across the thread pool.

@@ -19,6 +19,7 @@ Option Explicit On
 Imports System.Numerics
 Imports System.IO
 Imports System.Threading
+Imports System.Threading.Tasks
 Imports System.Runtime.InteropServices
 Imports Math.Gmp.Native
 Imports System.Diagnostics
@@ -41,6 +42,23 @@ Public Class Form1
     Private _displayNativeBufSize As Long = 0   ' GmpAllocFunc alloc size; >= GMP_LARGE_THRESHOLD → VirtualAlloc'd
     Private WithEvents displayTimer As New System.Windows.Forms.Timer()
     Private gmpC3Const As mpz_t = Nothing
+
+    ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
+    ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
+    ' thread-safe.  Only the File.AppendAllText log writes need serialisation so
+    ' that concurrent allocator callbacks from parallel worker threads don't race
+    ' on the log file and lose entries (or silently throw IOException).
+    Private Shared ReadOnly _logLock As New Object()
+
+    Private Shared Sub AppendLog(message As String)
+        SyncLock _logLock
+            Try
+                System.IO.File.AppendAllText(LOG_FILE, message)
+            Catch
+                ' Swallow — log failures must never crash the allocator callbacks.
+            End Try
+        End SyncLock
+    End Sub
 
     ' Disk-based node storage for massive computations
     Private Const DISK_CACHE_DIR As String = "c:\PiOutput\NodeCache\"
@@ -257,8 +275,7 @@ Public Class Form1
         If rawSz > CULng(Long.MaxValue) Then
             ' Size > 9.2 EB — clearly corrupted GMP internal state.
             ' Return null so GMP will abort cleanly; native crash handler logs it.
-            System.IO.File.AppendAllText(LOG_FILE,
-                $"[GmpAllocFunc] CORRUPT SIZE ({rawSz}) — returning null{vbCrLf}")
+            AppendLog($"[GmpAllocFunc] CORRUPT SIZE ({rawSz}) — returning null{vbCrLf}")
             Return New void_ptr(IntPtr.Zero)
         End If
         Dim sz As Long = CLng(rawSz)
@@ -271,20 +288,16 @@ Public Class Form1
             ' them confirms (a) GmpAllocFunc is reached and (b) the allocation
             ' size seen here, which sets _mp_alloc in the native GMP struct.
             If sz >= 400L * 1024L AndAlso sz <= 2L * 1024L * 1024L Then
-                System.IO.File.AppendAllText(LOG_FILE,
-                    $"[GmpAlloc] VA: size={sz:N0} → ptr={ptr:X}{vbCrLf}")
+                AppendLog($"[GmpAlloc] VA: size={sz:N0} → ptr={ptr:X}{vbCrLf}")
             End If
             If ptr = IntPtr.Zero Then
-                ' VirtualAlloc failed — log directly (WriteToLog is instance-only)
-                System.IO.File.AppendAllText(LOG_FILE,
-                    $"[GmpAlloc] VirtualAlloc({sz:N0} bytes) FAILED — GMP will abort{vbCrLf}")
+                AppendLog($"[GmpAlloc] VirtualAlloc({sz:N0} bytes) FAILED — GMP will abort{vbCrLf}")
             End If
             Return New void_ptr(ptr)
         End If
         Return _savedGmpAlloc(alloc_size)
         Catch ex As Exception
-            System.IO.File.AppendAllText(LOG_FILE,
-                $"[GmpAllocFunc] EXCEPTION ({ex.GetType().Name}): {ex.Message} — returning null{vbCrLf}")
+            AppendLog($"[GmpAllocFunc] EXCEPTION ({ex.GetType().Name}): {ex.Message} — returning null{vbCrLf}")
             Return New void_ptr(IntPtr.Zero)
         End Try
     End Function
@@ -296,8 +309,7 @@ Public Class Form1
         Dim rawOld As ULong = CULng(old_size)
         Dim rawNew As ULong = CULng(new_size)
         If rawOld > CULng(Long.MaxValue) OrElse rawNew > CULng(Long.MaxValue) Then
-            System.IO.File.AppendAllText(LOG_FILE,
-                $"[GmpReallocFunc] CORRUPT SIZE (old={rawOld}, new={rawNew}) — returning null{vbCrLf}")
+            AppendLog($"[GmpReallocFunc] CORRUPT SIZE (old={rawOld}, new={rawNew}) — returning null{vbCrLf}")
             Return New void_ptr(IntPtr.Zero)
         End If
         Dim oldSz As Long = CLng(rawOld)
@@ -319,52 +331,43 @@ Public Class Form1
         If oldSz >= GMP_LARGE_THRESHOLD AndAlso newSz >= GMP_LARGE_THRESHOLD Then
             ' large → large: new VirtualAlloc, copy, free old
             If newSz >= LOG_STEP_THRESHOLD Then
-                System.IO.File.AppendAllText(LOG_FILE,
-                    $"[GmpRealloc] L→L enter: new={newSz:N0} old={oldSz:N0}{vbCrLf}")
+                AppendLog($"[GmpRealloc] L→L enter: new={newSz:N0} old={oldSz:N0}{vbCrLf}")
             End If
             newP = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(newSz)),
                                 MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             If newP <> IntPtr.Zero Then
                 If newSz >= LOG_STEP_THRESHOLD Then
-                    System.IO.File.AppendAllText(LOG_FILE,
-                        $"[GmpRealloc] L→L VA ok: newP={newP:X} copy={copyBytes.ToUInt64():N0}{vbCrLf}")
+                    AppendLog($"[GmpRealloc] L→L VA ok: newP={newP:X} copy={copyBytes.ToUInt64():N0}{vbCrLf}")
                 End If
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
                 If newSz >= LOG_STEP_THRESHOLD Then
-                    System.IO.File.AppendAllText(LOG_FILE,
-                        $"[GmpRealloc] L→L copy done; about to VirtualFree oldP={oldP:X}{vbCrLf}")
+                    AppendLog($"[GmpRealloc] L→L copy done; about to VirtualFree oldP={oldP:X}{vbCrLf}")
                 End If
                 VirtualFree(oldP, UIntPtr.Zero, MEM_RELEASE)
                 If newSz >= LOG_STEP_THRESHOLD Then
-                    System.IO.File.AppendAllText(LOG_FILE,
-                        $"[GmpRealloc] L→L VirtualFree done → OK{vbCrLf}")
+                    AppendLog($"[GmpRealloc] L→L VirtualFree done → OK{vbCrLf}")
                 End If
             Else
-                System.IO.File.AppendAllText(LOG_FILE,
-                    $"[GmpRealloc] large→large VirtualAlloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
+                AppendLog($"[GmpRealloc] large→large VirtualAlloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
             End If
         ElseIf newSz >= GMP_LARGE_THRESHOLD Then
             ' small → large: VirtualAlloc for new, CRT-free for old
             If newSz >= LOG_STEP_THRESHOLD Then
-                System.IO.File.AppendAllText(LOG_FILE,
-                    $"[GmpRealloc] S→L enter: new={newSz:N0} old={oldSz:N0}{vbCrLf}")
+                AppendLog($"[GmpRealloc] S→L enter: new={newSz:N0} old={oldSz:N0}{vbCrLf}")
             End If
             newP = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(newSz)),
                                 MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             If newP <> IntPtr.Zero Then
                 If newSz >= LOG_STEP_THRESHOLD Then
-                    System.IO.File.AppendAllText(LOG_FILE,
-                        $"[GmpRealloc] S→L VA ok: newP={newP:X} copy={copyBytes.ToUInt64():N0}{vbCrLf}")
+                    AppendLog($"[GmpRealloc] S→L VA ok: newP={newP:X} copy={copyBytes.ToUInt64():N0}{vbCrLf}")
                 End If
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
                 _savedGmpFree(old_ptr, old_size)
                 If newSz >= LOG_STEP_THRESHOLD Then
-                    System.IO.File.AppendAllText(LOG_FILE,
-                        $"[GmpRealloc] S→L CRT-free done → OK{vbCrLf}")
+                    AppendLog($"[GmpRealloc] S→L CRT-free done → OK{vbCrLf}")
                 End If
             Else
-                System.IO.File.AppendAllText(LOG_FILE,
-                    $"[GmpRealloc] small→large VirtualAlloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
+                AppendLog($"[GmpRealloc] small→large VirtualAlloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
             End If
         Else
             ' large → small: CRT-alloc for new, VirtualFree for old
@@ -374,15 +377,13 @@ Public Class Form1
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
                 VirtualFree(oldP, UIntPtr.Zero, MEM_RELEASE)
             Else
-                System.IO.File.AppendAllText(LOG_FILE,
-                    $"[GmpRealloc] large→small CRT alloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
+                AppendLog($"[GmpRealloc] large→small CRT alloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
             End If
         End If
 
         Return New void_ptr(newP)
         Catch ex As Exception
-            System.IO.File.AppendAllText(LOG_FILE,
-                $"[GmpReallocFunc] EXCEPTION ({ex.GetType().Name}): {ex.Message} — returning null{vbCrLf}")
+            AppendLog($"[GmpReallocFunc] EXCEPTION ({ex.GetType().Name}): {ex.Message} — returning null{vbCrLf}")
             Return New void_ptr(IntPtr.Zero)
         End Try
     End Function
@@ -394,8 +395,7 @@ Public Class Form1
         Dim rawSz As ULong = CULng(size)
         If rawSz > CULng(Long.MaxValue) Then
             ' Corrupted size — can't determine allocator; log and leak.
-            System.IO.File.AppendAllText(LOG_FILE,
-                $"[GmpFreeFunc] CORRUPT SIZE ({rawSz}) ptr={p:X} — leaking{vbCrLf}")
+            AppendLog($"[GmpFreeFunc] CORRUPT SIZE ({rawSz}) ptr={p:X} — leaking{vbCrLf}")
             Return
         End If
         Dim sz As Long = CLng(rawSz)
@@ -405,8 +405,7 @@ Public Class Form1
             _savedGmpFree(ptr, size)
         End If
         Catch ex As Exception
-            System.IO.File.AppendAllText(LOG_FILE,
-                $"[GmpFreeFunc] EXCEPTION ({ex.GetType().Name}): {ex.Message} — leaking ptr{vbCrLf}")
+            AppendLog($"[GmpFreeFunc] EXCEPTION ({ex.GetType().Name}): {ex.Message} — leaking ptr{vbCrLf}")
         End Try
     End Sub
 
@@ -1583,48 +1582,61 @@ Public Class Form1
         Dim currentSize As Long = numChunks
         Dim level As Integer = 0
 
-        ' ── Phase 1: stream all chunks to disk ──────────────────────────────
-        ' Compute one chunk at a time, serialize immediately, clear GMP memory.
-        ' Only one chunk's worth of GMP integers lives in RAM at any point.
-        For i As Long = 0 To numChunks - 1
-            Dim chunkStart As Long = i * CHUNK_SIZE
-            Dim chunkEnd As Long = System.Math.Min(chunkStart + CHUNK_SIZE, numTerms)
+        ' ── Phase 1: compute all chunks in parallel ──────────────────────────
+        ' All numChunks chunks are fully independent — each BinarySplitChunk
+        ' call uses only thread-local mpz_t objects and writes to a unique file.
+        ' gmpC3Const is read-only throughout so concurrent GMP reads are safe.
+        ' The custom allocator's memory operations (VirtualAlloc/VirtualFree,
+        ' CRT malloc/free) are thread-safe Win32/CRT APIs; their file-logging
+        ' paths are serialised via _logLock inside AppendLog.
+        ' Results are written into a pre-sized array by index (no list locking).
+        Dim chunkResults(CInt(numChunks) - 1) As DiskNode
+        Dim completedChunks As Long = 0L
+        Parallel.For(0L, numChunks,
+            Sub(i As Long)
+                Dim chunkStart As Long = i * CHUNK_SIZE
+                Dim chunkEnd As Long = System.Math.Min(chunkStart + CHUNK_SIZE, numTerms)
 
-            Dim tempP As mpz_t = Nothing
-            Dim tempQ As mpz_t = Nothing
-            Dim tempT As mpz_t = Nothing
-            BinarySplitChunk(chunkStart, chunkEnd, tempP, tempQ, tempT)
+                Dim tempP As mpz_t = Nothing
+                Dim tempQ As mpz_t = Nothing
+                Dim tempT As mpz_t = Nothing
+                BinarySplitChunk(chunkStart, chunkEnd, tempP, tempQ, tempT)
 
-            Dim node As DiskNode
-            node.FilePath = Nothing
-            node.MemP = Nothing
-            node.MemQ = Nothing
-            node.MemT = Nothing
-            node.Level = 0
-            node.Index = CInt(i)
-            node.IsInMemory = (numChunks <= DISK_THRESHOLD)
+                Dim node As DiskNode
+                node.FilePath = Nothing
+                node.MemP = Nothing
+                node.MemQ = Nothing
+                node.MemT = Nothing
+                node.Level = 0
+                node.Index = CInt(i)
+                node.IsInMemory = (numChunks <= DISK_THRESHOLD)
 
-            If node.IsInMemory Then
-                node.MemP = tempP
-                node.MemQ = tempQ
-                node.MemT = tempT
-            Else
-                node.FilePath = $"{DISK_CACHE_DIR}L0_N{i}.bin"
-                SerializeNodeToDisk(tempP, tempQ, tempT, node.FilePath)
-                gmp_lib.mpz_clears(tempP, tempQ, tempT, Nothing)
-            End If
+                If node.IsInMemory Then
+                    node.MemP = tempP
+                    node.MemQ = tempQ
+                    node.MemT = tempT
+                Else
+                    node.FilePath = $"{DISK_CACHE_DIR}L0_N{i}.bin"
+                    ' detailLog:=False — suppress per-chunk serialize entries;
+                    ' 137K parallel log writes would flood the file under contention.
+                    SerializeNodeToDisk(tempP, tempQ, tempT, node.FilePath, detailLog:=False)
+                    gmp_lib.mpz_clears(tempP, tempQ, tempT, Nothing)
+                End If
 
-            diskNodes.Add(node)
+                chunkResults(CInt(i)) = node
 
-            If i Mod 100 = 0 AndAlso i > 0 Then
-                LogPhase($"Chunks: {i:N0}/{numChunks:N0} (streamed to disk)")
-            End If
-        Next
+                Dim done As Long = Interlocked.Increment(completedChunks)
+                If done Mod 5000L = 0L Then
+                    WriteToLog($"[Phase1] {done:N0}/{numChunks:N0} chunks complete (parallel)")
+                End If
+            End Sub)
+
+        diskNodes.AddRange(chunkResults)
 
         If currentSize > DISK_THRESHOLD Then
-            LogPhase($"Streamed {currentSize:N0} chunks directly to disk (no array allocation)")
+            LogPhase($"Parallel: {currentSize:N0} chunks streamed to disk")
         Else
-            LogPhase($"Computed {currentSize:N0} chunks in memory")
+            LogPhase($"Parallel: {currentSize:N0} chunks computed in memory")
         End If
 
         ' ── Phase 2: combine levels until one node remains ──────────────────
