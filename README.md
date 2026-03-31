@@ -1626,9 +1626,12 @@ Sizes: `tmpHigh` = `finalQ._mp_size - k1/64 + 2` limbs ≈ 747 MB; `mpQ1` = `mpQ
 
 **Why:** With 138 chunks (small digit counts), `done` only reaches 138, so `done Mod 1000 = 0` is never satisfied and `LblStatus` stays frozen on the initial `LogPhase` message for the entire duration of Phase 1. The dynamic interval fires at every ~1% of completion regardless of total chunk count — for 138 chunks it updates every 1–2 chunks; for 137,700 chunks it updates every ~1,377.
 
-**Why:** The 137,700 Level-0 chunks are fully independent. Each `BinarySplitChunk` invocation:
-- uses only thread-local `mpz_t` variables (no shared mutable GMP state)
-- reads `gmpC3Const` as a constant (concurrent GMP reads of an unmodified integer are safe)
-- writes to a uniquely named file `L0_N{i}.bin` (no file contention)
+---
 
-On a 16-core / 24-logical-processor machine, distributing the work across all cores reduces Phase 1 from ~O(N) sequential chunk time to ~O(N/24) wall time. With `CHUNK_SIZE = 512` and ~70.5M Chudnovsky terms for 1B digits, each chunk takes roughly equal time, so load is well balanced across the thread pool.
+## Section 51 — Fix Phase 1 Status Label Not Updating on Full 1B Run (Timer-Based Polling)
+
+**Branch:** PerfWork
+
+**Change:** Replaced the `BeginInvoke`-inside-parallel-loop approach with a `System.Threading.Timer` that fires every 500 ms, reads `completedChunks` via `Interlocked.Read`, and posts a single `BeginInvoke` to update `LblStatus`. The `Parallel.For` body now only calls `Interlocked.Increment` and logs to file every 5,000 completions — no UI calls inside the loop. The timer is disposed immediately after `Parallel.For` returns.
+
+**Why:** When all 24 logical cores are saturated with GMP arithmetic, the UI thread gets very little CPU time. The `BeginInvoke` calls queued from inside the parallel loop may never be processed before Phase 1 completes, leaving the label frozen at the initial `LogPhase` message. A dedicated OS timer thread fires independently of core saturation, guaranteeing a label update every 500 ms regardless of how fast or slow the chunks are completing.

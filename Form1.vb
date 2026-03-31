@@ -1592,8 +1592,18 @@ Public Class Form1
         ' Results are written into a pre-sized array by index (no list locking).
         Dim chunkResults(CInt(numChunks) - 1) As DiskNode
         Dim completedChunks As Long = 0L
-        ' Update status every ~1% of chunks, but at least every 1 chunk.
-        Dim statusUpdateInterval As Long = System.Math.Max(1L, numChunks \ 100L)
+        ' A System.Threading.Timer polls completedChunks every 500 ms and pushes
+        ' a label update via BeginInvoke.  This decouples UI refresh from the
+        ' parallel loop: even when all cores are saturated the timer fires on a
+        ' dedicated OS thread and the UI thread stays responsive.
+        Dim phase1Timer As New System.Threading.Timer(
+            Sub(state As Object)
+                Dim snap As Long = Interlocked.Read(completedChunks)
+                Me.BeginInvoke(Sub()
+                                   LblStatus.Text = $"Phase 1: {snap:N0} / {numChunks:N0} chunks ({snap * 100L \ numChunks:N0}%)"
+                               End Sub)
+            End Sub, Nothing, 500, 500)
+
         Parallel.For(0L, numChunks,
             Sub(i As Long)
                 Dim chunkStart As Long = i * CHUNK_SIZE
@@ -1628,13 +1638,12 @@ Public Class Form1
                 chunkResults(CInt(i)) = node
 
                 Dim done As Long = Interlocked.Increment(completedChunks)
-                If done Mod statusUpdateInterval = 0L Then
+                If done Mod 5000L = 0L Then
                     WriteToLog($"[Phase1] {done:N0}/{numChunks:N0} chunks complete (parallel)")
-                    Me.BeginInvoke(Sub()
-                                       LblStatus.Text = $"Phase 1: {done:N0} / {numChunks:N0} chunks ({done * 100L \ numChunks:N0}%)"
-                                   End Sub)
                 End If
             End Sub)
+
+        phase1Timer.Dispose()
 
         diskNodes.AddRange(chunkResults)
 
