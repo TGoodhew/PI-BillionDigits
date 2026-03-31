@@ -28,7 +28,7 @@ $ErrorActionPreference = 'Stop'
 
 $projectDir  = $PSScriptRoot
 $projectFile = Join-Path $projectDir 'PI-BillionDigits.vbproj'
-$outputDir   = Join-Path $projectDir 'bin\Release\net10.0-windows'
+$outputDir   = Join-Path $projectDir 'bin\Release\net10.0-windows10.0.26100.0'
 $exePath     = Join-Path $outputDir  'PI-BillionDigits.exe'
 
 Write-Host "=== PI-BillionDigits headless run ===" -ForegroundColor Cyan
