@@ -1664,6 +1664,19 @@ The `mpz_clears` early-free calls and the final `mpz_add` are unchanged and stil
 
 ---
 
+## Section 56 — Larger Staging Buffer in SerializeOneMpz / DeserializeOneMpz
+
+**Branch:** PerfWork
+
+**Change:** Increased the `staging` array from 64 KB (`staging(65535)`) to 4 MB (`staging(4194303)`) in three places:
+- `SerializeNodeToDisk` — the buffer passed to `SerializeOneMpz` for all three fields
+- `LoadNodeFromDisk` — the buffer passed to `DeserializeOneMpz` for all three fields
+- The `Parallel.For` lambda in Phase 1 (`stagingBuf`) — used for the per-chunk `MemoryStream` serialization path
+
+**Why:** `SerializeOneMpz` and `DeserializeOneMpz` read/write limb data in a `While remaining > 0` loop, each iteration copying `staging.Length` bytes via `Marshal.Copy` and writing/reading via `BinaryWriter`/`BinaryReader`. With a 64 KB buffer, a Level-17 value (~560 MB) requires ~8,738 loop iterations. A 4 MB buffer reduces this to ~137 iterations — a 64x reduction in loop overhead. The gains are largest at Levels 14–17 where each `mpz_t` is tens to hundreds of MB. The 4 MB buffer exceeds the .NET 85 KB LOH threshold but is short-lived (local to each call, collected promptly) so LOH fragmentation is not a concern.
+
+---
+
 ## Section 55 — Single-File L0.bin Format for Level-0 Chunks
 
 **Branch:** PerfWork

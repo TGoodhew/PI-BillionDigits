@@ -928,9 +928,12 @@ Public Class Form1
     ' ════════════════════════════════════════════════════════════════════════
 
     ' Issue #2 fix: replaced per-field managed byte arrays (which land on the
-    ' LOH and never get compacted) with a single small staging buffer that is
-    ' reused for all three fields.  The 64 KB size is well below the 85 KB LOH
-    ' threshold so it always lives in the SOH and is freely compactable.
+    ' LOH and never get compacted) with a single staging buffer that is
+    ' reused for all three fields.  The 4 MB buffer (§56) exceeds the 85 KB LOH
+    ' threshold, but it is short-lived (local to each call) and allocated only
+    ' once per node serialized, so LOH fragmentation is not a practical concern.
+    ' The 64x larger buffer reduces Marshal.Copy loop iterations 64x for large
+    ' mpz_t values (e.g. Level-17 ~560 MB: ~8,738 → ~137 iterations).
     '
     ' Issue #6 fix (partial): signature takes three mpz_t directly instead of a
     ' Tuple(Of mpz_t,mpz_t,mpz_t), eliminating one throw-away heap allocation
@@ -942,7 +945,7 @@ Public Class Form1
 #ElseIf LOGGING_DETAIL = 1 Then
         If detailLog Then WriteToLog($"[Serialize] Writing {System.IO.Path.GetFileName(filePath)}")
 #End If
-        Dim staging(65535) As Byte  ' 64 KB staging buffer — always SOH, reused for all three fields
+        Dim staging(4194303) As Byte  ' 4 MB staging buffer (§56) — reused for all three fields
         Try
             Using fs As New FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 65536)
                 Using bw As New BinaryWriter(fs)
@@ -1048,7 +1051,7 @@ Public Class Form1
         t = New mpz_t()
         gmp_lib.mpz_inits(p, q, t, Nothing)
 
-        Dim staging(65535) As Byte  ' 64 KB staging buffer — always SOH
+        Dim staging(4194303) As Byte  ' 4 MB staging buffer (§56)
         Try
             Using fs As New FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536)
                 If fileOffset > 0L Then fs.Seek(fileOffset, SeekOrigin.Begin)
@@ -1661,7 +1664,7 @@ Public Class Form1
                     ' Serialize to a MemoryStream first (no lock needed), then
                     ' write to the shared L0.bin under lock — recording the byte
                     ' offset so Phase 2 can seek directly to this chunk.
-                    Dim stagingBuf(65535) As Byte
+                    Dim stagingBuf(4194303) As Byte  ' 4 MB staging buffer (§56)
                     Using ms As New System.IO.MemoryStream()
                         Using bw As New System.IO.BinaryWriter(ms)
                             SerializeOneMpz(tempP, bw, stagingBuf)
