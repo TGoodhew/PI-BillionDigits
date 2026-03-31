@@ -1602,7 +1602,7 @@ Public Class Form1
                 Me.BeginInvoke(Sub()
                                    LblStatus.Text = $"Phase 1: {snap:N0} / {numChunks:N0} chunks ({snap * 100L \ numChunks:N0}%)"
                                End Sub)
-            End Sub, Nothing, 500, 500)
+            End Sub, Nothing, 0, 500)
 
         Parallel.For(0L, numChunks,
             Sub(i As Long)
