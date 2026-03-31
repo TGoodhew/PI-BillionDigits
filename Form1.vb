@@ -72,6 +72,7 @@ Public Class Form1
     ' so no throw-away Tuple object is created when storing in-memory nodes.
     Private Structure DiskNode
         Public FilePath As String
+        Public FileOffset As Long  ' byte offset within FilePath; 0 for individual node files
         Public IsInMemory As Boolean
         Public MemP As mpz_t   ' used only when IsInMemory = True
         Public MemQ As mpz_t
@@ -1027,6 +1028,7 @@ Public Class Form1
     ' Issue #6 fix (partial): returns via ByRef parameters instead of a Tuple,
     ' eliminating one throw-away heap allocation per call.
     Private Sub LoadNodeFromDisk(filePath As String,
+                                 fileOffset As Long,
                                  ByRef p As mpz_t,
                                  ByRef q As mpz_t,
                                  ByRef t As mpz_t,
@@ -1049,6 +1051,7 @@ Public Class Form1
         Dim staging(65535) As Byte  ' 64 KB staging buffer — always SOH
         Try
             Using fs As New FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536)
+                If fileOffset > 0L Then fs.Seek(fileOffset, SeekOrigin.Begin)
                 Using br As New BinaryReader(fs)
                     DeserializeOneMpz(p, br, staging)
                     DeserializeOneMpz(q, br, staging)
@@ -1601,6 +1604,18 @@ Public Class Form1
         ' Results are written into a pre-sized array by index (no list locking).
         Dim chunkResults(CInt(numChunks) - 1) As DiskNode
         Dim completedChunks As Long = 0L
+        ' §54: single-file format — all Level-0 chunks written to one L0.bin.
+        ' Eliminates 137K individual file creates/deletes (the ~2 min NVMe
+        ' metadata overhead at the start of every run).  Each thread serializes
+        ' to a MemoryStream outside the lock; only the file-position record and
+        ' write happen under SyncLock, keeping lock hold-time minimal.
+        Const L0_BIN_PATH As String = DISK_CACHE_DIR & "L0.bin"
+        Dim l0Stream As FileStream = Nothing
+        Dim l0Lock As New Object()
+        If numChunks > DISK_THRESHOLD Then
+            l0Stream = New FileStream(L0_BIN_PATH, FileMode.Create, FileAccess.Write,
+                                      FileShare.None, 4 * 1024 * 1024)
+        End If
         ' Dedicated background thread (not thread-pool) polls completedChunks
         ' every 500 ms.  System.Threading.Timer callbacks run on thread-pool
         ' threads, which Parallel.For exhausts — causing ~2 min delay before
@@ -1643,11 +1658,25 @@ Public Class Form1
                     node.MemQ = tempQ
                     node.MemT = tempT
                 Else
-                    node.FilePath = $"{DISK_CACHE_DIR}L0_N{i}.bin"
-                    ' detailLog:=False — suppress per-chunk serialize entries;
-                    ' 137K parallel log writes would flood the file under contention.
-                    SerializeNodeToDisk(tempP, tempQ, tempT, node.FilePath, detailLog:=False)
-                    gmp_lib.mpz_clears(tempP, tempQ, tempT, Nothing)
+                    ' Serialize to a MemoryStream first (no lock needed), then
+                    ' write to the shared L0.bin under lock — recording the byte
+                    ' offset so Phase 2 can seek directly to this chunk.
+                    Dim stagingBuf(65535) As Byte
+                    Using ms As New System.IO.MemoryStream()
+                        Using bw As New System.IO.BinaryWriter(ms)
+                            SerializeOneMpz(tempP, bw, stagingBuf)
+                            SerializeOneMpz(tempQ, bw, stagingBuf)
+                            SerializeOneMpz(tempT, bw, stagingBuf)
+                        End Using
+                        gmp_lib.mpz_clears(tempP, tempQ, tempT, Nothing)
+                        Dim chunkData As Byte() = ms.GetBuffer()
+                        Dim chunkLen As Integer = CInt(ms.Length)
+                        SyncLock l0Lock
+                            node.FileOffset = l0Stream.Position
+                            l0Stream.Write(chunkData, 0, chunkLen)
+                        End SyncLock
+                    End Using
+                    node.FilePath = L0_BIN_PATH
                 End If
 
                 chunkResults(CInt(i)) = node
@@ -1660,10 +1689,16 @@ Public Class Form1
 
         phase1PollThread.Join()
 
+        If l0Stream IsNot Nothing Then
+            l0Stream.Flush()
+            l0Stream.Dispose()
+            l0Stream = Nothing
+        End If
+
         diskNodes.AddRange(chunkResults)
 
         If currentSize > DISK_THRESHOLD Then
-            LogPhase($"Parallel: {currentSize:N0} chunks streamed to disk")
+            LogPhase($"Parallel: {currentSize:N0} chunks streamed to L0.bin")
         Else
             LogPhase($"Parallel: {currentSize:N0} chunks computed in memory")
         End If
@@ -1713,8 +1748,12 @@ Public Class Form1
                             leftQ = diskNodes(leftIdx).MemQ
                             leftT = diskNodes(leftIdx).MemT
                         Else
-                            LoadNodeFromDisk(diskNodes(leftIdx).FilePath, leftP, leftQ, leftT, isLastLevel)
-                            Try : System.IO.File.Delete(diskNodes(leftIdx).FilePath) : Catch : End Try
+                            LoadNodeFromDisk(diskNodes(leftIdx).FilePath, diskNodes(leftIdx).FileOffset, leftP, leftQ, leftT, isLastLevel)
+                            ' Level-0 nodes share L0.bin — skip per-node delete; L0.bin is
+                            ' cleaned up by the cache clear at the start of the next run.
+                            If diskNodes(leftIdx).Level > 0 Then
+                                Try : System.IO.File.Delete(diskNodes(leftIdx).FilePath) : Catch : End Try
+                            End If
                         End If
 
                         ' Load right
@@ -1726,8 +1765,10 @@ Public Class Form1
                             rightQ = diskNodes(rightIdx).MemQ
                             rightT = diskNodes(rightIdx).MemT
                         Else
-                            LoadNodeFromDisk(diskNodes(rightIdx).FilePath, rightP, rightQ, rightT, isLastLevel)
-                            Try : System.IO.File.Delete(diskNodes(rightIdx).FilePath) : Catch : End Try
+                            LoadNodeFromDisk(diskNodes(rightIdx).FilePath, diskNodes(rightIdx).FileOffset, rightP, rightQ, rightT, isLastLevel)
+                            If diskNodes(rightIdx).Level > 0 Then
+                                Try : System.IO.File.Delete(diskNodes(rightIdx).FilePath) : Catch : End Try
+                            End If
                         End If
 
                         ' Combine (same early-free and in-place-add sequence as serial path)
@@ -1791,11 +1832,13 @@ Public Class Form1
                         leftQ = diskNodes(CInt(nodeIdx)).MemQ
                         leftT = diskNodes(CInt(nodeIdx)).MemT
                     Else
-                        LoadNodeFromDisk(diskNodes(CInt(nodeIdx)).FilePath, leftP, leftQ, leftT, isLastLevel)
-                        Try
-                            System.IO.File.Delete(diskNodes(CInt(nodeIdx)).FilePath)
-                        Catch
-                        End Try
+                        LoadNodeFromDisk(diskNodes(CInt(nodeIdx)).FilePath, diskNodes(CInt(nodeIdx)).FileOffset, leftP, leftQ, leftT, isLastLevel)
+                        If diskNodes(CInt(nodeIdx)).Level > 0 Then
+                            Try
+                                System.IO.File.Delete(diskNodes(CInt(nodeIdx)).FilePath)
+                            Catch
+                            End Try
+                        End If
                     End If
 
                     ' Load right operand
@@ -1808,11 +1851,13 @@ Public Class Form1
                         rightQ = diskNodes(CInt(nodeIdx + 1)).MemQ
                         rightT = diskNodes(CInt(nodeIdx + 1)).MemT
                     Else
-                        LoadNodeFromDisk(diskNodes(CInt(nodeIdx + 1)).FilePath, rightP, rightQ, rightT, isLastLevel)
-                        Try
-                            System.IO.File.Delete(diskNodes(CInt(nodeIdx + 1)).FilePath)
-                        Catch
-                        End Try
+                        LoadNodeFromDisk(diskNodes(CInt(nodeIdx + 1)).FilePath, diskNodes(CInt(nodeIdx + 1)).FileOffset, rightP, rightQ, rightT, isLastLevel)
+                        If diskNodes(CInt(nodeIdx + 1)).Level > 0 Then
+                            Try
+                                System.IO.File.Delete(diskNodes(CInt(nodeIdx + 1)).FilePath)
+                            Catch
+                            End Try
+                        End If
                     End If
 
                     ' Combine
@@ -1965,7 +2010,7 @@ Public Class Form1
                 Dim rP As mpz_t = Nothing
                 Dim rQ As mpz_t = Nothing
                 Dim rT As mpz_t = Nothing
-                LoadNodeFromDisk(diskNodes(i).FilePath, rP, rQ, rT)
+                LoadNodeFromDisk(diskNodes(i).FilePath, diskNodes(i).FileOffset, rP, rQ, rT)
                 nodes.Add(New Result With {.P = rP, .Q = rQ, .T = rT})
                 Try
                     System.IO.File.Delete(diskNodes(i).FilePath)

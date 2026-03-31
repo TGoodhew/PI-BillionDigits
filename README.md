@@ -1664,6 +1664,23 @@ The `mpz_clears` early-free calls and the final `mpz_add` are unchanged and stil
 
 ---
 
+## Section 55 — Single-File L0.bin Format for Level-0 Chunks
+
+**Branch:** PerfWork
+
+**Change:** Replaced 137,739 individual `L0_N{i}.bin` files with a single `L0.bin` file for all Level-0 chunks. Key design points:
+
+- A `FileStream` for `L0.bin` (4 MB buffer, `FileShare.None`) is opened once before the `Parallel.For`.
+- Each worker thread serializes its three `mpz_t` values to a `MemoryStream` outside any lock (no contention for large serialization work), then enters a `SyncLock` only to record the current stream position into `node.FileOffset` and write the pre-built bytes — minimising lock hold-time to a single seek + write.
+- `DiskNode` gains a `FileOffset As Long` field (0 for non-L0 nodes that use individual files).
+- `LoadNodeFromDisk` gains a `fileOffset As Long` parameter; if non-zero, `fs.Seek(fileOffset, SeekOrigin.Begin)` is called before reading.
+- All five `LoadNodeFromDisk` call sites pass `diskNodes(idx).FileOffset`.
+- Phase 2 combine loops skip `File.Delete` for Level-0 nodes (`diskNodes(idx).Level = 0`) — `L0.bin` is cleaned up by the single-file `Directory.GetFiles` + delete at the start of the next run (§50), which now removes 1 file instead of 137,739.
+
+**Why:** The ~2-minute NVMe metadata overhead at the start of every run was caused by deleting 137,739 small individual files (§50 visible). A single `L0.bin` file reduces the next run's cache clear from 137,739 `File.Delete` calls to 1, eliminating that entire overhead. The lock-outside-memorystream pattern keeps thread contention minimal even on 24 cores writing simultaneously.
+
+---
+
 ## Section 53 — Parallel Phase 2 Combines (Levels 1–N-3)
 
 **Branch:** PerfWork
