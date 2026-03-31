@@ -249,6 +249,103 @@ Public Class Form1
     Private Shared Function GetCurrentProcess() As IntPtr
     End Function
 
+    <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Shared Function SetProcessAffinityMask(
+        hProcess As IntPtr,
+        dwProcessAffinityMask As IntPtr) As Boolean
+    End Function
+
+    <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Shared Function GetLogicalProcessorInformationEx(
+        relationshipType As Integer,
+        buffer As IntPtr,
+        ByRef returnedLength As UInteger) As Boolean
+    End Function
+
+    Private Const RelationProcessorCore As Integer = 0
+
+    ''' <summary>
+    ''' Detects hybrid CPU topology (P-cores vs E-cores) via
+    ''' GetLogicalProcessorInformationEx and restricts the process affinity mask
+    ''' to P-cores only.  On a non-hybrid CPU, or if detection fails, the affinity
+    ''' mask is left unchanged.
+    '''
+    ''' Intel 12th gen+ (Alder Lake) and AMD Zen 4c hybrid designs expose
+    ''' EfficiencyClass in PROCESSOR_RELATIONSHIP:
+    '''   EfficiencyClass = 0  → E-core (lower power, lower single-thread perf)
+    '''   EfficiencyClass > 0  → P-core (full-power, preferred for GMP math)
+    '''
+    ''' Restricting to P-cores prevents the thread-pool from placing GMP arithmetic
+    ''' workers on E-cores, which run at reduced clock speeds and share L2 caches
+    ''' differently, causing unexpected slowdowns in data-parallel workloads.
+    ''' </summary>
+    Private Shared Sub SetPCoreAffinity()
+        Try
+            ' First call: get required buffer size
+            Dim bufferSize As UInteger = 0
+            GetLogicalProcessorInformationEx(RelationProcessorCore, IntPtr.Zero, bufferSize)
+            If bufferSize = 0 Then
+                AppendLog($"[Affinity] GetLogicalProcessorInformationEx size query failed{vbCrLf}")
+                Return
+            End If
+
+            Dim buffer As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(CInt(bufferSize))
+            Try
+                If Not GetLogicalProcessorInformationEx(RelationProcessorCore, buffer, bufferSize) Then
+                    AppendLog($"[Affinity] GetLogicalProcessorInformationEx data query failed{vbCrLf}")
+                    Return
+                End If
+
+                ' Parse SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX records.
+                ' Each record layout (RelationProcessorCore):
+                '   +0  Relationship  : DWORD (4)
+                '   +4  Size          : DWORD (4)
+                '   +8  Flags         : BYTE  (1)
+                '   +9  EfficiencyClass: BYTE (1) — 0=E-core, >0=P-core
+                '  +10  Reserved[20]  : BYTE (20)
+                '  +30  GroupCount    : WORD  (2)
+                '  +32  GroupMask[0].Mask : ULONG_PTR (8 on x64)
+                '  +40  GroupMask[0].Group: WORD (2)
+                '  +42  GroupMask[0].Reserved: 6 bytes
+                Dim pCoreMask As Long = 0L
+                Dim eCoreMask As Long = 0L
+                Dim offset As Integer = 0
+
+                Do While offset < CInt(bufferSize)
+                    Dim recordSize As Integer = Runtime.InteropServices.Marshal.ReadInt32(buffer, offset + 4)
+                    If recordSize <= 0 Then Exit Do
+
+                    Dim efficiencyClass As Byte = Runtime.InteropServices.Marshal.ReadByte(buffer, offset + 9)
+                    Dim mask As Long = Runtime.InteropServices.Marshal.ReadInt64(buffer, offset + 32)
+
+                    If efficiencyClass > 0 Then
+                        pCoreMask = pCoreMask Or mask
+                    Else
+                        eCoreMask = eCoreMask Or mask
+                    End If
+
+                    offset += recordSize
+                Loop
+
+                If pCoreMask <> 0L AndAlso eCoreMask <> 0L Then
+                    ' Hybrid CPU — restrict process to P-cores
+                    If SetProcessAffinityMask(GetCurrentProcess(), New IntPtr(pCoreMask)) Then
+                        AppendLog($"[Affinity] Hybrid CPU detected. P-core mask=0x{pCoreMask:X}  E-core mask=0x{eCoreMask:X}. Process restricted to P-cores.{vbCrLf}")
+                    Else
+                        AppendLog($"[Affinity] Hybrid CPU detected but SetProcessAffinityMask failed. P=0x{pCoreMask:X} E=0x{eCoreMask:X}{vbCrLf}")
+                    End If
+                Else
+                    ' Uniform CPU — all cores same efficiency class; no change needed
+                    AppendLog($"[Affinity] Uniform CPU (no E-cores detected). P=0x{pCoreMask:X} E=0x{eCoreMask:X}. Affinity unchanged.{vbCrLf}")
+                End If
+            Finally
+                Runtime.InteropServices.Marshal.FreeHGlobal(buffer)
+            End Try
+        Catch ex As Exception
+            AppendLog($"[Affinity] Exception during P-core detection: {ex.Message}{vbCrLf}")
+        End Try
+    End Sub
+
     Private Shared Sub DisablePowerThrottling()
         Dim state As New PROCESS_POWER_THROTTLING_STATE With {
             .Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
@@ -625,6 +722,11 @@ Public Class Form1
         ' to E-cores and halving their CPU quota.
         DisablePowerThrottling()
 
+        ' Restrict process affinity to P-cores on hybrid CPUs (Intel 12th gen+,
+        ' AMD Zen 4c).  E-cores run GMP arithmetic ~30-50% slower and cause
+        ' cache-topology mismatches in parallel workloads.
+        SetPCoreAffinity()
+
         ' Install VirtualAlloc/VirtualFree custom GMP allocator so large limb
         ' buffers are immediately decommitted on free, preventing commit-charge
         ' accumulation that caused abort() in multi-pass multiply.
@@ -781,6 +883,13 @@ Public Class Form1
         End If
         BtnCompute.Enabled = False
         BtnPause.Enabled = True
+
+        ' Pre-warm the thread pool to ProcessorCount threads before the compute
+        ' thread starts.  Without this, the thread pool ramps up one thread at a
+        ' time as Parallel.For enqueues work, causing LowLevelLifoSemaphore stalls
+        ' during Phase 1 (137K tasks) and the early Phase 2 levels.
+        ThreadPool.SetMinThreads(Environment.ProcessorCount, Environment.ProcessorCount)
+
         DIGITS = CLng(TxtDigitsofPI.Text.Replace(",", ""))
         stopWatch.Restart()
         phaseStopWatch.Restart()
