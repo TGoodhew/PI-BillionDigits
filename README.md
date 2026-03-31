@@ -1664,6 +1664,19 @@ The `mpz_clears` early-free calls and the final `mpz_add` are unchanged and stil
 
 ---
 
+## Section 57 — Phase 2 Level Progress in Status Label
+
+**Branch:** PerfWork
+
+**Change:** The status label now shows pair progress for every Phase 2 combine level:
+
+- **Parallel path** (`pairCount >= 4`): A dedicated background `Thread` (not thread-pool) polls an `Interlocked`-incremented `completedPairs` counter every 500 ms and posts `BeginInvoke` updates showing `"Phase 2 Level N: X / Y pairs"`. `Interlocked.Increment(completedPairs)` is called at the end of each `Parallel.For` lambda body. The calling thread calls `phase2PollThread.Join()` after `Parallel.For` returns (same pattern as Phase 1 §51).
+- **Serial path** (`pairCount < 4`, top levels): A direct `BeginInvoke` is posted after each pair completes, showing the same `"Phase 2 Level N: X / Y pairs"` format. The thread pool is not exhausted at these levels (only 1–3 pairs, each taking minutes), so `BeginInvoke` reaches the UI thread promptly.
+
+**Why:** During Phase 2 the status label was frozen with no indication of progress within a level. For Level 1 (~68,869 pairs) running in parallel, users had no visibility into how far along the combine was. The dedicated-thread pattern is required for the parallel path for the same reason as Phase 1: `Parallel.For` exhausts the thread pool, starving any timer-based polling.
+
+---
+
 ## Section 56 — Larger Staging Buffer in SerializeOneMpz / DeserializeOneMpz
 
 **Branch:** PerfWork

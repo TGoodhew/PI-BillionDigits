@@ -1737,6 +1737,19 @@ Public Class Form1
             If pairCount >= 4L Then
                 ' ── Parallel path ────────────────────────────────────────────
                 Dim nextResults(CInt(pairCount) - 1) As DiskNode
+                Dim completedPairs As Long = 0L
+                Dim phase2PollThread As New System.Threading.Thread(
+                    Sub()
+                        While Interlocked.Read(completedPairs) < pairCount
+                            Dim snap As Long = Interlocked.Read(completedPairs)
+                            Me.BeginInvoke(Sub()
+                                LblStatus.Text = $"Phase 2 Level {level}: {snap:N0} / {pairCount:N0} pairs"
+                            End Sub)
+                            System.Threading.Thread.Sleep(500)
+                        End While
+                    End Sub)
+                phase2PollThread.IsBackground = True
+                phase2PollThread.Start()
                 Parallel.For(0L, pairCount,
                     Sub(pairIdx As Long)
                         Dim leftIdx As Integer = CInt(pairIdx * 2L)
@@ -1817,7 +1830,9 @@ Public Class Form1
                         End If
 
                         nextResults(CInt(pairIdx)) = resultNode
+                        Interlocked.Increment(completedPairs)
                     End Sub)
+                phase2PollThread.Join()
                 nextDiskNodes.AddRange(nextResults)
 
             Else
@@ -1970,6 +1985,11 @@ Public Class Form1
                     End If
 
                     nextDiskNodes.Add(resultNode)
+
+                    Dim _done As Integer = nextDiskNodes.Count
+                    Me.BeginInvoke(Sub()
+                        LblStatus.Text = $"Phase 2 Level {level}: {_done:N0} / {pairCount:N0} pairs"
+                    End Sub)
 
                     If nextDiskNodes.Count Mod 100 = 0 Then
                         LogPhase($"  Processed {nextDiskNodes.Count:N0}/{nextSize:N0} node pairs")
