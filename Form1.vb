@@ -2036,30 +2036,86 @@ Public Class Form1
             ' Combine:  gmpNumer = ((r2 << k) + r1) << k + r0
 
             Dim totalBits As Long = CLng(gmp_lib.mpz_sizeinbase(finalQ, 2))
+            WriteToLog($"[3PM-DBG] totalBits={totalBits:N0} finalQ._mp_size={Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer, 4):N0} _mp_alloc={Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer, 0):N0}")
             Dim thirdBits As Long = totalBits \ 3L
             ' mp_bitcnt_t is 32-bit on Windows (MSVC unsigned long).  thirdBits ≈ 3 billion
             ' which fits in UInt32 (max 4.29 billion).  2*thirdBits would overflow UInt32, so
             ' all shifts use k1 only and are done in two single-k1 steps instead.
             Dim k1 As New mp_bitcnt_t(CUInt(thirdBits))
+            WriteToLog($"[3PM-DBG] thirdBits={thirdBits:N0} k1.Value={k1.Value}")
 
             ' Shared staging buffer for all spill I/O (sequential, never concurrent).
             Dim spillStaging(65535) As Byte
 
+            ' finalQ._mp_size / k1-limb counts used for pre-alloc sizing below.
+            Dim _finalQSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer, 4)))
+            Dim _k1Limbs As Long = CLng(k1.Value) \ 64L   ' limb_cnt = k1 / GMP_NUMB_BITS
+
             ' Extract Q0 = finalQ mod 2^k (low third) and shift finalQ to hold Q2*2^k + Q1.
             ' Using only k1-sized shifts avoids the 2k overflow in mp_bitcnt_t.
+            '
+            ' Pre-alloc tmpHigh before the tdiv call — same pattern as Combine section.
+            ' Without it, GmpReallocFunc is invoked for the S→L transition (~747 MB), and
+            ' GMP crashes silently (AV inside native code) when it immediately writes to the
+            ' freshly VirtualAlloc'd pages before the OS has a chance to back them.
+            ' With pre-alloc, MPZ_REALLOC short-circuits and GmpReallocFunc is never called.
             Dim tmpHigh As New mpz_t()
-            gmp_lib.mpz_init(tmpHigh)
+            gmp_lib.mpz_init2(tmpHigh, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L))) ' seed with VirtualAlloc'd buffer
+            Dim _tHNeeded As Long = _finalQSz - _k1Limbs + 2L   ' result ≤ finalQSz - k1Limbs limbs; +2 margin
+            Dim _tHBytes As Long = _tHNeeded * 8L
+            Dim _tHBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_tHBytes)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If _tHBuf <> IntPtr.Zero Then
+                Dim _tHOld As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(tmpHigh.Pointer, 8))
+                VirtualFree(_tHOld, UIntPtr.Zero, MEM_RELEASE)  ' free the init2 seed buffer
+                Runtime.InteropServices.Marshal.WriteInt32(tmpHigh.Pointer, 0, CInt(_tHNeeded))
+                Runtime.InteropServices.Marshal.WriteInt64(tmpHigh.Pointer, 8, _tHBuf.ToInt64())
+                WriteToLog($"[3PM-DBG] tmpHigh pre-alloc {_tHNeeded:N0} limbs ({_tHBytes \ 1048576L:N0} MB) ptr={_tHBuf:X}")
+            Else
+                WriteToLog($"[3PM-DBG] tmpHigh pre-alloc FAILED for {_tHBytes \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+            End If
+            WriteToLog($"[3PM-DBG] tmpHigh _mp_alloc={Runtime.InteropServices.Marshal.ReadInt32(tmpHigh.Pointer, 0):N0}  about to tdiv_q_2exp(tmpHigh, finalQ, k1)")
             gmp_lib.mpz_tdiv_q_2exp(tmpHigh, finalQ, k1)  ' tmpHigh = Q2*2^k + Q1
-            gmp_lib.mpz_tdiv_r_2exp(finalQ, finalQ, k1)   ' finalQ  = Q0
+            WriteToLog($"[3PM-DBG] tdiv_q_2exp done: tmpHigh._mp_size={Runtime.InteropServices.Marshal.ReadInt32(tmpHigh.Pointer, 4):N0}  about to tdiv_r_2exp(finalQ, finalQ, k1)")
+            gmp_lib.mpz_tdiv_r_2exp(finalQ, finalQ, k1)   ' finalQ  = Q0 (fits in existing alloc; no realloc)
+            WriteToLog($"[3PM-DBG] tdiv_r_2exp done: finalQ._mp_size={Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer, 4):N0}")
 
             ' Extract Q1 and Q2 from tmpHigh with another k1-sized shift.
+            ' Both results are ≤ k1/64 limbs ≈ 373 MB — pre-alloc both for the same reason.
             Dim mpQ1 As New mpz_t()
-            gmp_lib.mpz_init(mpQ1)
+            gmp_lib.mpz_init2(mpQ1, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
+            Dim _q1Needed As Long = _k1Limbs + 2L
+            Dim _q1Bytes As Long = _q1Needed * 8L
+            Dim _q1Buf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_q1Bytes)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If _q1Buf <> IntPtr.Zero Then
+                Dim _q1Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpQ1.Pointer, 8))
+                VirtualFree(_q1Old, UIntPtr.Zero, MEM_RELEASE)
+                Runtime.InteropServices.Marshal.WriteInt32(mpQ1.Pointer, 0, CInt(_q1Needed))
+                Runtime.InteropServices.Marshal.WriteInt64(mpQ1.Pointer, 8, _q1Buf.ToInt64())
+                WriteToLog($"[3PM-DBG] mpQ1 pre-alloc {_q1Needed:N0} limbs ({_q1Bytes \ 1048576L:N0} MB)")
+            Else
+                WriteToLog($"[3PM-DBG] mpQ1 pre-alloc FAILED for {_q1Bytes \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+            End If
             Dim mpQ2 As New mpz_t()
-            gmp_lib.mpz_init(mpQ2)
+            gmp_lib.mpz_init2(mpQ2, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
+            Dim _q2Needed As Long = _k1Limbs + 2L  ' same upper bound as Q1
+            Dim _q2Bytes As Long = _q2Needed * 8L
+            Dim _q2Buf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_q2Bytes)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If _q2Buf <> IntPtr.Zero Then
+                Dim _q2Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpQ2.Pointer, 8))
+                VirtualFree(_q2Old, UIntPtr.Zero, MEM_RELEASE)
+                Runtime.InteropServices.Marshal.WriteInt32(mpQ2.Pointer, 0, CInt(_q2Needed))
+                Runtime.InteropServices.Marshal.WriteInt64(mpQ2.Pointer, 8, _q2Buf.ToInt64())
+                WriteToLog($"[3PM-DBG] mpQ2 pre-alloc {_q2Needed:N0} limbs ({_q2Bytes \ 1048576L:N0} MB)")
+            Else
+                WriteToLog($"[3PM-DBG] mpQ2 pre-alloc FAILED for {_q2Bytes \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+            End If
+            WriteToLog($"[3PM-DBG] about to extract Q1/Q2 from tmpHigh")
             gmp_lib.mpz_tdiv_r_2exp(mpQ1, tmpHigh, k1)   ' mpQ1 = Q1
+            WriteToLog($"[3PM-DBG] mpQ1._mp_size={Runtime.InteropServices.Marshal.ReadInt32(mpQ1.Pointer, 4):N0}  about to tdiv_q_2exp(mpQ2, tmpHigh, k1)")
             gmp_lib.mpz_tdiv_q_2exp(mpQ2, tmpHigh, k1)   ' mpQ2 = Q2
+            WriteToLog($"[3PM-DBG] mpQ2._mp_size={Runtime.InteropServices.Marshal.ReadInt32(mpQ2.Pointer, 4):N0}  clearing tmpHigh")
             gmp_lib.mpz_clear(tmpHigh)
+            WriteToLog($"[3PM-DBG] Q split complete")
 
             ' Spill Q2 and Q1; free them to clear the deck for Pass 0.
             Dim Q2_path As String = $"{DISK_CACHE_DIR}Q2_spill.bin"

@@ -1508,3 +1508,32 @@ gmp_lib.mpz_clear(tmpHigh)
 ```
 
 All shift operations use `k1` (≈ 2.99 billion bits), which fits in `UInt32`. Two sequential k1-sized shifts replace the single k2-sized shift, with a temporary holding the upper two-thirds of `finalQ` between them.
+
+---
+
+## Section 47 — Three-Pass Multiply Q-Split: Silent Crash in `mpz_tdiv_q_2exp` (Pre-alloc Missing)
+
+**Crash symptom:** After Section 46 fixed the `OverflowException`, the process still died silently at the exact same log line — `"[ComputePi] Three-pass multiply: splitting finalQ"`. New fine-grained `[3PM-DBG]` logging confirmed the last entry was `"about to tdiv_q_2exp(tmpHigh, finalQ, k1)"`. Neither `"tdiv_q_2exp done"` nor any `[GmpRealloc] S→L enter` log appeared. The crash occurred inside `gmp_lib.mpz_tdiv_q_2exp(tmpHigh, finalQ, k1)` before `GmpReallocFunc` was ever reached.
+
+**Root cause:** `tmpHigh` was initialised with `mpz_init` (1-limb CRT buffer, `_mp_alloc = 1`). When `mpz_tdiv_q_2exp` ran, GMP needed to realloc `tmpHigh` from 1 limb to ~93.4 million limbs (~747 MB) via `GmpReallocFunc`. Inside `GmpReallocFunc`, `VirtualAlloc(MEM_COMMIT | MEM_RESERVE)` was called for 747 MB. Even though `MEM_COMMIT` succeeded, the physical pages were not yet faulted in. GMP then immediately started writing the right-shifted limbs into those pages. The page faults could not be serviced fast enough (or the OS raised a structured exception for the committed-but-unfaulted region) → silent access violation inside native GMP → CLR FailFast with no managed handler possible.
+
+This is the same root cause already documented in Section 43/44 and the Combine section: "VirtualAllocs new pages that GMP writes to immediately; if those page faults can't be satisfied → silent AV inside native GMP → CLR FailFast".
+
+`mpQ1` (~373 MB, result of `mpz_tdiv_r_2exp(mpQ1, tmpHigh, k1)`) and `mpQ2` (~373 MB, result of `mpz_tdiv_q_2exp(mpQ2, tmpHigh, k1)`) had the same problem and were pre-allocated at the same time.
+
+**Fix:** Pre-allocate `tmpHigh`, `mpQ1`, and `mpQ2` via `VirtualAlloc` before the GMP calls, exactly as the Combine section does. Changed from `mpz_init` to `mpz_init2(GMP_LARGE_THRESHOLD * 8 bits)` (so the seed buffer is VirtualAlloc'd and can be freed with `VirtualFree`), then immediately replaced the seed buffer with the correctly-sized VirtualAlloc'd buffer. With `_mp_alloc` set to the needed limb count, `MPZ_REALLOC` short-circuits and `GmpReallocFunc` is never called.
+
+```vb
+' Before (crashes):
+Dim tmpHigh As New mpz_t()
+gmp_lib.mpz_init(tmpHigh)                       ' _mp_alloc = 1
+gmp_lib.mpz_tdiv_q_2exp(tmpHigh, finalQ, k1)   ' GMP tries S→L realloc → crash
+
+' After (pre-alloc bypasses GmpReallocFunc):
+Dim tmpHigh As New mpz_t()
+gmp_lib.mpz_init2(tmpHigh, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))  ' VirtualAlloc'd seed
+' ... VirtualAlloc full buffer, VirtualFree seed, write _mp_alloc + _mp_d ...
+gmp_lib.mpz_tdiv_q_2exp(tmpHigh, finalQ, k1)   ' MPZ_REALLOC short-circuits → no crash
+```
+
+Sizes: `tmpHigh` = `finalQ._mp_size - k1/64 + 2` limbs ≈ 747 MB; `mpQ1` = `mpQ2` = `k1/64 + 2` limbs ≈ 373 MB each.
