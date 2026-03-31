@@ -45,7 +45,7 @@ if ($ReportOnly -ne "") {
     Write-Host "Trace  : $ReportOnly"
     Write-Host "Report : $reportFile"
     Write-Host ""
-    dotnet trace report $ReportOnly topN -n 50 --inclusive | Tee-Object -FilePath $reportFile
+    dotnet-trace report $ReportOnly topN -n 50 --inclusive | Tee-Object -FilePath $reportFile
     Write-Host ""
     Write-Host "Report written: $reportFile" -ForegroundColor Green
     Write-Host "Paste the contents of that file into Claude for analysis."
@@ -101,7 +101,7 @@ if ($Trace) {
     Write-Host "Report : $reportFile"
     Write-Host ""
 
-    dotnet trace collect `
+    dotnet-trace collect `
         --output $traceFile `
         --providers "Microsoft-DotNETCore-SampleProfiler:0xF00000000000:2,Microsoft-DotNETRuntime:0x1F000080018:5" `
         -- $exePath --digits 1000000000 --autostart --autoverify
@@ -112,7 +112,7 @@ if ($Trace) {
     if (Test-Path $traceFile) {
         Write-Host ""
         Write-Host "--- dotnet trace report (topN) ---" -ForegroundColor Yellow
-        dotnet trace report $traceFile topN -n 50 --inclusive | Tee-Object -FilePath $reportFile
+        dotnet-trace report $traceFile topN -n 50 --inclusive | Tee-Object -FilePath $reportFile
         Write-Host ""
         Write-Host "Report written: $reportFile" -ForegroundColor Green
         Write-Host "Paste the contents of that file into Claude for analysis."
