@@ -1664,6 +1664,20 @@ The `mpz_clears` early-free calls and the final `mpz_add` are unchanged and stil
 
 ---
 
+## Section 60 — Parallel.Invoke Inside Parallel Phase 2 Pairs
+
+**Branch:** AdvPerfWork
+
+**Change:** Added `Parallel.Invoke` for the two independent multiply pairs inside the `Parallel.For` lambda of the parallel Phase 2 path — the same §54 pattern already used in the serial top-level path:
+- **Invoke pair 1:** `newP = leftP × rightP` and `newQ = leftQ × rightQ` run simultaneously (disjoint operands).
+- **Invoke pair 2:** `tempA = leftT × rightQ` and `tempB = leftP × rightT` run simultaneously (disjoint operands).
+
+**Why:** As Phase 2 levels rise, the number of pairs halves each level while each pair's operands double in size (and multiply time grows quadratically). Without this change, each outer `Parallel.For` task uses only 1 core — the 4 multiplications per pair are serial. By Level 2 (34,435 pairs, each taking ~4× longer than Level 1), each task was using 1/24th of available cores. Adding `Parallel.Invoke` within each task doubles intra-pair parallelism, effectively maintaining the same number of concurrent multiplications as Level 1 (34,435 × 2 = 68,870 simultaneous multiplies vs Level 1's ~68,870 pairs × 1).
+
+This mirrors the §54 change applied to the serial top-level path. `SafeMpzMul` with non-aliased operands is thread-safe; all shared log writes are already serialised via `SyncLock _logLock`.
+
+---
+
 ## Section 59 — Parallel 9 Sub-Products Inside SafeMpzMul
 
 **Branch:** AdvPerfWork

@@ -1668,16 +1668,18 @@ Public Class Form1
                         Dim tempB As New mpz_t()
                         gmp_lib.mpz_inits(newP, newQ, tempA, tempB, Nothing)
 
-                        SafeMpzMul(newP, leftP, rightP)
+                        ' §60: newP and newQ use disjoint operands — run both simultaneously.
+                        System.Threading.Tasks.Parallel.Invoke(
+                            Sub() SafeMpzMul(newP, leftP, rightP),
+                            Sub() SafeMpzMul(newQ, leftQ, rightQ))
                         gmp_lib.mpz_clears(rightP, Nothing)
-
-                        SafeMpzMul(newQ, leftQ, rightQ)
                         gmp_lib.mpz_clears(leftQ, Nothing)
 
-                        SafeMpzMul(tempA, leftT, rightQ)
+                        ' §60: tempA and tempB use disjoint operands — run both simultaneously.
+                        System.Threading.Tasks.Parallel.Invoke(
+                            Sub() SafeMpzMul(tempA, leftT, rightQ),
+                            Sub() SafeMpzMul(tempB, leftP, rightT))
                         gmp_lib.mpz_clears(leftT, rightQ, Nothing)
-
-                        SafeMpzMul(tempB, leftP, rightT)
                         gmp_lib.mpz_clears(leftP, rightT, Nothing)
 
                         gmp_lib.mpz_add(tempA, tempA, tempB)
