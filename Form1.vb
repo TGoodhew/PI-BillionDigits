@@ -1325,7 +1325,12 @@ Public Class Form1
         ' GMP arithmetic on non-aliased objects is thread-safe. The §44 accumPtr stash lives in
         ' result's native struct (_mp_d slot); inner calls stash into prods(k) structs instead
         ' and never touch result's struct, so the outer stash is preserved across the Parallel.For.
-        Parallel.For(0, 9, Sub(k As Integer)
+        ' §62: Cap DOP to ProcessorCount. When SafeMpzMul is called from Phase 2's Parallel.For
+        ' (which already uses all cores), uncapped inner parallelism causes severe oversubscription.
+        Dim _smm_opts As New System.Threading.Tasks.ParallelOptions() With {
+            .MaxDegreeOfParallelism = Environment.ProcessorCount
+        }
+        Parallel.For(0, 9, _smm_opts, Sub(k As Integer)
             SafeMpzMul(prods(k), A_parts(k \ 3), B_parts(k Mod 3))
         End Sub)
 
@@ -1624,7 +1629,13 @@ Public Class Form1
                     End Sub)
                 phase2PollThread.IsBackground = True
                 phase2PollThread.Start()
-                Parallel.For(0L, pairCount,
+                ' §62: Cap outer DOP to ProcessorCount\2. Each outer task spawns 2 inner tasks
+                ' via Parallel.Invoke, so uncapped outer × 2 = 2×ProcessorCount concurrent
+                ' multiplications — saturating memory bandwidth without proportional speedup.
+                Dim _p2opts As New System.Threading.Tasks.ParallelOptions() With {
+                    .MaxDegreeOfParallelism = System.Math.Max(1, Environment.ProcessorCount \ 2)
+                }
+                Parallel.For(0L, pairCount, _p2opts,
                     Sub(pairIdx As Long)
                         Dim leftIdx As Integer = CInt(pairIdx * 2L)
                         Dim rightIdx As Integer = CInt(pairIdx * 2L + 1L)

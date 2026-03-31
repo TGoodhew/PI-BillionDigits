@@ -1664,6 +1664,20 @@ The `mpz_clears` early-free calls and the final `mpz_add` are unchanged and stil
 
 ---
 
+## Section 62 — Degree-of-Parallelism Caps to Prevent Oversubscription
+
+**Branch:** AdvPerfWork
+
+**Change:** Added `ParallelOptions.MaxDegreeOfParallelism` to two sites:
+
+1. **SafeMpzMul `Parallel.For(0, 9)`** — capped to `Environment.ProcessorCount`. When `SafeMpzMul` is called from inside Phase 2's outer `Parallel.For`, uncapped inner parallelism creates `pairCount × 2 × 9` concurrent tasks on 24 cores (e.g. 8 pairs × 2 × 9 = 144 tasks). This saturates memory bandwidth without proportional throughput gain. Capping to `ProcessorCount` ensures the inner loop never exceeds the physical core count regardless of nesting depth.
+
+2. **Phase 2 outer `Parallel.For(pairCount)`** — capped to `Math.Max(1, Environment.ProcessorCount \ 2)`. Each outer task spawns 2 inner tasks via `Parallel.Invoke` (§60), so uncapped outer DOP × 2 = `2 × ProcessorCount` concurrent multiplications. Capping outer DOP to `ProcessorCount \ 2` keeps total concurrent multiplications at ~`ProcessorCount`, leaving the thread pool headroom to schedule the inner `Parallel.Invoke` tasks without queuing.
+
+**Why:** .NET's thread pool uses work-stealing so oversubscription doesn't deadlock, but it does cause excessive context switching and memory bus contention for GMP's FFT multiplications which are already memory-bandwidth-bound at the larger operand sizes. These caps keep effective concurrency at the physical core count without reducing throughput at levels where pairCount < ProcessorCount/2 (where the outer cap is non-binding anyway).
+
+---
+
 ## Section 61 — Parallel Three-Pass Q Multiply + Non-Blocking GC Between Levels
 
 **Branch:** AdvPerfWork
