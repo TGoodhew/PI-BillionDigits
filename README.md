@@ -1664,6 +1664,28 @@ The `mpz_clears` early-free calls and the final `mpz_add` are unchanged and stil
 
 ---
 
+## Section 61 — Parallel Three-Pass Q Multiply + Non-Blocking GC Between Levels
+
+**Branch:** AdvPerfWork
+
+### Part A — Parallel three-pass Q multiply
+
+**Change:** The three serial passes `r0 = gmpNumer × Q0`, `r1 = gmpNumer × Q1`, `r2 = gmpNumer × Q2` now run simultaneously via `System.Threading.Tasks.Parallel.Invoke`. `gmpNumer` is read-only in all three calls; each result is a distinct `mpz_t`, so there is no shared mutable state between threads.
+
+Q1 and Q2 are no longer spilled to disk between extraction and use — they stay in RAM. r0 and r1 are no longer spilled and reloaded between passes — Combine B and D use the in-memory variables directly. This removes 6 disk I/O operations (4 serialize + 2 deserialize) and eliminates the disk round-trip latency entirely.
+
+**Why:** The three passes were purely serial because of the disk spill/reload pattern. Each pass took roughly the same time as one `SafeMpzMul` on ~400 MB operands. Running them in parallel gives up to 3× speedup on this section. The disk spilling was necessary when memory was constrained (before §58 raised `DISK_THRESHOLD`); with the full-RAM mode on a 64 GB machine the ~1.2 GB peak for all three simultaneous results is trivial.
+
+**Memory impact:** Peak during parallel multiply: gmpNumer (~208 MB) + Q0+Q1+Q2 (~549 MB) + r0+r1+r2 (~1.15 GB) + SafeMpzMul intermediates (~2.9 GB) ≈ ~4.8 GB. Well within the 64 GB budget.
+
+### Part B — Non-blocking GC between Phase 2 levels
+
+**Change:** The `GC.Collect(MaxGeneration, Aggressive, blocking:=True, compacting:=True)` call between Phase 2 levels now uses `GCCollectionMode.Optimized` with `blocking:=False` at all levels except the final level (where the aggressive blocking collect is retained to reclaim the large Phase 2 intermediates before the final arithmetic).
+
+**Why:** The aggressive blocking GC was pausing all threads at each of ~17 levels. At lower levels (many small nodes, fast combines) these pauses were a significant fraction of level time. A non-blocking optimized collect is sufficient to reclaim the `mpz_t` wrapper objects from freed pairs without stalling parallel work.
+
+---
+
 ## Section 60 — Parallel.Invoke Inside Parallel Phase 2 Pairs
 
 **Branch:** AdvPerfWork
