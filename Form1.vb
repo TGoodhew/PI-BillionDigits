@@ -368,66 +368,81 @@ Public Class Form1
     Private Shared _savedGmpFree As free_function
 
     ' ── GMP limb buffer pool ──────────────────────────────────────────────────
-    ' Trace showed GmpAllocFunc (21.8%) + GmpFreeFunc (19.0%) = ~41% of all CPU
-    ' time, purely from VirtualAlloc/VirtualFree kernel round-trips.  The pool
-    ' keeps freed blocks in a per-size LIFO stack and hands them back on the next
-    ' alloc of the same size, eliminating OS kernel calls for the common case.
+    ' Trace 1: GmpAllocFunc (21.8%) + GmpFreeFunc (19.0%) = 40.8% — VirtualAlloc/Free kernel cost.
+    ' Trace 2: ConcurrentDictionary pool → Monitor.Wait appeared at 5.55% because
+    '   GetOrAdd acquires an internal dictionary lock when inserting a new size class.
+    '   Under 24 parallel threads hitting new size classes simultaneously, threads
+    '   blocked on each other inside the dictionary.
     '
-    ' POOL_MAX_BLOCK: blocks larger than this are NOT pooled — they are
-    ' VirtualFree'd immediately.  Top-level combine blocks grow with every level
-    ' and are never reused at the same size, so pooling them commits tens of GB
-    ' that can never be reclaimed until FlushGmpPool, causing VirtualAlloc to
-    ' fail at the very top levels (observed crash at Level 16 with 107 MB alloc
-    ' failing despite 64 GB machine).  16 MB covers all of Phase 1 and the lower
-    ' Phase 2 levels where block sizes repeat; anything bigger is freed directly.
+    ' Fix: power-of-2 bucketed fixed array.  64 pre-allocated ConcurrentStack slots,
+    ' indexed by floor(log2(sz)).  No dictionary, no Monitor — only
+    ' Interlocked.CompareExchange inside ConcurrentStack.TryPop/Push.
     '
-    ' Key   = exact byte size (GMP always frees with the same size it requested).
-    ' Value = LIFO stack of available pointers (LIFO keeps TLB/cache warm).
-    ' Cap   = POOL_CAP blocks per size class; excess blocks are VirtualFree'd.
-    Private Shared ReadOnly _gmpPool As New ConcurrentDictionary(Of Long, ConcurrentStack(Of IntPtr))()
+    ' Bucket b covers requests in [2^(b-1)+1, 2^b].  We allocate 2^b bytes so the
+    ' block always satisfies the request.  GmpFreeFunc receives the original requested
+    ' size, computes the same bucket, and returns the block correctly.
+    '
+    ' POOL_MAX_BLOCK = 16 MB: blocks above this bypass the pool (VirtualFree directly).
+    ' Top-level combine blocks grow with every level; pooling them accumulated 38 GB of
+    ' committed-but-idle pages that caused VirtualAlloc to fail (observed crash at L16).
+    ' Flushing between Phase 2 levels further ensures committed memory tracks live data.
+    '
+    ' Cap = POOL_CAP blocks per bucket; excess blocks are VirtualFree'd immediately.
     Private Const POOL_CAP As Integer = 32
-    Private Const POOL_MAX_BLOCK As Long = 16L * 1024L * 1024L  ' 16 MB
+    Private Const POOL_MAX_BLOCK As Long = 16L * 1024L * 1024L  ' 16 MB — max pooled block
+    Private Const POOL_BUCKETS As Integer = 64
+    ' Initialised in InitGmpVirtualAllocFunctions before the first GMP call.
+    Private Shared _gmpPool(POOL_BUCKETS - 1) As ConcurrentStack(Of IntPtr)
+
+    ''' <summary>Returns floor(log2(sz)) clamped to [0, POOL_BUCKETS-1].</summary>
+    Private Shared Function PoolBucket(sz As Long) As Integer
+        If sz <= 1L Then Return 0
+        Dim b As Integer = 0
+        Dim v As Long = sz - 1L   ' -1 so exact powers of 2 map to their own bucket
+        While v > 0L
+            v = v >> 1
+            b += 1
+        End While
+        Return System.Math.Min(b, POOL_BUCKETS - 1)
+    End Function
 
     Private Shared Function PoolGet(sz As Long) As IntPtr
-        If sz <= POOL_MAX_BLOCK Then
-            Dim stack As ConcurrentStack(Of IntPtr) = Nothing
-            If _gmpPool.TryGetValue(sz, stack) Then
-                Dim ptr As IntPtr
-                If stack.TryPop(ptr) Then Return ptr
-            End If
+        If sz > 0L AndAlso sz <= POOL_MAX_BLOCK Then
+            Dim b As Integer = PoolBucket(sz)
+            Dim ptr As IntPtr
+            If _gmpPool(b).TryPop(ptr) Then Return ptr
+            ' Pool miss — allocate rounded-up bucket size (>= sz, no Monitor needed)
+            Dim allocSz As Long = 1L << b
+            Return VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(allocSz)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
         End If
-        ' Pool miss or oversized block — allocate from OS
+        ' sz=0 or oversized — allocate exactly
         Return VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(sz)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
     End Function
 
     Private Shared Sub PoolReturn(ptr As IntPtr, sz As Long)
-        If sz <= POOL_MAX_BLOCK Then
-            Dim stack As ConcurrentStack(Of IntPtr) =
-                _gmpPool.GetOrAdd(sz, Function(k) New ConcurrentStack(Of IntPtr)())
-            If stack.Count < POOL_CAP Then
-                stack.Push(ptr)
+        If sz > 0L AndAlso sz <= POOL_MAX_BLOCK Then
+            Dim b As Integer = PoolBucket(sz)
+            If _gmpPool(b).Count < POOL_CAP Then
+                _gmpPool(b).Push(ptr)
                 Return
             End If
         End If
-        ' Oversized block or pool full — release to OS immediately
+        ' Oversized, zero-size, or pool full — release to OS immediately
         VirtualFree(ptr, UIntPtr.Zero, MEM_RELEASE)
     End Sub
 
     ''' <summary>
-    ''' Returns all pooled limb blocks to the OS.  Call after each computation
-    ''' to release pooled memory (can be several GB) back to the system.
-    ''' Safe to call while _displayNativePtr is still alive — that buffer is
-    ''' owned by the caller (GMP never calls GmpFreeFunc on it) and is not in
-    ''' the pool.
+    ''' Returns all pooled limb blocks to the OS.  Call between Phase 2 levels and
+    ''' after the full computation so committed memory tracks the live working set.
+    ''' Safe while _displayNativePtr is alive — GMP never calls GmpFreeFunc on it.
     ''' </summary>
     Private Shared Sub FlushGmpPool()
-        For Each kvp In _gmpPool
+        For b As Integer = 0 To POOL_BUCKETS - 1
             Dim ptr As IntPtr
-            While kvp.Value.TryPop(ptr)
+            While _gmpPool(b).TryPop(ptr)
                 VirtualFree(ptr, UIntPtr.Zero, MEM_RELEASE)
             End While
         Next
-        _gmpPool.Clear()
         AppendLog($"[GmpPool] flushed{vbCrLf}")
     End Sub
 
@@ -602,6 +617,11 @@ Public Class Form1
     End Function
 
     Private Sub InitGmpVirtualAllocFunctions()
+        ' Initialise pool buckets (fixed array — no ConcurrentDictionary overhead).
+        For b As Integer = 0 To POOL_BUCKETS - 1
+            _gmpPool(b) = New ConcurrentStack(Of IntPtr)()
+        Next
+
         ' Step 1: Force gmp_lib's static initializer to run NOW, while the native
         ' GMP table still points to the default CRT malloc/realloc/free.
         ' gmp_lib initializes lazily (first access).  If it runs AFTER our thunks
