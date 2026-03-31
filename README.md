@@ -1618,7 +1618,17 @@ Sizes: `tmpHigh` = `finalQ._mp_size - k1/64 + 2` limbs ≈ 747 MB; `mpQ1` = `mpQ
 
 ---
 
-## Section 50 — Fix Phase 1 Status Label Never Updating for Small Chunk Counts
+## Section 50 — Progress Updates During Old Cache Deletion
+
+**Branch:** PerfWork
+
+**Change:** Before deleting old `.bin` cache files, the file list is now fetched with `Directory.GetFiles` so the total count is known. An initial `BeginInvoke` sets `LblStatus` to `"Clearing N cached files from previous run..."`. During the deletion loop a further update fires every 1,000 files showing `"Clearing cache: X / N files deleted..."`.
+
+**Why:** Deleting ~137,739 small files from a previous run is a pure NVMe metadata workload taking ~2 minutes. The thread pool is idle at this point (the `Parallel.For` hasn't started) so `BeginInvoke` reaches the UI thread promptly. Without this change the status label was frozen at the `LogPhase` message for the entire deletion period with no indication of progress.
+
+---
+
+## Section 51 — Fix Phase 1 Status Label Never Updating for Small Chunk Counts
 
 **Branch:** PerfWork
 

@@ -1570,9 +1570,18 @@ Public Class Form1
         ' Clear old cache
         Try
             If System.IO.Directory.Exists(DISK_CACHE_DIR) Then
-                For Each file In System.IO.Directory.GetFiles(DISK_CACHE_DIR, "*.bin")
-                    System.IO.File.Delete(file)
-                Next
+                Dim oldFiles = System.IO.Directory.GetFiles(DISK_CACHE_DIR, "*.bin")
+                Dim oldCount As Integer = oldFiles.Length
+                If oldCount > 0 Then
+                    Me.BeginInvoke(Sub() LblStatus.Text = $"Clearing {oldCount:N0} cached files from previous run...")
+                    For idx As Integer = 0 To oldFiles.Length - 1
+                        System.IO.File.Delete(oldFiles(idx))
+                        If (idx + 1) Mod 1000 = 0 Then
+                            Dim snap As Integer = idx + 1
+                            Me.BeginInvoke(Sub() LblStatus.Text = $"Clearing cache: {snap:N0} / {oldCount:N0} files deleted...")
+                        End If
+                    Next
+                End If
             End If
         Catch
         End Try
