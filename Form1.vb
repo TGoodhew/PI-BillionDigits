@@ -1561,7 +1561,7 @@ Public Class Form1
 
         Const CHUNK_SIZE As Long = 512L
         Const STOP_AT As Long = 1L
-        Const DISK_THRESHOLD As Integer = 1  ' Stay in disk mode until final 2→1 combine only
+        Const DISK_THRESHOLD As Integer = 200_000  ' Keep all data in RAM (137,739 chunks < 200K; peak ~8 GB)
 
         Dim numChunks As Long = (numTerms + CHUNK_SIZE - 1) \ CHUNK_SIZE
 

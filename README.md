@@ -1664,6 +1664,16 @@ The `mpz_clears` early-free calls and the final `mpz_add` are unchanged and stil
 
 ---
 
+## Section 58 — Full RAM Mode (DISK_THRESHOLD raised to 200,000)
+
+**Branch:** AdvPerfWork
+
+**Change:** `DISK_THRESHOLD` raised from `1` to `200_000` in `BinarySplitGMP`. Since `numChunks = 137,739 < 200,000`, Phase 1 keeps all chunk results in the `chunkResults()` array in RAM (no `L0.bin` written). Since every Phase 2 level produces `nextSize < 200,000` nodes, all levels also stay in RAM. The NVMe is no longer touched during computation at all — only for writing the final digit string.
+
+**Why:** `DISK_THRESHOLD = 1` was set defensively during the §40–§44 allocator crash fixes, not because RAM was insufficient. The machine has 64 GB RAM; the total P+Q+T data across any single Phase 2 level is ~1.7 GB (constant across all levels), and peak RAM during a combine (current level + next level + multiply intermediates) is ~6–8 GB. With the allocator now stable, there is no reason to use disk as a crutch. Eliminating disk I/O from Phase 2 removes the NVMe read/write overhead that dominated wall-clock time at Levels 1–13.
+
+---
+
 ## Section 57 — Phase 2 Level Progress in Status Label
 
 **Branch:** PerfWork
