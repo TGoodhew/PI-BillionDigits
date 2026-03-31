@@ -1844,44 +1844,41 @@ Public Class Form1
                     '   tempB are all still live, which was pushing peak RAM from
                     '   ~1,781 MB to ~2,215 MB and triggering a GMP abort().
                     '   After the add, tempB is freed and tempA holds the T result.
+                    ' Steps 1 & 2: newP = leftP*rightP and newQ = leftQ*rightQ are fully
+                    ' independent (disjoint operands) — run both on the thread pool simultaneously.
+                    ' WriteToLog (used in LOGGING_DETAIL) is thread-safe via SyncLock _logLock.
 #If LOGGING_DETAIL >= 1 Then
                     If isTopLevel Then
                         Dim _szLP As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftP.Pointer, 4)
                         Dim _szRP As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightP.Pointer, 4)
                         WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newP  leftP={System.Math.Abs(_szLP):N0} rightP={System.Math.Abs(_szRP):N0} limbs")
-                    End If
-#End If
-                    SafeMpzMul(newP, leftP, rightP)
-                    gmp_lib.mpz_clears(rightP, Nothing)             ' rightP done
-
-#If LOGGING_DETAIL >= 1 Then
-                    If isTopLevel Then
                         Dim _szLQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftQ.Pointer, 4)
                         Dim _szRQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightQ.Pointer, 4)
                         WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newQ  leftQ={System.Math.Abs(_szLQ):N0} rightQ={System.Math.Abs(_szRQ):N0} limbs")
                     End If
 #End If
-                    SafeMpzMul(newQ, leftQ, rightQ)
+                    System.Threading.Tasks.Parallel.Invoke(
+                        Sub() SafeMpzMul(newP, leftP, rightP),
+                        Sub() SafeMpzMul(newQ, leftQ, rightQ))
+                    gmp_lib.mpz_clears(rightP, Nothing)             ' rightP done
                     gmp_lib.mpz_clears(leftQ, Nothing)              ' leftQ done
 
+                    ' Steps 3 & 4: tempA = leftT*rightQ and tempB = leftP*rightT are fully
+                    ' independent (disjoint operands) — run both on the thread pool simultaneously.
 #If LOGGING_DETAIL >= 1 Then
                     If isTopLevel Then
                         Dim _szLT As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftT.Pointer, 4)
                         Dim _szRQ2 As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightQ.Pointer, 4)
                         WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempA  leftT={System.Math.Abs(_szLT):N0} rightQ={System.Math.Abs(_szRQ2):N0} limbs")
-                    End If
-#End If
-                    SafeMpzMul(tempA, leftT, rightQ)
-                    gmp_lib.mpz_clears(leftT, rightQ, Nothing)      ' leftT, rightQ done
-
-#If LOGGING_DETAIL >= 1 Then
-                    If isTopLevel Then
                         Dim _szLP2 As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftP.Pointer, 4)
                         Dim _szRT As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightT.Pointer, 4)
                         WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempB  leftP={System.Math.Abs(_szLP2):N0} rightT={System.Math.Abs(_szRT):N0} limbs")
                     End If
 #End If
-                    SafeMpzMul(tempB, leftP, rightT)
+                    System.Threading.Tasks.Parallel.Invoke(
+                        Sub() SafeMpzMul(tempA, leftT, rightQ),
+                        Sub() SafeMpzMul(tempB, leftP, rightT))
+                    gmp_lib.mpz_clears(leftT, rightQ, Nothing)      ' leftT, rightQ done
                     gmp_lib.mpz_clears(leftP, rightT, Nothing)      ' leftP, rightT done
 
 #If LOGGING_DETAIL >= 1 Then

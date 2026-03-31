@@ -1648,6 +1648,22 @@ Sizes: `tmpHigh` = `finalQ._mp_size - k1/64 + 2` limbs ≈ 747 MB; `mpQ1` = `mpQ
 
 ---
 
+## Section 54 — Parallel Multiplications Within Phase 2 Serial Combines
+
+**Branch:** PerfWork
+
+**Change:** In the serial Phase 2 combine path (top levels, `pairCount < 4`), replaced the four sequential `SafeMpzMul` calls with two `Parallel.Invoke` pairs:
+- **Pair 1:** `newP = leftP × rightP` and `newQ = leftQ × rightQ` run simultaneously (disjoint operands).
+- **Pair 2:** `tempA = leftT × rightQ` and `tempB = leftP × rightT` run simultaneously (disjoint operands).
+
+The `mpz_clears` early-free calls and the final `mpz_add` are unchanged and still happen after both tasks in each pair complete. `LOGGING_DETAIL` pre-call size logs for each pair are emitted together before the `Parallel.Invoke` (read-only access; safe).
+
+**Why:** At the top 2–3 combine levels (1–3 pairs), each `SafeMpzMul` operates on operands hundreds of MB to over a GB in size and takes minutes. Since `newP`/`newQ` use completely disjoint operands, and `tempA`/`tempB` likewise, `Parallel.Invoke` gives ~2× wall-clock speedup on each pair. `SafeMpzMul` calls with distinct result and operand objects are thread-safe: GMP arithmetic on non-aliased `mpz_t` objects is safe concurrently, and all shared state (allocator logging) is already protected by `SyncLock _logLock` (§48).
+
+**Note:** The full 9 sub-product parallelism inside `SafeMpzMul` itself was considered but deferred — see memory file `project_safempzmul_parallel_future.md`.
+
+---
+
 ## Section 53 — Parallel Phase 2 Combines (Levels 1–N-3)
 
 **Branch:** PerfWork
