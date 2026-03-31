@@ -37,6 +37,66 @@ The computation uses the **Chudnovsky algorithm** with **binary splitting**, whi
 
 ---
 
+## Cumulative Summary of Changes
+
+A high-level overview of everything that was changed from the original implementation to reach a working 1-billion-digit computation. The detailed Change Log below documents each individual change and its root cause.
+
+### Architecture
+
+**Disk-based binary split (§3):** The original code held all ~137,000 chunk P/Q/T values in RAM simultaneously — feasible for small digit counts but tens of GB at 1 billion digits. The rewrite streams each chunk to disk immediately after computation and loads one pair at a time during the combine phase. Only the final combine pair is held in memory at once.
+
+**Three-pass multiply (§7, §46, §47):** The final `gmpNumer *= finalQ` multiplication (~1.1 GB × ~1.1 GB) peaks at ~2.3 GB, exceeding available headroom after the other live buffers. `finalQ` is split into three equal bit-thirds (Q0, Q1, Q2) and multiplied separately; the three partial products are shifted and summed to reconstruct the full result. Peak per-pass is ~1.2 GB.
+
+**`SafeMpzMul` (§17–§45):** GMP's internal FFT uses a 32-bit `mp_size_t` (signed `int` on Windows MSVC). For operands above ~67 million limbs (≈ 536 MB each) the FFT's internal size arithmetic overflows, producing garbage or crashing. `SafeMpzMul` is a schoolbook 3×3 split: each operand is divided into three equal thirds by bit position and the nine sub-products are computed separately with GMP's fast routines, which never see an operand large enough to trigger the overflow. Recursive: sub-products that still exceed the threshold recurse.
+
+---
+
+### Memory management
+
+**Custom VirtualAlloc/VirtualFree allocator (§6):** GMP's internal CRT `malloc/free` retains freed pages in a free-list instead of releasing them to the OS. After repeated large allocate/free cycles (Level 17 combine, sqrt, three-pass multiply) the committed-but-idle pages accumulated, hitting the system commit limit (`RAM + page file`). The next large allocation then failed with `NULL` from `malloc` and GMP called `abort()`. Fix: GMP's `mp_set_memory_functions` API replaces the three allocator callbacks. Allocations ≥ 512 KB use `VirtualAlloc(MEM_COMMIT|MEM_RESERVE)` / `VirtualFree(MEM_RELEASE)`, which immediately returns pages to the OS on free. Smaller allocations stay on GMP's own CRT heap.
+
+**Pre-allocation pattern (§19, §21, §23, §37–§38, §47):** When GMP allocates a fresh result buffer via `GmpReallocFunc` (S→L transition), it calls `VirtualAlloc` and then immediately writes into the new pages. The page faults for that write cannot always be serviced in time, causing a silent access violation inside native GMP — a CLR FailFast with no managed handler reachable. The fix used throughout the code is to manually pre-allocate the result buffer with `VirtualAlloc` before the GMP call, then write the pointer and alloc count directly into the native `__mpz_struct`. `MPZ_REALLOC` then short-circuits (result already large enough) and `GmpReallocFunc` is never called.
+
+**`SerializeOneMpz` / `DeserializeOneMpz` (§6, §30):** The original serializer called `mpz_export` with a NULL destination, asking GMP to allocate the export buffer. After the custom allocator was installed that buffer came from `VirtualAlloc`, but the subsequent `gmp_lib.free` used CRT `free` — a heap mismatch crash. Fixed by pre-allocating with `Marshal.AllocHGlobal` and passing it directly. `mpz_export` was also replaced entirely for numbers above 67 million limbs because `mp_size_t` overflow in GMP's export code returns wrong sizes; the serializer now reads raw limb data directly from the native struct via `Marshal.ReadInt64`.
+
+**Spill-and-reload pattern (§5):** Large intermediate values (`finalP`, `finalT`, `gmpSqrt`) are freed or serialised to disk before the peak-memory operations and reloaded afterwards. This keeps peak live memory around ~1.6 GB for the three-pass multiply rather than ~3+ GB.
+
+---
+
+### `SafeMpzMul` internals
+
+`SafeMpzMul` went through approximately 25 iterative fixes (§17–§45) to handle increasingly subtle memory and interop issues. The key ones:
+
+- **Accumulator isolation (§40):** GMP's FFT stack writes beyond its stack frame, corrupting the outer managed call frame's local variables (including `result.Pointer`). A separate `accum` accumulator object, never passed to inner GMP calls, is immune to this corruption.
+- **Raw P/Invoke bypass (§42):** Math.Gmp.Native's managed wrapper reassigns `mpz_t.Pointer` on every P/Invoke call in a way that does not persist for local value-type objects. All inner GMP calls inside `SafeMpzMul` are made via raw `DllImport` helpers operating on saved `IntPtr` values directly, bypassing the wrapper.
+- **§44 stash:** `accumPtr` (the 16-byte header for the accumulator) is stored at `result.Pointer + 8` (the `_mp_d` slot of the blanked result struct). This slot survives native GMP stack-frame corruption because inner calls only write to `prod`'s struct. After all 9 sub-products, `accumPtr` is recovered from the stash and its fields are copied back to `result`.
+- **A-piece direct extraction (§35):** A-pieces 1 and 2 are extracted by copying limbs directly from `opA`'s limb array into the pre-allocated `A_part` buffer, avoiding a 710 MB temporary per A-piece.
+- **`mpz_init2` for A_part (§45):** When `mpz_tdiv_r_2exp` produces zero (all low limbs of Q are zero due to accumulated factors of 2), GMP skips `MPZ_REALLOC` and leaves `_mp_alloc = 1`. The subsequent `CopyMemory` of 57+ MB into a 1-limb buffer was a silent heap overflow. Fixed by using `mpz_init2(A_part, bitsA)` to pre-allocate the correct number of limbs before the tdiv call.
+
+---
+
+### Platform / interop fixes
+
+**`mp_bitcnt_t` 32-bit limit (§22, §46):** On Windows, GMP is compiled with MSVC where `unsigned long` is 32 bits. `mp_bitcnt_t` (used for bit-shift counts) therefore caps at 4,294,967,295. At 1-billion-digit scale several shift counts exceed this. Fixed by splitting operations that would require a shift > 4.29 billion bits into two sequential shifts each within the 32-bit range.
+
+**`mp_size_t` 32-bit overflow (§17):** GMP's FFT code computes intermediate sizes as `mp_size_t` (32-bit signed int on Windows). Numbers above ~67 million limbs cause overflow in that arithmetic, producing wrong results or crashes. `SafeMpzMul` ensures GMP never sees an operand that large.
+
+**`Chr()` encoding (§24):** VB.NET's `Chr()` uses Windows-1252 code page encoding, unavailable in .NET Core. Replaced with `ChrW()` (Unicode) throughout.
+
+**Delegate lifetime (§2, §6):** All delegate objects passed to native APIs (`SetUnhandledExceptionFilter`, `mp_set_memory_functions`) are stored as `Shared` fields. Local-variable delegates are collected by the GC, leaving dangling function pointers.
+
+---
+
+### Observability
+
+- Structured log file with timestamp, thread ID, elapsed time, and RAM per entry; synchronous flush on every write guarantees the last entry before a crash is on disk (§2).
+- `SetUnhandledExceptionFilter` native crash handler catches GMP `abort()` and writes a marker before the process exits (§2).
+- `LOGGING_DETAIL` compile-time constant: 0 = phases only, 1 = detail on final combine + all ComputePiGMP steps (default), 2 = full trace (§2).
+- Native buffer streaming: the billion-digit result is kept as a native `char*` rather than a managed string, avoiding a 1 GB managed allocation and GC pressure during display (§13).
+- Thread priority `AboveNormal` + `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` to prevent Windows from throttling the compute thread (§27).
+
+---
+
 ## Change Log
 
 Differences between the original implementation and the current code, with explanations of why each change was made.
