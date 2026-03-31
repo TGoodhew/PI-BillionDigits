@@ -1666,7 +1666,7 @@ Public Class Form1
                     ' offset so Phase 2 can seek directly to this chunk.
                     Dim stagingBuf(4194303) As Byte  ' 4 MB staging buffer (§56)
                     Using ms As New System.IO.MemoryStream()
-                        Using bw As New System.IO.BinaryWriter(ms)
+                        Using bw As New System.IO.BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen:=True)
                             SerializeOneMpz(tempP, bw, stagingBuf)
                             SerializeOneMpz(tempQ, bw, stagingBuf)
                             SerializeOneMpz(tempT, bw, stagingBuf)
