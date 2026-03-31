@@ -1626,8 +1626,11 @@ Public Class Form1
                 chunkResults(CInt(i)) = node
 
                 Dim done As Long = Interlocked.Increment(completedChunks)
-                If done Mod 5000L = 0L Then
+                If done Mod 1000L = 0L Then
                     WriteToLog($"[Phase1] {done:N0}/{numChunks:N0} chunks complete (parallel)")
+                    Me.BeginInvoke(Sub()
+                                       LblStatus.Text = $"Phase 1: {done:N0} / {numChunks:N0} chunks ({done * 100L \ numChunks:N0}%)"
+                                   End Sub)
                 End If
             End Sub)
 
