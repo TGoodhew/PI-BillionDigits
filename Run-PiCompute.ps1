@@ -90,7 +90,7 @@ if ($Trace) {
     if (Test-Path $traceFile) {
         Write-Host ""
         Write-Host "--- dotnet trace report (topN) ---" -ForegroundColor Yellow
-        dotnet trace report $traceFile --report topN | Tee-Object -FilePath $reportFile
+        dotnet trace report $traceFile topN -n 50 --inclusive | Tee-Object -FilePath $reportFile
         Write-Host ""
         Write-Host "Report written: $reportFile" -ForegroundColor Green
         Write-Host "Paste the contents of that file into Claude for analysis."
