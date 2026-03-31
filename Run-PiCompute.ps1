@@ -19,16 +19,38 @@
     directory, suitable for pasting into Claude for analysis.
     Requires: dotnet tool install --global dotnet-trace
 
+.PARAMETER ReportOnly
+    Path to an existing .nettrace file.  Skips clean/build/run and goes
+    straight to generating the topN report.  Use this to process a trace
+    file from a previous run.
+
 .EXAMPLE
     .\Run-PiCompute.ps1
     .\Run-PiCompute.ps1 -Trace
+    .\Run-PiCompute.ps1 -ReportOnly "C:\...\pi_trace_20260331_121017.nettrace"
 #>
 param(
-    [switch]$Trace
+    [switch]$Trace,
+    [string]$ReportOnly = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# ── ReportOnly: skip everything except report generation ─────────────────────
+if ($ReportOnly -ne "") {
+    if (-not (Test-Path $ReportOnly)) { throw "Trace file not found: $ReportOnly" }
+    $reportFile = [System.IO.Path]::ChangeExtension($ReportOnly, $null).TrimEnd('.') + "_report.txt"
+    Write-Host "--- dotnet trace report (topN) ---" -ForegroundColor Yellow
+    Write-Host "Trace  : $ReportOnly"
+    Write-Host "Report : $reportFile"
+    Write-Host ""
+    dotnet trace report $ReportOnly topN -n 50 --inclusive | Tee-Object -FilePath $reportFile
+    Write-Host ""
+    Write-Host "Report written: $reportFile" -ForegroundColor Green
+    Write-Host "Paste the contents of that file into Claude for analysis."
+    exit 0
+}
 
 $projectDir  = $PSScriptRoot
 $projectFile = Join-Path $projectDir 'PI-BillionDigits.vbproj'
