@@ -1614,7 +1614,17 @@ Sizes: `tmpHigh` = `finalQ._mp_size - k1/64 + 2` limbs ≈ 747 MB; `mpQ1` = `mpQ
 
 **Branch:** PerfWork
 
-**Change:** Replaced the serial `For i As Long = 0 To numChunks - 1` loop in `BinarySplitGMP` Phase 1 with `Parallel.For(0L, numChunks, Sub(i) ...)`. Results are written into a pre-sized `DiskNode()` array by index (no locking needed — each index is written exactly once by exactly one thread). After the parallel section, `diskNodes.AddRange(chunkResults)` populates the list in order. Progress is tracked with `Interlocked.Increment` and logged every 5,000 completions. Per-chunk `SerializeNodeToDisk` log entries are suppressed (`detailLog:=False`) to avoid 137K concurrent log writes.
+**Change:** Replaced the serial `For i As Long = 0 To numChunks - 1` loop in `BinarySplitGMP` Phase 1 with `Parallel.For(0L, numChunks, Sub(i) ...)`. Results are written into a pre-sized `DiskNode()` array by index (no locking needed — each index is written exactly once by exactly one thread). After the parallel section, `diskNodes.AddRange(chunkResults)` populates the list in order. Progress is tracked with `Interlocked.Increment` and the status label is updated every ~1% of chunks (`statusUpdateInterval = Math.Max(1, numChunks \ 100)`). Per-chunk `SerializeNodeToDisk` log entries are suppressed (`detailLog:=False`) to avoid 137K concurrent log writes.
+
+---
+
+## Section 50 — Fix Phase 1 Status Label Never Updating for Small Chunk Counts
+
+**Branch:** PerfWork
+
+**Change:** Replaced the hard-coded `done Mod 1000L = 0L` update condition with `done Mod statusUpdateInterval = 0L`, where `statusUpdateInterval = Math.Max(1L, numChunks \ 100L)`. The interval variable is computed once before the `Parallel.For`.
+
+**Why:** With 138 chunks (small digit counts), `done` only reaches 138, so `done Mod 1000 = 0` is never satisfied and `LblStatus` stays frozen on the initial `LogPhase` message for the entire duration of Phase 1. The dynamic interval fires at every ~1% of completion regardless of total chunk count — for 138 chunks it updates every 1–2 chunks; for 137,700 chunks it updates every ~1,377.
 
 **Why:** The 137,700 Level-0 chunks are fully independent. Each `BinarySplitChunk` invocation:
 - uses only thread-local `mpz_t` variables (no shared mutable GMP state)

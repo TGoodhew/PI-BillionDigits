@@ -1592,6 +1592,8 @@ Public Class Form1
         ' Results are written into a pre-sized array by index (no list locking).
         Dim chunkResults(CInt(numChunks) - 1) As DiskNode
         Dim completedChunks As Long = 0L
+        ' Update status every ~1% of chunks, but at least every 1 chunk.
+        Dim statusUpdateInterval As Long = Math.Max(1L, numChunks \ 100L)
         Parallel.For(0L, numChunks,
             Sub(i As Long)
                 Dim chunkStart As Long = i * CHUNK_SIZE
@@ -1626,7 +1628,7 @@ Public Class Form1
                 chunkResults(CInt(i)) = node
 
                 Dim done As Long = Interlocked.Increment(completedChunks)
-                If done Mod 1000L = 0L Then
+                If done Mod statusUpdateInterval = 0L Then
                     WriteToLog($"[Phase1] {done:N0}/{numChunks:N0} chunks complete (parallel)")
                     Me.BeginInvoke(Sub()
                                        LblStatus.Text = $"Phase 1: {done:N0} / {numChunks:N0} chunks ({done * 100L \ numChunks:N0}%)"
