@@ -81,8 +81,7 @@ if ($Trace) {
 
     dotnet trace collect `
         --output $traceFile `
-        --profile cpu-sampling `
-        --providers "Microsoft-DotNETRuntime:0x1F000080018:5" `
+        --providers "Microsoft-DotNETCore-SampleProfiler:0xF00000000000:2,Microsoft-DotNETRuntime:0x1F000080018:5" `
         -- $exePath --digits 1000000000 --autostart --autoverify
 
     if ($LASTEXITCODE -ne 0) { Write-Warning "dotnet trace exited with code $LASTEXITCODE" }
