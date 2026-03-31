@@ -43,6 +43,12 @@ Public Class Form1
     Private WithEvents displayTimer As New System.Windows.Forms.Timer()
     Private gmpC3Const As mpz_t = Nothing
 
+    ' ── Headless / command-line mode ─────────────────────────────────────────
+    ' Set by --autostart (suppress all dialogs) and --autoverify (run verify +
+    ' Application.Exit after computation completes).
+    Private _headless As Boolean = False
+    Private _autoVerify As Boolean = False
+
     ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
     ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
     ' thread-safe.  Only the File.AppendAllText log writes need serialisation so
@@ -510,8 +516,33 @@ Public Class Form1
     End Function
 
     Private Sub Form1_Load(sender As Object, e As EventArgs) Handles MyBase.Load
+        ' ── Parse command-line arguments ─────────────────────────────────────
+        ' Supported flags:
+        '   --digits N       Set the digit count (no commas required)
+        '   --autostart      Suppress all dialogs and auto-begin computation
+        '   --autoverify     After computation, auto-run verify + exit
+        Dim args() As String = Environment.GetCommandLineArgs()
+        Dim i As Integer = 1
+        Do While i < args.Length
+            Select Case args(i).ToLower()
+                Case "--digits"
+                    If i + 1 < args.Length Then
+                        Dim d As Long
+                        If Long.TryParse(args(i + 1).Replace(",", ""), d) Then
+                            TxtDigitsofPI.Text = d.ToString("N0")
+                        End If
+                        i += 1
+                    End If
+                Case "--autostart"
+                    _headless = True
+                Case "--autoverify"
+                    _autoVerify = True
+            End Select
+            i += 1
+        Loop
+
         LblStatus.Text = "Ready"
-        TxtDigitsofPI.Text = "1,000,000"
+        TxtDigitsofPI.Text = If(TxtDigitsofPI.Text <> "", TxtDigitsofPI.Text, "1,000,000")
         ChkboxDisplay.Checked = True
         RtbPiDigits.MaxLength = 0
         RtbPiDigits.ReadOnly = False
@@ -570,7 +601,11 @@ Public Class Form1
                 System.IO.Directory.CreateDirectory(DISK_CACHE_DIR)
             End If
         Catch ex As Exception
-            MessageBox.Show("Warning: Could not create output directory: " & ex.Message)
+            If Not _headless Then
+                MessageBox.Show("Warning: Could not create output directory: " & ex.Message)
+            Else
+                WriteToLog("[DIALOG] Warning: Could not create output directory: " & ex.Message)
+            End If
         End Try
 
         ' Verify which libgmp DLL is loaded
@@ -585,13 +620,25 @@ Public Class Form1
         Catch
         End Try
 
-        MessageBox.Show(
-        "64-bit process: " & Environment.Is64BitProcess.ToString() & vbCrLf &
-        "IntPtr.Size: " & IntPtr.Size.ToString() & " (must be 8)" & vbCrLf &
-        "Available RAM: " & (GC.GetGCMemoryInfo().TotalAvailableMemoryBytes \ 1048576).ToString() & "MB" & vbCrLf &
-        "GMP DLL: " & gmpDllPath & vbCrLf &
-        "GMP Memory: System allocator (default)",
-        "Process Info")
+        Dim processInfoMsg As String =
+            "64-bit process: " & Environment.Is64BitProcess.ToString() & vbCrLf &
+            "IntPtr.Size: " & IntPtr.Size.ToString() & " (must be 8)" & vbCrLf &
+            "Available RAM: " & (GC.GetGCMemoryInfo().TotalAvailableMemoryBytes \ 1048576).ToString() & "MB" & vbCrLf &
+            "GMP DLL: " & gmpDllPath & vbCrLf &
+            "GMP Memory: System allocator (default)"
+        If Not _headless Then
+            MessageBox.Show(processInfoMsg, "Process Info")
+        Else
+            WriteToLog("[DIALOG] Process Info: " & processInfoMsg.Replace(vbCrLf, " | "))
+        End If
+    End Sub
+
+    Private Sub Form1_Shown(sender As Object, e As EventArgs) Handles MyBase.Shown
+        ' When --autostart is supplied, kick off computation as soon as the
+        ' form is fully visible (so all Load-time initialisation is complete).
+        If _headless Then
+            BtnCompute_Click(Me, EventArgs.Empty)
+        End If
     End Sub
 
     ' ── AppDomain-level unhandled exception handler ──────────────────────────
@@ -717,10 +764,21 @@ Public Class Form1
                     If _displayNativePtr <> IntPtr.Zero OrElse result <> "" Then
                         Me.Invoke(Sub() StreamPiToScreen(result))
                     End If
+                    ' --autoverify: run verify logic headlessly then exit
+                    If _autoVerify Then
+                        Me.Invoke(Sub()
+                                      BtnTest_Click(Nothing, EventArgs.Empty)
+                                      Application.Exit()
+                                  End Sub)
+                    End If
                 Catch oex As OutOfMemoryException
                     WriteExceptionToLog("ComputeThread/OutOfMemoryException", oex)
                     Me.Invoke(Sub()
-                                  MessageBox.Show("OUT OF MEMORY!" & vbCrLf & oex.Message & vbCrLf & oex.StackTrace)
+                                  If Not _headless Then
+                                      MessageBox.Show("OUT OF MEMORY!" & vbCrLf & oex.Message & vbCrLf & oex.StackTrace)
+                                  Else
+                                      WriteToLog("[DIALOG] OUT OF MEMORY: " & oex.Message)
+                                  End If
                                   LblStatus.Text = "Error: Out of memory"
                                   BtnCompute.Enabled = True
                                   BtnPause.Enabled = False
@@ -729,7 +787,11 @@ Public Class Form1
                 Catch ovex As OverflowException
                     WriteExceptionToLog("ComputeThread/OverflowException", ovex)
                     Me.Invoke(Sub()
-                                  MessageBox.Show("OVERFLOW!" & vbCrLf & ovex.Message & vbCrLf & ovex.StackTrace)
+                                  If Not _headless Then
+                                      MessageBox.Show("OVERFLOW!" & vbCrLf & ovex.Message & vbCrLf & ovex.StackTrace)
+                                  Else
+                                      WriteToLog("[DIALOG] OVERFLOW: " & ovex.Message)
+                                  End If
                                   LblStatus.Text = "Error: Overflow"
                                   BtnCompute.Enabled = True
                                   BtnPause.Enabled = False
@@ -738,7 +800,11 @@ Public Class Form1
                 Catch ex As Exception
                     WriteExceptionToLog("ComputeThread", ex)
                     Me.Invoke(Sub()
-                                  MessageBox.Show("EXCEPTION: " & ex.GetType().Name & vbCrLf & ex.Message & vbCrLf & ex.StackTrace)
+                                  If Not _headless Then
+                                      MessageBox.Show("EXCEPTION: " & ex.GetType().Name & vbCrLf & ex.Message & vbCrLf & ex.StackTrace)
+                                  Else
+                                      WriteToLog("[DIALOG] EXCEPTION: " & ex.GetType().Name & ": " & ex.Message)
+                                  End If
                                   LblStatus.Text = "Error: " & ex.Message
                                   BtnCompute.Enabled = True
                                   BtnPause.Enabled = False
@@ -2759,28 +2825,43 @@ Public Class Form1
         End If
 
         Dim pos1 As Integer = piText.IndexOf("999999")
+        Dim verify1 As String
         If pos1 >= 0 Then
-            MessageBox.Show($"Found '999999' at position {pos1}!" & vbCrLf &
-                           $"Expected position: 762" & vbCrLf &
-                           $"Correct: {pos1 = 762}")
+            verify1 = $"Found '999999' at position {pos1}! Expected: 762. Correct: {pos1 = 762}"
         Else
-            MessageBox.Show("999999 not found!")
+            verify1 = "999999 not found!"
+        End If
+        If Not _headless Then
+            MessageBox.Show(verify1)
+        Else
+            WriteToLog("[DIALOG] Verify 999999: " & verify1)
+            LblStatus.Text = verify1
         End If
 
         Dim pos2 As Integer = piText.IndexOf("777777777")
+        Dim verify2 As String
         If pos2 >= 0 Then
-            MessageBox.Show($"Found '777777777' at position {pos2}!" & vbCrLf &
-                           $"Expected position: 24,658,601" & vbCrLf &
-                           $"Correct: {pos2 = 24658601}")
+            verify2 = $"Found '777777777' at position {pos2}! Expected: 24,658,601. Correct: {pos2 = 24658601}"
         Else
-            MessageBox.Show("777777777 not found - may need more digits!")
+            verify2 = "777777777 not found - may need more digits!"
+        End If
+        If Not _headless Then
+            MessageBox.Show(verify2)
+        Else
+            WriteToLog("[DIALOG] Verify 777777777: " & verify2)
         End If
 
         Dim pos3 As Integer = piText.IndexOf("27182818284")
+        Dim verify3 As String
         If pos3 >= 0 Then
-            MessageBox.Show($"Found first digits of e '27182818284' at position {pos3}!")
+            verify3 = $"Found first digits of e '27182818284' at position {pos3}!"
         Else
-            MessageBox.Show("First digits of e not found in current digits!")
+            verify3 = "First digits of e not found in current digits!"
+        End If
+        If Not _headless Then
+            MessageBox.Show(verify3)
+        Else
+            WriteToLog("[DIALOG] Verify e digits: " & verify3)
         End If
     End Sub
 
