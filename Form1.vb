@@ -543,7 +543,7 @@ Public Class Form1
 
         LblStatus.Text = "Ready"
         TxtDigitsofPI.Text = If(TxtDigitsofPI.Text <> "", TxtDigitsofPI.Text, "1,000,000")
-        ChkboxDisplay.Checked = True
+        ChkboxDisplay.Checked = Not _headless
         RtbPiDigits.MaxLength = 0
         RtbPiDigits.ReadOnly = False
         RtbPiDigits.Font = New Font("Consolas", 10)
@@ -554,7 +554,8 @@ Public Class Form1
         displayTimer.Interval = 100
         displayTimer.Enabled = False
         RtbPiDigits.Dock = DockStyle.Fill
-        TxtChunkSize.Text = "500"
+        TxtChunkSize.Text = If(_headless, "500000", "500")
+        If _headless Then ChkboxWriteToFile.Checked = True
         LstBoxPhases.Items.Clear()
 
         ' ── Subscribe to AppDomain.UnhandledException ─────────────────────────

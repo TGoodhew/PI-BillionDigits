@@ -16,3 +16,7 @@ packages/
 # Windows
 Thumbs.db
 Desktop.ini
+
+# dotnet-trace output
+*.nettrace
+*_report.txt
