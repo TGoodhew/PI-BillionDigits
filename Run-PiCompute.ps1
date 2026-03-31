@@ -9,15 +9,19 @@
     No dialogs will appear during the run.  All suppressed dialog text
     is written to the phase log with a [DIALOG] prefix for review.
 
+    Output files (always written to c:\PiOutput):
+        pi_digits.txt      — computed Pi digits
+        pi_phase_log.txt   — phase timings + suppressed dialog text
+
 .PARAMETER Trace
     Wrap the run in dotnet-trace to collect CPU sampling + runtime events.
-    Produces a .nettrace file and a plain-text _report.txt suitable for
-    pasting into Claude for analysis.
+    Produces a .nettrace file and a plain-text _report.txt in the project
+    directory, suitable for pasting into Claude for analysis.
     Requires: dotnet tool install --global dotnet-trace
 
 .EXAMPLE
     .\Run-PiCompute.ps1
-    .\Run-PiCompute.ps1 --trace
+    .\Run-PiCompute.ps1 -Trace
 #>
 param(
     [switch]$Trace
@@ -28,14 +32,24 @@ $ErrorActionPreference = 'Stop'
 
 $projectDir  = $PSScriptRoot
 $projectFile = Join-Path $projectDir 'PI-BillionDigits.vbproj'
-$outputDir   = Join-Path $projectDir 'bin\Release\net10.0-windows10.0.26100.0'
-$exePath     = Join-Path $outputDir  'PI-BillionDigits.exe'
+$buildDir    = Join-Path $projectDir 'bin\Release\net10.0-windows10.0.26100.0'
+$exePath     = Join-Path $buildDir   'PI-BillionDigits.exe'
+$piOutputDir = 'c:\PiOutput'
+$digitsFile  = Join-Path $piOutputDir 'pi_digits.txt'
+$logFile     = Join-Path $piOutputDir 'pi_phase_log.txt'
 
 Write-Host "=== PI-BillionDigits headless run ===" -ForegroundColor Cyan
 Write-Host "Project : $projectFile"
-Write-Host "Output  : $exePath"
+Write-Host "Digits  : $digitsFile"
+Write-Host "Log     : $logFile"
 if ($Trace) { Write-Host "Mode    : CPU trace enabled" -ForegroundColor Magenta }
 Write-Host ""
+
+# ── Ensure output directory exists ───────────────────────────────────────────
+if (-not (Test-Path $piOutputDir)) {
+    Write-Host "Creating output directory: $piOutputDir"
+    New-Item -ItemType Directory -Path $piOutputDir | Out-Null
+}
 
 # ── 1. Clean ─────────────────────────────────────────────────────────────────
 Write-Host "--- dotnet clean ---" -ForegroundColor Yellow
@@ -52,7 +66,7 @@ if (-not (Test-Path $exePath)) { throw "Exe not found after build: $exePath" }
 
 # ── 3. Run (with or without trace) ───────────────────────────────────────────
 Write-Host ""
-Write-Host "Suppressed dialogs will appear in c:\PiOutput\pi_phase_log.txt with [DIALOG] prefix."
+Write-Host "Suppressed dialogs will appear in $logFile with [DIALOG] prefix."
 Write-Host ""
 
 if ($Trace) {
@@ -91,3 +105,5 @@ if ($Trace) {
 
 Write-Host ""
 Write-Host "=== Run complete ===" -ForegroundColor Cyan
+Write-Host "Digits : $digitsFile"
+Write-Host "Log    : $logFile"
