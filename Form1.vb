@@ -2678,6 +2678,19 @@ Public Class Form1
                 $" | Streaming started ({digitCount:N0} digits)" & vbCrLf)
         Catch
         End Try
+
+        ' Fast path: display is off — skip the timer loop entirely and go straight
+        ' to file write (if requested), then re-enable the Compute button.
+        If Not ChkboxDisplay.Checked Then
+            BtnCompute.Enabled = True
+            BtnPause.Enabled = False
+            Timer1.Stop()
+            LstBoxPhases.Items.Add($"{stopWatch.Elapsed:hh\:mm\:ss\.ff} | Display skipped")
+            WriteResultToFile(digitCount)
+            If _displayNativePtr = IntPtr.Zero Then displayStr = Nothing
+            Return
+        End If
+
         displayTimer.Enabled = False
         RtbPiDigits.Clear()
         LblDigitsDisplayed.Text = "0"
@@ -2686,6 +2699,47 @@ Public Class Form1
         displayIdx = 0
         displayTotal = 0
         displayTimer.Enabled = True
+    End Sub
+
+    ''' <summary>
+    ''' Writes the computed Pi digits to outputFile (if ChkboxWriteToFile is checked),
+    ''' or just updates the status label.  Called from both the display-timer completion
+    ''' path and the fast path when display is turned off.
+    ''' </summary>
+    Private Sub WriteResultToFile(digitCount As Long)
+        If ChkboxWriteToFile.Checked Then
+            LblStatus.Text = "Writing to file..."
+            Try
+                If Not System.IO.Directory.Exists(System.IO.Path.GetDirectoryName(outputFile)) Then
+                    System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(outputFile))
+                End If
+                If _displayNativePtr <> IntPtr.Zero Then
+                    ' Stream the native char buffer to file in 1 MB chunks.
+                    ' Insert decimal point after the first digit ("3" → "3.").
+                    Using fs As New System.IO.FileStream(outputFile, System.IO.FileMode.Create, System.IO.FileAccess.Write)
+                        fs.WriteByte(Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, 0))
+                        fs.WriteByte(Asc("."c))
+                        Const FILE_CHUNK As Integer = 1024 * 1024
+                        Dim buf(FILE_CHUNK - 1) As Byte
+                        Dim written As Long = 1
+                        While written < _displayNativeLen
+                            Dim toWrite As Integer = CInt(System.Math.Min(FILE_CHUNK, _displayNativeLen - written))
+                            Runtime.InteropServices.Marshal.Copy(
+                                New IntPtr(_displayNativePtr.ToInt64() + written), buf, 0, toWrite)
+                            fs.Write(buf, 0, toWrite)
+                            written += toWrite
+                        End While
+                    End Using
+                Else
+                    System.IO.File.WriteAllText(outputFile, displayStr)
+                End If
+                LblStatus.Text = $"Done! Saved to {outputFile}"
+            Catch ex As Exception
+                LblStatus.Text = "File save error: " & ex.Message
+            End Try
+        Else
+            LblStatus.Text = $"Done! {digitCount:N0} digits computed."
+        End If
     End Sub
 
     Private Sub DisplayTimer_Tick(sender As Object, e As EventArgs) Handles displayTimer.Tick
@@ -2707,37 +2761,7 @@ Public Class Form1
             Catch
             End Try
 
-            If ChkboxWriteToFile.Checked Then
-                LblStatus.Text = "Writing to file..."
-                Try
-                    If Not System.IO.Directory.Exists(System.IO.Path.GetDirectoryName(outputFile)) Then
-                        System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(outputFile))
-                    End If
-                    If useNative Then
-                        ' Stream the native char buffer to file in 1 MB chunks.
-                        ' Insert decimal point after the first digit ("3" → "3.").
-                        Using fs As New System.IO.FileStream(outputFile, System.IO.FileMode.Create, System.IO.FileAccess.Write)
-                            fs.WriteByte(Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, 0))
-                            fs.WriteByte(Asc("."c))
-                            Const FILE_CHUNK As Integer = 1024 * 1024
-                            Dim buf(FILE_CHUNK - 1) As Byte
-                            Dim written As Long = 1
-                            While written < _displayNativeLen
-                                Dim toWrite As Integer = CInt(System.Math.Min(FILE_CHUNK, _displayNativeLen - written))
-                                Runtime.InteropServices.Marshal.Copy(
-                                    New IntPtr(_displayNativePtr.ToInt64() + written), buf, 0, toWrite)
-                                fs.Write(buf, 0, toWrite)
-                                written += toWrite
-                            End While
-                        End Using
-                    Else
-                        System.IO.File.WriteAllText(outputFile, displayStr)
-                    End If
-                    LblStatus.Text = $"Done! Saved to {outputFile}"
-                Catch ex As Exception
-                    LblStatus.Text = "File save error: " & ex.Message
-                End Try
-            End If
+            WriteResultToFile(CLng(totalLen))
 
             If useNative Then
                 ' Leave _displayNativePtr alive so BtnTest_Click can search it directly.
