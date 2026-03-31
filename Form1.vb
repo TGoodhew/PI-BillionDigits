@@ -20,6 +20,7 @@ Imports System.Numerics
 Imports System.IO
 Imports System.Threading
 Imports System.Threading.Tasks
+Imports System.Collections.Concurrent
 Imports System.Runtime.InteropServices
 Imports Math.Gmp.Native
 Imports System.Diagnostics
@@ -269,6 +270,58 @@ Public Class Form1
     Private Shared _savedGmpRealloc As reallocate_function
     Private Shared _savedGmpFree As free_function
 
+    ' ── GMP limb buffer pool ──────────────────────────────────────────────────
+    ' Trace showed GmpAllocFunc (21.8%) + GmpFreeFunc (19.0%) = ~41% of all CPU
+    ' time, purely from VirtualAlloc/VirtualFree kernel round-trips.  The pool
+    ' keeps freed large blocks in a per-size stack and hands them back on the next
+    ' alloc of the same size, eliminating OS kernel calls for the common case.
+    '
+    ' Key   = exact byte size (GMP always frees with the same size it requested).
+    ' Value = LIFO stack of available pointers (LIFO is cache-friendly — the most
+    '         recently freed block still has warm TLB/cache entries).
+    ' Cap   = POOL_CAP blocks per size class; excess blocks are VirtualFree'd so
+    '         pooled memory stays proportional to current working set.
+    Private Shared ReadOnly _gmpPool As New ConcurrentDictionary(Of Long, ConcurrentStack(Of IntPtr))()
+    Private Const POOL_CAP As Integer = 32
+
+    Private Shared Function PoolGet(sz As Long) As IntPtr
+        Dim stack As ConcurrentStack(Of IntPtr) = Nothing
+        If _gmpPool.TryGetValue(sz, stack) Then
+            Dim ptr As IntPtr
+            If stack.TryPop(ptr) Then Return ptr
+        End If
+        ' Pool miss — allocate from OS
+        Return VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(sz)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+    End Function
+
+    Private Shared Sub PoolReturn(ptr As IntPtr, sz As Long)
+        Dim stack As ConcurrentStack(Of IntPtr) =
+            _gmpPool.GetOrAdd(sz, Function(k) New ConcurrentStack(Of IntPtr)())
+        If stack.Count < POOL_CAP Then
+            stack.Push(ptr)
+        Else
+            VirtualFree(ptr, UIntPtr.Zero, MEM_RELEASE)
+        End If
+    End Sub
+
+    ''' <summary>
+    ''' Returns all pooled limb blocks to the OS.  Call after each computation
+    ''' to release pooled memory (can be several GB) back to the system.
+    ''' Safe to call while _displayNativePtr is still alive — that buffer is
+    ''' owned by the caller (GMP never calls GmpFreeFunc on it) and is not in
+    ''' the pool.
+    ''' </summary>
+    Private Shared Sub FlushGmpPool()
+        For Each kvp In _gmpPool
+            Dim ptr As IntPtr
+            While kvp.Value.TryPop(ptr)
+                VirtualFree(ptr, UIntPtr.Zero, MEM_RELEASE)
+            End While
+        Next
+        _gmpPool.Clear()
+        AppendLog($"[GmpPool] flushed{vbCrLf}")
+    End Sub
+
     ' Large allocations (>= 512 KB) use VirtualAlloc so VirtualFree immediately
     ' decommits the pages.  Small allocations delegate to GMP's own default CRT
     ' allocator — the static CRT heap inside libgmp-10.dll — which is the SAME
@@ -287,18 +340,9 @@ Public Class Form1
         End If
         Dim sz As Long = CLng(rawSz)
         If sz >= GMP_LARGE_THRESHOLD Then
-            Dim ptr As IntPtr = VirtualAlloc(IntPtr.Zero,
-                                             New UIntPtr(rawSz),
-                                             MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
-            ' Log VirtualAlloc calls in the 400 KB–2 MB range — these are the
-            ' mpz_init2 seed allocations for combine output variables.  Logging
-            ' them confirms (a) GmpAllocFunc is reached and (b) the allocation
-            ' size seen here, which sets _mp_alloc in the native GMP struct.
-            If sz >= 400L * 1024L AndAlso sz <= 2L * 1024L * 1024L Then
-                AppendLog($"[GmpAlloc] VA: size={sz:N0} → ptr={ptr:X}{vbCrLf}")
-            End If
+            Dim ptr As IntPtr = PoolGet(sz)
             If ptr = IntPtr.Zero Then
-                AppendLog($"[GmpAlloc] VirtualAlloc({sz:N0} bytes) FAILED — GMP will abort{vbCrLf}")
+                AppendLog($"[GmpAlloc] PoolGet({sz:N0} bytes) FAILED — GMP will abort{vbCrLf}")
             End If
             Return New void_ptr(ptr)
         End If
@@ -336,53 +380,42 @@ Public Class Form1
         Const LOG_STEP_THRESHOLD As Long = 400L * 1024L * 1024L
 
         If oldSz >= GMP_LARGE_THRESHOLD AndAlso newSz >= GMP_LARGE_THRESHOLD Then
-            ' large → large: new VirtualAlloc, copy, free old
+            ' large → large: pool-get new block, copy, pool-return old block
             If newSz >= LOG_STEP_THRESHOLD Then
                 AppendLog($"[GmpRealloc] L→L enter: new={newSz:N0} old={oldSz:N0}{vbCrLf}")
             End If
-            newP = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(newSz)),
-                                MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            newP = PoolGet(newSz)
             If newP <> IntPtr.Zero Then
-                If newSz >= LOG_STEP_THRESHOLD Then
-                    AppendLog($"[GmpRealloc] L→L VA ok: newP={newP:X} copy={copyBytes.ToUInt64():N0}{vbCrLf}")
-                End If
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
+                PoolReturn(oldP, oldSz)
                 If newSz >= LOG_STEP_THRESHOLD Then
-                    AppendLog($"[GmpRealloc] L→L copy done; about to VirtualFree oldP={oldP:X}{vbCrLf}")
-                End If
-                VirtualFree(oldP, UIntPtr.Zero, MEM_RELEASE)
-                If newSz >= LOG_STEP_THRESHOLD Then
-                    AppendLog($"[GmpRealloc] L→L VirtualFree done → OK{vbCrLf}")
+                    AppendLog($"[GmpRealloc] L→L done → OK{vbCrLf}")
                 End If
             Else
-                AppendLog($"[GmpRealloc] large→large VirtualAlloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
+                AppendLog($"[GmpRealloc] large→large PoolGet({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
             End If
         ElseIf newSz >= GMP_LARGE_THRESHOLD Then
-            ' small → large: VirtualAlloc for new, CRT-free for old
+            ' small → large: pool-get new block, CRT-free old block
             If newSz >= LOG_STEP_THRESHOLD Then
                 AppendLog($"[GmpRealloc] S→L enter: new={newSz:N0} old={oldSz:N0}{vbCrLf}")
             End If
-            newP = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(newSz)),
-                                MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            newP = PoolGet(newSz)
             If newP <> IntPtr.Zero Then
-                If newSz >= LOG_STEP_THRESHOLD Then
-                    AppendLog($"[GmpRealloc] S→L VA ok: newP={newP:X} copy={copyBytes.ToUInt64():N0}{vbCrLf}")
-                End If
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
                 _savedGmpFree(old_ptr, old_size)
                 If newSz >= LOG_STEP_THRESHOLD Then
-                    AppendLog($"[GmpRealloc] S→L CRT-free done → OK{vbCrLf}")
+                    AppendLog($"[GmpRealloc] S→L done → OK{vbCrLf}")
                 End If
             Else
-                AppendLog($"[GmpRealloc] small→large VirtualAlloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
+                AppendLog($"[GmpRealloc] small→large PoolGet({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
             End If
         Else
-            ' large → small: CRT-alloc for new, VirtualFree for old
+            ' large → small: CRT-alloc new block, pool-return old block
             Dim newVoid As void_ptr = _savedGmpAlloc(new_size)
             newP = newVoid.ToIntPtr()
             If newP <> IntPtr.Zero Then
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
-                VirtualFree(oldP, UIntPtr.Zero, MEM_RELEASE)
+                PoolReturn(oldP, oldSz)
             Else
                 AppendLog($"[GmpRealloc] large→small CRT alloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
             End If
@@ -407,7 +440,7 @@ Public Class Form1
         End If
         Dim sz As Long = CLng(rawSz)
         If sz >= GMP_LARGE_THRESHOLD Then
-            VirtualFree(p, UIntPtr.Zero, MEM_RELEASE)
+            PoolReturn(p, sz)
         Else
             _savedGmpFree(ptr, size)
         End If
@@ -2663,6 +2696,10 @@ Public Class Form1
                 End If
             Catch
             End Try
+            ' Return all pooled limb blocks to the OS now that computation is done.
+            ' _displayNativePtr is NOT in the pool (GMP never calls GmpFreeFunc on
+            ' the mpz_get_str result buffer) so it remains valid for display/verify.
+            FlushGmpPool()
         End Try
     End Function
 
