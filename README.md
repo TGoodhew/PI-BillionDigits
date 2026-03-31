@@ -1664,6 +1664,25 @@ The `mpz_clears` early-free calls and the final `mpz_add` are unchanged and stil
 
 ---
 
+## Section 59 — Parallel 9 Sub-Products Inside SafeMpzMul
+
+**Branch:** AdvPerfWork
+
+**Change:** The 9 independent sub-products `A_i × B_j` (i,j ∈ {0,1,2}) inside `SafeMpzMul`'s slow path now run concurrently via `Parallel.For(0, 9, ...)` instead of serially in nested `For i / For j` loops.
+
+Key design points:
+- **A-piece extraction moved upfront:** A0, A1, A2 are all extracted before the parallel section (previously A_part was lazily re-extracted per-i iteration). Each is `mpz_init2`'d to ensure `_mp_alloc >= mA` before direct limb copies for A1 and A2.
+- **9 distinct `prods(k)` result buffers:** Each thread writes into its own `prods(k)` object; no shared mutable state between threads.
+- **Thread safety:** A_parts and B_parts are read-only during the parallel section. GMP arithmetic on non-aliased `mpz_t` objects is intrinsically thread-safe. The §44 accumPtr stash lives in `result`'s native struct; inner calls stash into `prods(k)` structs and never touch `result`'s struct, preserving the outer stash.
+- **Serial accumulation after:** After `Parallel.For`, a serial `For k = 0 To 8` loop shifts each `prod_k` into its positional slot (`shiftBits = i*bitsA + j*bitsB`) and accumulates into `accum`. No inner `SafeMpzMul` calls in this loop — no §42/§44 corruption risk. Each `prods(k)` is freed immediately after use to limit peak RAM.
+- **Existing shift/add/free logic preserved:** The VirtualAlloc pre-sizing for `shifted`, two-step shift for large `shiftBits`, and `GmpRaw_add` accumulation are unchanged from the serial path.
+
+**Why:** At Levels 14–17 of Phase 2, `SafeMpzMul` hits the slow path because `szA + szB > 33,554,431` limbs. The 9 sub-products were computed serially, leaving 23 cores idle during each multiply. Running them in parallel gives up to 9× speedup on the sub-product step — the dominant cost at the top combine levels.
+
+**Memory impact:** At Level 17, 9 simultaneous sub-products × ~374 MB each = ~3.4 GB extra peak RAM. Plus A0+A1+A2 simultaneously (~1.1 GB vs ~374 MB lazy). Total ~3.1 GB extra vs serial — well within the 64 GB machine's headroom.
+
+---
+
 ## Section 58 — Full RAM Mode (DISK_THRESHOLD raised to 200,000)
 
 **Branch:** AdvPerfWork
