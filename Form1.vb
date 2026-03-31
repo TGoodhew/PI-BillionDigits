@@ -1592,17 +1592,23 @@ Public Class Form1
         ' Results are written into a pre-sized array by index (no list locking).
         Dim chunkResults(CInt(numChunks) - 1) As DiskNode
         Dim completedChunks As Long = 0L
-        ' A System.Threading.Timer polls completedChunks every 500 ms and pushes
-        ' a label update via BeginInvoke.  This decouples UI refresh from the
-        ' parallel loop: even when all cores are saturated the timer fires on a
-        ' dedicated OS thread and the UI thread stays responsive.
-        Dim phase1Timer As New System.Threading.Timer(
-            Sub(state As Object)
-                Dim snap As Long = Interlocked.Read(completedChunks)
-                Me.BeginInvoke(Sub()
-                                   LblStatus.Text = $"Phase 1: {snap:N0} / {numChunks:N0} chunks ({snap * 100L \ numChunks:N0}%)"
-                               End Sub)
-            End Sub, Nothing, 0, 500)
+        ' Dedicated background thread (not thread-pool) polls completedChunks
+        ' every 500 ms.  System.Threading.Timer callbacks run on thread-pool
+        ' threads, which Parallel.For exhausts — causing ~2 min delay before
+        ' the first update.  A dedicated Thread gets its own OS time-slice
+        ' independent of thread-pool saturation.
+        Dim phase1PollThread As New System.Threading.Thread(
+            Sub()
+                While Interlocked.Read(completedChunks) < numChunks
+                    Dim snap As Long = Interlocked.Read(completedChunks)
+                    Me.BeginInvoke(Sub()
+                                       LblStatus.Text = $"Phase 1: {snap:N0} / {numChunks:N0} chunks ({snap * 100L \ numChunks:N0}%)"
+                                   End Sub)
+                    System.Threading.Thread.Sleep(500)
+                End While
+            End Sub)
+        phase1PollThread.IsBackground = True
+        phase1PollThread.Start()
 
         Parallel.For(0L, numChunks,
             Sub(i As Long)
@@ -1643,7 +1649,7 @@ Public Class Form1
                 End If
             End Sub)
 
-        phase1Timer.Dispose()
+        phase1PollThread.Join()
 
         diskNodes.AddRange(chunkResults)
 
