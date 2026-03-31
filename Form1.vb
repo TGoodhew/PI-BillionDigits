@@ -1688,160 +1688,251 @@ Public Class Form1
                 LogPhase($"Level {level}: Processing {currentSize:N0} → {nextSize:N0} nodes (MEMORY mode)")
             End If
 
-            Dim nodeIdx As Long = 0
-            While nodeIdx < diskNodes.Count - 1
+            ' ── Choose serial or parallel combine ────────────────────────────
+            ' Each pair (left, right) is fully independent: it reads from unique
+            ' disk files, allocates only thread-local mpz_t objects, and writes
+            ' to a unique output file.  Parallel.For is used when pairCount is
+            ' large enough to justify the overhead.  At the top levels (few pairs,
+            ' very large operands) we stay serial to avoid multiplying peak RAM.
+            Dim pairCount As Long = diskNodes.Count \ 2L
 
-                ' ── Load left operand ────────────────────────────────────────
-                Dim leftP As mpz_t = Nothing
-                Dim leftQ As mpz_t = Nothing
-                Dim leftT As mpz_t = Nothing
+            If pairCount >= 4L Then
+                ' ── Parallel path ────────────────────────────────────────────
+                Dim nextResults(CInt(pairCount) - 1) As DiskNode
+                Parallel.For(0L, pairCount,
+                    Sub(pairIdx As Long)
+                        Dim leftIdx As Integer = CInt(pairIdx * 2L)
+                        Dim rightIdx As Integer = CInt(pairIdx * 2L + 1L)
 
-                If diskNodes(CInt(nodeIdx)).IsInMemory Then
-                    leftP = diskNodes(CInt(nodeIdx)).MemP
-                    leftQ = diskNodes(CInt(nodeIdx)).MemQ
-                    leftT = diskNodes(CInt(nodeIdx)).MemT
-                Else
-                    LoadNodeFromDisk(diskNodes(CInt(nodeIdx)).FilePath, leftP, leftQ, leftT, isLastLevel)
-                    Try
-                        System.IO.File.Delete(diskNodes(CInt(nodeIdx)).FilePath)
-                    Catch
-                    End Try
-                End If
+                        ' Load left
+                        Dim leftP As mpz_t = Nothing
+                        Dim leftQ As mpz_t = Nothing
+                        Dim leftT As mpz_t = Nothing
+                        If diskNodes(leftIdx).IsInMemory Then
+                            leftP = diskNodes(leftIdx).MemP
+                            leftQ = diskNodes(leftIdx).MemQ
+                            leftT = diskNodes(leftIdx).MemT
+                        Else
+                            LoadNodeFromDisk(diskNodes(leftIdx).FilePath, leftP, leftQ, leftT, isLastLevel)
+                            Try : System.IO.File.Delete(diskNodes(leftIdx).FilePath) : Catch : End Try
+                        End If
 
-                ' ── Load right operand ───────────────────────────────────────
-                Dim rightP As mpz_t = Nothing
-                Dim rightQ As mpz_t = Nothing
-                Dim rightT As mpz_t = Nothing
+                        ' Load right
+                        Dim rightP As mpz_t = Nothing
+                        Dim rightQ As mpz_t = Nothing
+                        Dim rightT As mpz_t = Nothing
+                        If diskNodes(rightIdx).IsInMemory Then
+                            rightP = diskNodes(rightIdx).MemP
+                            rightQ = diskNodes(rightIdx).MemQ
+                            rightT = diskNodes(rightIdx).MemT
+                        Else
+                            LoadNodeFromDisk(diskNodes(rightIdx).FilePath, rightP, rightQ, rightT, isLastLevel)
+                            Try : System.IO.File.Delete(diskNodes(rightIdx).FilePath) : Catch : End Try
+                        End If
 
-                If diskNodes(CInt(nodeIdx + 1)).IsInMemory Then
-                    rightP = diskNodes(CInt(nodeIdx + 1)).MemP
-                    rightQ = diskNodes(CInt(nodeIdx + 1)).MemQ
-                    rightT = diskNodes(CInt(nodeIdx + 1)).MemT
-                Else
-                    LoadNodeFromDisk(diskNodes(CInt(nodeIdx + 1)).FilePath, rightP, rightQ, rightT, isLastLevel)
-                    Try
-                        System.IO.File.Delete(diskNodes(CInt(nodeIdx + 1)).FilePath)
-                    Catch
-                    End Try
-                End If
+                        ' Combine (same early-free and in-place-add sequence as serial path)
+                        Dim newP As New mpz_t()
+                        Dim newQ As New mpz_t()
+                        Dim tempA As New mpz_t()
+                        Dim tempB As New mpz_t()
+                        gmp_lib.mpz_inits(newP, newQ, tempA, tempB, Nothing)
 
-                ' ── Combine ──────────────────────────────────────────────────
-                Dim newP As New mpz_t()
-                Dim newQ As New mpz_t()
-                Dim tempA As New mpz_t()
-                Dim tempB As New mpz_t()
-                gmp_lib.mpz_inits(newP, newQ, tempA, tempB, Nothing)
+                        SafeMpzMul(newP, leftP, rightP)
+                        gmp_lib.mpz_clears(rightP, Nothing)
 
-                ' Early-free optimisation: release each input operand immediately
-                ' after its last use so GMP can reuse that memory for the next
-                ' allocation.  Holding all 6 inputs alive through all 4 multiplies
-                ' was the primary cause of the Level-17 OOM crash — peak RAM was
-                ' ~2 GB higher than necessary.
-                '
-                ' Dependency map (determines earliest safe free point):
-                '   rightP  → only needed for newP      → free after step 1
-                '   leftQ   → only needed for newQ      → free after step 2
-                '   rightQ  → needed for newQ AND tempA → free after step 3
-                '   leftT   → only needed for tempA     → free after step 3
-                '   leftP   → needed for newP AND tempB → free after step 4
-                '   rightT  → only needed for tempB     → free after step 4
-                '
-                ' In-place add optimisation (Level-17 crash fix):
-                '   mpz_add(tempA, tempA, tempB) accumulates the T result into
-                '   tempA's already-allocated limb buffer (GMP §5.5 explicitly
-                '   permits an aliased destination).  This avoids allocating a
-                '   fresh ~443 MB block for newT while newP, newQ, tempA, and
-                '   tempB are all still live, which was pushing peak RAM from
-                '   ~1,781 MB to ~2,215 MB and triggering a GMP abort().
-                '   After the add, tempB is freed and tempA holds the T result.
-#If LOGGING_DETAIL >= 1 Then
-                If isTopLevel Then
-                    Dim _szLP As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftP.Pointer, 4)
-                    Dim _szRP As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightP.Pointer, 4)
-                    WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newP  leftP={System.Math.Abs(_szLP):N0} rightP={System.Math.Abs(_szRP):N0} limbs")
-                End If
-#End If
-                SafeMpzMul(newP, leftP, rightP)
-                gmp_lib.mpz_clears(rightP, Nothing)             ' rightP done
+                        SafeMpzMul(newQ, leftQ, rightQ)
+                        gmp_lib.mpz_clears(leftQ, Nothing)
 
-#If LOGGING_DETAIL >= 1 Then
-                If isTopLevel Then
-                    Dim _szLQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftQ.Pointer, 4)
-                    Dim _szRQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightQ.Pointer, 4)
-                    WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newQ  leftQ={System.Math.Abs(_szLQ):N0} rightQ={System.Math.Abs(_szRQ):N0} limbs")
-                End If
-#End If
-                SafeMpzMul(newQ, leftQ, rightQ)
-                gmp_lib.mpz_clears(leftQ, Nothing)              ' leftQ done
+                        SafeMpzMul(tempA, leftT, rightQ)
+                        gmp_lib.mpz_clears(leftT, rightQ, Nothing)
 
-#If LOGGING_DETAIL >= 1 Then
-                If isTopLevel Then
-                    Dim _szLT As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftT.Pointer, 4)
-                    Dim _szRQ2 As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightQ.Pointer, 4)
-                    WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempA  leftT={System.Math.Abs(_szLT):N0} rightQ={System.Math.Abs(_szRQ2):N0} limbs")
-                End If
-#End If
-                SafeMpzMul(tempA, leftT, rightQ)
-                gmp_lib.mpz_clears(leftT, rightQ, Nothing)      ' leftT, rightQ done
+                        SafeMpzMul(tempB, leftP, rightT)
+                        gmp_lib.mpz_clears(leftP, rightT, Nothing)
 
-#If LOGGING_DETAIL >= 1 Then
-                If isTopLevel Then
-                    Dim _szLP2 As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftP.Pointer, 4)
-                    Dim _szRT As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightT.Pointer, 4)
-                    WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempB  leftP={System.Math.Abs(_szLP2):N0} rightT={System.Math.Abs(_szRT):N0} limbs")
-                End If
-#End If
-                SafeMpzMul(tempB, leftP, rightT)
-                gmp_lib.mpz_clears(leftP, rightT, Nothing)      ' leftP, rightT done
+                        gmp_lib.mpz_add(tempA, tempA, tempB)
+                        gmp_lib.mpz_clears(tempB, Nothing)
 
-#If LOGGING_DETAIL >= 1 Then
-                If isTopLevel Then
-                    Dim _szTA As Integer = Runtime.InteropServices.Marshal.ReadInt32(tempA.Pointer, 4)
-                    Dim _szTB As Integer = Runtime.InteropServices.Marshal.ReadInt32(tempB.Pointer, 4)
-                    WriteToLog($"[Combine] L{level} N{nodeIdx\2}: add newT  tempA={System.Math.Abs(_szTA):N0} tempB={System.Math.Abs(_szTB):N0} limbs")
-                End If
-#End If
-                gmp_lib.mpz_add(tempA, tempA, tempB)            ' T result in tempA's buffer
-                gmp_lib.mpz_clears(tempB, Nothing)              ' tempB done; tempA IS newT
-#If LOGGING_DETAIL >= 1 Then
-                If isTopLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: combine complete")
-#End If
+                        ' Store result
+                        Dim resultNode As DiskNode
+                        resultNode.FilePath = Nothing
+                        resultNode.MemP = Nothing
+                        resultNode.MemQ = Nothing
+                        resultNode.MemT = Nothing
+                        resultNode.Level = level
+                        resultNode.Index = CInt(pairIdx)
+                        resultNode.IsInMemory = Not useDisk
 
-                ' ── Store result ─────────────────────────────────────────────
-                ' tempA holds the T result (renamed conceptually to newT below)
-                Dim resultNode As DiskNode
-                resultNode.FilePath = Nothing
-                resultNode.MemP = Nothing
-                resultNode.MemQ = Nothing
-                resultNode.MemT = Nothing
-                resultNode.Level = level
-                resultNode.Index = nextDiskNodes.Count
-                resultNode.IsInMemory = Not useDisk
+                        If useDisk Then
+                            resultNode.FilePath = $"{DISK_CACHE_DIR}L{level}_N{pairIdx}.bin"
+                            SerializeNodeToDisk(newP, newQ, tempA, resultNode.FilePath, isLastLevel)
+                            gmp_lib.mpz_clears(newP, newQ, tempA, Nothing)
+                        Else
+                            resultNode.MemP = newP
+                            resultNode.MemQ = newQ
+                            resultNode.MemT = tempA
+                        End If
 
-                If useDisk Then
-                    resultNode.FilePath = $"{DISK_CACHE_DIR}L{level}_N{resultNode.Index}.bin"
+                        nextResults(CInt(pairIdx)) = resultNode
+                    End Sub)
+                nextDiskNodes.AddRange(nextResults)
+
+            Else
+                ' ── Serial path (top levels: few pairs, very large operands) ─
+                Dim nodeIdx As Long = 0
+                While nodeIdx < diskNodes.Count - 1
+
+                    ' Load left operand
+                    Dim leftP As mpz_t = Nothing
+                    Dim leftQ As mpz_t = Nothing
+                    Dim leftT As mpz_t = Nothing
+
+                    If diskNodes(CInt(nodeIdx)).IsInMemory Then
+                        leftP = diskNodes(CInt(nodeIdx)).MemP
+                        leftQ = diskNodes(CInt(nodeIdx)).MemQ
+                        leftT = diskNodes(CInt(nodeIdx)).MemT
+                    Else
+                        LoadNodeFromDisk(diskNodes(CInt(nodeIdx)).FilePath, leftP, leftQ, leftT, isLastLevel)
+                        Try
+                            System.IO.File.Delete(diskNodes(CInt(nodeIdx)).FilePath)
+                        Catch
+                        End Try
+                    End If
+
+                    ' Load right operand
+                    Dim rightP As mpz_t = Nothing
+                    Dim rightQ As mpz_t = Nothing
+                    Dim rightT As mpz_t = Nothing
+
+                    If diskNodes(CInt(nodeIdx + 1)).IsInMemory Then
+                        rightP = diskNodes(CInt(nodeIdx + 1)).MemP
+                        rightQ = diskNodes(CInt(nodeIdx + 1)).MemQ
+                        rightT = diskNodes(CInt(nodeIdx + 1)).MemT
+                    Else
+                        LoadNodeFromDisk(diskNodes(CInt(nodeIdx + 1)).FilePath, rightP, rightQ, rightT, isLastLevel)
+                        Try
+                            System.IO.File.Delete(diskNodes(CInt(nodeIdx + 1)).FilePath)
+                        Catch
+                        End Try
+                    End If
+
+                    ' Combine
+                    Dim newP As New mpz_t()
+                    Dim newQ As New mpz_t()
+                    Dim tempA As New mpz_t()
+                    Dim tempB As New mpz_t()
+                    gmp_lib.mpz_inits(newP, newQ, tempA, tempB, Nothing)
+
+                    ' Early-free optimisation: release each input operand immediately
+                    ' after its last use so GMP can reuse that memory for the next
+                    ' allocation.  Holding all 6 inputs alive through all 4 multiplies
+                    ' was the primary cause of the Level-17 OOM crash — peak RAM was
+                    ' ~2 GB higher than necessary.
+                    '
+                    ' Dependency map (determines earliest safe free point):
+                    '   rightP  → only needed for newP      → free after step 1
+                    '   leftQ   → only needed for newQ      → free after step 2
+                    '   rightQ  → needed for newQ AND tempA → free after step 3
+                    '   leftT   → only needed for tempA     → free after step 3
+                    '   leftP   → needed for newP AND tempB → free after step 4
+                    '   rightT  → only needed for tempB     → free after step 4
+                    '
+                    ' In-place add optimisation (Level-17 crash fix):
+                    '   mpz_add(tempA, tempA, tempB) accumulates the T result into
+                    '   tempA's already-allocated limb buffer (GMP §5.5 explicitly
+                    '   permits an aliased destination).  This avoids allocating a
+                    '   fresh ~443 MB block for newT while newP, newQ, tempA, and
+                    '   tempB are all still live, which was pushing peak RAM from
+                    '   ~1,781 MB to ~2,215 MB and triggering a GMP abort().
+                    '   After the add, tempB is freed and tempA holds the T result.
 #If LOGGING_DETAIL >= 1 Then
                     If isTopLevel Then
-                        Dim _preSerNewQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(newQ.Pointer, 4)
-                        WriteToLog($"[Combine] L{level} N{nodeIdx\2}: pre-serialize newQ._mp_size={_preSerNewQ:N0}")
+                        Dim _szLP As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftP.Pointer, 4)
+                        Dim _szRP As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightP.Pointer, 4)
+                        WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newP  leftP={System.Math.Abs(_szLP):N0} rightP={System.Math.Abs(_szRP):N0} limbs")
                     End If
 #End If
-                    SerializeNodeToDisk(newP, newQ, tempA, resultNode.FilePath, isLastLevel)
-                    gmp_lib.mpz_clears(newP, newQ, tempA, Nothing)
-                Else
-                    resultNode.MemP = newP
-                    resultNode.MemQ = newQ
-                    resultNode.MemT = tempA
-                End If
+                    SafeMpzMul(newP, leftP, rightP)
+                    gmp_lib.mpz_clears(rightP, Nothing)             ' rightP done
 
-                nextDiskNodes.Add(resultNode)
+#If LOGGING_DETAIL >= 1 Then
+                    If isTopLevel Then
+                        Dim _szLQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftQ.Pointer, 4)
+                        Dim _szRQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightQ.Pointer, 4)
+                        WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newQ  leftQ={System.Math.Abs(_szLQ):N0} rightQ={System.Math.Abs(_szRQ):N0} limbs")
+                    End If
+#End If
+                    SafeMpzMul(newQ, leftQ, rightQ)
+                    gmp_lib.mpz_clears(leftQ, Nothing)              ' leftQ done
 
-                If nextDiskNodes.Count Mod 100 = 0 Then
-                    LogPhase($"  Processed {nextDiskNodes.Count:N0}/{nextSize:N0} node pairs")
-                End If
+#If LOGGING_DETAIL >= 1 Then
+                    If isTopLevel Then
+                        Dim _szLT As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftT.Pointer, 4)
+                        Dim _szRQ2 As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightQ.Pointer, 4)
+                        WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempA  leftT={System.Math.Abs(_szLT):N0} rightQ={System.Math.Abs(_szRQ2):N0} limbs")
+                    End If
+#End If
+                    SafeMpzMul(tempA, leftT, rightQ)
+                    gmp_lib.mpz_clears(leftT, rightQ, Nothing)      ' leftT, rightQ done
 
-                nodeIdx += 2
-            End While
+#If LOGGING_DETAIL >= 1 Then
+                    If isTopLevel Then
+                        Dim _szLP2 As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftP.Pointer, 4)
+                        Dim _szRT As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightT.Pointer, 4)
+                        WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempB  leftP={System.Math.Abs(_szLP2):N0} rightT={System.Math.Abs(_szRT):N0} limbs")
+                    End If
+#End If
+                    SafeMpzMul(tempB, leftP, rightT)
+                    gmp_lib.mpz_clears(leftP, rightT, Nothing)      ' leftP, rightT done
+
+#If LOGGING_DETAIL >= 1 Then
+                    If isTopLevel Then
+                        Dim _szTA As Integer = Runtime.InteropServices.Marshal.ReadInt32(tempA.Pointer, 4)
+                        Dim _szTB As Integer = Runtime.InteropServices.Marshal.ReadInt32(tempB.Pointer, 4)
+                        WriteToLog($"[Combine] L{level} N{nodeIdx\2}: add newT  tempA={System.Math.Abs(_szTA):N0} tempB={System.Math.Abs(_szTB):N0} limbs")
+                    End If
+#End If
+                    gmp_lib.mpz_add(tempA, tempA, tempB)            ' T result in tempA's buffer
+                    gmp_lib.mpz_clears(tempB, Nothing)              ' tempB done; tempA IS newT
+#If LOGGING_DETAIL >= 1 Then
+                    If isTopLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: combine complete")
+#End If
+
+                    ' Store result
+                    ' tempA holds the T result (renamed conceptually to newT below)
+                    Dim resultNode As DiskNode
+                    resultNode.FilePath = Nothing
+                    resultNode.MemP = Nothing
+                    resultNode.MemQ = Nothing
+                    resultNode.MemT = Nothing
+                    resultNode.Level = level
+                    resultNode.Index = nextDiskNodes.Count
+                    resultNode.IsInMemory = Not useDisk
+
+                    If useDisk Then
+                        resultNode.FilePath = $"{DISK_CACHE_DIR}L{level}_N{resultNode.Index}.bin"
+#If LOGGING_DETAIL >= 1 Then
+                        If isTopLevel Then
+                            Dim _preSerNewQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(newQ.Pointer, 4)
+                            WriteToLog($"[Combine] L{level} N{nodeIdx\2}: pre-serialize newQ._mp_size={_preSerNewQ:N0}")
+                        End If
+#End If
+                        SerializeNodeToDisk(newP, newQ, tempA, resultNode.FilePath, isLastLevel)
+                        gmp_lib.mpz_clears(newP, newQ, tempA, Nothing)
+                    Else
+                        resultNode.MemP = newP
+                        resultNode.MemQ = newQ
+                        resultNode.MemT = tempA
+                    End If
+
+                    nextDiskNodes.Add(resultNode)
+
+                    If nextDiskNodes.Count Mod 100 = 0 Then
+                        LogPhase($"  Processed {nextDiskNodes.Count:N0}/{nextSize:N0} node pairs")
+                    End If
+
+                    nodeIdx += 2
+                End While
+            End If
 
             ' Handle odd node — carry it forward unchanged
             If diskNodes.Count Mod 2 = 1 Then

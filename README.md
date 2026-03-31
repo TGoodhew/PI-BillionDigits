@@ -1645,3 +1645,13 @@ Sizes: `tmpHigh` = `finalQ._mp_size - k1/64 + 2` limbs ≈ 747 MB; `mpQ1` = `mpQ
 **Change:** Replaced the `BeginInvoke`-inside-parallel-loop approach with a dedicated background `Thread` (not a thread-pool thread) that polls `completedChunks` via `Interlocked.Read` every 500 ms and posts a `BeginInvoke` to update `LblStatus`. The thread loops `While completedChunks < numChunks` and exits naturally when the parallel loop finishes; the calling thread calls `phase1PollThread.Join()` after `Parallel.For` returns. The `Parallel.For` body retains only `Interlocked.Increment` and a file log every 5,000 completions.
 
 **Why:** `System.Threading.Timer` callbacks execute on thread-pool threads. `Parallel.For` exhausts the thread pool, so timer callbacks are queued but cannot run — causing the status label to stay frozen at the initial `LogPhase` message for ~2 minutes. A dedicated `Thread` gets its own OS time-slice from the Windows scheduler, independent of thread-pool saturation, so the first status update appears within 500 ms of `Parallel.For` starting.
+
+---
+
+## Section 53 — Parallel Phase 2 Combines (Levels 1–N-3)
+
+**Branch:** PerfWork
+
+**Change:** Replaced the serial `While nodeIdx < diskNodes.Count - 1` inner loop in the Phase 2 combine pass with a `Parallel.For` over pair indices when `pairCount >= 4`. Each pair is fully independent: it loads from two unique disk files, uses only thread-local `mpz_t` objects, and writes to a unique output file. Results are written into a pre-sized `nextResults(pairCount-1)` array by pair index (no locking needed), then `nextDiskNodes.AddRange(nextResults)` populates the list in order. The serial path is retained for `pairCount < 4` (the top levels where operands are very large and there are too few pairs for parallelism to help without excessive RAM pressure). The `LOGGING_DETAIL` diagnostic blocks and the per-100-pair `LogPhase` call remain in the serial path only.
+
+**Why:** At the lower combine levels there are thousands of independent node pairs per level — e.g. ~68,869 pairs at Level 1, ~34 at Level 12. Each pair's four `SafeMpzMul` calls are entirely independent of all other pairs. On a 24-logical-processor machine this is the same situation as Phase 1: a serial loop leaves 23 cores idle. The `pairCount >= 4` threshold keeps the top 1–2 levels serial where loading multiple pairs simultaneously would multiply already-large (~hundreds of MB to GB) operands across threads and risk OOM.
