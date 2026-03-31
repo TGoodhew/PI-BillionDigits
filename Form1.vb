@@ -2126,6 +2126,13 @@ Public Class Form1
                 GC.Collect(GC.MaxGeneration, GCCollectionMode.Optimized, False, False)
             End If
 
+            ' §65: Flush the pool between levels.  Blocks freed during level N are
+            ' unique sizes that double each level — they will never be reused at the
+            ' same size in level N+1, so pooling them only commits pages that can
+            ' never be reclaimed.  Flushing here keeps committed memory proportional
+            ' to the current working set instead of accumulating across all levels.
+            FlushGmpPool()
+
             Dim memNow As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
             LogPhase($"Combine level {level}: {currentSize:N0} nodes remaining (RAM: {memNow:N0}MB)")
         End While
