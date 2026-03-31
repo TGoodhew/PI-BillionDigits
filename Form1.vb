@@ -273,35 +273,47 @@ Public Class Form1
     ' ── GMP limb buffer pool ──────────────────────────────────────────────────
     ' Trace showed GmpAllocFunc (21.8%) + GmpFreeFunc (19.0%) = ~41% of all CPU
     ' time, purely from VirtualAlloc/VirtualFree kernel round-trips.  The pool
-    ' keeps freed large blocks in a per-size stack and hands them back on the next
+    ' keeps freed blocks in a per-size LIFO stack and hands them back on the next
     ' alloc of the same size, eliminating OS kernel calls for the common case.
     '
+    ' POOL_MAX_BLOCK: blocks larger than this are NOT pooled — they are
+    ' VirtualFree'd immediately.  Top-level combine blocks grow with every level
+    ' and are never reused at the same size, so pooling them commits tens of GB
+    ' that can never be reclaimed until FlushGmpPool, causing VirtualAlloc to
+    ' fail at the very top levels (observed crash at Level 16 with 107 MB alloc
+    ' failing despite 64 GB machine).  16 MB covers all of Phase 1 and the lower
+    ' Phase 2 levels where block sizes repeat; anything bigger is freed directly.
+    '
     ' Key   = exact byte size (GMP always frees with the same size it requested).
-    ' Value = LIFO stack of available pointers (LIFO is cache-friendly — the most
-    '         recently freed block still has warm TLB/cache entries).
-    ' Cap   = POOL_CAP blocks per size class; excess blocks are VirtualFree'd so
-    '         pooled memory stays proportional to current working set.
+    ' Value = LIFO stack of available pointers (LIFO keeps TLB/cache warm).
+    ' Cap   = POOL_CAP blocks per size class; excess blocks are VirtualFree'd.
     Private Shared ReadOnly _gmpPool As New ConcurrentDictionary(Of Long, ConcurrentStack(Of IntPtr))()
     Private Const POOL_CAP As Integer = 32
+    Private Const POOL_MAX_BLOCK As Long = 16L * 1024L * 1024L  ' 16 MB
 
     Private Shared Function PoolGet(sz As Long) As IntPtr
-        Dim stack As ConcurrentStack(Of IntPtr) = Nothing
-        If _gmpPool.TryGetValue(sz, stack) Then
-            Dim ptr As IntPtr
-            If stack.TryPop(ptr) Then Return ptr
+        If sz <= POOL_MAX_BLOCK Then
+            Dim stack As ConcurrentStack(Of IntPtr) = Nothing
+            If _gmpPool.TryGetValue(sz, stack) Then
+                Dim ptr As IntPtr
+                If stack.TryPop(ptr) Then Return ptr
+            End If
         End If
-        ' Pool miss — allocate from OS
+        ' Pool miss or oversized block — allocate from OS
         Return VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(sz)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
     End Function
 
     Private Shared Sub PoolReturn(ptr As IntPtr, sz As Long)
-        Dim stack As ConcurrentStack(Of IntPtr) =
-            _gmpPool.GetOrAdd(sz, Function(k) New ConcurrentStack(Of IntPtr)())
-        If stack.Count < POOL_CAP Then
-            stack.Push(ptr)
-        Else
-            VirtualFree(ptr, UIntPtr.Zero, MEM_RELEASE)
+        If sz <= POOL_MAX_BLOCK Then
+            Dim stack As ConcurrentStack(Of IntPtr) =
+                _gmpPool.GetOrAdd(sz, Function(k) New ConcurrentStack(Of IntPtr)())
+            If stack.Count < POOL_CAP Then
+                stack.Push(ptr)
+                Return
+            End If
         End If
+        ' Oversized block or pool full — release to OS immediately
+        VirtualFree(ptr, UIntPtr.Zero, MEM_RELEASE)
     End Sub
 
     ''' <summary>
