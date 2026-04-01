@@ -99,10 +99,10 @@ dotnet build $projectFile --configuration Release --no-incremental
 if ($LASTEXITCODE -ne 0) { throw "dotnet build failed (exit $LASTEXITCODE)" }
 
 # ── Auto-detect exe path ─────────────────────────────────────────────────────
-$exeCandidates = Get-ChildItem -Path (Join-Path $projectDir 'bin\Release') `
+$exeCandidates = @(Get-ChildItem -Path (Join-Path $projectDir 'bin\Release') `
                                -Filter 'PI-BillionDigits.exe' `
                                -Recurse -ErrorAction SilentlyContinue |
-                 Sort-Object LastWriteTime -Descending
+                 Sort-Object LastWriteTime -Descending)
 if ($exeCandidates.Count -eq 0) {
     throw "PI-BillionDigits.exe not found under bin\Release after build."
 }
