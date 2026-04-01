@@ -816,6 +816,23 @@ Public Class Form1
         If _headless Then ChkboxWriteToFile.Checked = True
         LstBoxPhases.Items.Clear()
 
+        ' ── Ctrl+C / Ctrl+Break from the console ─────────────────────────────
+        ' When launched via "dotnet run", the terminal and the WinForms process
+        ' share a console.  Pressing Ctrl+C sends a CTRL_C_EVENT to every
+        ' process in the console group, which kills the WinForms app immediately
+        ' without going through FormClosing.  Suppress that so the normal
+        ' FormClosing confirmation dialog can run instead.
+        If Not _headless Then
+            Try
+                AddHandler Console.CancelKeyPress,
+                    Sub(s As Object, ce As ConsoleCancelEventArgs)
+                        ce.Cancel = True   ' suppress default kill
+                        Me.BeginInvoke(Sub() Me.Close())   ' route through FormClosing
+                    End Sub
+            Catch
+            End Try
+        End If
+
         ' ── UI-thread exception handler ───────────────────────────────────────
         ' Application.ThreadException fires for any unhandled exception that
         ' originates on the WinForms UI thread (timer ticks, button clicks, etc.).
@@ -1001,14 +1018,32 @@ Public Class Form1
         End Try
     End Sub
 
-    ' ── Form closing diagnostic ───────────────────────────────────────────────
-    ' Logs whenever the form is about to close so we can distinguish between
-    ' user-initiated close (CloseReason.UserClosing) and code-driven close.
+    ' ── Form closing — confirmation dialog ───────────────────────────────────
     Private Sub Form1_FormClosing(sender As Object, e As FormClosingEventArgs) Handles MyBase.FormClosing
         Try
-            WriteToLog($"[FormClosing] Reason={e.CloseReason} Cancel={e.Cancel}")
+            WriteToLog($"[FormClosing] Reason={e.CloseReason}")
         Catch
         End Try
+
+        ' Headless runs exit unattended; autoverify path uses ApplicationExitCall.
+        If _headless OrElse e.CloseReason = CloseReason.ApplicationExitCall Then Return
+
+        Dim msg As String
+        If BtnCompute.Enabled = False Then
+            ' Computation is in progress
+            msg = "A computation is currently running. Closing now will lose all progress." &
+                  vbCrLf & vbCrLf & "Are you sure you want to close?"
+        Else
+            msg = "Are you sure you want to close the application?"
+        End If
+
+        Dim result As DialogResult = MessageBox.Show(
+            msg, "Confirm Close",
+            MessageBoxButtons.YesNo, MessageBoxIcon.Question,
+            MessageBoxDefaultButton.Button2)
+        If result <> DialogResult.Yes Then
+            e.Cancel = True
+        End If
     End Sub
 
     ' ════════════════════════════════════════════════════════════════════════
