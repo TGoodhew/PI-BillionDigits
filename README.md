@@ -2048,6 +2048,28 @@ Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately bef
 
 ---
 
+## Section 88 — Raw DllImport in SafeMpzMul Slow Path; GmpRaw_add in Phase 2 (issues #25, #26)
+
+**Branch:** PerfWork
+
+### #25 — Math.Gmp.Native wrapper dispatch eliminated from SafeMpzMul slow path
+
+Added five new raw `DllImport` declarations (`GmpRaw_init`, `GmpRaw_init2`, `GmpRaw_clear`, `GmpRaw_tdiv_r_2exp`, `GmpRaw_tdiv_q_2exp`) and replaced all `gmp_lib.*` calls in the `SafeMpzMul` slow path with direct P/Invoke.
+
+The slow path calls the wrapper for B-piece splitting (4 init + 4 tdiv + 1 clear), A-piece init (3 × `mpz_init2` + 1 tdiv), 9 product inits, 9 product clears (inside the accumulation loop), and 7 final clears. Each wrapper call went through `Marshal.GetDelegateForFunctionPointerInternal` before every native call.
+
+**Pattern:** Struct headers for locally-created objects allocated via `Marshal.AllocHGlobal(16)`; limb buffers filled by `GmpRaw_init`/`GmpRaw_init2` via `GmpAllocFunc` (same path as `gmp_lib.mpz_init`). Cleanup: `GmpRaw_clear` + `Marshal.FreeHGlobal`. Matches the existing `accumPtr` pattern already in the slow path (§42).
+
+### #26 — GmpRaw_add for Phase 2 T-accumulation
+
+Replaced `gmp_lib.mpz_add(tempA, tempA, tempB)` with `GmpRaw_add(tempA.Pointer, tempA.Pointer, tempB.Pointer)` in both the parallel and serial Phase 2 combine paths. `GmpRaw_add` was already declared (§42). One wrapper dispatch eliminated per pair at every Phase 2 level — 68,869 calls at level 1 alone.
+
+The `newP`/`newQ`/`tempA`/`tempB` init and clear calls in Phase 2 are unchanged: their struct headers are allocated by `gmp_lib.mpz_init` and their lifetimes span levels (stored as `MemP`/`MemQ`/`MemT` in `DiskNode`), so switching ownership models there would require also changing `BinarySplitChunk` and `LoadNodeFromDisk`.
+
+Trace results pending from the combined 1B-digit run (§88).
+
+---
+
 ## Section 87 — Phase 2 Parallel Path: Remove Inner Parallel.Invoke (issue #24)
 
 **Branch:** PerfWork
