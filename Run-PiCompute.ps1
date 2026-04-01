@@ -43,7 +43,8 @@
       777777777     expected at position 24,658,601 — checked when digits >= 24,658,610
       e-digits      27182818284 — position unknown; reported as Found/Not found (informational)
 
-    Mutually exclusive with -Trace.
+    Combine with -Trace to run dotnet-trace on every power-of-10 run; per-run
+    trace reports are appended to the combined report.
 
 .PARAMETER LogLevel
     Logging detail level passed to the exe as --log-level N.  Defaults to 1.
@@ -68,6 +69,7 @@
     .\Run-PiCompute.ps1 -Trace -LogLevel 2
     .\Run-PiCompute.ps1 -Test
     .\Run-PiCompute.ps1 -Test -Digits 1000000
+    .\Run-PiCompute.ps1 -Test -Trace
     .\Run-PiCompute.ps1 -ReportOnly ".\pi_trace_20260331_121017.nettrace"
 #>
 param(
@@ -170,12 +172,26 @@ if ($Test) {
         $runDir = Join-Path $OutputDir ("test_" + $d.ToString())
         if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir | Out-Null }
 
-        # Use Start-Process -Wait: the exe is a WinForms GUI app and & returns immediately.
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        Start-Process -FilePath $exePath `
-            -ArgumentList @("--digits", $d, "--autostart", "--autoverify",
-                            "--log-level", $LogLevel, "--output-dir", $runDir) `
-            -NoNewWindow -Wait
+        if ($Trace) {
+            $runTraceFile  = Join-Path $runDir "trace.nettrace"
+            $runReportFile = Join-Path $runDir "trace_report.txt"
+            Write-Host "  [trace] $runTraceFile" -ForegroundColor DarkMagenta
+            dotnet-trace collect `
+                --output $runTraceFile `
+                --providers "Microsoft-DotNETCore-SampleProfiler:0xF00000000000:5,Microsoft-DotNETRuntime:0x1F000080018:5" `
+                -- $exePath --digits $d --autostart --autoverify --log-level $LogLevel --output-dir $runDir
+            if (Test-Path $runTraceFile) {
+                dotnet-trace report $runTraceFile topN -n 20 --inclusive |
+                    Out-File -FilePath $runReportFile -Encoding utf8
+            }
+        } else {
+            # Use Start-Process -Wait: the exe is a WinForms GUI app and & returns immediately.
+            Start-Process -FilePath $exePath `
+                -ArgumentList @("--digits", $d, "--autostart", "--autoverify",
+                                "--log-level", $LogLevel, "--output-dir", $runDir) `
+                -NoNewWindow -Wait
+        }
         $sw.Stop()
         $elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 1)
 
@@ -238,6 +254,24 @@ if ($Test) {
     $summaryLine = "Overall: $overall   Completed: $(Get-Date)"
     Write-Host $summaryLine -ForegroundColor $overallColour
     $reportLines.Add($summaryLine)
+
+    # ── Append per-run trace reports to combined report ───────────────────────
+    if ($Trace) {
+        $reportLines.Add("")
+        $reportLines.Add("=" * 90)
+        $reportLines.Add("PER-RUN TRACE SUMMARIES (dotnet-trace topN, top 20 inclusive)")
+        $reportLines.Add("=" * 90)
+        foreach ($d in $testRuns) {
+            $runReportFile = Join-Path $OutputDir ("test_" + $d.ToString()) "trace_report.txt"
+            $reportLines.Add("")
+            $reportLines.Add("--- $($d.ToString('N0')) digits ---")
+            if (Test-Path $runReportFile) {
+                Get-Content $runReportFile | ForEach-Object { $reportLines.Add($_) }
+            } else {
+                $reportLines.Add("(trace report not found)")
+            }
+        }
+    }
 
     $reportLines | Out-File -FilePath $reportFile -Encoding utf8
     Write-Host ""
