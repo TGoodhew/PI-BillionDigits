@@ -833,14 +833,6 @@ Public Class Form1
             End Try
         End If
 
-        ' ── UI-thread exception handler ───────────────────────────────────────
-        ' Application.ThreadException fires for any unhandled exception that
-        ' originates on the WinForms UI thread (timer ticks, button clicks, etc.).
-        ' The default handler shows a dialog and then EXITS — we override it to
-        ' log, show the dialog, and keep the app alive.
-        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException)
-        AddHandler Application.ThreadException, AddressOf OnUIThreadException
-
         ' ── Subscribe to AppDomain.UnhandledException ─────────────────────────
         ' This fires for any managed exception that is not caught anywhere,
         ' including AccessViolationException marshaled back from a P/Invoke call
@@ -982,26 +974,6 @@ Public Class Form1
     Private Sub ChkboxDisplay_CheckedChanged(sender As Object, e As EventArgs) Handles ChkboxDisplay.CheckedChanged
         Label3.Visible = ChkboxDisplay.Checked
         LblDigitsDisplayed.Visible = ChkboxDisplay.Checked
-    End Sub
-
-    ' ── UI-thread (WinForms message-loop) exception handler ──────────────────
-    ' Catches any unhandled exception that originates on the UI thread —
-    ' timer ticks, button click handlers, BeginInvoke callbacks, etc.
-    ' Without this, the default WinForms handler exits the app after showing
-    ' an error dialog (or silently if the dialog is auto-dismissed).
-    Private Sub OnUIThreadException(sender As Object, e As System.Threading.ThreadExceptionEventArgs)
-        Try
-            WriteExceptionToLog("UIThread.ThreadException", e.Exception)
-            If Not _headless Then
-                MessageBox.Show(
-                    "An unexpected error occurred on the UI thread." & vbCrLf &
-                    e.Exception.GetType().Name & ": " & e.Exception.Message & vbCrLf & vbCrLf &
-                    "The application will continue running. Check the log for details.",
-                    "Unexpected Error", MessageBoxButtons.OK, MessageBoxIcon.Warning)
-            End If
-        Catch
-        End Try
-        ' Do NOT re-throw — that would invoke the default handler which exits the app.
     End Sub
 
     ' ── AppDomain-level unhandled exception handler ──────────────────────────
