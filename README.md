@@ -2048,6 +2048,28 @@ Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately bef
 
 ---
 
+## Section 87 — Phase 2 Parallel Path: Remove Inner Parallel.Invoke (issue #24)
+
+**Branch:** PerfWork
+
+`Parallel.Invoke` appeared at 20.45% inclusive in the 1B-digit trace. It was called twice per pair inside the Phase 2 `Parallel.For` body — once for (newP, newQ) and once for (tempA, tempB) — creating and scheduling 2 thread-pool tasks per invocation × 2 invocations × pairCount = `4 × pairCount` task round-trips per level.
+
+**Changes:**
+
+- **Outer DOP raised** from `ProcessorCount \ 2` to `ProcessorCount`. The halved DOP existed only to leave free threads for the inner `Parallel.Invoke` tasks; removing `Parallel.Invoke` eliminates this constraint.
+- **Inner `Parallel.Invoke` removed.** The 4 `SafeMpzMul` calls per pair now run sequentially within each outer task. Parallelism across pairs comes from the outer `Parallel.For`; parallelism within each `SafeMpzMul` comes from `_safeMulDop`.
+- **`_safeMulDop` now scales with pairCount** (`= ProcessorCount \ pairCount`, minimum 1) so sub-product parallelism fills idle cores when the level has few large pairs:
+
+| pairCount | `_safeMulDop` | Active threads |
+|---|---|---|
+| ≥ 24 | 1 | 24 (outer For saturated) |
+| 8 | 3 | 8 × 3 = 24 |
+| 4 | 6 | 4 × 6 = 24 |
+
+No deadlock risk: outer tasks no longer block on `Parallel.Invoke`; the inner `Parallel.For` sub-tasks are short fast-path `GmpRaw_mul` calls with no further nesting. The serial path (pairCount < 4) is unchanged — it retains its `Parallel.Invoke` and uses `_safeMulDop = ProcessorCount` (restored after each parallel level).
+
+---
+
 ## Section 86 — SafeMpzMul: Shared Shifted Buffer (issue #23)
 
 **Branch:** PerfWork

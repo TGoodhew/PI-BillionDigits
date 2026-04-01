@@ -2100,16 +2100,19 @@ Public Class Form1
                     End Sub)
                 phase2PollThread.IsBackground = True
                 phase2PollThread.Start()
-                ' §69 revised (trace 5): Outer DOP = ProcessorCount\2. Each outer task calls
-                ' Parallel.Invoke(newP, newQ) then Parallel.Invoke(tempA, tempB), requiring
-                ' a free thread for the second Invoke task. With outer=ProcessorCount all
-                ' threads are occupied by outer tasks — Parallel.Invoke deadlocks on itself
-                ' causing Task.WaitAll to hit 19.33% in trace 5. ProcessorCount\2 leaves half
-                ' the threads free so both Invoke tasks always run immediately in parallel.
-                ' SafeMpzMul inner DOP remains 1 (serial) to avoid nested oversubscription.
-                _safeMulDop = 1
+                ' §24: Outer DOP raised to ProcessorCount; inner Parallel.Invoke removed.
+                ' Each outer task runs 4 SafeMpzMul calls sequentially, eliminating
+                ' 2×pairCount task-scheduling round-trips (20.45% inclusive in trace).
+                ' _safeMulDop scales inversely with pairCount so sub-product parallelism
+                ' fills idle cores when the level has few pairs:
+                '   pairCount ≥ ProcessorCount → _safeMulDop = 1 (outer For fills all cores)
+                '   pairCount = 4              → _safeMulDop = 6 (4 × 6 = 24 active threads)
+                '   pairCount = 8              → _safeMulDop = 3 (8 × 3 = 24 active threads)
+                ' No deadlock: outer tasks no longer block on Parallel.Invoke; inner
+                ' Parallel.For sub-tasks are short fast-path GmpRaw_mul calls with no nesting.
+                _safeMulDop = System.Math.Max(1, Environment.ProcessorCount \ CInt(System.Math.Max(1L, pairCount)))
                 Dim _p2opts As New System.Threading.Tasks.ParallelOptions() With {
-                    .MaxDegreeOfParallelism = System.Math.Max(1, Environment.ProcessorCount \ 2)
+                    .MaxDegreeOfParallelism = Environment.ProcessorCount
                 }
                 Parallel.For(0L, pairCount, _p2opts,
                     Sub(pairIdx As Long)
@@ -2155,17 +2158,16 @@ Public Class Form1
                         Dim tempB As New mpz_t()
                         gmp_lib.mpz_inits(newP, newQ, tempA, tempB, Nothing)
 
-                        ' §60: newP and newQ use disjoint operands — run both simultaneously.
-                        System.Threading.Tasks.Parallel.Invoke(
-                            Sub() SafeMpzMul(newP, leftP, rightP),
-                            Sub() SafeMpzMul(newQ, leftQ, rightQ))
+                        ' §24: sequential within each outer task — parallelism comes from
+                        ' the outer Parallel.For (DOP=ProcessorCount) and from _safeMulDop
+                        ' sub-product parallelism within each SafeMpzMul call.
+                        SafeMpzMul(newP, leftP, rightP)
+                        SafeMpzMul(newQ, leftQ, rightQ)
                         gmp_lib.mpz_clears(rightP, Nothing)
                         gmp_lib.mpz_clears(leftQ, Nothing)
 
-                        ' §60: tempA and tempB use disjoint operands — run both simultaneously.
-                        System.Threading.Tasks.Parallel.Invoke(
-                            Sub() SafeMpzMul(tempA, leftT, rightQ),
-                            Sub() SafeMpzMul(tempB, leftP, rightT))
+                        SafeMpzMul(tempA, leftT, rightQ)
+                        SafeMpzMul(tempB, leftP, rightT)
                         gmp_lib.mpz_clears(leftT, rightQ, Nothing)
                         gmp_lib.mpz_clears(leftP, rightT, Nothing)
 
