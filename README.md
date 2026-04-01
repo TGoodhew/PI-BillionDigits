@@ -2048,6 +2048,18 @@ Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately bef
 
 ---
 
+## Section 86 — SafeMpzMul: Shared Shifted Buffer (issue #23)
+
+**Branch:** PerfWork
+
+The slow-path accumulation loop in `SafeMpzMul` (`Form1.vb` ~line 1809) previously called `VirtualAlloc` + `VirtualFree` for each of the 8 non-zero-shift k iterations — a total of 8 VirtualAlloc + 8 VirtualFree syscalls per slow-path call.
+
+**Fix:** A single shared buffer is now pre-allocated before the loop, sized to the maximum any iteration could need (`≤ 3·mA + 3·mB + 4` limbs, where `mA = ⌈szA/3⌉`, `mB = ⌈szB/3⌉`). Each iteration resets only `_mp_size = 0` and reuses the same buffer; `GmpRaw_mul_2exp` writes in place since the pre-alloc is always sufficient. The shared buffer is freed once after the loop and `shifted` is reinitialised to a 1-limb stub so the subsequent `mpz_clears` call remains safe.
+
+This reduces per-slow-path-call VirtualAlloc/VirtualFree count from 8+8 to 1+1 — saving 7 kernel round-trips each way.
+
+---
+
 ## Section 85 — GMP Pool Allocator Hot-Path Optimisation (issues #20, #21, #22)
 
 **Branch:** PerfWork

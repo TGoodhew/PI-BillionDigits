@@ -1808,60 +1808,64 @@ Public Class Form1
 
         ' Serial accumulation: shift each prod_k into its positional slot and add to accum.
         ' No inner SafeMpzMul calls — no §42/§44 managed-stack corruption in this loop.
+        '
+        ' §23: Pre-allocate ONE shared shifted buffer sized for the largest iteration,
+        ' replacing the original 8 per-k VirtualAlloc/VirtualFree pairs with a single pair.
+        ' Upper bound for any k=8 (max shift = 2*bitsA + 2*bitsB):
+        '   sub-product limbs ≤ mA + mB,  shift limbs = (2*bitsA+2*bitsB)/64 + 1
+        '   which simplifies to ≤ 3*mA + 3*mB + 4 total limbs.
+        Dim _maxShiftBitsShared As ULong = 2UL * bitsA + 2UL * bitsB
+        Dim _maxShiftedLimbs As Long = CLng(mA) + CLng(mB) + CLng(_maxShiftBitsShared \ 64UL) + 4L
+        Dim _sharedSjBuf As IntPtr = VirtualAlloc(IntPtr.Zero,
+                                                   New UIntPtr(CULng(_maxShiftedLimbs * 8L)),
+                                                   MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+        If _sharedSjBuf = IntPtr.Zero Then
+            VirtualFree(accumBuf, UIntPtr.Zero, MEM_RELEASE)
+            Runtime.InteropServices.Marshal.FreeHGlobal(accumPtr)
+            AppendLog($"[SafeMpzMul] shared shifted pre-alloc FAILED for {_maxShiftedLimbs * 8L \ 1048576L:N0} MB — throwing OOM{vbCrLf}")
+            Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shared shifted ({_maxShiftedLimbs * 8L \ 1048576L} MB)")
+        End If
         Dim shifted As New mpz_t()
         gmp_lib.mpz_init(shifted)
+        ' Replace shifted's initial 1-limb CRT buffer with the shared VirtualAlloc'd buffer.
+        Dim _sv_shifted_hdr As IntPtr = shifted.Pointer
+        Dim _shiftedInitAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted_hdr, 0))
+        Dim _shiftedInitPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_shifted_hdr, 8))
+        _savedGmpFree(New void_ptr(_shiftedInitPtr), New size_t(CULng(_shiftedInitAlloc) * 8UL))
+        Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 0, CInt(_maxShiftedLimbs))
+        Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 4, 0)
+        Runtime.InteropServices.Marshal.WriteInt64(_sv_shifted_hdr, 8, _sharedSjBuf.ToInt64())
+
         For k As Integer = 0 To 8
             Dim ki As Integer = k \ 3
             Dim kj As Integer = k Mod 3
             Dim shiftBits As ULong = CULng(ki) * bitsA + CULng(kj) * bitsB
             Dim _sv_prod As IntPtr = prods(k).Pointer
-            Dim _sv_shifted As IntPtr = shifted.Pointer
             If shiftBits = 0UL Then
                 GmpRaw_add(accumPtr, accumPtr, _sv_prod)
             Else
-                ' Pre-allocate shifted to the exact size needed; same sizing as the original
-                ' per-j path. No inner SafeMpzMul calls here so no memory-pressure interaction.
-                Dim _szProd As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_prod, 4)))
-                Dim _shiftLimbs As Long = CLng(shiftBits) \ 64L + 1L
-                Dim _neededLimbs As Long = _szProd + _shiftLimbs + 2L
-                Dim _sj_buf As IntPtr = VirtualAlloc(IntPtr.Zero,
-                                                     New UIntPtr(CULng(_neededLimbs * 8L)),
-                                                     MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
-                If _sj_buf = IntPtr.Zero Then
-                    VirtualFree(accumBuf, UIntPtr.Zero, MEM_RELEASE)
-                    Runtime.InteropServices.Marshal.FreeHGlobal(accumPtr)
-                    AppendLog(
-                        $"[SafeMpzMul] shifted pre-alloc FAILED for {_neededLimbs * 8L \ 1048576L:N0} MB at k={k} — throwing OOM{vbCrLf}")
-                    Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shifted ({_neededLimbs * 8L \ 1048576L} MB)")
-                End If
-                Dim _sjOldBytes As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted, 0)) * 8L
-                If _sjOldBytes >= GMP_LARGE_THRESHOLD Then
-                    VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_shifted, 8)), UIntPtr.Zero, MEM_RELEASE)
-                Else
-                    _savedGmpFree(New void_ptr(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_shifted, 8))),
-                                  New size_t(CULng(_sjOldBytes)))
-                End If
-                Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted, 0, CInt(_neededLimbs))
-                Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted, 4, 0)
-                Runtime.InteropServices.Marshal.WriteInt64(_sv_shifted, 8, _sj_buf.ToInt64())
+                ' §23: reset _mp_size only — shared buffer already covers the maximum size.
+                Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 4, 0)
                 If shiftBits <= CULng(UInt32.MaxValue) Then
-                    GmpRaw_mul_2exp(_sv_shifted, _sv_prod, CUInt(shiftBits))
+                    GmpRaw_mul_2exp(_sv_shifted_hdr, _sv_prod, CUInt(shiftBits))
                 Else
                     Dim _shift1 As ULong = shiftBits \ 2UL
                     Dim _shift2 As ULong = shiftBits - _shift1
-                    GmpRaw_mul_2exp(_sv_shifted, _sv_prod, CUInt(_shift1))
-                    GmpRaw_mul_2exp(_sv_shifted, _sv_shifted, CUInt(_shift2))
+                    GmpRaw_mul_2exp(_sv_shifted_hdr, _sv_prod, CUInt(_shift1))
+                    GmpRaw_mul_2exp(_sv_shifted_hdr, _sv_shifted_hdr, CUInt(_shift2))
                 End If
-                GmpRaw_add(accumPtr, accumPtr, _sv_shifted)
-                ' Free shifted's buffer; reinit for next k.
-                VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_shifted, 8)), UIntPtr.Zero, MEM_RELEASE)
-                Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted, 4, 0)
-                Runtime.InteropServices.Marshal.WriteInt64(_sv_shifted, 8, 0L)
-                gmp_lib.mpz_init(shifted)
+                GmpRaw_add(accumPtr, accumPtr, _sv_shifted_hdr)
             End If
             ' Free prod_k immediately after accumulation to limit peak RAM.
             gmp_lib.mpz_clear(prods(k))
         Next k
+        ' §23: Free the shared buffer once, then put shifted into a clean 1-limb stub
+        ' so the subsequent mpz_clears call frees it without double-freeing _sharedSjBuf.
+        VirtualFree(_sharedSjBuf, UIntPtr.Zero, MEM_RELEASE)
+        Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 0, 0)
+        Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 4, 0)
+        Runtime.InteropServices.Marshal.WriteInt64(_sv_shifted_hdr, 8, 0L)
+        gmp_lib.mpz_init(shifted)
         ' §44: re-read accumPtr from result's stash after the serial accumulation loop.
         ' The accumulation loop contains no inner SafeMpzMul calls so locals are uncorrupted,
         ' but we re-read from the stash anyway for consistency with the §44 pattern.
