@@ -2048,6 +2048,28 @@ Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately bef
 
 ---
 
+## Section 75 — Button Text Centering, Uniform Size, and Equal Row Spacing
+
+**Branch:** PerfWork
+
+**Change:** Three related UI polish fixes in `Form1.Designer.vb`:
+
+**1. Button text alignment**
+`TextAlign = ContentAlignment.MiddleCenter` set explicitly on `BtnCompute`, `BtnPause`, and `BtnTest`.
+
+**2. Uniform button size**
+`BtnTest` width corrected from 112 px to 134 px, matching `BtnCompute` and `BtnPause` (all now 134×47).
+
+**3. Equal row spacing**
+Panel1 height reduced from 319 px to 205 px. The three control rows are now evenly spaced with 12 px top/bottom margins and 20 px gaps between rows:
+- Row 1 (Start / Cancel / Digits / Displayed / Running Time): Y = 12
+- Row 2 (Display / Write to File / Test / RAM Threshold): Y = 79
+- Row 3 (Status bar): Y = 146
+
+Non-button controls within each row are vertically centred relative to the 47 px row height. `LstBoxPhases` height reduced from 279 px to 181 px to match the new panel height. `RtbPiDigits` design-time origin updated from Y=319 to Y=205 (runtime docking overrides this, but kept consistent for the designer).
+
+**Why:** `BtnTest` was 22 px narrower than the other buttons, and its text had unequal left/right margins. The gaps between rows were 16 px (rows 1→2) and 35 px (rows 2→3), making the header panel look uneven.
+
 ## Section 74 — Revert Output Directory to C:\PiOutput
 
 **Branch:** PerfWork
