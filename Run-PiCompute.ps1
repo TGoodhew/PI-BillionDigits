@@ -199,7 +199,7 @@ if ($Test) {
         $runLog = Join-Path $runDir "pi_phase_log.txt"
         $verifyLine = ""
         if (Test-Path $runLog) {
-            $match = Select-String -Path $runLog -Pattern '^\[Verify\]' | Select-Object -Last 1
+            $match = Select-String -Path $runLog -Pattern '\[Verify\]' | Select-Object -Last 1
             if ($match) { $verifyLine = $match.Line }
         }
 

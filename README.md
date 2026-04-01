@@ -2077,6 +2077,10 @@ Runs with too few digits to contain a sequence report `N/A` (not a failure). The
 .\Run-PiCompute.ps1 -Test -Digits 1000000      # suite up to 1M only
 ```
 
+### Bug fix: log pattern anchor (Run-PiCompute.ps1)
+
+`WriteToLog` prefixes every log entry with a timestamp, thread ID, elapsed time, and RAM reading — so log lines read `2026-04-01 12:00:00 | T1 | ... | [Verify] Verify OK: ...`. The original `Select-String` pattern was `'^\[Verify\]'` (anchored to start of line), which never matched. Changed to `'\[Verify\]'` (unanchored) so the verify result is correctly parsed from any run's phase log.
+
 ---
 
 ## Section 83 — Runtime Logging Level (issue #15)
