@@ -1117,6 +1117,8 @@ Public Class Form1
             _displayNativePtr = IntPtr.Zero
             WriteToLog("[BtnCompute] retained native pi buffer freed before new computation")
         End If
+        RtbPiDigits.Clear()
+        LblDigitsDisplayed.Text = "0"
         BtnCompute.Enabled = False
         BtnPause.Enabled = True
 
