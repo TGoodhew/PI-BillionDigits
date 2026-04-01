@@ -1806,6 +1806,31 @@ Key design points:
 
 ---
 
+## Section 68 — GMP Pool Cap Raised to 256
+
+**Branch:** AdvPerfWork
+
+**Change:** `POOL_CAP` increased from 32 to 256.
+
+**Why:** With outer Phase 2 DOP=24 (§69) and each pair running `Parallel.Invoke(2 SafeMpzMul)`, up to 48 concurrent GMP operations can return pool blocks simultaneously. A cap of 32 meant the pool was constantly evicting via `VirtualFree` and missing on the next alloc via `VirtualAlloc`, negating the pool's purpose. Raising to 256 keeps all concurrently live blocks in the pool for immediate reuse.
+
+---
+
+## Section 69 — DOP Rebalance: Phase 2 Outer=ProcessorCount, SafeMpzMul Inner=1
+
+**Branch:** AdvPerfWork
+
+**Change:** Two coordinated DOP changes to eliminate nested thread-pool oversubscription:
+
+1. **Phase 2 parallel outer DOP:** raised from `ProcessorCount \ 2` (12) to `ProcessorCount` (24).
+2. **SafeMpzMul inner DOP:** controlled by new `Shared _safeMulDop As Integer` field. Set to `1` (serial) before the Phase 2 outer `Parallel.For`; restored to `ProcessorCount` after the parallel path completes (before the serial top-level path and `ComputePiGMP`). In `SafeMpzMul`, when `_safeMulDop <= 1`, the 9 sub-products run in a serial `For k = 0 To 8` loop instead of `Parallel.For`.
+
+**Effect:** 24 outer tasks × 2 `Parallel.Invoke` tasks = 48 concurrent single-threaded SafeMpzMul calls on 24 threads — no nested parallelism, no task-queue depth, no park/unpark overhead. Serial Phase 2 top levels and `ComputePiGMP` still use `Parallel.For` with DOP=ProcessorCount for all 9 sub-products.
+
+**Why:** Trace 4 showed `LowLevelLifoSemaphore.WaitForSignal` at 18.77% exclusive — thread pool threads parking while waiting for the next task. Root cause: with outer DOP=12 and inner SafeMpzMul DOP=24, each outer task submitted 9 sub-product tasks to the pool and then blocked on the pool itself. With 12 outer × 2 `Parallel.Invoke` × 9 inner = 216 logical tasks competing for 24 threads, threads were constantly parking after completing a sub-product and waiting to be woken for the next. Eliminating the inner `Parallel.For` from the parallel path removes this entirely.
+
+---
+
 ## Section 63 — Headless / Automation Mode + PowerShell Script
 
 **Branch:** PerfWork / AdvPerfWork

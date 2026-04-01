@@ -55,6 +55,14 @@ Public Class Form1
     Private _verifyAt As New List(Of Tuple(Of String, Long))()   ' (digits, expectedPos)
     Private _verifyContains As New List(Of String)()
 
+    ' §69: Controls SafeMpzMul inner Parallel.For DOP.
+    ' Set to 1 before Phase 2 parallel Parallel.For so sub-products run serially —
+    ' eliminates the thread-pool park/unpark cycle (18.77% LowLevelLifoSemaphore in
+    ' trace 4) caused by 24-outer × 2-Invoke × 9-inner = 432 tasks on 24 threads.
+    ' Restored to ProcessorCount before Phase 2 serial path and ComputePiGMP so
+    ' those single-pair operations still use all cores.
+    Private Shared _safeMulDop As Integer = -1   ' -1 = not yet set; reads as ProcessorCount
+
     ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
     ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
     ' thread-safe.  Only the File.AppendAllText log writes need serialisation so
@@ -393,7 +401,10 @@ Public Class Form1
     ' Flushing between Phase 2 levels further ensures committed memory tracks live data.
     '
     ' Cap = POOL_CAP blocks per bucket; excess blocks are VirtualFree'd immediately.
-    Private Const POOL_CAP As Integer = 32
+    ' §68: raised from 32 → 256. With outer Phase 2 DOP=24 each doing Parallel.Invoke(2
+    ' SafeMpzMul), up to 48 concurrent GMP operations can return blocks simultaneously.
+    ' A cap of 32 caused constant pool eviction (VirtualFree) + re-miss (VirtualAlloc).
+    Private Const POOL_CAP As Integer = 256
     Private Const POOL_MAX_BLOCK As Long = 16L * 1024L * 1024L  ' 16 MB — max pooled block
     Private Const POOL_BUCKETS As Integer = 64
     ' Initialised in InitGmpVirtualAllocFunctions before the first GMP call.
@@ -1589,14 +1600,24 @@ Public Class Form1
         ' GMP arithmetic on non-aliased objects is thread-safe. The §44 accumPtr stash lives in
         ' result's native struct (_mp_d slot); inner calls stash into prods(k) structs instead
         ' and never touch result's struct, so the outer stash is preserved across the Parallel.For.
-        ' §62: Cap DOP to ProcessorCount. When SafeMpzMul is called from Phase 2's Parallel.For
-        ' (which already uses all cores), uncapped inner parallelism causes severe oversubscription.
-        Dim _smm_opts As New System.Threading.Tasks.ParallelOptions() With {
-            .MaxDegreeOfParallelism = Environment.ProcessorCount
-        }
-        Parallel.For(0, 9, _smm_opts, Sub(k As Integer)
-            SafeMpzMul(prods(k), A_parts(k \ 3), B_parts(k Mod 3))
-        End Sub)
+        ' §69: Use _safeMulDop to control inner parallelism. When called from Phase 2's
+        ' Parallel.For (outer DOP=24), _safeMulDop=1 so sub-products run serially — eliminates
+        ' the thread-pool park/unpark overhead. When called from the serial Phase 2 top levels
+        ' or ComputePiGMP, _safeMulDop=ProcessorCount to use all cores.
+        Dim _smmDop As Integer = If(_safeMulDop > 0, _safeMulDop, Environment.ProcessorCount)
+        If _smmDop <= 1 Then
+            ' Serial path: no thread pool involvement, no park/unpark overhead.
+            For k As Integer = 0 To 8
+                SafeMpzMul(prods(k), A_parts(k \ 3), B_parts(k Mod 3))
+            Next k
+        Else
+            Dim _smm_opts As New System.Threading.Tasks.ParallelOptions() With {
+                .MaxDegreeOfParallelism = _smmDop
+            }
+            Parallel.For(0, 9, _smm_opts, Sub(k As Integer)
+                SafeMpzMul(prods(k), A_parts(k \ 3), B_parts(k Mod 3))
+            End Sub)
+        End If
 
         ' §44: recover accumPtr from result's stash after Parallel.For.
         savedResultPtr = result.Pointer
@@ -1893,11 +1914,13 @@ Public Class Form1
                     End Sub)
                 phase2PollThread.IsBackground = True
                 phase2PollThread.Start()
-                ' §62: Cap outer DOP to ProcessorCount\2. Each outer task spawns 2 inner tasks
-                ' via Parallel.Invoke, so uncapped outer × 2 = 2×ProcessorCount concurrent
-                ' multiplications — saturating memory bandwidth without proportional speedup.
+                ' §69: Outer DOP raised from ProcessorCount\2 → ProcessorCount (24).
+                ' SafeMpzMul inner DOP is set to 1 (serial) below so there is no nested
+                ' thread-pool parallelism: 24 outer tasks × 2 Parallel.Invoke tasks = 48
+                ' concurrent tasks on 24 threads — no oversubscription.
+                _safeMulDop = 1
                 Dim _p2opts As New System.Threading.Tasks.ParallelOptions() With {
-                    .MaxDegreeOfParallelism = System.Math.Max(1, Environment.ProcessorCount \ 2)
+                    .MaxDegreeOfParallelism = Environment.ProcessorCount
                 }
                 Parallel.For(0L, pairCount, _p2opts,
                     Sub(pairIdx As Long)
@@ -1985,6 +2008,8 @@ Public Class Form1
                     End Sub)
                 phase2PollThread.Join()
                 nextDiskNodes.AddRange(nextResults)
+                ' §69: Restore full DOP for serial Phase 2 top levels and ComputePiGMP.
+                _safeMulDop = Environment.ProcessorCount
 
             Else
                 ' ── Serial path (top levels: few pairs, very large operands) ─
