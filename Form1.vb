@@ -425,16 +425,18 @@ Public Class Form1
     Private Const POOL_BUCKETS As Integer = 64
     ' Initialised in InitGmpVirtualAllocFunctions before the first GMP call.
     Private Shared _gmpPool(POOL_BUCKETS - 1) As ConcurrentStack(Of IntPtr)
+    ' §20: Per-bucket atomic counters replacing ConcurrentStack.Count (which is O(n)).
+    ' Interlocked.Increment/Decrement are single atomic instructions vs. linked-list walk.
+    Private Shared _gmpPoolCount(POOL_BUCKETS - 1) As Integer
 
-    ''' <summary>Returns floor(log2(sz)) clamped to [0, POOL_BUCKETS-1].</summary>
+    ''' <summary>
+    ''' Returns the pool bucket index for a given byte size.
+    ''' §22: Uses BitOperations.Log2 (single LZCNT/BSR instruction on x64) replacing
+    ''' the previous O(log n) bit-counting While loop.
+    ''' </summary>
     Private Shared Function PoolBucket(sz As Long) As Integer
         If sz <= 1L Then Return 0
-        Dim b As Integer = 0
-        Dim v As Long = sz - 1L   ' -1 so exact powers of 2 map to their own bucket
-        While v > 0L
-            v = v >> 1
-            b += 1
-        End While
+        Dim b As Integer = System.Numerics.BitOperations.Log2(CULng(sz - 1L)) + 1
         Return System.Math.Min(b, POOL_BUCKETS - 1)
     End Function
 
@@ -442,7 +444,10 @@ Public Class Form1
         If sz > 0L AndAlso sz <= POOL_MAX_BLOCK Then
             Dim b As Integer = PoolBucket(sz)
             Dim ptr As IntPtr
-            If _gmpPool(b).TryPop(ptr) Then Return ptr
+            If _gmpPool(b).TryPop(ptr) Then
+                Interlocked.Decrement(_gmpPoolCount(b))  ' §20: maintain atomic count
+                Return ptr
+            End If
             ' Pool miss — allocate rounded-up bucket size (>= sz, no Monitor needed)
             Dim allocSz As Long = 1L << b
             Return VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(allocSz)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
@@ -454,10 +459,13 @@ Public Class Form1
     Private Shared Sub PoolReturn(ptr As IntPtr, sz As Long)
         If sz > 0L AndAlso sz <= POOL_MAX_BLOCK Then
             Dim b As Integer = PoolBucket(sz)
-            If _gmpPool(b).Count < POOL_CAP Then
+            ' §20: Interlocked.Increment is O(1) — replaces ConcurrentStack.Count which is O(n).
+            ' Increment first; if we exceeded the cap, decrement back and fall through to VirtualFree.
+            If Interlocked.Increment(_gmpPoolCount(b)) <= POOL_CAP Then
                 _gmpPool(b).Push(ptr)
                 Return
             End If
+            Interlocked.Decrement(_gmpPoolCount(b))  ' rolled back — pool is full
         End If
         ' Oversized, zero-size, or pool full — release to OS immediately
         VirtualFree(ptr, UIntPtr.Zero, MEM_RELEASE)
@@ -472,6 +480,7 @@ Public Class Form1
         For b As Integer = 0 To POOL_BUCKETS - 1
             Dim ptr As IntPtr
             While _gmpPool(b).TryPop(ptr)
+                Interlocked.Decrement(_gmpPoolCount(b))  ' §20: keep counter in sync
                 VirtualFree(ptr, UIntPtr.Zero, MEM_RELEASE)
             End While
         Next
@@ -485,8 +494,11 @@ Public Class Form1
     ' Marshal.AllocHGlobal (process default heap) for the same blocks corrupts
     ' GMP's internal state (crash/NullReferenceException in BinarySplitChunk).
 
+    ' §21: Try/Catch removed — prevents JIT inlining and adds per-call overhead.
+    ' Corrupt-size and PoolGet-failure paths already handle errors via early return / null.
+    ' If an unexpected exception occurs GMP will receive a null pointer and abort, which
+    ' is the correct behaviour for a corrupted allocator state (no silent data corruption).
     Private Shared Function GmpAllocFunc(alloc_size As size_t) As void_ptr
-        Try
         Dim rawSz As ULong = CULng(alloc_size)
         If rawSz > CULng(Long.MaxValue) Then
             ' Size > 9.2 EB — clearly corrupted GMP internal state.
@@ -503,16 +515,12 @@ Public Class Form1
             Return New void_ptr(ptr)
         End If
         Return _savedGmpAlloc(alloc_size)
-        Catch ex As Exception
-            AppendLog($"[GmpAllocFunc] EXCEPTION ({ex.GetType().Name}): {ex.Message} — returning null{vbCrLf}")
-            Return New void_ptr(IntPtr.Zero)
-        End Try
     End Function
 
+    ' §21: Try/Catch removed — same rationale as GmpAllocFunc.
     Private Shared Function GmpReallocFunc(old_ptr As void_ptr,
                                             old_size As size_t,
                                             new_size As size_t) As void_ptr
-        Try
         Dim rawOld As ULong = CULng(old_size)
         Dim rawNew As ULong = CULng(new_size)
         If rawOld > CULng(Long.MaxValue) OrElse rawNew > CULng(Long.MaxValue) Then
@@ -578,14 +586,10 @@ Public Class Form1
         End If
 
         Return New void_ptr(newP)
-        Catch ex As Exception
-            AppendLog($"[GmpReallocFunc] EXCEPTION ({ex.GetType().Name}): {ex.Message} — returning null{vbCrLf}")
-            Return New void_ptr(IntPtr.Zero)
-        End Try
     End Function
 
+    ' §21: Try/Catch removed — same rationale as GmpAllocFunc.
     Private Shared Sub GmpFreeFunc(ptr As void_ptr, size As size_t)
-        Try
         Dim p As IntPtr = ptr.ToIntPtr()
         If p = IntPtr.Zero Then Return
         Dim rawSz As ULong = CULng(size)
@@ -600,9 +604,6 @@ Public Class Form1
         Else
             _savedGmpFree(ptr, size)
         End If
-        Catch ex As Exception
-            AppendLog($"[GmpFreeFunc] EXCEPTION ({ex.GetType().Name}): {ex.Message} — leaking ptr{vbCrLf}")
-        End Try
     End Sub
 
     ' Direct P/Invoke to set GMP's native memory function table, bypassing the

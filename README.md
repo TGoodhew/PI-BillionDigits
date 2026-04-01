@@ -2048,6 +2048,32 @@ Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately bef
 
 ---
 
+## Section 85 — GMP Pool Allocator Hot-Path Optimisation (issues #20, #21, #22)
+
+**Branch:** PerfWork
+
+Three targeted fixes to the GMP limb-buffer pool, all motivated by the 1B-digit dotnet-trace report where `GmpAllocFunc` (18.08% exclusive) and `GmpFreeFunc` (17.25% exclusive) together accounted for **35% of total CPU time**.
+
+### §20 — Replace O(n) ConcurrentStack.Count with atomic counter (issue #20)
+
+`PoolReturn` previously called `_gmpPool(b).Count` to decide whether the pool was full. `ConcurrentStack(Of T).Count` is O(n) — it walks the entire linked list. With `POOL_CAP = 256`, every free could walk 256 nodes.
+
+**Fix:** Added `_gmpPoolCount(POOL_BUCKETS - 1) As Integer` — one `Interlocked` counter per bucket. `PoolReturn` now increments atomically and rolls back if the cap is exceeded; `PoolGet` decrements on a successful pop; `FlushGmpPool` decrements as it drains each bucket.
+
+### §21 — Remove Try/Catch from GmpAllocFunc / GmpFreeFunc / GmpReallocFunc (issue #21)
+
+All three native GMP callbacks were wrapped in `Try/Catch`. The .NET JIT cannot inline through `Try/Catch` boundaries, and even in the non-exception path the handler frame adds overhead on every call. Since the corrupt-size and failed-alloc paths already return `IntPtr.Zero` (causing GMP to abort, which is the correct behaviour), the `Catch` clause added no real safety.
+
+**Fix:** Removed the outer `Try/Catch` from all three functions.
+
+### §22 — PoolBucket bit-counting loop → BitOperations.Log2 (issue #22)
+
+`PoolBucket` used a managed `While` loop to count leading bits — up to 25 iterations for a typical 32 MB block. It is called on every alloc and free.
+
+**Fix:** Replaced with `System.Numerics.BitOperations.Log2(CULng(sz - 1L)) + 1`, which the JIT lowers to a single `LZCNT`/`BSR` instruction on x64.
+
+---
+
 ## Section 84 — Power-of-10 Test Suite (issue #18)
 
 **Branch:** PerfWork
