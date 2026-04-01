@@ -1583,10 +1583,12 @@ Public Class Form1
             ' mpz_init is simply overwritten (trivial leak).
             ' byteCount >= 67M * 8 = ~536 MB >> GMP_LARGE_THRESHOLD, so when
             ' mpz_clear is later called (during computation cleanup), GmpFreeFunc
-            ' will see size >= GMP_LARGE_THRESHOLD and call VirtualFree —
-            ' matching this VirtualAlloc.
-            Dim limbs As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(byteCount)),
-                                               MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            ' will see size >= GMP_LARGE_THRESHOLD and call PoolReturn(ptr, byteCount).
+            ' §79: Use PoolGet so the block is sized to 1L<<PoolBucket(byteCount) — the
+            ' exact capacity the pool bucket assumes.  VirtualAlloc(byteCount) only gave
+            ' byteCount bytes (page-rounded), which is ≤ 1L<<bucket, so any subsequent
+            ' PoolGet from the same bucket would get an undersized block → buffer overrun.
+            Dim limbs As IntPtr = PoolGet(CLng(byteCount))
             If limbs = IntPtr.Zero Then _
                 Throw New OutOfMemoryException($"VirtualAlloc({byteCount:N0}) failed in DeserializeOneMpz")
             ' Write the struct immediately so val is in a consistent (zero-valued) state
@@ -2639,7 +2641,7 @@ Public Class Form1
             ' GmpFreeFunc to route the later free through _savedGmpFree (CRT free) on a
             ' VirtualAlloc'd pointer — crashing on small digit counts (< ~200K digits).
             If _tHBytes >= GMP_LARGE_THRESHOLD Then
-                Dim _tHBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_tHBytes)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                Dim _tHBuf As IntPtr = PoolGet(_tHBytes)  ' §79: PoolGet so pool bucket capacity matches actual allocation
                 If _tHBuf <> IntPtr.Zero Then
                     Dim _tHOld As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(tmpHigh.Pointer, 8))
                     VirtualFree(_tHOld, UIntPtr.Zero, MEM_RELEASE)  ' free the init2 seed buffer
@@ -2665,7 +2667,7 @@ Public Class Form1
             Dim _q1Needed As Long = _k1Limbs + 2L
             Dim _q1Bytes As Long = _q1Needed * 8L
             If _q1Bytes >= GMP_LARGE_THRESHOLD Then
-                Dim _q1Buf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_q1Bytes)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                Dim _q1Buf As IntPtr = PoolGet(_q1Bytes)  ' §79
                 If _q1Buf <> IntPtr.Zero Then
                     Dim _q1Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpQ1.Pointer, 8))
                     VirtualFree(_q1Old, UIntPtr.Zero, MEM_RELEASE)
@@ -2683,7 +2685,7 @@ Public Class Form1
             Dim _q2Needed As Long = _k1Limbs + 2L  ' same upper bound as Q1
             Dim _q2Bytes As Long = _q2Needed * 8L
             If _q2Bytes >= GMP_LARGE_THRESHOLD Then
-                Dim _q2Buf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_q2Bytes)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                Dim _q2Buf As IntPtr = PoolGet(_q2Bytes)  ' §79
                 If _q2Buf <> IntPtr.Zero Then
                     Dim _q2Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpQ2.Pointer, 8))
                     VirtualFree(_q2Old, UIntPtr.Zero, MEM_RELEASE)
@@ -2732,7 +2734,7 @@ Public Class Form1
             Dim _r0Needed As Long = _numerSz + _q0Sz + 2L
             Dim _r0Bytes As Long = _r0Needed * 8L
             If _r0Bytes >= GMP_LARGE_THRESHOLD Then
-                Dim _r0Buf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_r0Bytes)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                Dim _r0Buf As IntPtr = PoolGet(_r0Bytes)  ' §79
                 If _r0Buf <> IntPtr.Zero Then
                     Dim _r0Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpR0.Pointer, 8))
                     VirtualFree(_r0Old, UIntPtr.Zero, MEM_RELEASE)
@@ -2750,7 +2752,7 @@ Public Class Form1
             Dim _r1Needed As Long = _numerSz + _q1SzR + 2L
             Dim _r1Bytes As Long = _r1Needed * 8L
             If _r1Bytes >= GMP_LARGE_THRESHOLD Then
-                Dim _r1Buf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_r1Bytes)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                Dim _r1Buf As IntPtr = PoolGet(_r1Bytes)  ' §79
                 If _r1Buf <> IntPtr.Zero Then
                     Dim _r1Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpR1.Pointer, 8))
                     VirtualFree(_r1Old, UIntPtr.Zero, MEM_RELEASE)
@@ -2768,7 +2770,7 @@ Public Class Form1
             Dim _r2Needed As Long = _numerSz + _q2SzR + 2L
             Dim _r2Bytes As Long = _r2Needed * 8L
             If _r2Bytes >= GMP_LARGE_THRESHOLD Then
-                Dim _r2Buf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_r2Bytes)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                Dim _r2Buf As IntPtr = PoolGet(_r2Bytes)  ' §79
                 If _r2Buf <> IntPtr.Zero Then
                     Dim _r2Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpR2.Pointer, 8))
                     VirtualFree(_r2Old, UIntPtr.Zero, MEM_RELEASE)
@@ -2858,7 +2860,7 @@ Public Class Form1
                 ' VirtualAlloc buffer would be freed by GmpFreeFunc via _savedGmpFree
                 ' (size < threshold) which is wrong for VirtualAlloc memory → crash.
                 If _shiftBytesA >= GMP_LARGE_THRESHOLD Then
-                    Dim _bigBufA As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_shiftBytesA)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                    Dim _bigBufA As IntPtr = PoolGet(_shiftBytesA)  ' §79
                     If _bigBufA <> IntPtr.Zero Then
                         Dim _oldBufA As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpShiftA.Pointer, 8))
                         VirtualFree(_oldBufA, UIntPtr.Zero, MEM_RELEASE)
@@ -2937,7 +2939,7 @@ Public Class Form1
                 Dim _addLimbs As Long = System.Math.Max(_numerAbsSzB, _r1AbsSzB) + 2L
                 Dim _addBytesB As Long = _addLimbs * 8L
                 If _addBytesB >= GMP_LARGE_THRESHOLD Then
-                    Dim _bigBufB As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_addBytesB)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                    Dim _bigBufB As IntPtr = PoolGet(_addBytesB)  ' §79
                     If _bigBufB <> IntPtr.Zero Then
                         Dim _oldBufB As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpAddB.Pointer, 8))
                         VirtualFree(_oldBufB, UIntPtr.Zero, MEM_RELEASE)
@@ -2988,7 +2990,7 @@ Public Class Form1
                 Dim _shiftLimbs As Long = _numerAbsSzC + (_kBitsC \ 64L) + 2L
                 Dim _shiftBytesC As Long = _shiftLimbs * 8L
                 If _shiftBytesC >= GMP_LARGE_THRESHOLD Then
-                    Dim _bigBufC As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_shiftBytesC)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                    Dim _bigBufC As IntPtr = PoolGet(_shiftBytesC)  ' §79
                     If _bigBufC <> IntPtr.Zero Then
                         Dim _oldBufC As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpShiftC.Pointer, 8))
                         VirtualFree(_oldBufC, UIntPtr.Zero, MEM_RELEASE)
@@ -3048,7 +3050,7 @@ Public Class Form1
                 Dim _addLimbs As Long = System.Math.Max(_numerAbsSzD, _r0AbsSzD) + 2L
                 Dim _addBytesD As Long = _addLimbs * 8L
                 If _addBytesD >= GMP_LARGE_THRESHOLD Then
-                    Dim _bigBufD As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_addBytesD)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                    Dim _bigBufD As IntPtr = PoolGet(_addBytesD)  ' §79
                     If _bigBufD <> IntPtr.Zero Then
                         Dim _oldBufD As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpAddD.Pointer, 8))
                         VirtualFree(_oldBufD, UIntPtr.Zero, MEM_RELEASE)
@@ -3113,7 +3115,7 @@ Public Class Form1
                 Dim _quotLimbs As Long = System.Math.Max(_numerSzDiv - _denomSzDiv + 1L, 1L) + 2L
                 Dim _quotBytes As Long = _quotLimbs * 8L
                 If _quotBytes >= GMP_LARGE_THRESHOLD Then
-                    Dim _bigBufPi As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_quotBytes)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                    Dim _bigBufPi As IntPtr = PoolGet(_quotBytes)  ' §79
                     If _bigBufPi <> IntPtr.Zero Then
                         Dim _oldAllocPi As Integer = Runtime.InteropServices.Marshal.ReadInt32(gmpPi.Pointer, 0)
                         Dim _oldBufPi As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(gmpPi.Pointer, 8))

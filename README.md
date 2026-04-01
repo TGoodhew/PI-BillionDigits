@@ -2048,6 +2048,24 @@ Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately bef
 
 ---
 
+## Section 79 — Fix Pool Corruption: Pre-Alloc Blocks Must Use PoolGet Not VirtualAlloc
+
+**Branch:** PerfWork
+
+**Root cause (confirmed by struct-field diagnostics):** Every pre-alloc block that stores a limb buffer directly into an `mpz_t._mp_d` field via `Marshal.WriteInt64` was allocated with `VirtualAlloc(_xBytes)`, giving exactly `_xBytes` bytes (page-rounded). When the `mpz_t` is later freed via `mpz_clear` → `GmpFreeFunc(ptr, _mp_alloc * 8 = _xBytes)` → `PoolReturn(ptr, _xBytes)`, the pool places the block in bucket `PoolBucket(_xBytes) = b`. The pool's invariant for bucket `b` is that all blocks are `1L << b` bytes — but `_xBytes ≤ 1L << b`. When a subsequent `GmpAllocFunc` request in the same bucket pops this block, it uses up to `1L << b` bytes from a block that only has `_xBytes` (page-rounded) bytes → buffer overrun → access violation in native GMP.
+
+**Specific crash:** After `mpz_clear(tmpHigh)`, the `tmpHigh` pre-alloc block (`VirtualAlloc(571,736 bytes)` → only ~572 KB actual) enters bucket 20 (`1L << 20 = 1,048,576 bytes`). When `GmpRaw_mul` → `mpn_mul` → FFT internally calls `GmpAllocFunc` for a ~700 KB scratch buffer (bucket 20), it pops the 572 KB block and writes 700 KB to it → AV. This crash was consistent across all three SafeMpzMul fast-path calls for 1M digits.
+
+**Fix:** Replace `VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_xBytes)), ...)` with `PoolGet(_xBytes)` at all pre-alloc sites. `PoolGet` allocates `1L << PoolBucket(_xBytes)` bytes — exactly the capacity the bucket assumes — so any subsequent pop of that block uses memory that was actually allocated.
+
+**Sites fixed** (all in `Form1.vb`):
+- `DeserializeOneMpz`: `limbs` buffer
+- Three-pass multiply: `tmpHigh`, `mpQ1`, `mpQ2`, `mpR0`, `mpR1`, `mpR2`
+- Combine A/B/C/D: `_bigBufA`, `_bigBufB`, `_bigBufC`, `_bigBufD`
+- Pi quotient: `_bigBufPi`
+
+**Why 1B-digit runs were unaffected:** For 1B digits, the pre-alloc sizes are hundreds of MB, which are above `POOL_MAX_BLOCK = 16 MB`. `PoolReturn` calls `VirtualFree` directly for oversized blocks (they never enter the pool), so there's no bucket-size assumption to violate.
+
 ## Section 78 — Fix SafeMpzMul Fast Path: Use Raw P/Invoke to Avoid Managed Wrapper Corruption
 
 **Branch:** PerfWork
