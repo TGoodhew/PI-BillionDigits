@@ -34,9 +34,7 @@ Public Class Form1
     ' Output directory: defaults to %LOCALAPPDATA%\PI-BillionDigits — always writable,
     ' no admin rights required, works on any machine regardless of drive letter.
     ' All output paths (digits file, log file, node cache) derive from this one field.
-    Private Shared _outputDir As String = System.IO.Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "PI-BillionDigits")
+    Private Shared _outputDir As String = "C:\PiOutput"
     Private ReadOnly Property outputFile As String
         Get
             Return System.IO.Path.Combine(_outputDir, "pi_digits.txt")
