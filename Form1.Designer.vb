@@ -29,6 +29,8 @@ Partial Class Form1
         LstBoxPhases = New ListBox()
         LblRamThreshold = New Label()
         NudRamThreshold = New NumericUpDown()
+        LblLogLevel = New Label()
+        NudLogLevel = New NumericUpDown()
         ChkAutoVerify = New CheckBox()
         BtnTest = New Button()
         LblDigitsDisplayed = New Label()
@@ -45,6 +47,7 @@ Partial Class Form1
         BtnCompute = New Button()
         RtbPiDigits = New RichTextBox()
         CType(NudRamThreshold, System.ComponentModel.ISupportInitialize).BeginInit()
+        CType(NudLogLevel, System.ComponentModel.ISupportInitialize).BeginInit()
         Panel1.SuspendLayout()
         SuspendLayout()
         ' 
@@ -56,6 +59,8 @@ Partial Class Form1
         Panel1.Controls.Add(LstBoxPhases)
         Panel1.Controls.Add(LblRamThreshold)
         Panel1.Controls.Add(NudRamThreshold)
+        Panel1.Controls.Add(LblLogLevel)
+        Panel1.Controls.Add(NudLogLevel)
         Panel1.Controls.Add(ChkAutoVerify)
         Panel1.Controls.Add(BtnTest)
         Panel1.Controls.Add(LblDigitsDisplayed)
@@ -145,9 +150,30 @@ Partial Class Form1
         LblRunningTime.Name = "LblRunningTime"
         LblRunningTime.Size = New Size(313, 38)
         LblRunningTime.TabIndex = 35
-        ' 
+        '
+        ' LblLogLevel
+        '
+        LblLogLevel.AutoSize = True
+        LblLogLevel.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        LblLogLevel.Location = New Point(1762, 16)
+        LblLogLevel.Name = "LblLogLevel"
+        LblLogLevel.Size = New Size(120, 38)
+        LblLogLevel.TabIndex = 43
+        LblLogLevel.Text = "Log Level:"
+        '
+        ' NudLogLevel
+        '
+        NudLogLevel.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        NudLogLevel.Location = New Point(1900, 12)
+        NudLogLevel.Minimum = New Decimal(New Integer() {0, 0, 0, 0})
+        NudLogLevel.Maximum = New Decimal(New Integer() {5, 0, 0, 0})
+        NudLogLevel.Value = New Decimal(New Integer() {1, 0, 0, 0})
+        NudLogLevel.Name = "NudLogLevel"
+        NudLogLevel.Size = New Size(75, 39)
+        NudLogLevel.TabIndex = 44
+        '
         ' Label4
-        ' 
+        '
         Label4.AutoSize = True
         Label4.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
         Label4.Location = New Point(1236, 16)
@@ -266,6 +292,7 @@ Partial Class Form1
         Text = "Calculate PI to 1 Billion"
         WindowState = FormWindowState.Maximized
         CType(NudRamThreshold, System.ComponentModel.ISupportInitialize).EndInit()
+        CType(NudLogLevel, System.ComponentModel.ISupportInitialize).EndInit()
         Panel1.ResumeLayout(False)
         Panel1.PerformLayout()
         ResumeLayout(False)
@@ -291,5 +318,7 @@ Partial Class Form1
     Friend WithEvents LblRamThreshold As Label
     Friend WithEvents NudRamThreshold As NumericUpDown
     Friend WithEvents ChkAutoVerify As CheckBox
+    Friend WithEvents LblLogLevel As Label
+    Friend WithEvents NudLogLevel As NumericUpDown
 
 End Class

@@ -32,6 +32,15 @@
     directory, suitable for pasting into Claude for analysis.
     Requires: dotnet tool install --global dotnet-trace
 
+.PARAMETER LogLevel
+    Logging detail level passed to the exe as --log-level N.  Defaults to 1.
+      0  None        Errors and crashes only. Silent on success.
+      1  Performance [PHASE] markers with wall-clock timing (default).
+      2  Stages      Per-phase step detail: file I/O, initial calc steps, node sizes.
+      3  Last stage  Full per-operation trace for the final combine and ComputePiGMP.
+      4  Full trace  Everything in 3, plus SafeMpzMul diagnostics and BinarySplitChunk.
+      5  Allocator   Everything in 4, plus pool/affinity diagnostics.
+
 .PARAMETER ReportOnly
     Path to an existing .nettrace file.  Skips clean/build/run and goes
     straight to generating the topN report.  Use this to process a trace
@@ -41,12 +50,15 @@
     .\Run-PiCompute.ps1
     .\Run-PiCompute.ps1 -OutputDir "D:\PiResults"
     .\Run-PiCompute.ps1 -Digits 100000000
-    .\Run-PiCompute.ps1 -Trace
+    .\Run-PiCompute.ps1 -LogLevel 0
+    .\Run-PiCompute.ps1 -LogLevel 3
+    .\Run-PiCompute.ps1 -Trace -LogLevel 2
     .\Run-PiCompute.ps1 -ReportOnly ".\pi_trace_20260331_121017.nettrace"
 #>
 param(
     [string]$OutputDir  = 'C:\PiOutput',
     [long]  $Digits     = 1000000000,
+    [int]   $LogLevel   = 1,
     [switch]$Trace,
     [string]$ReportOnly = ""
 )
@@ -75,10 +87,11 @@ $digitsFile  = Join-Path $OutputDir  'pi_digits.txt'
 $logFile     = Join-Path $OutputDir  'pi_phase_log.txt'
 
 Write-Host "=== PI-BillionDigits headless run ===" -ForegroundColor Cyan
-Write-Host "Project : $projectFile"
-Write-Host "Output  : $OutputDir"
-Write-Host "Digits  : $Digits"
-if ($Trace) { Write-Host "Mode    : CPU trace enabled" -ForegroundColor Magenta }
+Write-Host "Project  : $projectFile"
+Write-Host "Output   : $OutputDir"
+Write-Host "Digits   : $Digits"
+Write-Host "LogLevel : $LogLevel"
+if ($Trace) { Write-Host "Mode     : CPU trace enabled" -ForegroundColor Magenta }
 Write-Host ""
 
 # ── Ensure output directory exists ───────────────────────────────────────────
@@ -127,7 +140,7 @@ if ($Trace) {
     dotnet-trace collect `
         --output $traceFile `
         --providers "Microsoft-DotNETCore-SampleProfiler:0xF00000000000:5,Microsoft-DotNETRuntime:0x1F000080018:5" `
-        -- $exePath --digits $Digits --autostart --autoverify
+        -- $exePath --digits $Digits --autostart --autoverify --log-level $LogLevel
 
     if ($LASTEXITCODE -ne 0) { Write-Warning "dotnet trace exited with code $LASTEXITCODE" }
 
@@ -143,8 +156,8 @@ if ($Trace) {
         Write-Warning "Trace file not found — report skipped."
     }
 } else {
-    Write-Host "--- Launching ($Digits digits, autostart, autoverify) ---" -ForegroundColor Yellow
-    & $exePath --digits $Digits --autostart --autoverify
+    Write-Host "--- Launching ($Digits digits, autostart, autoverify, log-level $LogLevel) ---" -ForegroundColor Yellow
+    & $exePath --digits $Digits --autostart --autoverify --log-level $LogLevel
 }
 
 Write-Host ""

@@ -2048,6 +2048,40 @@ Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately bef
 
 ---
 
+## Section 83 — Runtime Logging Level (issue #15)
+
+**Branch:** PerfWork
+
+**Problem:** the logging detail level was controlled by `#Const LOGGING_DETAIL` — a compile-time constant requiring a rebuild to change. The three levels (0/1/2) were poorly defined and the existing level 1 was too coarse, mixing stage detail with full-trace diagnostics.
+
+**Changes:**
+
+### New 6-level runtime system
+
+| Level | Name | What it logs |
+|---|---|---|
+| **0** | None | Errors and crashes only. Silent on success. |
+| **1** | Performance *(default)* | `[PHASE]` markers with wall-clock timing — enough to reconstruct per-phase timing. |
+| **2** | Stages | Level 1 + serialization file names/sizes, node digit-count summaries, initial calc steps (pow, sqrt, mul_ui), division description, `mpz_get_str` wall time. |
+| **3** | Last stage | Level 2 + full per-operation trace for the final BinarySplitGMP combine level and all `ComputePiGMP` steps (§61 serial multiply call trace, combine A/B/C/D call trace, RAM snapshots). |
+| **4** | Full trace | Level 3 + `SafeMpzMul` fast-path and slow-path diagnostics, accum pre-alloc confirmation, B-piece extraction details, `BinarySplitChunk` entry/exit on every call, bit-size predictions for combine steps. |
+| **5** | Allocator | Level 4 + pool/affinity diagnostics (reserved for future use). |
+
+### Implementation
+
+- `#Const LOGGING_DETAIL` removed; all 74 `#If LOGGING_DETAIL` blocks converted to `If _logLevel >= N Then` runtime checks.
+- `Private _logLevel As Integer = 1` field added (default: Performance).
+- `--log-level N` CLI argument parsed in `Form1_Load`.
+- **`NudLogLevel` spinner** (0–5, default 1) added to the control panel row 1; read into `_logLevel` when Start is clicked. Disabled in headless mode.
+- Logging mode description in the phase log header updated to show the runtime level name.
+
+### Run-PiCompute.ps1
+
+- `-LogLevel` parameter added (default: 1); passed as `--log-level $LogLevel` to the exe in both normal and trace-mode runs.
+- Level names documented in `.PARAMETER LogLevel`.
+
+---
+
 ## Section 82 — Auto-Verify Checkbox; Verification Results in Status Bar (issue #12)
 
 **Branch:** PerfWork

@@ -820,6 +820,9 @@ Public Class Form1
         NudRamThreshold.Value = System.Math.Max(NudRamThreshold.Minimum,
                                 System.Math.Min(NudRamThreshold.Maximum, _diskThreshold))
         NudRamThreshold.Enabled = Not _headless
+        NudLogLevel.Value = System.Math.Max(NudLogLevel.Minimum,
+                            System.Math.Min(NudLogLevel.Maximum, _logLevel))
+        NudLogLevel.Enabled = Not _headless
         RtbPiDigits.MaxLength = 0
         RtbPiDigits.ReadOnly = False
         RtbPiDigits.Font = New Font("Consolas", 10)
@@ -959,6 +962,16 @@ Public Class Form1
             "If it exceeds this value, nodes are written to the NVMe cache (uses less RAM). " &
             "Auto-detected from available system RAM at startup: ≥16 GB → 200,000 (all RAM); ≥8 GB → 100,000; <8 GB → 1 (full disk). " &
             "Lower this if you get out-of-memory errors.")
+        TipMain.SetToolTip(NudLogLevel,
+            "Logging detail level (0–5). " &
+            "0=None (errors only)  1=Performance (phase timings, default)  " &
+            "2=Stages (file I/O, step detail)  3=Last stage (final combine trace)  " &
+            "4=Full trace (SafeMpzMul, BinarySplitChunk)  5=Allocator (pool/affinity).")
+        TipMain.SetToolTip(LblLogLevel,
+            "Logging detail level (0–5). " &
+            "0=None (errors only)  1=Performance (phase timings, default)  " &
+            "2=Stages (file I/O, step detail)  3=Last stage (final combine trace)  " &
+            "4=Full trace (SafeMpzMul, BinarySplitChunk)  5=Allocator (pool/affinity).")
         TipMain.SetToolTip(ChkAutoVerify,
             "When checked, verification runs automatically after computation completes. " &
             "Results appear in the status bar — no dialog boxes.")
@@ -1126,8 +1139,9 @@ Public Class Form1
         BtnCompute.Enabled = False
         BtnPause.Enabled = True
 
-        ' Capture threshold from UI (or keep CLI-supplied value in headless mode).
+        ' Capture threshold and log level from UI (or keep CLI-supplied values in headless mode).
         _diskThreshold = CInt(NudRamThreshold.Value)
+        _logLevel = CInt(NudLogLevel.Value)
 
         ' Pre-warm the thread pool to ProcessorCount threads before the compute
         ' thread starts.  Without this, the thread pool ramps up one thread at a
