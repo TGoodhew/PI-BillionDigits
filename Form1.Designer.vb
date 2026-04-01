@@ -94,7 +94,7 @@ Partial Class Form1
         '
         ' NudRamThreshold
         '
-        NudRamThreshold.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        NudRamThreshold.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
         NudRamThreshold.Location = New Point(748, 91)
         NudRamThreshold.Minimum = New Decimal(New Integer() {1, 0, 0, 0})
         NudRamThreshold.Maximum = New Decimal(New Integer() {500000, 0, 0, 0})
@@ -106,9 +106,10 @@ Partial Class Form1
         '
         ' BtnTest
         '
-        BtnTest.Location = New Point(403, 91)
+        BtnTest.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        BtnTest.Location = New Point(403, 79)
         BtnTest.Name = "BtnTest"
-        BtnTest.Size = New Size(112, 34)
+        BtnTest.Size = New Size(112, 47)
         BtnTest.TabIndex = 28
         BtnTest.Text = "Test"
         BtnTest.UseVisualStyleBackColor = True
@@ -142,7 +143,7 @@ Partial Class Form1
         ' ChkboxWriteToFile
         ' 
         ChkboxWriteToFile.AutoSize = True
-        ChkboxWriteToFile.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        ChkboxWriteToFile.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
         ChkboxWriteToFile.Location = New Point(180, 89)
         ChkboxWriteToFile.Name = "ChkboxWriteToFile"
         ChkboxWriteToFile.Size = New Size(170, 36)
@@ -153,7 +154,7 @@ Partial Class Form1
         ' ChkboxDisplay
         ' 
         ChkboxDisplay.AutoSize = True
-        ChkboxDisplay.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        ChkboxDisplay.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
         ChkboxDisplay.Location = New Point(25, 89)
         ChkboxDisplay.Name = "ChkboxDisplay"
         ChkboxDisplay.Size = New Size(117, 36)
@@ -169,11 +170,11 @@ Partial Class Form1
         Label3.Name = "Label3"
         Label3.Size = New Size(223, 38)
         Label3.TabIndex = 31
-        Label3.Text = "Digits Displayed:"
+        Label3.Text = "Displayed:"
         ' 
         ' TxtDigitsofPI
         ' 
-        TxtDigitsofPI.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        TxtDigitsofPI.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
         TxtDigitsofPI.Location = New Point(508, 26)
         TxtDigitsofPI.Name = "TxtDigitsofPI"
         TxtDigitsofPI.Size = New Size(205, 39)
@@ -201,7 +202,7 @@ Partial Class Form1
         ' 
         ' BtnPause
         ' 
-        BtnPause.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        BtnPause.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
         BtnPause.Location = New Point(180, 26)
         BtnPause.Name = "BtnPause"
         BtnPause.Size = New Size(134, 47)
@@ -211,7 +212,7 @@ Partial Class Form1
         ' 
         ' LblStatus
         ' 
-        LblStatus.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        LblStatus.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
         LblStatus.Location = New Point(148, 161)
         LblStatus.Name = "LblStatus"
         LblStatus.Size = New Size(1125, 39)
@@ -219,7 +220,7 @@ Partial Class Form1
         ' 
         ' BtnCompute
         ' 
-        BtnCompute.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        BtnCompute.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
         BtnCompute.Location = New Point(25, 26)
         BtnCompute.Name = "BtnCompute"
         BtnCompute.Size = New Size(134, 47)

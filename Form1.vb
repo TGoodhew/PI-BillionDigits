@@ -767,6 +767,8 @@ Public Class Form1
         LblStatus.Text = "Ready"
         TxtDigitsofPI.Text = If(TxtDigitsofPI.Text <> "", TxtDigitsofPI.Text, "1,000,000")
         ChkboxDisplay.Checked = Not _headless
+        Label3.Visible = ChkboxDisplay.Checked
+        LblDigitsDisplayed.Visible = ChkboxDisplay.Checked
 
         ' ── Auto-detect RAM threshold ─────────────────────────────────────────
         ' If --threshold was not supplied on the CLI, estimate a safe default
@@ -937,6 +939,11 @@ Public Class Form1
         If _headless Then
             BtnCompute_Click(Me, EventArgs.Empty)
         End If
+    End Sub
+
+    Private Sub ChkboxDisplay_CheckedChanged(sender As Object, e As EventArgs) Handles ChkboxDisplay.CheckedChanged
+        Label3.Visible = ChkboxDisplay.Checked
+        LblDigitsDisplayed.Visible = ChkboxDisplay.Checked
     End Sub
 
     ' ── AppDomain-level unhandled exception handler ──────────────────────────
