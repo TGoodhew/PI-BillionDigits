@@ -2048,6 +2048,18 @@ Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately bef
 
 ---
 
+## Section 78 — Fix SafeMpzMul Fast Path: Use Raw P/Invoke to Avoid Managed Wrapper Corruption
+
+**Branch:** PerfWork
+
+**Symptom:** App crashed at `[ComputePi] §61 calling r0 = N*Q0...` on 1M-digit runs. The granular §77 logging narrowed it to the very first `SafeMpzMul(mpR0, gmpNumer, finalQ)` call. Same 1B-digit run never crashed.
+
+**Root cause:** `SafeMpzMul`'s fast path (`szA+szB ≤ SAFE_LIMB_THRESHOLD`) called `gmp_lib.mpz_mul(result, opA, opB)` — the Math.Gmp.Native managed wrapper. This wrapper is known to corrupt `mpz_t.Pointer` fields during native calls (the §42 root cause, which the slow path already fixes by using raw `IntPtr` accumulators). For 1B-digit runs, `szA+szB ≈ 87.6M > SAFE_LIMB_THRESHOLD`, so those runs always take the slow path (already safe). For 1M-digit runs, `szA+szB = 87,639 ≤ SAFE_LIMB_THRESHOLD`, so they take the fast path and hit the wrapper corruption — crashing inside the native `__gmpz_mul` call when it tries to write to a corrupted result pointer.
+
+**Fix:** Added `GmpRaw_mul` P/Invoke declaration (`[DllImport("libgmp-10.dll", EntryPoint:="__gmpz_mul")]`) and replaced `gmp_lib.mpz_mul(result, opA, opB)` with `GmpRaw_mul(result.Pointer, opA.Pointer, opB.Pointer)` in the fast path. Passing the raw `IntPtr` values bypasses the managed wrapper entirely, so the wrapper never touches the `mpz_t` objects and cannot corrupt their Pointer fields.
+
+**Why 1B-digit runs were unaffected:** The §61 multiply operand sizes for 1B digits (`szA ≈ 51.9M`, `szB ≈ 35.7M`, sum ≈ 87.6M) exceed `SAFE_LIMB_THRESHOLD = 33,554,431`, so the slow path (which already uses raw IntPtrs) was always taken. 1M-digit operand sizes (87,639 total) fall well below the threshold, exposing the fast path wrapper bug for the first time.
+
 ## Section 77 — Granular Per-Call Logging in §61 Multiply Block
 
 **Branch:** PerfWork

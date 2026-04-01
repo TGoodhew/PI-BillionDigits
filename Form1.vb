@@ -628,6 +628,16 @@ Public Class Form1
     ' recursive SafeMpzMul calls, even for objects not passed to inner calls.  Using plain
     ' IntPtr (Marshal.AllocHGlobal) for the accumulator and saved _sv_xxx IntPtrs for
     ' product/shifted avoids the corruption entirely.
+    ' §78: Fast-path SafeMpzMul must bypass Math.Gmp.Native's managed wrapper for the
+    ' same reason the slow path uses raw IntPtrs (§42): the wrapper corrupts mpz_t.Pointer
+    ' fields during native calls.  For the slow path this was fixed by using accum (a raw
+    ' IntPtr).  For the fast path (szA+szB ≤ SAFE_LIMB_THRESHOLD) the direct mpz_mul call
+    ' must also go through a raw P/Invoke so the wrapper never touches the mpz_t objects.
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_mul",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_mul(rop As IntPtr, op1 As IntPtr, op2 As IntPtr)
+    End Sub
+
     <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_add",
                CallingConvention:=CallingConvention.Cdecl)>
     Private Shared Sub GmpRaw_add(rop As IntPtr, op1 As IntPtr, op2 As IntPtr)
@@ -1635,7 +1645,9 @@ Public Class Form1
                     $"opB.Ptr={opB.Pointer.ToInt64():X} opB_sz={szB_signed:N0}{vbCrLf}")
             End If
 #End If
-            gmp_lib.mpz_mul(result, opA, opB)
+            ' §78: Use raw P/Invoke to bypass Math.Gmp.Native's managed wrapper, which
+            ' corrupts mpz_t.Pointer fields during native calls (same root cause as §42).
+            GmpRaw_mul(result.Pointer, opA.Pointer, opB.Pointer)
 #If LOGGING_DETAIL >= 1 Then
             If CLng(szA) + CLng(szB) > 5_000_000L Then
                 AppendLog(
