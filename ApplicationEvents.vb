@@ -45,12 +45,17 @@ Namespace My
 
             ' Write to the log file before showing UI
             Try
-                System.IO.File.AppendAllText("c:\PiOutput\pi_phase_log.txt", sb.ToString())
+                Dim logDir As String = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "PI-BillionDigits")
+                System.IO.Directory.CreateDirectory(logDir)
+                System.IO.File.AppendAllText(
+                    System.IO.Path.Combine(logDir, "pi_phase_log.txt"), sb.ToString())
             Catch
             End Try
 
             MessageBox.Show(sb.ToString(), "Unhandled Exception", MessageBoxButtons.OK, MessageBoxIcon.Error)
-            e.ExitApplication = True
+            e.ExitApplication = False   ' keep the app alive; user can review state and close manually
         End Sub
 
     End Class
