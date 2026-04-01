@@ -49,6 +49,11 @@ Public Class Form1
     ' Application.Exit after computation completes).
     Private _headless As Boolean = False
     Private _autoVerify As Boolean = False
+    ' Custom verify checks supplied via --verify-at "DIGITS:POSITION" and
+    ' --verify-contains "DIGITS".  Populated during CLI arg parsing; consumed
+    ' by RunCustomVerifications() which is called from BtnTest_Click.
+    Private _verifyAt As New List(Of Tuple(Of String, Long))()   ' (digits, expectedPos)
+    Private _verifyContains As New List(Of String)()
 
     ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
     ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
@@ -699,6 +704,24 @@ Public Class Form1
                     _headless = True
                 Case "--autoverify"
                     _autoVerify = True
+                Case "--verify-at"
+                    ' Format: DIGITS:POSITION  e.g. "999999:762"
+                    If i + 1 < args.Length Then
+                        Dim parts() As String = args(i + 1).Split(":"c)
+                        Dim pos As Long
+                        If parts.Length = 2 AndAlso Long.TryParse(parts(1), pos) AndAlso parts(0).Length > 0 Then
+                            _verifyAt.Add(Tuple.Create(parts(0), pos))
+                        End If
+                        i += 1
+                    End If
+                Case "--verify-contains"
+                    ' Format: DIGITS  e.g. "27182818284"
+                    If i + 1 < args.Length Then
+                        If args(i + 1).Length > 0 Then
+                            _verifyContains.Add(args(i + 1))
+                        End If
+                        i += 1
+                    End If
             End Select
             i += 1
         Loop
@@ -3011,6 +3034,46 @@ Public Class Form1
                               Format(span.Milliseconds, "000")
     End Sub
 
+    ''' <summary>
+    ''' Runs any --verify-at and --verify-contains checks supplied on the command line.
+    ''' Results are shown in a MessageBox (interactive) or written to the log (headless).
+    ''' </summary>
+    Private Sub RunCustomVerifications(piText As String)
+        For Each chk In _verifyAt
+            Dim digits As String = chk.Item1
+            Dim expectedPos As Long = chk.Item2
+            Dim actualPos As Long = CLng(piText.IndexOf(digits))
+            Dim msg As String
+            If actualPos >= 0 Then
+                msg = $"[verify-at] '{digits}' found at position {actualPos}. Expected: {expectedPos}. Correct: {actualPos = expectedPos}"
+            Else
+                msg = $"[verify-at] '{digits}' NOT FOUND (expected at position {expectedPos})"
+            End If
+            If Not _headless Then
+                MessageBox.Show(msg, "Verify")
+            Else
+                WriteToLog("[DIALOG] " & msg)
+                LblStatus.Text = msg
+            End If
+        Next
+
+        For Each needle In _verifyContains
+            Dim pos As Long = CLng(piText.IndexOf(needle))
+            Dim msg As String
+            If pos >= 0 Then
+                msg = $"[verify-contains] '{needle}' found at position {pos}"
+            Else
+                msg = $"[verify-contains] '{needle}' NOT FOUND"
+            End If
+            If Not _headless Then
+                MessageBox.Show(msg, "Verify")
+            Else
+                WriteToLog("[DIALOG] " & msg)
+                LblStatus.Text = msg
+            End If
+        Next
+    End Sub
+
     Private Sub BtnTest_Click(sender As Object, e As EventArgs) Handles BtnTest.Click
         ' Search the full native buffer when available (complete digits regardless of
         ' how far the display timer has streamed); fall back to the text box otherwise.
@@ -3072,6 +3135,11 @@ Public Class Form1
             MessageBox.Show(verify3)
         Else
             WriteToLog("[DIALOG] Verify e digits: " & verify3)
+        End If
+
+        ' Run any additional checks supplied via --verify-at / --verify-contains
+        If _verifyAt.Count > 0 OrElse _verifyContains.Count > 0 Then
+            RunCustomVerifications(piText)
         End If
     End Sub
 
