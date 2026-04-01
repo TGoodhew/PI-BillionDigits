@@ -55,7 +55,7 @@ Public Class Form1
     ' Set by --autostart (suppress all dialogs) and --autoverify (run verify +
     ' Application.Exit after computation completes).
     Private _headless As Boolean = False
-    Private _logLevel As Integer = 1
+    Private Shared _logLevel As Integer = 1
     Private _autoVerify As Boolean = False
     ' Custom verify checks supplied via --verify-at "DIGITS:POSITION" and
     ' --verify-contains "DIGITS".  Populated during CLI arg parsing; consumed
