@@ -1044,23 +1044,25 @@ Public Class Form1
     End Sub
 
     Private Sub BtnPause_Click_1(sender As Object, e As EventArgs) Handles BtnPause.Click
+        ' Confirmation dialog — cancellation discards all progress (no checkpoint exists).
+        If Not _headless Then
+            Dim confirm As DialogResult = MessageBox.Show(
+                "This will cancel the computation and all progress will be lost." & vbCrLf &
+                "Are you sure you want to cancel?",
+                "Cancel Computation",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2)
+            If confirm <> DialogResult.Yes Then Return
+        End If
+
         cts.Cancel()
         displayTimer.Enabled = False
         BtnPause.Enabled = False
         BtnCompute.Enabled = True
         Timer1.Stop()
-        LblStatus.Text = "Paused."
-        If ChkboxWriteToFile.Checked Then
-            Try
-                If Not System.IO.Directory.Exists(System.IO.Path.GetDirectoryName(outputFile)) Then
-                    System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(outputFile))
-                End If
-                System.IO.File.WriteAllText(outputFile, RtbPiDigits.Text)
-                LblStatus.Text = "Paused. Saved to file."
-            Catch ex As Exception
-                LblStatus.Text = "Paused. File save error: " & ex.Message
-            End Try
-        End If
+        LblStatus.Text = "Cancelled."
+        WriteToLog("Computation cancelled by user.")
     End Sub
 
     ' ════════════════════════════════════════════════════════════════════════

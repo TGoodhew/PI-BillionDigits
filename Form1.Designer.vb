@@ -178,7 +178,7 @@ Partial Class Form1
         BtnPause.Name = "BtnPause"
         BtnPause.Size = New Size(134, 47)
         BtnPause.TabIndex = 27
-        BtnPause.Text = "Pause"
+        BtnPause.Text = "Cancel"
         BtnPause.UseVisualStyleBackColor = True
         ' 
         ' LblStatus
