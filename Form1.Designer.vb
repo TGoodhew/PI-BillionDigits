@@ -26,8 +26,6 @@ Partial Class Form1
         Timer1 = New Timer(components)
         Panel1 = New Panel()
         LstBoxPhases = New ListBox()
-        Label5 = New Label()
-        TxtChunkSize = New TextBox()
         BtnTest = New Button()
         LblDigitsDisplayed = New Label()
         LblRunningTime = New Label()
@@ -51,8 +49,6 @@ Partial Class Form1
         ' Panel1
         ' 
         Panel1.Controls.Add(LstBoxPhases)
-        Panel1.Controls.Add(Label5)
-        Panel1.Controls.Add(TxtChunkSize)
         Panel1.Controls.Add(BtnTest)
         Panel1.Controls.Add(LblDigitsDisplayed)
         Panel1.Controls.Add(LblRunningTime)
@@ -79,24 +75,6 @@ Partial Class Form1
         LstBoxPhases.Name = "LstBoxPhases"
         LstBoxPhases.Size = New Size(1106, 279)
         LstBoxPhases.TabIndex = 39
-        ' 
-        ' Label5
-        ' 
-        Label5.AutoSize = True
-        Label5.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        Label5.Location = New Point(1260, 91)
-        Label5.Name = "Label5"
-        Label5.Size = New Size(160, 38)
-        Label5.TabIndex = 38
-        Label5.Text = "Chunk Size:"
-        ' 
-        ' TxtChunkSize
-        ' 
-        TxtChunkSize.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        TxtChunkSize.Location = New Point(1438, 93)
-        TxtChunkSize.Name = "TxtChunkSize"
-        TxtChunkSize.Size = New Size(185, 39)
-        TxtChunkSize.TabIndex = 37
         ' 
         ' BtnTest
         ' 
@@ -260,8 +238,6 @@ Partial Class Form1
     Friend WithEvents BtnCompute As Button
     Friend WithEvents RtbPiDigits As RichTextBox
     Friend WithEvents BtnTest As Button
-    Friend WithEvents Label5 As Label
-    Friend WithEvents TxtChunkSize As TextBox
     Friend WithEvents LstBoxPhases As ListBox
 
 End Class

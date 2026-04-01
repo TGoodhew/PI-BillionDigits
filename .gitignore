@@ -16,3 +16,16 @@ packages/
 # Windows
 Thumbs.db
 Desktop.ini
+
+# dotnet-trace / PerfView output
+*.nettrace
+*.nettrace.etlx
+*.etlx
+*.etl
+*.etl.zip
+*.speedscope.json
+*.diagsession
+*.vspx
+*.psess
+*_report.txt
+pi_trace_*

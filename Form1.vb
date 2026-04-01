@@ -20,6 +20,7 @@ Imports System.Numerics
 Imports System.IO
 Imports System.Threading
 Imports System.Threading.Tasks
+Imports System.Collections.Concurrent
 Imports System.Runtime.InteropServices
 Imports Math.Gmp.Native
 Imports System.Diagnostics
@@ -30,7 +31,17 @@ Public Class Form1
     Private phaseStopWatch As New Stopwatch()
     Private cts As CancellationTokenSource
     Private DIGITS As Long
-    Private Const outputFile As String = "c:\PiOutput\pi_digits.txt"
+    ' Output directory: defaults to %LOCALAPPDATA%\PI-BillionDigits — always writable,
+    ' no admin rights required, works on any machine regardless of drive letter.
+    ' All output paths (digits file, log file, node cache) derive from this one field.
+    Private Shared _outputDir As String = System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "PI-BillionDigits")
+    Private ReadOnly Property outputFile As String
+        Get
+            Return System.IO.Path.Combine(_outputDir, "pi_digits.txt")
+        End Get
+    End Property
     Private displayStr As String = ""
     Private displayIdx As Integer = 0
     Private displayTotal As Long = 0
@@ -42,6 +53,25 @@ Public Class Form1
     Private _displayNativeBufSize As Long = 0   ' GmpAllocFunc alloc size; >= GMP_LARGE_THRESHOLD → VirtualAlloc'd
     Private WithEvents displayTimer As New System.Windows.Forms.Timer()
     Private gmpC3Const As mpz_t = Nothing
+
+    ' ── Headless / command-line mode ─────────────────────────────────────────
+    ' Set by --autostart (suppress all dialogs) and --autoverify (run verify +
+    ' Application.Exit after computation completes).
+    Private _headless As Boolean = False
+    Private _autoVerify As Boolean = False
+    ' Custom verify checks supplied via --verify-at "DIGITS:POSITION" and
+    ' --verify-contains "DIGITS".  Populated during CLI arg parsing; consumed
+    ' by RunCustomVerifications() which is called from BtnTest_Click.
+    Private _verifyAt As New List(Of Tuple(Of String, Long))()   ' (digits, expectedPos)
+    Private _verifyContains As New List(Of String)()
+
+    ' §69: Controls SafeMpzMul inner Parallel.For DOP.
+    ' Set to 1 before Phase 2 parallel Parallel.For so sub-products run serially —
+    ' eliminates the thread-pool park/unpark cycle (18.77% LowLevelLifoSemaphore in
+    ' trace 4) caused by 24-outer × 2-Invoke × 9-inner = 432 tasks on 24 threads.
+    ' Restored to ProcessorCount before Phase 2 serial path and ComputePiGMP so
+    ' those single-pair operations still use all cores.
+    Private Shared _safeMulDop As Integer = -1   ' -1 = not yet set; reads as ProcessorCount
 
     ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
     ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
@@ -61,7 +91,11 @@ Public Class Form1
     End Sub
 
     ' Disk-based node storage for massive computations
-    Private Const DISK_CACHE_DIR As String = "c:\PiOutput\NodeCache\"
+    Private Shared ReadOnly Property DISK_CACHE_DIR As String
+        Get
+            Return System.IO.Path.Combine(_outputDir, "NodeCache") & System.IO.Path.DirectorySeparatorChar
+        End Get
+    End Property
 
     ' ── Issue #4 fix: DiskNode changed from Class to Structure ──────────────
     ' Value types stored in List(Of DiskNode) live inside the list's internal
@@ -242,6 +276,103 @@ Public Class Form1
     Private Shared Function GetCurrentProcess() As IntPtr
     End Function
 
+    <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Shared Function SetProcessAffinityMask(
+        hProcess As IntPtr,
+        dwProcessAffinityMask As IntPtr) As Boolean
+    End Function
+
+    <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Shared Function GetLogicalProcessorInformationEx(
+        relationshipType As Integer,
+        buffer As IntPtr,
+        ByRef returnedLength As UInteger) As Boolean
+    End Function
+
+    Private Const RelationProcessorCore As Integer = 0
+
+    ''' <summary>
+    ''' Detects hybrid CPU topology (P-cores vs E-cores) via
+    ''' GetLogicalProcessorInformationEx and restricts the process affinity mask
+    ''' to P-cores only.  On a non-hybrid CPU, or if detection fails, the affinity
+    ''' mask is left unchanged.
+    '''
+    ''' Intel 12th gen+ (Alder Lake) and AMD Zen 4c hybrid designs expose
+    ''' EfficiencyClass in PROCESSOR_RELATIONSHIP:
+    '''   EfficiencyClass = 0  → E-core (lower power, lower single-thread perf)
+    '''   EfficiencyClass > 0  → P-core (full-power, preferred for GMP math)
+    '''
+    ''' Restricting to P-cores prevents the thread-pool from placing GMP arithmetic
+    ''' workers on E-cores, which run at reduced clock speeds and share L2 caches
+    ''' differently, causing unexpected slowdowns in data-parallel workloads.
+    ''' </summary>
+    Private Shared Sub SetPCoreAffinity()
+        Try
+            ' First call: get required buffer size
+            Dim bufferSize As UInteger = 0
+            GetLogicalProcessorInformationEx(RelationProcessorCore, IntPtr.Zero, bufferSize)
+            If bufferSize = 0 Then
+                AppendLog($"[Affinity] GetLogicalProcessorInformationEx size query failed{vbCrLf}")
+                Return
+            End If
+
+            Dim buffer As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(CInt(bufferSize))
+            Try
+                If Not GetLogicalProcessorInformationEx(RelationProcessorCore, buffer, bufferSize) Then
+                    AppendLog($"[Affinity] GetLogicalProcessorInformationEx data query failed{vbCrLf}")
+                    Return
+                End If
+
+                ' Parse SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX records.
+                ' Each record layout (RelationProcessorCore):
+                '   +0  Relationship  : DWORD (4)
+                '   +4  Size          : DWORD (4)
+                '   +8  Flags         : BYTE  (1)
+                '   +9  EfficiencyClass: BYTE (1) — 0=E-core, >0=P-core
+                '  +10  Reserved[20]  : BYTE (20)
+                '  +30  GroupCount    : WORD  (2)
+                '  +32  GroupMask[0].Mask : ULONG_PTR (8 on x64)
+                '  +40  GroupMask[0].Group: WORD (2)
+                '  +42  GroupMask[0].Reserved: 6 bytes
+                Dim pCoreMask As Long = 0L
+                Dim eCoreMask As Long = 0L
+                Dim offset As Integer = 0
+
+                Do While offset < CInt(bufferSize)
+                    Dim recordSize As Integer = Runtime.InteropServices.Marshal.ReadInt32(buffer, offset + 4)
+                    If recordSize <= 0 Then Exit Do
+
+                    Dim efficiencyClass As Byte = Runtime.InteropServices.Marshal.ReadByte(buffer, offset + 9)
+                    Dim mask As Long = Runtime.InteropServices.Marshal.ReadInt64(buffer, offset + 32)
+
+                    If efficiencyClass > 0 Then
+                        pCoreMask = pCoreMask Or mask
+                    Else
+                        eCoreMask = eCoreMask Or mask
+                    End If
+
+                    offset += recordSize
+                Loop
+
+                If pCoreMask <> 0L AndAlso eCoreMask <> 0L Then
+                    ' Hybrid CPU — restrict process to P-cores
+                    If SetProcessAffinityMask(GetCurrentProcess(), New IntPtr(pCoreMask)) Then
+                        AppendLog($"[Affinity] Hybrid CPU detected. P-core mask=0x{pCoreMask:X}  E-core mask=0x{eCoreMask:X}. Process restricted to P-cores.{vbCrLf}")
+                    Else
+                        AppendLog($"[Affinity] Hybrid CPU detected but SetProcessAffinityMask failed. P=0x{pCoreMask:X} E=0x{eCoreMask:X}{vbCrLf}")
+                    End If
+                Else
+                    ' Uniform CPU — all cores same efficiency class; no change needed
+                    AppendLog($"[Affinity] Uniform CPU (no E-cores detected). P=0x{pCoreMask:X} E=0x{eCoreMask:X}. Affinity unchanged.{vbCrLf}")
+                End If
+            Finally
+                Runtime.InteropServices.Marshal.FreeHGlobal(buffer)
+            End Try
+        Catch ex As Exception
+            AppendLog($"[Affinity] Exception during P-core detection: {ex.Message}{vbCrLf}")
+        End Try
+    End Sub
+
     Private Shared Sub DisablePowerThrottling()
         Dim state As New PROCESS_POWER_THROTTLING_STATE With {
             .Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
@@ -263,6 +394,88 @@ Public Class Form1
     Private Shared _savedGmpRealloc As reallocate_function
     Private Shared _savedGmpFree As free_function
 
+    ' ── GMP limb buffer pool ──────────────────────────────────────────────────
+    ' Trace 1: GmpAllocFunc (21.8%) + GmpFreeFunc (19.0%) = 40.8% — VirtualAlloc/Free kernel cost.
+    ' Trace 2: ConcurrentDictionary pool → Monitor.Wait appeared at 5.55% because
+    '   GetOrAdd acquires an internal dictionary lock when inserting a new size class.
+    '   Under 24 parallel threads hitting new size classes simultaneously, threads
+    '   blocked on each other inside the dictionary.
+    '
+    ' Fix: power-of-2 bucketed fixed array.  64 pre-allocated ConcurrentStack slots,
+    ' indexed by floor(log2(sz)).  No dictionary, no Monitor — only
+    ' Interlocked.CompareExchange inside ConcurrentStack.TryPop/Push.
+    '
+    ' Bucket b covers requests in [2^(b-1)+1, 2^b].  We allocate 2^b bytes so the
+    ' block always satisfies the request.  GmpFreeFunc receives the original requested
+    ' size, computes the same bucket, and returns the block correctly.
+    '
+    ' POOL_MAX_BLOCK = 16 MB: blocks above this bypass the pool (VirtualFree directly).
+    ' Top-level combine blocks grow with every level; pooling them accumulated 38 GB of
+    ' committed-but-idle pages that caused VirtualAlloc to fail (observed crash at L16).
+    ' Flushing between Phase 2 levels further ensures committed memory tracks live data.
+    '
+    ' Cap = POOL_CAP blocks per bucket; excess blocks are VirtualFree'd immediately.
+    ' §68: raised from 32 → 256. With outer Phase 2 DOP=24 each doing Parallel.Invoke(2
+    ' SafeMpzMul), up to 48 concurrent GMP operations can return blocks simultaneously.
+    ' A cap of 32 caused constant pool eviction (VirtualFree) + re-miss (VirtualAlloc).
+    Private Const POOL_CAP As Integer = 256
+    Private Const POOL_MAX_BLOCK As Long = 16L * 1024L * 1024L  ' 16 MB — max pooled block
+    Private Const POOL_BUCKETS As Integer = 64
+    ' Initialised in InitGmpVirtualAllocFunctions before the first GMP call.
+    Private Shared _gmpPool(POOL_BUCKETS - 1) As ConcurrentStack(Of IntPtr)
+
+    ''' <summary>Returns floor(log2(sz)) clamped to [0, POOL_BUCKETS-1].</summary>
+    Private Shared Function PoolBucket(sz As Long) As Integer
+        If sz <= 1L Then Return 0
+        Dim b As Integer = 0
+        Dim v As Long = sz - 1L   ' -1 so exact powers of 2 map to their own bucket
+        While v > 0L
+            v = v >> 1
+            b += 1
+        End While
+        Return System.Math.Min(b, POOL_BUCKETS - 1)
+    End Function
+
+    Private Shared Function PoolGet(sz As Long) As IntPtr
+        If sz > 0L AndAlso sz <= POOL_MAX_BLOCK Then
+            Dim b As Integer = PoolBucket(sz)
+            Dim ptr As IntPtr
+            If _gmpPool(b).TryPop(ptr) Then Return ptr
+            ' Pool miss — allocate rounded-up bucket size (>= sz, no Monitor needed)
+            Dim allocSz As Long = 1L << b
+            Return VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(allocSz)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+        End If
+        ' sz=0 or oversized — allocate exactly
+        Return VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(sz)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+    End Function
+
+    Private Shared Sub PoolReturn(ptr As IntPtr, sz As Long)
+        If sz > 0L AndAlso sz <= POOL_MAX_BLOCK Then
+            Dim b As Integer = PoolBucket(sz)
+            If _gmpPool(b).Count < POOL_CAP Then
+                _gmpPool(b).Push(ptr)
+                Return
+            End If
+        End If
+        ' Oversized, zero-size, or pool full — release to OS immediately
+        VirtualFree(ptr, UIntPtr.Zero, MEM_RELEASE)
+    End Sub
+
+    ''' <summary>
+    ''' Returns all pooled limb blocks to the OS.  Call between Phase 2 levels and
+    ''' after the full computation so committed memory tracks the live working set.
+    ''' Safe while _displayNativePtr is alive — GMP never calls GmpFreeFunc on it.
+    ''' </summary>
+    Private Shared Sub FlushGmpPool()
+        For b As Integer = 0 To POOL_BUCKETS - 1
+            Dim ptr As IntPtr
+            While _gmpPool(b).TryPop(ptr)
+                VirtualFree(ptr, UIntPtr.Zero, MEM_RELEASE)
+            End While
+        Next
+        AppendLog($"[GmpPool] flushed{vbCrLf}")
+    End Sub
+
     ' Large allocations (>= 512 KB) use VirtualAlloc so VirtualFree immediately
     ' decommits the pages.  Small allocations delegate to GMP's own default CRT
     ' allocator — the static CRT heap inside libgmp-10.dll — which is the SAME
@@ -281,18 +494,9 @@ Public Class Form1
         End If
         Dim sz As Long = CLng(rawSz)
         If sz >= GMP_LARGE_THRESHOLD Then
-            Dim ptr As IntPtr = VirtualAlloc(IntPtr.Zero,
-                                             New UIntPtr(rawSz),
-                                             MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
-            ' Log VirtualAlloc calls in the 400 KB–2 MB range — these are the
-            ' mpz_init2 seed allocations for combine output variables.  Logging
-            ' them confirms (a) GmpAllocFunc is reached and (b) the allocation
-            ' size seen here, which sets _mp_alloc in the native GMP struct.
-            If sz >= 400L * 1024L AndAlso sz <= 2L * 1024L * 1024L Then
-                AppendLog($"[GmpAlloc] VA: size={sz:N0} → ptr={ptr:X}{vbCrLf}")
-            End If
+            Dim ptr As IntPtr = PoolGet(sz)
             If ptr = IntPtr.Zero Then
-                AppendLog($"[GmpAlloc] VirtualAlloc({sz:N0} bytes) FAILED — GMP will abort{vbCrLf}")
+                AppendLog($"[GmpAlloc] PoolGet({sz:N0} bytes) FAILED — GMP will abort{vbCrLf}")
             End If
             Return New void_ptr(ptr)
         End If
@@ -330,53 +534,42 @@ Public Class Form1
         Const LOG_STEP_THRESHOLD As Long = 400L * 1024L * 1024L
 
         If oldSz >= GMP_LARGE_THRESHOLD AndAlso newSz >= GMP_LARGE_THRESHOLD Then
-            ' large → large: new VirtualAlloc, copy, free old
+            ' large → large: pool-get new block, copy, pool-return old block
             If newSz >= LOG_STEP_THRESHOLD Then
                 AppendLog($"[GmpRealloc] L→L enter: new={newSz:N0} old={oldSz:N0}{vbCrLf}")
             End If
-            newP = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(newSz)),
-                                MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            newP = PoolGet(newSz)
             If newP <> IntPtr.Zero Then
-                If newSz >= LOG_STEP_THRESHOLD Then
-                    AppendLog($"[GmpRealloc] L→L VA ok: newP={newP:X} copy={copyBytes.ToUInt64():N0}{vbCrLf}")
-                End If
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
+                PoolReturn(oldP, oldSz)
                 If newSz >= LOG_STEP_THRESHOLD Then
-                    AppendLog($"[GmpRealloc] L→L copy done; about to VirtualFree oldP={oldP:X}{vbCrLf}")
-                End If
-                VirtualFree(oldP, UIntPtr.Zero, MEM_RELEASE)
-                If newSz >= LOG_STEP_THRESHOLD Then
-                    AppendLog($"[GmpRealloc] L→L VirtualFree done → OK{vbCrLf}")
+                    AppendLog($"[GmpRealloc] L→L done → OK{vbCrLf}")
                 End If
             Else
-                AppendLog($"[GmpRealloc] large→large VirtualAlloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
+                AppendLog($"[GmpRealloc] large→large PoolGet({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
             End If
         ElseIf newSz >= GMP_LARGE_THRESHOLD Then
-            ' small → large: VirtualAlloc for new, CRT-free for old
+            ' small → large: pool-get new block, CRT-free old block
             If newSz >= LOG_STEP_THRESHOLD Then
                 AppendLog($"[GmpRealloc] S→L enter: new={newSz:N0} old={oldSz:N0}{vbCrLf}")
             End If
-            newP = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(newSz)),
-                                MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            newP = PoolGet(newSz)
             If newP <> IntPtr.Zero Then
-                If newSz >= LOG_STEP_THRESHOLD Then
-                    AppendLog($"[GmpRealloc] S→L VA ok: newP={newP:X} copy={copyBytes.ToUInt64():N0}{vbCrLf}")
-                End If
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
                 _savedGmpFree(old_ptr, old_size)
                 If newSz >= LOG_STEP_THRESHOLD Then
-                    AppendLog($"[GmpRealloc] S→L CRT-free done → OK{vbCrLf}")
+                    AppendLog($"[GmpRealloc] S→L done → OK{vbCrLf}")
                 End If
             Else
-                AppendLog($"[GmpRealloc] small→large VirtualAlloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
+                AppendLog($"[GmpRealloc] small→large PoolGet({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
             End If
         Else
-            ' large → small: CRT-alloc for new, VirtualFree for old
+            ' large → small: CRT-alloc new block, pool-return old block
             Dim newVoid As void_ptr = _savedGmpAlloc(new_size)
             newP = newVoid.ToIntPtr()
             If newP <> IntPtr.Zero Then
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
-                VirtualFree(oldP, UIntPtr.Zero, MEM_RELEASE)
+                PoolReturn(oldP, oldSz)
             Else
                 AppendLog($"[GmpRealloc] large→small CRT alloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
             End If
@@ -401,7 +594,7 @@ Public Class Form1
         End If
         Dim sz As Long = CLng(rawSz)
         If sz >= GMP_LARGE_THRESHOLD Then
-            VirtualFree(p, UIntPtr.Zero, MEM_RELEASE)
+            PoolReturn(p, sz)
         Else
             _savedGmpFree(ptr, size)
         End If
@@ -454,6 +647,11 @@ Public Class Form1
     End Function
 
     Private Sub InitGmpVirtualAllocFunctions()
+        ' Initialise pool buckets (fixed array — no ConcurrentDictionary overhead).
+        For b As Integer = 0 To POOL_BUCKETS - 1
+            _gmpPool(b) = New ConcurrentStack(Of IntPtr)()
+        Next
+
         ' Step 1: Force gmp_lib's static initializer to run NOW, while the native
         ' GMP table still points to the default CRT malloc/realloc/free.
         ' gmp_lib initializes lazily (first access).  If it runs AFTER our thunks
@@ -510,9 +708,52 @@ Public Class Form1
     End Function
 
     Private Sub Form1_Load(sender As Object, e As EventArgs) Handles MyBase.Load
+        ' ── Parse command-line arguments ─────────────────────────────────────
+        ' Supported flags:
+        '   --digits N       Set the digit count (no commas required)
+        '   --autostart      Suppress all dialogs and auto-begin computation
+        '   --autoverify     After computation, auto-run verify + exit
+        Dim args() As String = Environment.GetCommandLineArgs()
+        Dim i As Integer = 1
+        Do While i < args.Length
+            Select Case args(i).ToLower()
+                Case "--digits"
+                    If i + 1 < args.Length Then
+                        Dim d As Long
+                        If Long.TryParse(args(i + 1).Replace(",", ""), d) Then
+                            TxtDigitsofPI.Text = d.ToString("N0")
+                        End If
+                        i += 1
+                    End If
+                Case "--autostart"
+                    _headless = True
+                Case "--autoverify"
+                    _autoVerify = True
+                Case "--verify-at"
+                    ' Format: DIGITS:POSITION  e.g. "999999:762"
+                    If i + 1 < args.Length Then
+                        Dim parts() As String = args(i + 1).Split(":"c)
+                        Dim pos As Long
+                        If parts.Length = 2 AndAlso Long.TryParse(parts(1), pos) AndAlso parts(0).Length > 0 Then
+                            _verifyAt.Add(Tuple.Create(parts(0), pos))
+                        End If
+                        i += 1
+                    End If
+                Case "--verify-contains"
+                    ' Format: DIGITS  e.g. "27182818284"
+                    If i + 1 < args.Length Then
+                        If args(i + 1).Length > 0 Then
+                            _verifyContains.Add(args(i + 1))
+                        End If
+                        i += 1
+                    End If
+            End Select
+            i += 1
+        Loop
+
         LblStatus.Text = "Ready"
-        TxtDigitsofPI.Text = "1,000,000"
-        ChkboxDisplay.Checked = True
+        TxtDigitsofPI.Text = If(TxtDigitsofPI.Text <> "", TxtDigitsofPI.Text, "1,000,000")
+        ChkboxDisplay.Checked = Not _headless
         RtbPiDigits.MaxLength = 0
         RtbPiDigits.ReadOnly = False
         RtbPiDigits.Font = New Font("Consolas", 10)
@@ -523,7 +764,7 @@ Public Class Form1
         displayTimer.Interval = 100
         displayTimer.Enabled = False
         RtbPiDigits.Dock = DockStyle.Fill
-        TxtChunkSize.Text = "500"
+        If _headless Then ChkboxWriteToFile.Checked = True
         LstBoxPhases.Items.Clear()
 
         ' ── Subscribe to AppDomain.UnhandledException ─────────────────────────
@@ -548,6 +789,11 @@ Public Class Form1
         ' to E-cores and halving their CPU quota.
         DisablePowerThrottling()
 
+        ' Restrict process affinity to P-cores on hybrid CPUs (Intel 12th gen+,
+        ' AMD Zen 4c).  E-cores run GMP arithmetic ~30-50% slower and cause
+        ' cache-topology mismatches in parallel workloads.
+        SetPCoreAffinity()
+
         ' Install VirtualAlloc/VirtualFree custom GMP allocator so large limb
         ' buffers are immediately decommitted on free, preventing commit-charge
         ' accumulation that caused abort() in multi-pass multiply.
@@ -570,7 +816,11 @@ Public Class Form1
                 System.IO.Directory.CreateDirectory(DISK_CACHE_DIR)
             End If
         Catch ex As Exception
-            MessageBox.Show("Warning: Could not create output directory: " & ex.Message)
+            If Not _headless Then
+                MessageBox.Show("Warning: Could not create output directory: " & ex.Message)
+            Else
+                WriteToLog("[DIALOG] Warning: Could not create output directory: " & ex.Message)
+            End If
         End Try
 
         ' Verify which libgmp DLL is loaded
@@ -585,13 +835,25 @@ Public Class Form1
         Catch
         End Try
 
-        MessageBox.Show(
-        "64-bit process: " & Environment.Is64BitProcess.ToString() & vbCrLf &
-        "IntPtr.Size: " & IntPtr.Size.ToString() & " (must be 8)" & vbCrLf &
-        "Available RAM: " & (GC.GetGCMemoryInfo().TotalAvailableMemoryBytes \ 1048576).ToString() & "MB" & vbCrLf &
-        "GMP DLL: " & gmpDllPath & vbCrLf &
-        "GMP Memory: System allocator (default)",
-        "Process Info")
+        Dim processInfoMsg As String =
+            "64-bit process: " & Environment.Is64BitProcess.ToString() & vbCrLf &
+            "IntPtr.Size: " & IntPtr.Size.ToString() & " (must be 8)" & vbCrLf &
+            "Available RAM: " & (GC.GetGCMemoryInfo().TotalAvailableMemoryBytes \ 1048576).ToString() & "MB" & vbCrLf &
+            "GMP DLL: " & gmpDllPath & vbCrLf &
+            "GMP Memory: System allocator (default)"
+        If Not _headless Then
+            MessageBox.Show(processInfoMsg, "Process Info")
+        Else
+            WriteToLog("[DIALOG] Process Info: " & processInfoMsg.Replace(vbCrLf, " | "))
+        End If
+    End Sub
+
+    Private Sub Form1_Shown(sender As Object, e As EventArgs) Handles MyBase.Shown
+        ' When --autostart is supplied, kick off computation as soon as the
+        ' form is fully visible (so all Load-time initialisation is complete).
+        If _headless Then
+            BtnCompute_Click(Me, EventArgs.Empty)
+        End If
     End Sub
 
     ' ── AppDomain-level unhandled exception handler ──────────────────────────
@@ -612,7 +874,11 @@ Public Class Form1
     '  Logging helpers
     ' ════════════════════════════════════════════════════════════════════════
 
-    Private Const LOG_FILE As String = "c:\PiOutput\pi_phase_log.txt"
+    Private Shared ReadOnly Property LOG_FILE As String
+        Get
+            Return System.IO.Path.Combine(_outputDir, "pi_phase_log.txt")
+        End Get
+    End Property
 
     ''' <summary>
     ''' Low-level log writer. Thread-safe, no UI interaction.
@@ -688,6 +954,13 @@ Public Class Form1
         End If
         BtnCompute.Enabled = False
         BtnPause.Enabled = True
+
+        ' Pre-warm the thread pool to ProcessorCount threads before the compute
+        ' thread starts.  Without this, the thread pool ramps up one thread at a
+        ' time as Parallel.For enqueues work, causing LowLevelLifoSemaphore stalls
+        ' during Phase 1 (137K tasks) and the early Phase 2 levels.
+        ThreadPool.SetMinThreads(Environment.ProcessorCount, Environment.ProcessorCount)
+
         DIGITS = CLng(TxtDigitsofPI.Text.Replace(",", ""))
         stopWatch.Restart()
         phaseStopWatch.Restart()
@@ -703,7 +976,7 @@ Public Class Form1
 #Else
             Dim loggingMode As String = "MAJOR PHASES ONLY"
 #End If
-            System.IO.File.WriteAllText("c:\PiOutput\pi_phase_log.txt",
+            System.IO.File.WriteAllText(LOG_FILE,
                 $"=== PI Computation Started {DateTime.Now} ===" & vbCrLf &
                 $"=== Digits: {DIGITS:N0} ===" & vbCrLf &
                 $"=== Logging: {loggingMode} ===" & vbCrLf)
@@ -717,10 +990,21 @@ Public Class Form1
                     If _displayNativePtr <> IntPtr.Zero OrElse result <> "" Then
                         Me.Invoke(Sub() StreamPiToScreen(result))
                     End If
+                    ' --autoverify: run verify logic headlessly then exit
+                    If _autoVerify Then
+                        Me.Invoke(Sub()
+                                      BtnTest_Click(Nothing, EventArgs.Empty)
+                                      Application.Exit()
+                                  End Sub)
+                    End If
                 Catch oex As OutOfMemoryException
                     WriteExceptionToLog("ComputeThread/OutOfMemoryException", oex)
                     Me.Invoke(Sub()
-                                  MessageBox.Show("OUT OF MEMORY!" & vbCrLf & oex.Message & vbCrLf & oex.StackTrace)
+                                  If Not _headless Then
+                                      MessageBox.Show("OUT OF MEMORY!" & vbCrLf & oex.Message & vbCrLf & oex.StackTrace)
+                                  Else
+                                      WriteToLog("[DIALOG] OUT OF MEMORY: " & oex.Message)
+                                  End If
                                   LblStatus.Text = "Error: Out of memory"
                                   BtnCompute.Enabled = True
                                   BtnPause.Enabled = False
@@ -729,7 +1013,11 @@ Public Class Form1
                 Catch ovex As OverflowException
                     WriteExceptionToLog("ComputeThread/OverflowException", ovex)
                     Me.Invoke(Sub()
-                                  MessageBox.Show("OVERFLOW!" & vbCrLf & ovex.Message & vbCrLf & ovex.StackTrace)
+                                  If Not _headless Then
+                                      MessageBox.Show("OVERFLOW!" & vbCrLf & ovex.Message & vbCrLf & ovex.StackTrace)
+                                  Else
+                                      WriteToLog("[DIALOG] OVERFLOW: " & ovex.Message)
+                                  End If
                                   LblStatus.Text = "Error: Overflow"
                                   BtnCompute.Enabled = True
                                   BtnPause.Enabled = False
@@ -738,7 +1026,11 @@ Public Class Form1
                 Catch ex As Exception
                     WriteExceptionToLog("ComputeThread", ex)
                     Me.Invoke(Sub()
-                                  MessageBox.Show("EXCEPTION: " & ex.GetType().Name & vbCrLf & ex.Message & vbCrLf & ex.StackTrace)
+                                  If Not _headless Then
+                                      MessageBox.Show("EXCEPTION: " & ex.GetType().Name & vbCrLf & ex.Message & vbCrLf & ex.StackTrace)
+                                  Else
+                                      WriteToLog("[DIALOG] EXCEPTION: " & ex.GetType().Name & ": " & ex.Message)
+                                  End If
                                   LblStatus.Text = "Error: " & ex.Message
                                   BtnCompute.Enabled = True
                                   BtnPause.Enabled = False
@@ -1276,248 +1568,137 @@ Public Class Form1
         End If
 #End If
 
-        ' Accumulate 9 safe sub-products: accum = Σ A_i·B_j·2^(i·bitsA + j·bitsB)
-        ' (accumPtr._mp_size = 0 already set above; accumBuf is VirtualAlloc-zero-committed.)
-        Dim prod As New mpz_t(), shifted As New mpz_t()
-        gmp_lib.mpz_inits(prod, shifted, Nothing)
+        ' §59: Pre-extract all three A pieces upfront so all 9 sub-products can run in parallel.
+        ' mpz_init2(bitsA) pre-allocates _mp_alloc >= mA before direct limb copies (A1, A2).
+        Dim A0 As New mpz_t(), A1 As New mpz_t(), A2 As New mpz_t()
+        gmp_lib.mpz_init2(A0, New mp_bitcnt_t(CUInt(bitsA)))
+        gmp_lib.mpz_init2(A1, New mp_bitcnt_t(CUInt(bitsA)))
+        gmp_lib.mpz_init2(A2, New mp_bitcnt_t(CUInt(bitsA)))
 
+        ' A0 = opA mod 2^bitsA  (low mA limbs)
+        gmp_lib.mpz_tdiv_r_2exp(A0, opA, New mp_bitcnt_t(CUInt(bitsA)))
+
+        ' A1 = limbs [mA, 2*mA) — direct copy into pre-alloc'd buffer
+        Dim _pre_opA_d As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
+        Dim _A1_src As IntPtr = New IntPtr(_pre_opA_d + CLng(mA) * 8L)
+        Dim _A1_dst As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(A1.Pointer, 8))
+        CopyMemory(_A1_dst, _A1_src, New UIntPtr(CULng(mA) * 8UL))
+        Dim _A1_sz As Integer = CInt(mA)
+        Dim _A1_dstL As Long = _A1_dst.ToInt64()
+        While _A1_sz > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_A1_dstL + CLng(_A1_sz - 1) * 8L)) = 0L
+            _A1_sz -= 1
+        End While
+        Runtime.InteropServices.Marshal.WriteInt32(A1.Pointer, 4, _A1_sz)
+
+        ' A2 = limbs [2*mA, szA) — direct copy
+        Dim _A2_limbs As Long = CLng(szA) - 2L * CLng(mA)
+        Dim _A2_src As IntPtr = New IntPtr(_pre_opA_d + 2L * CLng(mA) * 8L)
+        Dim _A2_dst As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(A2.Pointer, 8))
+        CopyMemory(_A2_dst, _A2_src, New UIntPtr(CULng(_A2_limbs) * 8UL))
+        Dim _A2_sz As Integer = CInt(_A2_limbs)
+        Dim _A2_dstL As Long = _A2_dst.ToInt64()
+        While _A2_sz > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_A2_dstL + CLng(_A2_sz - 1) * 8L)) = 0L
+            _A2_sz -= 1
+        End While
+        Runtime.InteropServices.Marshal.WriteInt32(A2.Pointer, 4, _A2_sz)
+
+        Dim A_parts() As mpz_t = {A0, A1, A2}
         Dim B_parts() As mpz_t = {B0, B1, B2}
 
-        ' A pieces are large (~355 MB each at L18) — create lazily, one per outer iteration.
-        ' Pre-allocate A_part to hold exactly mA limbs (= bitsA bits).  This is required because
-        ' mpz_tdiv_r_2exp does NOT grow the buffer when the result normalises to 0 (it just sets
-        ' _mp_size=0 and leaves _mp_alloc=1).  Case 1 and Case 2 both CopyMemory mA limbs into
-        ' A_part._mp_d; they depend on _mp_alloc >= mA to avoid a silent heap overflow.
-        Dim A_part As New mpz_t()
-        gmp_lib.mpz_init2(A_part, New mp_bitcnt_t(CUInt(bitsA)))
-#If LOGGING_DETAIL >= 1 Then
-        If CLng(szA) + CLng(szB) > 50_000_000L Then
-            AppendLog(
-                $"[SafeMpzMul] INIT szA={szA:N0} szB={szB:N0} | " &
-                $"result.Ptr={result.Pointer.ToInt64():X} stash@+8={Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8):X} " &
-                $"accumPtr(local)={accumPtr.ToInt64():X} prod_ptr={prod.Pointer.ToInt64():X} " &
-                $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8)), 0):N0}{vbCrLf}")
+        ' Allocate one result buffer per sub-product (k = i*3 + j, k ∈ 0..8).
+        Dim prods(8) As mpz_t
+        For k As Integer = 0 To 8
+            prods(k) = New mpz_t()
+            gmp_lib.mpz_init(prods(k))
+        Next k
+
+        ' §59: Run all 9 sub-products A_i × B_j simultaneously on the thread pool.
+        ' Each call uses a distinct prods(k) as result; A_parts and B_parts are read-only shared.
+        ' GMP arithmetic on non-aliased objects is thread-safe. The §44 accumPtr stash lives in
+        ' result's native struct (_mp_d slot); inner calls stash into prods(k) structs instead
+        ' and never touch result's struct, so the outer stash is preserved across the Parallel.For.
+        ' §69: Use _safeMulDop to control inner parallelism. When called from Phase 2's
+        ' Parallel.For (outer DOP=24), _safeMulDop=1 so sub-products run serially — eliminates
+        ' the thread-pool park/unpark overhead. When called from the serial Phase 2 top levels
+        ' or ComputePiGMP, _safeMulDop=ProcessorCount to use all cores.
+        Dim _smmDop As Integer = If(_safeMulDop > 0, _safeMulDop, Environment.ProcessorCount)
+        If _smmDop <= 1 Then
+            ' Serial path: no thread pool involvement, no park/unpark overhead.
+            For k As Integer = 0 To 8
+                SafeMpzMul(prods(k), A_parts(k \ 3), B_parts(k Mod 3))
+            Next k
+        Else
+            Dim _smm_opts As New System.Threading.Tasks.ParallelOptions() With {
+                .MaxDegreeOfParallelism = _smmDop
+            }
+            Parallel.For(0, 9, _smm_opts, Sub(k As Integer)
+                SafeMpzMul(prods(k), A_parts(k \ 3), B_parts(k Mod 3))
+            End Sub)
         End If
-#End If
 
-        For i As Integer = 0 To 2
-            ' Compute A_i for this iteration only; free any Atmp immediately after.
-            Select Case i
-                Case 0
-                    gmp_lib.mpz_tdiv_r_2exp(A_part, opA, New mp_bitcnt_t(CUInt(bitsA)))
-#If LOGGING_DETAIL >= 1 Then
-                    If CLng(szA) + CLng(szB) > 10_000_000L Then
-                        Dim _opA_d_ptr As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
-                        Dim _opA_d0 As Long = If(_opA_d_ptr <> 0L AndAlso Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4) > 0,
-                                                Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_opA_d_ptr), 0), -1L)
-                        AppendLog(
-                            $"[SafeMpzMul] Case0 post-tdiv | " &
-                            $"A_part.Ptr={A_part.Pointer.ToInt64():X} A_part_alloc={Runtime.InteropServices.Marshal.ReadInt32(A_part.Pointer, 0):N0} " &
-                            $"A_part_sz={Runtime.InteropServices.Marshal.ReadInt32(A_part.Pointer, 4):N0} " &
-                            $"A_part_d={Runtime.InteropServices.Marshal.ReadInt64(A_part.Pointer, 8):X} " &
-                            $"opA.Ptr={opA.Pointer.ToInt64():X} opA_sz={Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4):N0} " &
-                            $"opA_d={_opA_d_ptr:X} opA_d[0]={_opA_d0:X}{vbCrLf}")
-                    End If
-#End If
-                Case 1
-                    ' Direct limb extraction: A1 = opA's limbs [mA, 2*mA).
-                    ' bitsA = mA*64 is always limb-aligned, so no bit-masking is needed —
-                    ' the piece boundaries fall exactly on limb boundaries.  Copying directly
-                    ' from opA's limb array into A_part's existing buffer (allocated in Case 0
-                    ' to hold mA limbs) avoids the 710 MB Atmp1 temporary entirely.
-                    Dim _opA_d1 As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
-                    Dim _A1_src As IntPtr = New IntPtr(_opA_d1 + CLng(mA) * 8L)
-                    Dim _A1_dst As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(A_part.Pointer, 8))
-#If LOGGING_DETAIL >= 1 Then
-                    If CLng(szA) + CLng(szB) > 10_000_000L Then
-                        AppendLog(
-                            $"[SafeMpzMul] Case1 pre-copy | A_part_alloc={Runtime.InteropServices.Marshal.ReadInt32(A_part.Pointer, 0):N0} " &
-                            $"A_part_d={_A1_dst.ToInt64():X} A1_src={_A1_src.ToInt64():X} mA={mA:N0}{vbCrLf}")
-                    End If
-#End If
-                    CopyMemory(_A1_dst, _A1_src, New UIntPtr(CULng(mA) * 8UL))
-#If LOGGING_DETAIL >= 1 Then
-                    If CLng(szA) + CLng(szB) > 10_000_000L Then
-                        AppendLog( $"[SafeMpzMul] Case1 post-copy{vbCrLf}")
-                    End If
-#End If
-                    Dim _A1_sz As Integer = CInt(mA)
-                    Dim _A1_dstL As Long = _A1_dst.ToInt64()
-                    While _A1_sz > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_A1_dstL + CLng(_A1_sz - 1) * 8L)) = 0L
-                        _A1_sz -= 1
-                    End While
-                    Runtime.InteropServices.Marshal.WriteInt32(A_part.Pointer, 4, _A1_sz)
-                Case 2
-                    ' Direct limb extraction: A2 = opA's limbs [2*mA, szA).
-                    ' A2 has szA - 2*mA limbs (≤ mA), which fits in A_part's existing buffer.
-                    Dim _opA_d2 As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
-                    Dim _A2_limbs As Long = CLng(szA) - 2L * CLng(mA)
-                    Dim _A2_src As IntPtr = New IntPtr(_opA_d2 + 2L * CLng(mA) * 8L)
-                    Dim _A2_dst As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(A_part.Pointer, 8))
-                    CopyMemory(_A2_dst, _A2_src, New UIntPtr(CULng(_A2_limbs) * 8UL))
-                    Dim _A2_sz As Integer = CInt(_A2_limbs)
-                    Dim _A2_dstL As Long = _A2_dst.ToInt64()
-                    While _A2_sz > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_A2_dstL + CLng(_A2_sz - 1) * 8L)) = 0L
-                        _A2_sz -= 1
-                    End While
-                    Runtime.InteropServices.Marshal.WriteInt32(A_part.Pointer, 4, _A2_sz)
-            End Select
+        ' §44: recover accumPtr from result's stash after Parallel.For.
+        savedResultPtr = result.Pointer
+        accumPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(savedResultPtr, 8))
 
-            For j As Integer = 0 To 2
-                ' §42: Save prod and shifted struct addresses as plain IntPtr before the inner
-                ' call.  Math.Gmp.Native corrupts mpz_t.Pointer for locally-scoped objects during
-                ' recursive SafeMpzMul calls, making the property unreliable after return.
-                ' Using the saved IntPtrs directly in raw GMP P/Invoke calls bypasses this.
-                ' The inner call writes its result to whatever result.Pointer (= prod.Pointer)
-                ' is at the START of the inner call — which equals _sv_prod.  After the inner
-                ' call returns we read from _sv_prod (not prod.Pointer) to get the result.
-                Dim _sv_prod As IntPtr = prod.Pointer
-                Dim _sv_shifted As IntPtr = shifted.Pointer
-#If LOGGING_DETAIL >= 1 Then
-                ' §44 diagnostic: log result.Pointer, prod.Pointer, and stash before the inner call.
-                ' If result.Pointer == prod.Pointer, the inner call will overwrite our stash.
-                AppendLog(
-                    $"[SafeMpzMul] loop i={i} j={j}: before inner | " &
-                    $"result.Ptr={result.Pointer.ToInt64():X} prod.Ptr={_sv_prod.ToInt64():X} " &
-                    $"A_part.Ptr={A_part.Pointer.ToInt64():X} A_part_sz={Runtime.InteropServices.Marshal.ReadInt32(A_part.Pointer, 4):N0} " &
-                    $"stash@+8={Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8):X}{vbCrLf}")
-#End If
-                SafeMpzMul(prod, A_part, B_parts(j))
-                ' §44: native GMP may corrupt the outer managed stack frame during the inner call.
-                ' Recover accumPtr from result's native CRT struct (_mp_d slot), which inner calls
-                ' never touch (they write only to prod's struct).  Re-read _sv_prod/_sv_shifted
-                ' from their mpz_t managed-heap fields (inner call restores result.Pointer).
-                accumPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8))
-                _sv_prod = prod.Pointer
-                _sv_shifted = shifted.Pointer
-#If LOGGING_DETAIL >= 1 Then
-                AppendLog(
-                    $"[SafeMpzMul] loop i={i} j={j}: inner returned | " &
-                    $"result.Ptr={result.Pointer.ToInt64():X} stash@+8={Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8):X} " &
-                    $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0):N0} " &
-                    $"accum_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4)):N0} " &
-                    $"accumPtr={accumPtr.ToInt64():X} prod_sz={Runtime.InteropServices.Marshal.ReadInt32(_sv_prod, 4):N0} _sv_prod={_sv_prod.ToInt64():X}{vbCrLf}")
-#End If
-                Dim shiftBits As ULong = CULng(i) * bitsA + CULng(j) * bitsB
-                If shiftBits = 0UL Then
-                    GmpRaw_add(accumPtr, accumPtr, _sv_prod)
-#If LOGGING_DETAIL >= 1 Then
+        ' Serial accumulation: shift each prod_k into its positional slot and add to accum.
+        ' No inner SafeMpzMul calls — no §42/§44 managed-stack corruption in this loop.
+        Dim shifted As New mpz_t()
+        gmp_lib.mpz_init(shifted)
+        For k As Integer = 0 To 8
+            Dim ki As Integer = k \ 3
+            Dim kj As Integer = k Mod 3
+            Dim shiftBits As ULong = CULng(ki) * bitsA + CULng(kj) * bitsB
+            Dim _sv_prod As IntPtr = prods(k).Pointer
+            Dim _sv_shifted As IntPtr = shifted.Pointer
+            If shiftBits = 0UL Then
+                GmpRaw_add(accumPtr, accumPtr, _sv_prod)
+            Else
+                ' Pre-allocate shifted to the exact size needed; same sizing as the original
+                ' per-j path. No inner SafeMpzMul calls here so no memory-pressure interaction.
+                Dim _szProd As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_prod, 4)))
+                Dim _shiftLimbs As Long = CLng(shiftBits) \ 64L + 1L
+                Dim _neededLimbs As Long = _szProd + _shiftLimbs + 2L
+                Dim _sj_buf As IntPtr = VirtualAlloc(IntPtr.Zero,
+                                                     New UIntPtr(CULng(_neededLimbs * 8L)),
+                                                     MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                If _sj_buf = IntPtr.Zero Then
+                    VirtualFree(accumBuf, UIntPtr.Zero, MEM_RELEASE)
+                    Runtime.InteropServices.Marshal.FreeHGlobal(accumPtr)
                     AppendLog(
-                        $"[SafeMpzMul] loop i={i} j={j}: after direct add | " &
-                        $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0):N0} " &
-                        $"accum_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4)):N0}{vbCrLf}")
-#End If
-                Else
-                    ' Pre-allocate shifted to the EXACT size needed for this j-iteration, after
-                    ' the inner call has returned.  This keeps shifted un-allocated during all inner
-                    ' SafeMpzMul calls, eliminating it as a source of memory pressure there.
-                    '
-                    ' Sizing: shifted = prod << shiftBits requires szProd + shiftBits/64 + 3 limbs.
-                    ' (+1 for ceiling division, +2 for GMP internal rounding.)
-                    '
-                    ' For two-step shifts (shiftBits > UInt32.Max): the second mpz_mul_2exp call
-                    ' passes shifted as both rop and op1.  MPZ_REALLOC short-circuits because the
-                    ' pre-alloc covers the FINAL size, so no realloc occurs during the aliased step.
-                    ' For single-step shifts: shifted is rop, prod is op1 — no aliasing concern, but
-                    ' we still pre-alloc to prevent organic L→L realloc inside mpz_mul_2exp (which
-                    ' VirtualAllocs new pages that GMP writes to immediately; if those page faults
-                    ' can't be satisfied → silent AV inside native GMP → CLR FailFast).
-                    '
-                    ' After mpz_add, shifted is freed immediately so it is not live during the
-                    ' next j-iteration's inner SafeMpzMul call.
-                    ' §42: Use _sv_prod (not prod.Pointer) and _sv_shifted (not shifted.Pointer).
-                    Dim _szProd As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_prod, 4)))
-                    Dim _shiftLimbs As Long = CLng(shiftBits) \ 64L + 1L
-                    Dim _neededLimbs As Long = _szProd + _shiftLimbs + 2L
-                    Dim _sj_buf As IntPtr = VirtualAlloc(IntPtr.Zero,
-                                                         New UIntPtr(CULng(_neededLimbs * 8L)),
-                                                         MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
-                    If _sj_buf = IntPtr.Zero Then
-                        VirtualFree(accumBuf, UIntPtr.Zero, MEM_RELEASE)
-                        Runtime.InteropServices.Marshal.FreeHGlobal(accumPtr)
-                        AppendLog(
-                            $"[SafeMpzMul] shifted pre-alloc FAILED for {_neededLimbs * 8L \ 1048576L:N0} MB at i={i} j={j} — throwing OOM{vbCrLf}")
-                        Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shifted ({_neededLimbs * 8L \ 1048576L} MB)")
-                    End If
-                    Dim _sjOldBytes As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted, 0)) * 8L
-                    If _sjOldBytes >= GMP_LARGE_THRESHOLD Then
-                        VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_shifted, 8)), UIntPtr.Zero, MEM_RELEASE)
-                    Else
-                        _savedGmpFree(New void_ptr(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_shifted, 8))),
-                                      New size_t(CULng(_sjOldBytes)))
-                    End If
-                    Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted, 0, CInt(_neededLimbs))
-                    Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted, 4, 0)
-                    Runtime.InteropServices.Marshal.WriteInt64(_sv_shifted, 8, _sj_buf.ToInt64())
-
-                    ' shiftBits may exceed UInt32.MaxValue (4,294,967,295) when szA and szB are
-                    ' both large: max shift = 2*bitsA + 2*bitsB.  mp_bitcnt_t on Windows is 32-bit,
-                    ' so CUInt would overflow and place A2*B2 in the wrong position.
-                    ' Fix: split into two shifts each ≤ UInt32.MaxValue.
-                    ' §42: use raw P/Invoke with _sv_shifted/_sv_prod to bypass mpz_t corruption.
-                    If shiftBits <= CULng(UInt32.MaxValue) Then
-#If LOGGING_DETAIL >= 1 Then
-                        AppendLog( $"[SafeMpzMul] loop i={i} j={j}: single-step shift={shiftBits}{vbCrLf}")
-#End If
-                        GmpRaw_mul_2exp(_sv_shifted, _sv_prod, CUInt(shiftBits))
-                    Else
-                        Dim _shift1 As ULong = shiftBits \ 2UL
-                        Dim _shift2 As ULong = shiftBits - _shift1   ' both halves ≤ MAX32
-#If LOGGING_DETAIL >= 1 Then
-                        AppendLog(
-                            $"[SafeMpzMul] TWO-STEP i={i} j={j}: shiftBits={shiftBits} shift1={_shift1} shift2={_shift2}{vbCrLf}")
-#End If
-                        GmpRaw_mul_2exp(_sv_shifted, _sv_prod, CUInt(_shift1))
-                        GmpRaw_mul_2exp(_sv_shifted, _sv_shifted, CUInt(_shift2))
-                    End If
-#If LOGGING_DETAIL >= 1 Then
-                    AppendLog(
-                        $"[SafeMpzMul] loop i={i} j={j}: after shift, before add | " &
-                        $"accum_alloc={Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0):N0} " &
-                        $"accum_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4)):N0} " &
-                        $"shi_alloc={Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted, 0):N0} " &
-                        $"shi_sz={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted, 4)):N0}{vbCrLf}")
-#End If
-                    GmpRaw_add(accumPtr, accumPtr, _sv_shifted)
-#If LOGGING_DETAIL >= 1 Then
-                    AppendLog( $"[SafeMpzMul] loop i={i} j={j}: mpz_add done{vbCrLf}")
-#End If
-
-                    ' §42: Free shifted's VirtualAlloc'd limb buffer immediately (via _sv_shifted).
-                    ' Then reinit shifted so shifted.Pointer is a fresh small CRT-backed struct
-                    ' for the next j-iteration's pre-alloc and end-of-i cleanup paths.
-                    VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_shifted, 8)), UIntPtr.Zero, MEM_RELEASE)
-                    Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted, 4, 0)   ' zero _mp_size
-                    Runtime.InteropServices.Marshal.WriteInt64(_sv_shifted, 8, 0L)  ' zero _mp_d (freed)
-                    gmp_lib.mpz_init(shifted)   ' give shifted a fresh small CRT struct for next iter
-#If LOGGING_DETAIL >= 1 Then
-                    AppendLog( $"[SafeMpzMul] loop i={i} j={j}: shifted freed{vbCrLf}")
-#End If
+                        $"[SafeMpzMul] shifted pre-alloc FAILED for {_neededLimbs * 8L \ 1048576L:N0} MB at k={k} — throwing OOM{vbCrLf}")
+                    Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shifted ({_neededLimbs * 8L \ 1048576L} MB)")
                 End If
-            Next j
-
-            ' Free prod after this i-iteration's j-loop so it is not live during the
-            ' next A-piece computation.  shifted is already tiny (mpz_init'd after each
-            ' per-j VirtualFree above, or still tiny from mpz_inits if j=0 was shiftBits=0).
-            ' Clearing shifted here frees that tiny CRT buffer; mpz_init re-creates it.
-#If LOGGING_DETAIL >= 1 Then
-            If CLng(szA) + CLng(szB) > 10_000_000L Then
-                AppendLog( $"[SafeMpzMul] i={i} post-j: clearing prod/shifted{vbCrLf}")
+                Dim _sjOldBytes As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted, 0)) * 8L
+                If _sjOldBytes >= GMP_LARGE_THRESHOLD Then
+                    VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_shifted, 8)), UIntPtr.Zero, MEM_RELEASE)
+                Else
+                    _savedGmpFree(New void_ptr(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_shifted, 8))),
+                                  New size_t(CULng(_sjOldBytes)))
+                End If
+                Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted, 0, CInt(_neededLimbs))
+                Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted, 4, 0)
+                Runtime.InteropServices.Marshal.WriteInt64(_sv_shifted, 8, _sj_buf.ToInt64())
+                If shiftBits <= CULng(UInt32.MaxValue) Then
+                    GmpRaw_mul_2exp(_sv_shifted, _sv_prod, CUInt(shiftBits))
+                Else
+                    Dim _shift1 As ULong = shiftBits \ 2UL
+                    Dim _shift2 As ULong = shiftBits - _shift1
+                    GmpRaw_mul_2exp(_sv_shifted, _sv_prod, CUInt(_shift1))
+                    GmpRaw_mul_2exp(_sv_shifted, _sv_shifted, CUInt(_shift2))
+                End If
+                GmpRaw_add(accumPtr, accumPtr, _sv_shifted)
+                ' Free shifted's buffer; reinit for next k.
+                VirtualFree(New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_shifted, 8)), UIntPtr.Zero, MEM_RELEASE)
+                Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted, 4, 0)
+                Runtime.InteropServices.Marshal.WriteInt64(_sv_shifted, 8, 0L)
+                gmp_lib.mpz_init(shifted)
             End If
-#End If
-            gmp_lib.mpz_clear(shifted)
-            gmp_lib.mpz_init(shifted)
-            gmp_lib.mpz_clear(prod)
-            gmp_lib.mpz_init(prod)
-#If LOGGING_DETAIL >= 1 Then
-            If CLng(szA) + CLng(szB) > 10_000_000L Then
-                AppendLog( $"[SafeMpzMul] i={i} post-j: cleared{vbCrLf}")
-            End If
-#End If
-        Next i
-        ' §44: recover accumPtr and savedResultPtr after the i/j loops (locals may be corrupted).
-        ' result.Pointer is a managed-heap field — always correct.
-        ' result.Pointer._mp_d (offset +8) holds the stashed accumPtr.
+            ' Free prod_k immediately after accumulation to limit peak RAM.
+            gmp_lib.mpz_clear(prods(k))
+        Next k
+        ' §44: re-read accumPtr from result's stash after the serial accumulation loop.
+        ' The accumulation loop contains no inner SafeMpzMul calls so locals are uncorrupted,
+        ' but we re-read from the stash anyway for consistency with the §44 pattern.
         savedResultPtr = result.Pointer
         accumPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(savedResultPtr, 8))
 
@@ -1537,8 +1718,9 @@ Public Class Form1
         ' §42: negate via raw P/Invoke so result.Pointer corruption cannot affect the call.
         If resultSign < 0 Then GmpRaw_neg(savedResultPtr, savedResultPtr)
 
-        ' §42: accum is now a raw accumPtr (already freed above) — remove it from mpz_clears.
-        gmp_lib.mpz_clears(prod, shifted, A_part, B0, B1, B2, Nothing)
+        ' §59: prods(0..8) are already cleared inside the accumulation loop.
+        ' shifted was mpz_init'd after its last use; A0/A1/A2 replaced A_part.
+        gmp_lib.mpz_clears(shifted, A0, A1, A2, B0, B1, B2, Nothing)
         AppendLog(
             $"[SafeMpzMul] cleared: szA={szA:N0} szB={szB:N0}{vbCrLf}")
     End Sub
@@ -1561,7 +1743,7 @@ Public Class Form1
 
         Const CHUNK_SIZE As Long = 512L
         Const STOP_AT As Long = 1L
-        Const DISK_THRESHOLD As Integer = 1  ' Stay in disk mode until final 2→1 combine only
+        Const DISK_THRESHOLD As Integer = 200_000  ' Keep all data in RAM (137,739 chunks < 200K; peak ~8 GB)
 
         Dim numChunks As Long = (numTerms + CHUNK_SIZE - 1) \ CHUNK_SIZE
 
@@ -1611,7 +1793,7 @@ Public Class Form1
         ' metadata overhead at the start of every run).  Each thread serializes
         ' to a MemoryStream outside the lock; only the file-position record and
         ' write happen under SyncLock, keeping lock hold-time minimal.
-        Const L0_BIN_PATH As String = DISK_CACHE_DIR & "L0.bin"
+        Dim L0_BIN_PATH As String = DISK_CACHE_DIR & "L0.bin"
         Dim l0Stream As FileStream = Nothing
         Dim l0Lock As New Object()
         If numChunks > DISK_THRESHOLD Then
@@ -1749,7 +1931,18 @@ Public Class Form1
                     End Sub)
                 phase2PollThread.IsBackground = True
                 phase2PollThread.Start()
-                Parallel.For(0L, pairCount,
+                ' §69 revised (trace 5): Outer DOP = ProcessorCount\2. Each outer task calls
+                ' Parallel.Invoke(newP, newQ) then Parallel.Invoke(tempA, tempB), requiring
+                ' a free thread for the second Invoke task. With outer=ProcessorCount all
+                ' threads are occupied by outer tasks — Parallel.Invoke deadlocks on itself
+                ' causing Task.WaitAll to hit 19.33% in trace 5. ProcessorCount\2 leaves half
+                ' the threads free so both Invoke tasks always run immediately in parallel.
+                ' SafeMpzMul inner DOP remains 1 (serial) to avoid nested oversubscription.
+                _safeMulDop = 1
+                Dim _p2opts As New System.Threading.Tasks.ParallelOptions() With {
+                    .MaxDegreeOfParallelism = System.Math.Max(1, Environment.ProcessorCount \ 2)
+                }
+                Parallel.For(0L, pairCount, _p2opts,
                     Sub(pairIdx As Long)
                         Dim leftIdx As Integer = CInt(pairIdx * 2L)
                         Dim rightIdx As Integer = CInt(pairIdx * 2L + 1L)
@@ -1793,16 +1986,18 @@ Public Class Form1
                         Dim tempB As New mpz_t()
                         gmp_lib.mpz_inits(newP, newQ, tempA, tempB, Nothing)
 
-                        SafeMpzMul(newP, leftP, rightP)
+                        ' §60: newP and newQ use disjoint operands — run both simultaneously.
+                        System.Threading.Tasks.Parallel.Invoke(
+                            Sub() SafeMpzMul(newP, leftP, rightP),
+                            Sub() SafeMpzMul(newQ, leftQ, rightQ))
                         gmp_lib.mpz_clears(rightP, Nothing)
-
-                        SafeMpzMul(newQ, leftQ, rightQ)
                         gmp_lib.mpz_clears(leftQ, Nothing)
 
-                        SafeMpzMul(tempA, leftT, rightQ)
+                        ' §60: tempA and tempB use disjoint operands — run both simultaneously.
+                        System.Threading.Tasks.Parallel.Invoke(
+                            Sub() SafeMpzMul(tempA, leftT, rightQ),
+                            Sub() SafeMpzMul(tempB, leftP, rightT))
                         gmp_lib.mpz_clears(leftT, rightQ, Nothing)
-
-                        SafeMpzMul(tempB, leftP, rightT)
                         gmp_lib.mpz_clears(leftP, rightT, Nothing)
 
                         gmp_lib.mpz_add(tempA, tempA, tempB)
@@ -1833,6 +2028,8 @@ Public Class Form1
                     End Sub)
                 phase2PollThread.Join()
                 nextDiskNodes.AddRange(nextResults)
+                ' §69: Restore full DOP for serial Phase 2 top levels and ComputePiGMP.
+                _safeMulDop = Environment.ProcessorCount
 
             Else
                 ' ── Serial path (top levels: few pairs, very large operands) ─
@@ -2006,12 +2203,23 @@ Public Class Form1
             diskNodes = nextDiskNodes
             currentSize = nextSize
 
-            ' Issue #7 fix: one GC.Collect per level (~17 total for 1 B digits).
-            ' The aggressive every-10-pairs GC was removed; it interfered with
-            ' compaction and added overhead without measurable benefit once the
-            ' pinned-array and LOH fragmentation sources were eliminated.
-            GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, True, True)
-            GC.WaitForPendingFinalizers()
+            ' §61: Non-blocking GC between levels; blocking compacting only at the final level.
+            ' Aggressive+blocking was pausing all threads for hundreds of ms at each of 17 levels.
+            ' At lower levels an Optimized non-blocking collect is sufficient to reclaim the
+            ' mpz_t wrapper objects from freed pairs without stalling the parallel combines.
+            If isLastLevel Then
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, True, True)
+                GC.WaitForPendingFinalizers()
+            Else
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Optimized, False, False)
+            End If
+
+            ' §65: Flush the pool between levels.  Blocks freed during level N are
+            ' unique sizes that double each level — they will never be reused at the
+            ' same size in level N+1, so pooling them only commits pages that can
+            ' never be reclaimed.  Flushing here keeps committed memory proportional
+            ' to the current working set instead of accumulating across all levels.
+            FlushGmpPool()
 
             Dim memNow As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
             LogPhase($"Combine level {level}: {currentSize:N0} nodes remaining (RAM: {memNow:N0}MB)")
@@ -2241,7 +2449,7 @@ Public Class Form1
             WriteToLog($"[3PM-DBG] thirdBits={thirdBits:N0} k1.Value={k1.Value}")
 
             ' Shared staging buffer for all spill I/O (sequential, never concurrent).
-            Dim spillStaging(65535) As Byte
+            Dim spillStaging(4194303) As Byte  ' 4 MB staging buffer (§56) — finalT spill only
 
             ' finalQ._mp_size / k1-limb counts used for pre-alloc sizing below.
             Dim _finalQSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer, 4)))
@@ -2313,147 +2521,34 @@ Public Class Form1
             gmp_lib.mpz_clear(tmpHigh)
             WriteToLog($"[3PM-DBG] Q split complete")
 
-            ' Spill Q2 and Q1; free them to clear the deck for Pass 0.
-            Dim Q2_path As String = $"{DISK_CACHE_DIR}Q2_spill.bin"
-            Dim Q1_path As String = $"{DISK_CACHE_DIR}Q1_spill.bin"
-            Using fsW As New FileStream(Q2_path, FileMode.Create, FileAccess.Write)
-                Using bwW As New BinaryWriter(fsW)
-                    SerializeOneMpz(mpQ2, bwW, spillStaging)
-                End Using
-            End Using
-            gmp_lib.mpz_clear(mpQ2)
-            Using fsW As New FileStream(Q1_path, FileMode.Create, FileAccess.Write)
-                Using bwW As New BinaryWriter(fsW)
-                    SerializeOneMpz(mpQ1, bwW, spillStaging)
-                End Using
-            End Using
-            gmp_lib.mpz_clear(mpQ1)
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procSplit = Process.GetCurrentProcess()
-            Dim ramSplit As Long = _procSplit.WorkingSet64 \ 1048576
-            Dim vmSplit As Long = _procSplit.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Q split 3-way (k={thirdBits:N0} bits); Q1,Q2 spilled  RAM:{ramSplit:N0}MB  Committed:{vmSplit:N0}MB")
-#End If
-#If LOGGING_DETAIL >= 2 Then
-            Dim _q0Bits As Long = CLng(gmp_lib.mpz_sizeinbase(finalQ, 2))
-            Dim _numerBits0 As Long = CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2))
-            WriteToLog($"[ComputePi] Pass 0 operands: gmpNumer={_numerBits0:N0} bits ({_numerBits0 \ 8388608:N0} MB)  Q0={_q0Bits:N0} bits ({_q0Bits \ 8388608:N0} MB)  result≈{(_numerBits0 + _q0Bits) \ 8388608:N0} MB")
-#End If
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Pass 0 multiply: gmpNumer * Q0  RAM:{ramSplit:N0}MB  Committed:{vmSplit:N0}MB")
-#End If
-
-            ' ── Pass 0: r0 = gmpNumer * Q0  (finalQ is Q0 after truncations) ──
+            ' §61: Run all three products simultaneously — gmpNumer is read-only in all three
+            ' calls; each result is a distinct mpz_t so there is no shared mutable state.
+            ' Q0 (finalQ), Q1 (mpQ1), Q2 (mpQ2) stay in RAM — no disk spilling needed.
+            ' r0, r1, r2 also stay in RAM; Combine B and D use them directly without reloading.
             Dim mpR0 As New mpz_t()
-            gmp_lib.mpz_init(mpR0)
-            SafeMpzMul(mpR0, gmpNumer, finalQ)
-            gmp_lib.mpz_clears(finalQ, Nothing)   ' Q0 done; ~183 MB buffer freed
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procP0a = Process.GetCurrentProcess()
-            Dim _ramP0a As Long = _procP0a.WorkingSet64 \ 1048576
-            Dim _vmP0a As Long = _procP0a.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Pass 0 multiply done  RAM:{_ramP0a:N0}MB  Committed:{_vmP0a:N0}MB")
-#End If
-#If LOGGING_DETAIL >= 2 Then
-            WriteToLog($"[ComputePi] Pass 0 result: r0={CLng(gmp_lib.mpz_sizeinbase(mpR0, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(mpR0, 2)) \ 8388608:N0} MB)")
-#End If
-
-            Dim R0_path As String = $"{DISK_CACHE_DIR}R0_spill.bin"
-            Using fsW As New FileStream(R0_path, FileMode.Create, FileAccess.Write)
-                Using bwW As New BinaryWriter(fsW)
-                    SerializeOneMpz(mpR0, bwW, spillStaging)
-                End Using
-            End Using
-            gmp_lib.mpz_clear(mpR0)
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procP0b = Process.GetCurrentProcess()
-            Dim ramP0 As Long = _procP0b.WorkingSet64 \ 1048576
-            Dim _vmP0b As Long = _procP0b.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] r0 spilled  RAM:{ramP0:N0}MB  Committed:{_vmP0b:N0}MB")
-#End If
-
-            ' ── Pass 1: r1 = gmpNumer * Q1 ──
-            gmp_lib.mpz_init(mpQ1)
-            Using fsR As New FileStream(Q1_path, FileMode.Open, FileAccess.Read)
-                Using brR As New BinaryReader(fsR)
-                    DeserializeOneMpz(mpQ1, brR, spillStaging)
-                End Using
-            End Using
-            Try : System.IO.File.Delete(Q1_path) : Catch : End Try
-#If LOGGING_DETAIL >= 2 Then
-            Dim _q1Bits As Long = CLng(gmp_lib.mpz_sizeinbase(mpQ1, 2))
-            Dim _numerBits1 As Long = CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2))
-            WriteToLog($"[ComputePi] Pass 1 operands: gmpNumer={_numerBits1:N0} bits ({_numerBits1 \ 8388608:N0} MB)  Q1={_q1Bits:N0} bits ({_q1Bits \ 8388608:N0} MB)  result≈{(_numerBits1 + _q1Bits) \ 8388608:N0} MB")
-#End If
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procP1a = Process.GetCurrentProcess()
-            Dim ramP1 As Long = _procP1a.WorkingSet64 \ 1048576
-            Dim _vmP1a As Long = _procP1a.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Pass 1 multiply: gmpNumer * Q1  RAM:{ramP1:N0}MB  Committed:{_vmP1a:N0}MB")
-#End If
             Dim mpR1 As New mpz_t()
-            gmp_lib.mpz_init(mpR1)
-            SafeMpzMul(mpR1, gmpNumer, mpQ1)
-            gmp_lib.mpz_clear(mpQ1)
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procP1b = Process.GetCurrentProcess()
-            Dim _ramP1b As Long = _procP1b.WorkingSet64 \ 1048576
-            Dim _vmP1b As Long = _procP1b.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Pass 1 multiply done  RAM:{_ramP1b:N0}MB  Committed:{_vmP1b:N0}MB")
-#End If
-#If LOGGING_DETAIL >= 2 Then
-            WriteToLog($"[ComputePi] Pass 1 result: r1={CLng(gmp_lib.mpz_sizeinbase(mpR1, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(mpR1, 2)) \ 8388608:N0} MB)")
-#End If
-
-            Dim R1_path As String = $"{DISK_CACHE_DIR}R1_spill.bin"
-            Using fsW As New FileStream(R1_path, FileMode.Create, FileAccess.Write)
-                Using bwW As New BinaryWriter(fsW)
-                    SerializeOneMpz(mpR1, bwW, spillStaging)
-                End Using
-            End Using
-            gmp_lib.mpz_clear(mpR1)
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procP1c = Process.GetCurrentProcess()
-            Dim ramP1b As Long = _procP1c.WorkingSet64 \ 1048576
-            Dim _vmP1c As Long = _procP1c.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] r1 spilled  RAM:{ramP1b:N0}MB  Committed:{_vmP1c:N0}MB")
-#End If
-
-            ' ── Pass 2: r2 = gmpNumer * Q2  (separate output to avoid aliasing) ──
-            ' NOTE: mpz_t is a struct in GMP.NET, so passing gmpNumer as both dst and src
-            ' produces two different stack copies — GMP sees no alias, skips the temp-copy
-            ' guard, and corrupts the buffer it is still reading.  Always use a distinct
-            ' output variable when the destination would otherwise equal a source.
-            gmp_lib.mpz_init(mpQ2)
-            Using fsR As New FileStream(Q2_path, FileMode.Open, FileAccess.Read)
-                Using brR As New BinaryReader(fsR)
-                    DeserializeOneMpz(mpQ2, brR, spillStaging)
-                End Using
-            End Using
-            Try : System.IO.File.Delete(Q2_path) : Catch : End Try
-#If LOGGING_DETAIL >= 2 Then
-            Dim _q2Bits As Long = CLng(gmp_lib.mpz_sizeinbase(mpQ2, 2))
-            Dim _numerBits2 As Long = CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2))
-            WriteToLog($"[ComputePi] Pass 2 operands: gmpNumer={_numerBits2:N0} bits ({_numerBits2 \ 8388608:N0} MB)  Q2={_q2Bits:N0} bits ({_q2Bits \ 8388608:N0} MB)  result≈{(_numerBits2 + _q2Bits) \ 8388608:N0} MB")
-#End If
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procP2 = Process.GetCurrentProcess()
-            Dim ramP2 As Long = _procP2.WorkingSet64 \ 1048576
-            Dim vmP2 As Long = _procP2.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Pass 2 multiply: gmpNumer * Q2 (separate var)  RAM:{ramP2:N0}MB  Committed:{vmP2:N0}MB")
-#End If
             Dim mpR2 As New mpz_t()
-            gmp_lib.mpz_init(mpR2)
-            SafeMpzMul(mpR2, gmpNumer, mpQ2)
-            gmp_lib.mpz_clear(mpQ2)
-            ' Swap result into gmpNumer; clear frees the old ~208 MB gmpNumer buffer.
+            gmp_lib.mpz_inits(mpR0, mpR1, mpR2, Nothing)
+#If LOGGING_DETAIL >= 1 Then
+            Dim _procP_pre = Process.GetCurrentProcess()
+            Dim _ramP_pre As Long = _procP_pre.WorkingSet64 \ 1048576
+            Dim _vmP_pre As Long = _procP_pre.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] §61 parallel multiply start: r0=N*Q0, r1=N*Q1, r2=N*Q2  RAM:{_ramP_pre:N0}MB  Committed:{_vmP_pre:N0}MB")
+#End If
+            System.Threading.Tasks.Parallel.Invoke(
+                Sub() SafeMpzMul(mpR0, gmpNumer, finalQ),
+                Sub() SafeMpzMul(mpR1, gmpNumer, mpQ1),
+                Sub() SafeMpzMul(mpR2, gmpNumer, mpQ2))
+            gmp_lib.mpz_clears(finalQ, mpQ1, mpQ2, Nothing)
+            ' Swap r2 into gmpNumer (same pattern as the old serial Pass 2 end).
+            ' The old gmpNumer buffer (~208 MB, the 426880*sqrt value) is freed by the swap.
             gmp_lib.mpz_swap(gmpNumer, mpR2)
             gmp_lib.mpz_clear(mpR2)
 #If LOGGING_DETAIL >= 1 Then
-            Dim _procP2b = Process.GetCurrentProcess()
-            Dim _ramP2b As Long = _procP2b.WorkingSet64 \ 1048576
-            Dim _vmP2b As Long = _procP2b.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Pass 2 multiply done; entering Combine  RAM:{_ramP2b:N0}MB  Committed:{_vmP2b:N0}MB")
+            Dim _procP_post = Process.GetCurrentProcess()
+            Dim _ramP_post As Long = _procP_post.WorkingSet64 \ 1048576
+            Dim _vmP_post As Long = _procP_post.PrivateMemorySize64 \ 1048576
+            WriteToLog($"[ComputePi] §61 parallel multiply done; entering Combine  RAM:{_ramP_post:N0}MB  Committed:{_vmP_post:N0}MB")
 #End If
 #If LOGGING_DETAIL >= 2 Then
             WriteToLog($"[ComputePi] r2 (= gmpNumer after swap) = {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
@@ -2553,13 +2648,7 @@ Public Class Form1
 #If LOGGING_DETAIL >= 1 Then
             WriteToLog($"[ComputePi] Combine B: mpz_init(mpR1) + deserialize")
 #End If
-            gmp_lib.mpz_init(mpR1)
-            Using fsR As New FileStream(R1_path, FileMode.Open, FileAccess.Read)
-                Using brR As New BinaryReader(fsR)
-                    DeserializeOneMpz(mpR1, brR, spillStaging)
-                End Using
-            End Using
-            Try : System.IO.File.Delete(R1_path) : Catch : End Try
+            ' §61: mpR1 already in RAM from the parallel multiply — no disk reload.
 #If LOGGING_DETAIL >= 2 Then
             WriteToLog($"[ComputePi] Combine B: add gmpNumer ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) + r1 ({CLng(gmp_lib.mpz_sizeinbase(mpR1, 2)):N0} bits)")
 #End If
@@ -2567,7 +2656,7 @@ Public Class Form1
             Dim _procCBpre = Process.GetCurrentProcess()
             Dim _ramCombBpre As Long = _procCBpre.WorkingSet64 \ 1048576
             Dim _vmCombBpre As Long = _procCBpre.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Combine B r1 loaded  RAM:{_ramCombBpre:N0}MB  Committed:{_vmCombBpre:N0}MB")
+            WriteToLog($"[ComputePi] Combine B r1 in RAM  RAM:{_ramCombBpre:N0}MB  Committed:{_vmCombBpre:N0}MB")
 #End If
             Dim mpAddB As New mpz_t()
 #If LOGGING_DETAIL >= 1 Then
@@ -2670,13 +2759,7 @@ Public Class Form1
 #If LOGGING_DETAIL >= 1 Then
             WriteToLog($"[ComputePi] Combine D: mpz_init(mpR0) + deserialize")
 #End If
-            gmp_lib.mpz_init(mpR0)
-            Using fsR As New FileStream(R0_path, FileMode.Open, FileAccess.Read)
-                Using brR As New BinaryReader(fsR)
-                    DeserializeOneMpz(mpR0, brR, spillStaging)
-                End Using
-            End Using
-            Try : System.IO.File.Delete(R0_path) : Catch : End Try
+            ' §61: mpR0 already in RAM from the parallel multiply — no disk reload.
 #If LOGGING_DETAIL >= 2 Then
             WriteToLog($"[ComputePi] Combine D: add gmpNumer ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) + r0 ({CLng(gmp_lib.mpz_sizeinbase(mpR0, 2)):N0} bits)")
 #End If
@@ -2684,7 +2767,7 @@ Public Class Form1
             Dim _procCDpre = Process.GetCurrentProcess()
             Dim _ramCombDpre As Long = _procCDpre.WorkingSet64 \ 1048576
             Dim _vmCombDpre As Long = _procCDpre.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Combine D r0 loaded  RAM:{_ramCombDpre:N0}MB  Committed:{_vmCombDpre:N0}MB")
+            WriteToLog($"[ComputePi] Combine D r0 in RAM  RAM:{_ramCombDpre:N0}MB  Committed:{_vmCombDpre:N0}MB")
 #End If
             Dim mpAddD As New mpz_t()
 #If LOGGING_DETAIL >= 1 Then
@@ -2829,6 +2912,10 @@ Public Class Form1
                 End If
             Catch
             End Try
+            ' Return all pooled limb blocks to the OS now that computation is done.
+            ' _displayNativePtr is NOT in the pool (GMP never calls GmpFreeFunc on
+            ' the mpz_get_str result buffer) so it remains valid for display/verify.
+            FlushGmpPool()
         End Try
     End Function
 
@@ -2839,12 +2926,20 @@ Public Class Form1
     Private Sub StreamPiToScreen(piString As String)
         Dim digitCount As Long = If(_displayNativePtr <> IntPtr.Zero, _displayNativeLen, CLng(piString.Length))
         LstBoxPhases.Items.Add($"{stopWatch.Elapsed:hh\:mm\:ss\.ff} | Streaming started")
-        Try
-            System.IO.File.AppendAllText("c:\PiOutput\pi_phase_log.txt",
-                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") &
-                $" | Streaming started ({digitCount:N0} digits)" & vbCrLf)
-        Catch
-        End Try
+        WriteToLog($"Streaming started ({digitCount:N0} digits)")
+
+        ' Fast path: display is off — skip the timer loop entirely and go straight
+        ' to file write (if requested), then re-enable the Compute button.
+        If Not ChkboxDisplay.Checked Then
+            BtnCompute.Enabled = True
+            BtnPause.Enabled = False
+            Timer1.Stop()
+            LstBoxPhases.Items.Add($"{stopWatch.Elapsed:hh\:mm\:ss\.ff} | Display skipped")
+            WriteResultToFile(digitCount)
+            If _displayNativePtr = IntPtr.Zero Then displayStr = Nothing
+            Return
+        End If
+
         displayTimer.Enabled = False
         RtbPiDigits.Clear()
         LblDigitsDisplayed.Text = "0"
@@ -2853,6 +2948,47 @@ Public Class Form1
         displayIdx = 0
         displayTotal = 0
         displayTimer.Enabled = True
+    End Sub
+
+    ''' <summary>
+    ''' Writes the computed Pi digits to outputFile (if ChkboxWriteToFile is checked),
+    ''' or just updates the status label.  Called from both the display-timer completion
+    ''' path and the fast path when display is turned off.
+    ''' </summary>
+    Private Sub WriteResultToFile(digitCount As Long)
+        If ChkboxWriteToFile.Checked Then
+            LblStatus.Text = "Writing to file..."
+            Try
+                If Not System.IO.Directory.Exists(System.IO.Path.GetDirectoryName(outputFile)) Then
+                    System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(outputFile))
+                End If
+                If _displayNativePtr <> IntPtr.Zero Then
+                    ' Stream the native char buffer to file in 1 MB chunks.
+                    ' Insert decimal point after the first digit ("3" → "3.").
+                    Using fs As New System.IO.FileStream(outputFile, System.IO.FileMode.Create, System.IO.FileAccess.Write)
+                        fs.WriteByte(Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, 0))
+                        fs.WriteByte(Asc("."c))
+                        Const FILE_CHUNK As Integer = 1024 * 1024
+                        Dim buf(FILE_CHUNK - 1) As Byte
+                        Dim written As Long = 1
+                        While written < _displayNativeLen
+                            Dim toWrite As Integer = CInt(System.Math.Min(FILE_CHUNK, _displayNativeLen - written))
+                            Runtime.InteropServices.Marshal.Copy(
+                                New IntPtr(_displayNativePtr.ToInt64() + written), buf, 0, toWrite)
+                            fs.Write(buf, 0, toWrite)
+                            written += toWrite
+                        End While
+                    End Using
+                Else
+                    System.IO.File.WriteAllText(outputFile, displayStr)
+                End If
+                LblStatus.Text = $"Done! Saved to {outputFile}"
+            Catch ex As Exception
+                LblStatus.Text = "File save error: " & ex.Message
+            End Try
+        Else
+            LblStatus.Text = $"Done! {digitCount:N0} digits computed."
+        End If
     End Sub
 
     Private Sub DisplayTimer_Tick(sender As Object, e As EventArgs) Handles displayTimer.Tick
@@ -2867,44 +3003,9 @@ Public Class Form1
             Timer1.Stop()
 
             LstBoxPhases.Items.Add($"{stopWatch.Elapsed:hh\:mm\:ss\.ff} | Streaming complete")
-            Try
-                System.IO.File.AppendAllText("c:\PiOutput\pi_phase_log.txt",
-                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") &
-                    " | Streaming complete" & vbCrLf)
-            Catch
-            End Try
+            WriteToLog("Streaming complete")
 
-            If ChkboxWriteToFile.Checked Then
-                LblStatus.Text = "Writing to file..."
-                Try
-                    If Not System.IO.Directory.Exists(System.IO.Path.GetDirectoryName(outputFile)) Then
-                        System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(outputFile))
-                    End If
-                    If useNative Then
-                        ' Stream the native char buffer to file in 1 MB chunks.
-                        ' Insert decimal point after the first digit ("3" → "3.").
-                        Using fs As New System.IO.FileStream(outputFile, System.IO.FileMode.Create, System.IO.FileAccess.Write)
-                            fs.WriteByte(Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, 0))
-                            fs.WriteByte(Asc("."c))
-                            Const FILE_CHUNK As Integer = 1024 * 1024
-                            Dim buf(FILE_CHUNK - 1) As Byte
-                            Dim written As Long = 1
-                            While written < _displayNativeLen
-                                Dim toWrite As Integer = CInt(System.Math.Min(FILE_CHUNK, _displayNativeLen - written))
-                                Runtime.InteropServices.Marshal.Copy(
-                                    New IntPtr(_displayNativePtr.ToInt64() + written), buf, 0, toWrite)
-                                fs.Write(buf, 0, toWrite)
-                                written += toWrite
-                            End While
-                        End Using
-                    Else
-                        System.IO.File.WriteAllText(outputFile, displayStr)
-                    End If
-                    LblStatus.Text = $"Done! Saved to {outputFile}"
-                Catch ex As Exception
-                    LblStatus.Text = "File save error: " & ex.Message
-                End Try
-            End If
+            WriteResultToFile(CLng(totalLen))
 
             If useNative Then
                 ' Leave _displayNativePtr alive so BtnTest_Click can search it directly.
@@ -2917,10 +3018,9 @@ Public Class Form1
             Return
         End If
 
-        Dim chunkSize As Integer = 500
-        If Integer.TryParse(TxtChunkSize.Text, chunkSize) = False Then chunkSize = 500
-        If chunkSize < 1 Then chunkSize = 1
-        If chunkSize > 1000000 Then chunkSize = 1000000
+        ' Display streaming chunk: 500 chars/tick at 100 ms interval = ~5,000 chars/sec.
+        ' Sufficient for interactive viewing; irrelevant for headless runs (display is off).
+        Const chunkSize As Integer = 500
         Dim chunkEnd As Integer = System.Math.Min(displayIdx + chunkSize, totalLen)
 
         Dim chunk As New System.Text.StringBuilder()
@@ -2968,6 +3068,46 @@ Public Class Form1
                               Format(span.Milliseconds, "000")
     End Sub
 
+    ''' <summary>
+    ''' Runs any --verify-at and --verify-contains checks supplied on the command line.
+    ''' Results are shown in a MessageBox (interactive) or written to the log (headless).
+    ''' </summary>
+    Private Sub RunCustomVerifications(piText As String)
+        For Each chk In _verifyAt
+            Dim digits As String = chk.Item1
+            Dim expectedPos As Long = chk.Item2
+            Dim actualPos As Long = CLng(piText.IndexOf(digits))
+            Dim msg As String
+            If actualPos >= 0 Then
+                msg = $"[verify-at] '{digits}' found at position {actualPos}. Expected: {expectedPos}. Correct: {actualPos = expectedPos}"
+            Else
+                msg = $"[verify-at] '{digits}' NOT FOUND (expected at position {expectedPos})"
+            End If
+            If Not _headless Then
+                MessageBox.Show(msg, "Verify")
+            Else
+                WriteToLog("[DIALOG] " & msg)
+                LblStatus.Text = msg
+            End If
+        Next
+
+        For Each needle In _verifyContains
+            Dim pos As Long = CLng(piText.IndexOf(needle))
+            Dim msg As String
+            If pos >= 0 Then
+                msg = $"[verify-contains] '{needle}' found at position {pos}"
+            Else
+                msg = $"[verify-contains] '{needle}' NOT FOUND"
+            End If
+            If Not _headless Then
+                MessageBox.Show(msg, "Verify")
+            Else
+                WriteToLog("[DIALOG] " & msg)
+                LblStatus.Text = msg
+            End If
+        Next
+    End Sub
+
     Private Sub BtnTest_Click(sender As Object, e As EventArgs) Handles BtnTest.Click
         ' Search the full native buffer when available (complete digits regardless of
         ' how far the display timer has streamed); fall back to the text box otherwise.
@@ -2992,28 +3132,48 @@ Public Class Form1
         End If
 
         Dim pos1 As Integer = piText.IndexOf("999999")
+        Dim verify1 As String
         If pos1 >= 0 Then
-            MessageBox.Show($"Found '999999' at position {pos1}!" & vbCrLf &
-                           $"Expected position: 762" & vbCrLf &
-                           $"Correct: {pos1 = 762}")
+            verify1 = $"Found '999999' at position {pos1}! Expected: 762. Correct: {pos1 = 762}"
         Else
-            MessageBox.Show("999999 not found!")
+            verify1 = "999999 not found!"
+        End If
+        If Not _headless Then
+            MessageBox.Show(verify1)
+        Else
+            WriteToLog("[DIALOG] Verify 999999: " & verify1)
+            LblStatus.Text = verify1
         End If
 
         Dim pos2 As Integer = piText.IndexOf("777777777")
+        Dim verify2 As String
         If pos2 >= 0 Then
-            MessageBox.Show($"Found '777777777' at position {pos2}!" & vbCrLf &
-                           $"Expected position: 24,658,601" & vbCrLf &
-                           $"Correct: {pos2 = 24658601}")
+            verify2 = $"Found '777777777' at position {pos2}! Expected: 24,658,601. Correct: {pos2 = 24658601}"
         Else
-            MessageBox.Show("777777777 not found - may need more digits!")
+            verify2 = "777777777 not found - may need more digits!"
+        End If
+        If Not _headless Then
+            MessageBox.Show(verify2)
+        Else
+            WriteToLog("[DIALOG] Verify 777777777: " & verify2)
         End If
 
         Dim pos3 As Integer = piText.IndexOf("27182818284")
+        Dim verify3 As String
         If pos3 >= 0 Then
-            MessageBox.Show($"Found first digits of e '27182818284' at position {pos3}!")
+            verify3 = $"Found first digits of e '27182818284' at position {pos3}!"
         Else
-            MessageBox.Show("First digits of e not found in current digits!")
+            verify3 = "First digits of e not found in current digits!"
+        End If
+        If Not _headless Then
+            MessageBox.Show(verify3)
+        Else
+            WriteToLog("[DIALOG] Verify e digits: " & verify3)
+        End If
+
+        ' Run any additional checks supplied via --verify-at / --verify-contains
+        If _verifyAt.Count > 0 OrElse _verifyContains.Count > 0 Then
+            RunCustomVerifications(piText)
         End If
     End Sub
 

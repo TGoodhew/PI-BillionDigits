@@ -94,6 +94,128 @@ A high-level overview of everything that was changed from the original implement
 - `LOGGING_DETAIL` compile-time constant: 0 = phases only, 1 = detail on final combine + all ComputePiGMP steps (default), 2 = full trace (§2).
 - Native buffer streaming: the billion-digit result is kept as a native `char*` rather than a managed string, avoiding a 1 GB managed allocation and GC pressure during display (§13).
 - Thread priority `AboveNormal` + `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` to prevent Windows from throttling the compute thread (§27).
+- Headless / automation mode (§63): `--digits N --autostart --autoverify` runs end-to-end without any UI dialogs; suppressed dialogs written to the phase log with a `[DIALOG]` prefix.
+- Custom digit verification (§67): `--verify-at "DIGITS:POSITION"` and `--verify-contains "DIGITS"` CLI options for automated correctness checks.
+
+### P-Core Affinity on Hybrid CPUs
+
+Intel 12th-gen+ (Alder Lake, Raptor Lake) and AMD Zen 4c CPUs expose two classes of cores: **P-cores** (full-power, high IPC, preferred for GMP math) and **E-cores** (lower power, lower single-thread performance, shared L2). Without affinity pinning, the Windows thread pool schedules tasks onto whichever logical processors are available — including E-cores — which can unpredictably slow down bandwidth-bound GMP operations.
+
+**How it works (§66):**
+
+The Win32 API `GetLogicalProcessorInformationEx(RelationProcessorCore, ...)` returns one `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` record per physical core. The `EfficiencyClass` byte in each record tells you whether the core is a P-core (`EfficiencyClass > 0`) or an E-core (`EfficiencyClass = 0`). Accumulate a bitmask for each class, then call `SetProcessAffinityMask` if both classes are present.
+
+**P/Invoke declarations:**
+```vb
+<DllImport("kernel32.dll", SetLastError:=True)>
+Private Shared Function SetProcessAffinityMask(
+    hProcess As IntPtr,
+    dwProcessAffinityMask As IntPtr) As Boolean
+End Function
+
+<DllImport("kernel32.dll", SetLastError:=True)>
+Private Shared Function GetLogicalProcessorInformationEx(
+    relationshipType As Integer,
+    buffer As IntPtr,
+    ByRef returnedLength As UInteger) As Boolean
+End Function
+
+Private Const RelationProcessorCore As Integer = 0
+```
+
+**Detection and pinning:**
+```vb
+Private Shared Sub SetPCoreAffinity()
+    Try
+        ' Step 1: two-call pattern — first call returns required buffer size
+        Dim bufferSize As UInteger = 0
+        GetLogicalProcessorInformationEx(RelationProcessorCore, IntPtr.Zero, bufferSize)
+        If bufferSize = 0 Then Return
+
+        Dim buffer As IntPtr = Marshal.AllocHGlobal(CInt(bufferSize))
+        Try
+            If Not GetLogicalProcessorInformationEx(RelationProcessorCore, buffer, bufferSize) Then Return
+
+            ' Step 2: parse variable-length records.
+            ' SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX layout (RelationProcessorCore):
+            '   +0   Relationship   : DWORD  (4 bytes)
+            '   +4   Size           : DWORD  (4 bytes) — record length, varies
+            '   +8   Flags          : BYTE   (1 byte)
+            '   +9   EfficiencyClass: BYTE   (1 byte)  — 0=E-core, >0=P-core
+            '  +10   Reserved[20]   : BYTE  (20 bytes)
+            '  +30   GroupCount     : WORD   (2 bytes)
+            '  +32   GroupMask[0].Mask : ULONG_PTR (8 bytes on x64) — logical processor bitmask
+            Dim pCoreMask As Long = 0L
+            Dim eCoreMask As Long = 0L
+            Dim offset As Integer = 0
+
+            Do While offset < CInt(bufferSize)
+                Dim recordSize As Integer = Marshal.ReadInt32(buffer, offset + 4)
+                If recordSize <= 0 Then Exit Do
+
+                Dim efficiencyClass As Byte = Marshal.ReadByte(buffer, offset + 9)
+                Dim mask As Long = Marshal.ReadInt64(buffer, offset + 32)
+
+                If efficiencyClass > 0 Then
+                    pCoreMask = pCoreMask Or mask   ' P-core logical processors
+                Else
+                    eCoreMask = eCoreMask Or mask   ' E-core logical processors
+                End If
+
+                offset += recordSize  ' advance to next record
+            Loop
+
+            ' Step 3: only pin if this is actually a hybrid CPU
+            If pCoreMask <> 0L AndAlso eCoreMask <> 0L Then
+                SetProcessAffinityMask(GetCurrentProcess(), New IntPtr(pCoreMask))
+                ' Log: $"Hybrid CPU. P-core mask=0x{pCoreMask:X}  E-core mask=0x{eCoreMask:X}"
+            Else
+                ' Uniform CPU — all cores same class, leave affinity unchanged
+            End If
+        Finally
+            Marshal.FreeHGlobal(buffer)
+        End Try
+    Catch ex As Exception
+        ' Log and continue — affinity is an optimisation, not a correctness requirement
+    End Try
+End Sub
+```
+
+**Call site — invoke once before the first `Parallel.For`:**
+```vb
+SetPCoreAffinity()
+ThreadPool.SetMinThreads(Environment.ProcessorCount, Environment.ProcessorCount)
+```
+
+**Key points:**
+- The two-call pattern (size query with `IntPtr.Zero`, then data query) is required — the buffer size varies with the number of cores.
+- `Size` at offset +4 is the actual record length and must be used to advance the offset; do not assume a fixed struct size.
+- On a non-hybrid machine all records have the same `EfficiencyClass`, so `eCoreMask` stays 0 and the affinity mask is left unchanged — the function is safe to call unconditionally.
+- `GetCurrentProcess()` returns a pseudo-handle that is always valid; no `CloseHandle` required.
+- The affinity mask is inherited by all threads including thread pool workers, so one call from the UI/compute thread is sufficient.
+
+### Automation
+
+**Headless mode (§63):** All three `MessageBox.Show` dialogs are gated behind `If Not _headless Then`. In headless mode the text is written to the phase log with a `[DIALOG]` prefix so automated runs leave a full audit trail without blocking.
+
+**`Run-PiCompute.ps1` (§63, §70):** PowerShell script that clean-builds and launches the exe. Machine-independent: the exe path is auto-detected by globbing `bin\Release\**\PI-BillionDigits.exe` after the build (no hardcoded TFM folder), and the output directory defaults to `.\PiOutput` next to the script (overridable via `-OutputDir`). Parameters: `-Digits N` (default 1B), `-OutputDir <path>`, `-Trace`, `-ReportOnly <path>`.
+
+**Quick start:**
+```powershell
+# Standard run
+.\Run-PiCompute.ps1
+
+# Custom digit count and output location
+.\Run-PiCompute.ps1 -Digits 100000000 -OutputDir "D:\PiResults"
+
+# With CPU trace
+.\Run-PiCompute.ps1 -Trace
+
+# Re-generate report from existing trace
+.\Run-PiCompute.ps1 -ReportOnly ".\pi_trace_20260331_121017.nettrace"
+```
+
+**P-core affinity + thread pool pre-warm (§66):** On hybrid CPUs (Intel P+E core), `GetLogicalProcessorInformationEx` is used to detect P-cores by `EfficiencyClass` and restrict the process affinity mask to those cores only. `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` pre-warms the thread pool before Phase 1 to eliminate first-task latency.
 
 ---
 
@@ -1664,6 +1786,85 @@ The `mpz_clears` early-free calls and the final `mpz_add` are unchanged and stil
 
 ---
 
+## Section 62 — Degree-of-Parallelism Caps to Prevent Oversubscription
+
+**Branch:** AdvPerfWork
+
+**Change:** Added `ParallelOptions.MaxDegreeOfParallelism` to two sites:
+
+1. **SafeMpzMul `Parallel.For(0, 9)`** — capped to `Environment.ProcessorCount`. When `SafeMpzMul` is called from inside Phase 2's outer `Parallel.For`, uncapped inner parallelism creates `pairCount × 2 × 9` concurrent tasks on 24 cores (e.g. 8 pairs × 2 × 9 = 144 tasks). This saturates memory bandwidth without proportional throughput gain. Capping to `ProcessorCount` ensures the inner loop never exceeds the physical core count regardless of nesting depth.
+
+2. **Phase 2 outer `Parallel.For(pairCount)`** — capped to `Math.Max(1, Environment.ProcessorCount \ 2)`. Each outer task spawns 2 inner tasks via `Parallel.Invoke` (§60), so uncapped outer DOP × 2 = `2 × ProcessorCount` concurrent multiplications. Capping outer DOP to `ProcessorCount \ 2` keeps total concurrent multiplications at ~`ProcessorCount`, leaving the thread pool headroom to schedule the inner `Parallel.Invoke` tasks without queuing.
+
+**Why:** .NET's thread pool uses work-stealing so oversubscription doesn't deadlock, but it does cause excessive context switching and memory bus contention for GMP's FFT multiplications which are already memory-bandwidth-bound at the larger operand sizes. These caps keep effective concurrency at the physical core count without reducing throughput at levels where pairCount < ProcessorCount/2 (where the outer cap is non-binding anyway).
+
+---
+
+## Section 61 — Parallel Three-Pass Q Multiply + Non-Blocking GC Between Levels
+
+**Branch:** AdvPerfWork
+
+### Part A — Parallel three-pass Q multiply
+
+**Change:** The three serial passes `r0 = gmpNumer × Q0`, `r1 = gmpNumer × Q1`, `r2 = gmpNumer × Q2` now run simultaneously via `System.Threading.Tasks.Parallel.Invoke`. `gmpNumer` is read-only in all three calls; each result is a distinct `mpz_t`, so there is no shared mutable state between threads.
+
+Q1 and Q2 are no longer spilled to disk between extraction and use — they stay in RAM. r0 and r1 are no longer spilled and reloaded between passes — Combine B and D use the in-memory variables directly. This removes 6 disk I/O operations (4 serialize + 2 deserialize) and eliminates the disk round-trip latency entirely.
+
+**Why:** The three passes were purely serial because of the disk spill/reload pattern. Each pass took roughly the same time as one `SafeMpzMul` on ~400 MB operands. Running them in parallel gives up to 3× speedup on this section. The disk spilling was necessary when memory was constrained (before §58 raised `DISK_THRESHOLD`); with the full-RAM mode on a 64 GB machine the ~1.2 GB peak for all three simultaneous results is trivial.
+
+**Memory impact:** Peak during parallel multiply: gmpNumer (~208 MB) + Q0+Q1+Q2 (~549 MB) + r0+r1+r2 (~1.15 GB) + SafeMpzMul intermediates (~2.9 GB) ≈ ~4.8 GB. Well within the 64 GB budget.
+
+### Part B — Non-blocking GC between Phase 2 levels
+
+**Change:** The `GC.Collect(MaxGeneration, Aggressive, blocking:=True, compacting:=True)` call between Phase 2 levels now uses `GCCollectionMode.Optimized` with `blocking:=False` at all levels except the final level (where the aggressive blocking collect is retained to reclaim the large Phase 2 intermediates before the final arithmetic).
+
+**Why:** The aggressive blocking GC was pausing all threads at each of ~17 levels. At lower levels (many small nodes, fast combines) these pauses were a significant fraction of level time. A non-blocking optimized collect is sufficient to reclaim the `mpz_t` wrapper objects from freed pairs without stalling parallel work.
+
+---
+
+## Section 60 — Parallel.Invoke Inside Parallel Phase 2 Pairs
+
+**Branch:** AdvPerfWork
+
+**Change:** Added `Parallel.Invoke` for the two independent multiply pairs inside the `Parallel.For` lambda of the parallel Phase 2 path — the same §54 pattern already used in the serial top-level path:
+- **Invoke pair 1:** `newP = leftP × rightP` and `newQ = leftQ × rightQ` run simultaneously (disjoint operands).
+- **Invoke pair 2:** `tempA = leftT × rightQ` and `tempB = leftP × rightT` run simultaneously (disjoint operands).
+
+**Why:** As Phase 2 levels rise, the number of pairs halves each level while each pair's operands double in size (and multiply time grows quadratically). Without this change, each outer `Parallel.For` task uses only 1 core — the 4 multiplications per pair are serial. By Level 2 (34,435 pairs, each taking ~4× longer than Level 1), each task was using 1/24th of available cores. Adding `Parallel.Invoke` within each task doubles intra-pair parallelism, effectively maintaining the same number of concurrent multiplications as Level 1 (34,435 × 2 = 68,870 simultaneous multiplies vs Level 1's ~68,870 pairs × 1).
+
+This mirrors the §54 change applied to the serial top-level path. `SafeMpzMul` with non-aliased operands is thread-safe; all shared log writes are already serialised via `SyncLock _logLock`.
+
+---
+
+## Section 59 — Parallel 9 Sub-Products Inside SafeMpzMul
+
+**Branch:** AdvPerfWork
+
+**Change:** The 9 independent sub-products `A_i × B_j` (i,j ∈ {0,1,2}) inside `SafeMpzMul`'s slow path now run concurrently via `Parallel.For(0, 9, ...)` instead of serially in nested `For i / For j` loops.
+
+Key design points:
+- **A-piece extraction moved upfront:** A0, A1, A2 are all extracted before the parallel section (previously A_part was lazily re-extracted per-i iteration). Each is `mpz_init2`'d to ensure `_mp_alloc >= mA` before direct limb copies for A1 and A2.
+- **9 distinct `prods(k)` result buffers:** Each thread writes into its own `prods(k)` object; no shared mutable state between threads.
+- **Thread safety:** A_parts and B_parts are read-only during the parallel section. GMP arithmetic on non-aliased `mpz_t` objects is intrinsically thread-safe. The §44 accumPtr stash lives in `result`'s native struct; inner calls stash into `prods(k)` structs and never touch `result`'s struct, preserving the outer stash.
+- **Serial accumulation after:** After `Parallel.For`, a serial `For k = 0 To 8` loop shifts each `prod_k` into its positional slot (`shiftBits = i*bitsA + j*bitsB`) and accumulates into `accum`. No inner `SafeMpzMul` calls in this loop — no §42/§44 corruption risk. Each `prods(k)` is freed immediately after use to limit peak RAM.
+- **Existing shift/add/free logic preserved:** The VirtualAlloc pre-sizing for `shifted`, two-step shift for large `shiftBits`, and `GmpRaw_add` accumulation are unchanged from the serial path.
+
+**Why:** At Levels 14–17 of Phase 2, `SafeMpzMul` hits the slow path because `szA + szB > 33,554,431` limbs. The 9 sub-products were computed serially, leaving 23 cores idle during each multiply. Running them in parallel gives up to 9× speedup on the sub-product step — the dominant cost at the top combine levels.
+
+**Memory impact:** At Level 17, 9 simultaneous sub-products × ~374 MB each = ~3.4 GB extra peak RAM. Plus A0+A1+A2 simultaneously (~1.1 GB vs ~374 MB lazy). Total ~3.1 GB extra vs serial — well within the 64 GB machine's headroom.
+
+---
+
+## Section 58 — Full RAM Mode (DISK_THRESHOLD raised to 200,000)
+
+**Branch:** AdvPerfWork
+
+**Change:** `DISK_THRESHOLD` raised from `1` to `200_000` in `BinarySplitGMP`. Since `numChunks = 137,739 < 200,000`, Phase 1 keeps all chunk results in the `chunkResults()` array in RAM (no `L0.bin` written). Since every Phase 2 level produces `nextSize < 200,000` nodes, all levels also stay in RAM. The NVMe is no longer touched during computation at all — only for writing the final digit string.
+
+**Why:** `DISK_THRESHOLD = 1` was set defensively during the §40–§44 allocator crash fixes, not because RAM was insufficient. The machine has 64 GB RAM; the total P+Q+T data across any single Phase 2 level is ~1.7 GB (constant across all levels), and peak RAM during a combine (current level + next level + multiply intermediates) is ~6–8 GB. With the allocator now stable, there is no reason to use disk as a crutch. Eliminating disk I/O from Phase 2 removes the NVMe read/write overhead that dominated wall-clock time at Levels 1–13.
+
+---
+
 ## Section 57 — Phase 2 Level Progress in Status Label
 
 **Branch:** PerfWork
@@ -1714,3 +1915,157 @@ The `mpz_clears` early-free calls and the final `mpz_add` are unchanged and stil
 **Change:** Replaced the serial `While nodeIdx < diskNodes.Count - 1` inner loop in the Phase 2 combine pass with a `Parallel.For` over pair indices when `pairCount >= 4`. Each pair is fully independent: it loads from two unique disk files, uses only thread-local `mpz_t` objects, and writes to a unique output file. Results are written into a pre-sized `nextResults(pairCount-1)` array by pair index (no locking needed), then `nextDiskNodes.AddRange(nextResults)` populates the list in order. The serial path is retained for `pairCount < 4` (the top levels where operands are very large and there are too few pairs for parallelism to help without excessive RAM pressure). The `LOGGING_DETAIL` diagnostic blocks and the per-100-pair `LogPhase` call remain in the serial path only.
 
 **Why:** At the lower combine levels there are thousands of independent node pairs per level — e.g. ~68,869 pairs at Level 1, ~34 at Level 12. Each pair's four `SafeMpzMul` calls are entirely independent of all other pairs. On a 24-logical-processor machine this is the same situation as Phase 1: a serial loop leaves 23 cores idle. The `pairCount >= 4` threshold keeps the top 1–2 levels serial where loading multiple pairs simultaneously would multiply already-large (~hundreds of MB to GB) operands across threads and risk OOM.
+
+---
+
+## Section 68 — GMP Pool Cap Raised to 256
+
+**Branch:** AdvPerfWork
+
+**Change:** `POOL_CAP` increased from 32 to 256.
+
+**Why:** With outer Phase 2 DOP=24 (§69) and each pair running `Parallel.Invoke(2 SafeMpzMul)`, up to 48 concurrent GMP operations can return pool blocks simultaneously. A cap of 32 meant the pool was constantly evicting via `VirtualFree` and missing on the next alloc via `VirtualAlloc`, negating the pool's purpose. Raising to 256 keeps all concurrently live blocks in the pool for immediate reuse.
+
+---
+
+## Section 69 — DOP Rebalance: Phase 2 Outer=ProcessorCount, SafeMpzMul Inner=1
+
+**Branch:** AdvPerfWork
+
+**Change:** Two coordinated DOP changes to eliminate nested thread-pool oversubscription:
+
+1. **Phase 2 parallel outer DOP:** raised from `ProcessorCount \ 2` (12) to `ProcessorCount` (24).
+2. **SafeMpzMul inner DOP:** controlled by new `Shared _safeMulDop As Integer` field. Set to `1` (serial) before the Phase 2 outer `Parallel.For`; restored to `ProcessorCount` after the parallel path completes (before the serial top-level path and `ComputePiGMP`). In `SafeMpzMul`, when `_safeMulDop <= 1`, the 9 sub-products run in a serial `For k = 0 To 8` loop instead of `Parallel.For`.
+
+**Effect:** `_safeMulDop = 1` eliminates the inner `Parallel.For` inside `SafeMpzMul` when called from the Phase 2 parallel path — sub-products run serially, no nested task submission. Serial Phase 2 top levels and `ComputePiGMP` restore `_safeMulDop = Environment.ProcessorCount` to keep full inner parallelism for those single-pair operations.
+
+**Why (trace 4 → trace 5 correction):** Trace 4 showed `LowLevelLifoSemaphore.WaitForSignal` at 18.77% — thread pool threads parking between sub-product tasks. Eliminating inner `Parallel.For` from the parallel path fixed that. However trace 5 revealed that raising outer DOP to `ProcessorCount` (24) was counterproductive: each outer task calls `Parallel.Invoke(newP, newQ)` which needs a free thread for the second task. With all 24 threads occupied by outer tasks, `Parallel.Invoke` could not immediately place its second task — `Task.WaitAll` jumped to 19.33% and the allocator worsened from 35% to 44% (48 concurrent GMP operations vs 24). Outer DOP is therefore restored to `ProcessorCount \ 2`, giving 12 outer tasks × 2 free threads per Invoke = both newP and newQ always run truly in parallel with no blocking.
+
+---
+
+## Section 63 — Headless / Automation Mode + PowerShell Script
+
+**Branch:** PerfWork / AdvPerfWork
+
+**Change:** Added three CLI arguments parsed in `Form1_Load`:
+
+- `--digits N` — sets the digit count programmatically (bypasses the UI spinner).
+- `--autostart` — triggers `BtnCompute_Click` from `Form1_Shown` so the computation starts without any user interaction.
+- `--autoverify` — triggers `BtnTest_Click` automatically after computation completes.
+
+All three `MessageBox.Show` dialogs (compute complete, verify result, error) are gated: in headless mode the dialog text is written to the phase log with a `[DIALOG]` prefix instead of blocking the process.
+
+Headless defaults applied at startup: `ChkboxDisplay.Checked = False`, `TxtChunkSize.Text = "500000"`, `ChkboxWriteToFile.Checked = True`.
+
+Added `Run-PiCompute.ps1`:
+- `dotnet clean` → `dotnet build --configuration Release` → launch exe with `--digits $Digits --autostart --autoverify`.
+- `-Trace` switch: wraps the run with `dotnet-trace collect` (providers: `Microsoft-DotNETCore-SampleProfiler:0xF00000000000:5` + `Microsoft-DotNETRuntime:0x1F000080018:5`), then calls `dotnet-trace report topN -n 50 --inclusive` and saves a `_report.txt` alongside the `.nettrace`.
+- `-ReportOnly <path>`: skips build/run; re-generates the topN report from an existing `.nettrace`.
+- Output directory hardcoded to `c:\PiOutput`; created if missing. (Replaced in §70 — see below.)
+- `.gitignore` updated to exclude `*.nettrace`, `*.nettrace.etlx`, `*.etlx`, `*.etl`, `*.etl.zip`, `*.speedscope.json`, `*.diagsession`, `*.vspx`, `*.psess`, `*_report.txt`, `pi_trace_*`.
+
+---
+
+## Section 70 — Make Run-PiCompute.ps1 Machine-Independent
+
+**Branch:** AdvPerfWork
+
+**Change:** Three portability improvements to `Run-PiCompute.ps1`:
+
+1. **Auto-detect exe path** — after the build, `Get-ChildItem -Recurse` globs `bin\Release\**\PI-BillionDigits.exe` and takes the most recently written match. No hardcoded TFM folder (`net10.0-windows10.0.26100.0`) — works correctly when the target framework version changes or on machines with a different Windows SDK.
+
+2. **Relative output directory** — `$piOutputDir` replaced by `-OutputDir` parameter defaulting to `.\PiOutput` (i.e. a `PiOutput` folder next to the script). No longer requires write access to `c:\`. Override with `-OutputDir "D:\SomeOtherPath"` without editing the script body.
+
+3. **Configurable digit count** — `-Digits` parameter (default `1000000000`) passed through to the exe, replacing the hardcoded `--digits 1000000000`. Useful for quick test runs at lower digit counts.
+
+**Why:** The original hardcoded `c:\PiOutput` and `bin\Release\net10.0-windows10.0.26100.0` paths break silently on any machine where the system drive letter differs, the user lacks root-write permission, or the .NET SDK target framework version is updated. All machine-specific values are now computed defaults that work on a clean clone without any manual configuration.
+
+---
+
+## Section 71 — Portable Output Paths + Remove Vestigial Chunk Size UI
+
+**Branch:** AdvPerfWork
+
+**Change:** Three related clean-up items addressing issue #5:
+
+**1. Machine-independent output paths in Form1.vb**
+
+All hardcoded `c:\PiOutput` paths replaced with a single `Shared _outputDir` field defaulting to `%LOCALAPPDATA%\PI-BillionDigits` (always writable, no admin rights, works on any drive letter). `outputFile`, `LOG_FILE`, and `DISK_CACHE_DIR` are now computed `ReadOnly Property` values derived from `_outputDir`. The two `File.AppendAllText("c:\PiOutput\pi_phase_log.txt", ...)` calls in `StreamPiToScreen` and `DisplayTimer_Tick` that bypassed the logging subsystem are replaced with `WriteToLog(...)` calls.
+
+**2. Remove Chunk Size UI control**
+
+`TxtChunkSize` (TextBox) and its `Label5` ("Chunk Size:") label removed from the form. The control originally configured Phase 1 chunk size, which has been a compile-time constant (`Const CHUNK_SIZE As Long = 512`) since §49. Its only remaining effect was controlling `DisplayTimer_Tick` streaming speed (chars per 100 ms tick), which is now a code constant (`Const chunkSize As Integer = 500`). The headless default-setting line (`TxtChunkSize.Text = "500000"`) is also removed.
+
+**Why:** `TxtChunkSize` was presenting a misleading "Chunk Size" label to users that no longer did what it implied (Phase 1 computation granularity). Its actual effect (display streaming rate) is invisible to users running headless or with display off, and the default of 500 chars/tick is appropriate for interactive viewing of smaller runs. Removing it declutters the UI and eliminates a potential source of confusion.
+
+## Section 64 — Skip Display Loop When Display Is Off
+
+**Branch:** PerfWork / AdvPerfWork
+
+**Change:** `StreamPiToScreen` now fast-paths at entry: if `ChkboxDisplay.Checked = False`, it calls `WriteResultToFile()` directly and returns without entering the streaming loop. `WriteResultToFile(digitCount As Long)` is extracted as a shared helper used by both the fast path and the display loop's final step.
+
+**Why:** In headless mode (or any interactive run with Display unchecked) the streaming loop was still iterating over the native buffer one chunk at a time for no visible effect, wasting several seconds.
+
+---
+
+## Section 65 — Bucketed VirtualAlloc Pool (GMP Allocator v3)
+
+**Branch:** AdvPerfWork
+
+**Change:** Replaced the per-call `VirtualAlloc`/`VirtualFree` allocator with a power-of-2 bucketed pool:
+
+- 64 fixed `ConcurrentStack(Of IntPtr)` slots, one per bit-length bucket (bucket `b` holds blocks of exactly `2^b` bytes).
+- `PoolBucket(sz)` computes `ceil(log2(sz))` via a shift loop — no `Math.Log`, no dictionary lookup.
+- `PoolGet`: if `sz ≤ POOL_MAX_BLOCK (16 MB)`, pops from the matching bucket (or calls `VirtualAlloc(2^b)` on miss). Blocks above 16 MB bypass the pool entirely (their sizes are unique per combine level and would never hit).
+- `PoolReturn`: if `sz ≤ POOL_MAX_BLOCK` and `stack.Count < POOL_CAP (32)`, pushes back; otherwise `VirtualFree`.
+- `FlushGmpPool()` drains all 64 stacks via `VirtualFree`, called between Phase 2 levels and in the `ComputePiGMP` Finally block to prevent committed-memory accumulation.
+- Pool stacks initialised in `InitGmpVirtualAllocFunctions`.
+
+**Why (v1 → v2 → v3 evolution):**
+- v1 (§6): per-call `VirtualAlloc`/`VirtualFree` — correct but ~41% of wall-clock time in allocator overhead per dotnet-trace.
+- v2: `ConcurrentDictionary(sz → stack)` pool — `Monitor.Wait` lock contention at 5.55% of runtime (visible in trace 3 as `LowLevelLock` and `ConcurrentDictionary.GetOrAdd`).
+- v3: fixed 64-bucket array — no dictionary, no Monitor; only lock-free `ConcurrentStack` push/pop.
+
+Crash fix during pool development: top-level combine blocks (e.g. Level 16–17, 107 MB–268 MB) exceeded `POOL_MAX_BLOCK`, so `VirtualAlloc` returned NULL when committed memory hit ~38 GB from un-flushed pool blocks. Fixed by the `POOL_MAX_BLOCK` bypass and per-level `FlushGmpPool()`.
+
+---
+
+## Section 66 — P-Core Affinity Detection + Thread Pool Pre-Warm
+
+**Branch:** AdvPerfWork
+
+**Change:** Added `SetPCoreAffinity()` called from `BtnCompute_Click` before Phase 1:
+
+- Calls `GetLogicalProcessorInformationEx(RelationProcessorCore, ...)` to enumerate all logical processor groups.
+- Each `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` entry for a processor core exposes `EfficiencyClass` (0 = E-core, 1+ = P-core on Intel hybrid CPUs; on non-hybrid CPUs all cores report the same class).
+- Accumulates a bitmask of all P-core logical processors; if the set is non-empty and not equal to all processors, calls `SetProcessAffinityMask` to restrict the process.
+- Logs the detected counts and final affinity mask with an `[Affinity]` prefix.
+- No-op on non-hybrid machines (all cores report the same `EfficiencyClass`).
+
+Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately before Phase 1 to pre-warm the .NET thread pool, eliminating the ramp-up latency for the first `Parallel.For` tasks.
+
+**Why:** On Intel 12th-gen+ hybrid CPUs, Windows may schedule .NET thread pool threads onto E-cores. E-cores have lower single-thread IPC and share L3 differently, degrading GMP FFT performance which is memory-bandwidth-bound. Pinning to P-cores ensures consistent throughput. Thread pool pre-warming eliminates the ~100 ms first-task latency seen at Phase 1 start in trace runs.
+
+---
+
+## Section 67 — `--verify-at` and `--verify-contains` CLI Options
+
+**Branch:** AdvPerfWork
+
+**Change:** Added two repeatable CLI arguments parsed in `Form1_Load`:
+
+- `--verify-at "DIGITS:POSITION"` — after computation, checks that the digit sequence `DIGITS` appears at exactly position `POSITION` (0-based, including the leading `3`). Multiple `--verify-at` arguments are all checked.
+- `--verify-contains "DIGITS"` — checks that `DIGITS` appears anywhere in the output. Multiple `--verify-contains` arguments are all checked.
+
+Both options populate `_verifyAt As List(Of Tuple(Of String, Long))` and `_verifyContains As List(Of String)` at startup. The new helper `RunCustomVerifications(piText As String)` is called at the end of `BtnTest_Click` (after the built-in fixed digit checks) when either list is non-empty.
+
+Results in interactive mode: `MessageBox.Show`. In headless mode: written to the phase log with a `[DIALOG]` prefix and `LblStatus.Text` is updated.
+
+**Example usage:**
+```
+PI-BillionDigits.exe --digits 1000000000 --autostart --autoverify ^
+    --verify-at "999999:762" ^
+    --verify-contains "27182818284"
+```
+
+**Why:** The built-in test checks three fixed digit sequences hardcoded in `BtnTest_Click`. For automated regression testing or validating known Pi digit positions, it is useful to pass expected values on the command line without modifying the source. The `--verify-at` form gives an exact-position assertion (fails if the sequence is found elsewhere); `--verify-contains` is a looser sanity check useful for sequences like Euler's number embedded in Pi.
