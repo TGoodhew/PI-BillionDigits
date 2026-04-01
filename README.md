@@ -1143,15 +1143,15 @@ System.NotSupportedException: No data is available for encoding 1252.
 
 ---
 
-## Section 25 — Test Button Searches Native Buffer; Buffer Freed on Test or Compute
+## Section 25 — Test Button Searches Native Buffer Without Interrupting Display
 
-**Problem:** the Test button searched `RtbPiDigits.Text`, which only contains digits streamed so far by the display timer. The nine-7s sequence (`777777777`) appears at position 24,658,601 and the digits-of-e sequence (`27182818284`) appears even later — both would return "not found" if the user clicked Test before streaming reached those positions.
+**Problem:** the Test button searched `RtbPiDigits.Text`, which only contains digits streamed so far by the display timer. The nine-7s sequence (`777777777`) appears at position 24,658,601 and the digits-of-e sequence (`27182818284`) appears even later — both would return "not found" if the user clicked Test before streaming reached those positions. Additionally, the original implementation freed `_displayNativePtr` after searching, which stopped the display timer mid-stream.
 
-**Change:** the native Pi buffer (`_displayNativePtr`, the `~1 GB` null-terminated ASCII string produced by `mpz_get_str`) is now retained after streaming completes instead of being freed immediately. When the user clicks Test, the button marshals the full native buffer to a managed string via `Marshal.PtrToStringAnsi`, runs all three searches against the complete digit sequence, then frees the buffer. This makes all searches correct regardless of display progress.
+**Change:** the native Pi buffer (`_displayNativePtr`, the null-terminated ASCII string produced by `mpz_get_str`) is retained for the lifetime of the computation result. When the user clicks Test, the button marshals the full native buffer to a managed string via `Marshal.PtrToStringAnsi` and runs all searches against the complete digit sequence — without freeing the buffer. The display timer continues streaming uninterrupted after Test returns.
 
-The buffer is also freed at the top of `BtnCompute_Click` so that starting a new computation always releases any buffer held from the previous run.
+The buffer is freed only at the top of `BtnCompute_Click` when a new computation starts, releasing any buffer held from the previous run.
 
-If `_displayNativePtr` is zero (buffer already freed, or a run that used the managed-string path), the Test button falls back to searching `RtbPiDigits.Text` as before.
+If `_displayNativePtr` is zero (no native buffer, or a run that used the managed-string path), the Test button falls back to searching `RtbPiDigits.Text` as before.
 
 ---
 

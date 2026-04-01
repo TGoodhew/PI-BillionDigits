@@ -3278,7 +3278,7 @@ Public Class Form1
 
             If useNative Then
                 ' Leave _displayNativePtr alive so BtnTest_Click can search it directly.
-                ' The buffer will be freed when the user clicks Test or Compute.
+                ' The buffer is freed when a new computation starts (BtnCompute_Click).
                 WriteToLog("[DisplayTimer] streaming complete — native pi buffer retained for Test button")
             Else
                 displayStr = Nothing
@@ -3381,21 +3381,12 @@ Public Class Form1
         ' Search the full native buffer when available (complete digits regardless of
         ' how far the display timer has streamed); fall back to the text box otherwise.
         Dim piText As String
-        Dim usingNativeBuffer As Boolean = (_displayNativePtr <> IntPtr.Zero)
-        If usingNativeBuffer Then
-            ' Marshal the entire native string (null-terminated ASCII) into a managed string.
-            ' This is ~1 GB for a billion-digit run; it will briefly double memory usage but
-            ' lets IndexOf work normally.
+        If _displayNativePtr <> IntPtr.Zero Then
+            ' Search the full computed buffer directly — all digits regardless of how far
+            ' the display timer has streamed.  Do NOT free the buffer here; the display
+            ' timer must continue reading from it after the test completes.
             piText = Runtime.InteropServices.Marshal.PtrToStringAnsi(_displayNativePtr)
-            ' Free via the same allocator that GmpAllocFunc used: VirtualFree for large
-            ' buffers (>= 512 KB), _savedGmpFree for small ones (wrong result / test runs).
-            If _displayNativeBufSize >= GMP_LARGE_THRESHOLD Then
-                VirtualFree(_displayNativePtr, UIntPtr.Zero, MEM_RELEASE)
-            Else
-                _savedGmpFree(New void_ptr(_displayNativePtr), New size_t(CULng(_displayNativeBufSize)))
-            End If
-            _displayNativePtr = IntPtr.Zero
-            WriteToLog("[BtnTest] native pi buffer searched and freed")
+            WriteToLog("[BtnTest] native pi buffer searched (buffer retained for display)")
         Else
             piText = RtbPiDigits.Text.Replace(".", "").Replace(vbCrLf, "")
         End If
