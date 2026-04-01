@@ -1143,15 +1143,15 @@ System.NotSupportedException: No data is available for encoding 1252.
 
 ---
 
-## Section 25 — Test Button Searches Native Buffer Without Interrupting Display
+## Section 25 — Verify Button Searches Full Native Buffer Without Interrupting Display
 
 **Problem:** the Test button searched `RtbPiDigits.Text`, which only contains digits streamed so far by the display timer. The nine-7s sequence (`777777777`) appears at position 24,658,601 and the digits-of-e sequence (`27182818284`) appears even later — both would return "not found" if the user clicked Test before streaming reached those positions. Additionally, the original implementation freed `_displayNativePtr` after searching, which stopped the display timer mid-stream.
 
-**Change:** the native Pi buffer (`_displayNativePtr`, the null-terminated ASCII string produced by `mpz_get_str`) is retained for the lifetime of the computation result. When the user clicks Test, the button marshals the full native buffer to a managed string via `Marshal.PtrToStringAnsi` and runs all searches against the complete digit sequence — without freeing the buffer. The display timer continues streaming uninterrupted after Test returns.
+**Change:** the native Pi buffer (`_displayNativePtr`, the null-terminated ASCII string produced by `mpz_get_str`) is retained for the lifetime of the computation result. When the user clicks "Verify Now", the button marshals the full native buffer to a managed string via `Marshal.PtrToStringAnsi` and runs all searches against the complete digit sequence — without freeing the buffer. The display timer continues streaming uninterrupted.
 
-The buffer is freed only at the top of `BtnCompute_Click` when a new computation starts, releasing any buffer held from the previous run.
+The buffer is freed only at the top of `BtnCompute_Click` when a new computation starts.
 
-If `_displayNativePtr` is zero (no native buffer, or a run that used the managed-string path), the Test button falls back to searching `RtbPiDigits.Text` as before.
+If `_displayNativePtr` is zero (no native buffer, or a run that used the managed-string path), verification falls back to searching `RtbPiDigits.Text`.
 
 ---
 
@@ -2045,6 +2045,35 @@ Crash fix during pool development: top-level combine blocks (e.g. Level 16–17,
 Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately before Phase 1 to pre-warm the .NET thread pool, eliminating the ramp-up latency for the first `Parallel.For` tasks.
 
 **Why:** On Intel 12th-gen+ hybrid CPUs, Windows may schedule .NET thread pool threads onto E-cores. E-cores have lower single-thread IPC and share L3 differently, degrading GMP FFT performance which is memory-bandwidth-bound. Pinning to P-cores ensures consistent throughput. Thread pool pre-warming eliminates the ~100 ms first-task latency seen at Phase 1 start in trace runs.
+
+---
+
+## Section 82 — Auto-Verify Checkbox; Verification Results in Status Bar (issue #12)
+
+**Branch:** PerfWork
+
+**Changes (closes issue #12 / issue #3):**
+
+### UI changes
+- **`BtnTest` renamed to "Verify Now"** for clarity.
+- **`ChkAutoVerify` checkbox** ("Verify after compute") added to the control panel, defaulting to checked. Placed between `ChkboxWriteToFile` and "Verify Now" on the same row. `LblRamThreshold` and `NudRamThreshold` shifted right to make room.
+
+### Verification results: status bar only — no modal dialogs
+All verification results (built-in checks and `--verify-at` / `--verify-contains` custom checks) are now written to `LblStatus` and the phase log. **No `MessageBox.Show` is called** at any point during verification, in either interactive or headless mode. The status bar shows a compact summary:
+
+```
+Verify OK: 999999@762 OK | 777777777@24,658,601 OK | e-digits@{pos} OK
+Verify: 999999 not found | 777777777@24,658,601 OK | e-digits not found
+```
+
+### Auto-verify triggers
+- **After streaming completes** (`DisplayTimer_Tick` completion path): if `ChkAutoVerify.Checked`, `RunVerification()` is called automatically.
+- **When display is off** (`StreamPiToScreen` fast path): same check — `RunVerification()` is called after `WriteResultToFile`.
+- **Headless `--autoverify` flag**: calls `RunVerification()` directly (previously called `BtnTest_Click`).
+- **"Verify Now" button**: calls `RunVerification()` on demand at any time.
+
+### Code structure
+Verify logic consolidated into a single `RunVerification()` sub (previously duplicated across `BtnTest_Click` and the headless path). `BtnTest_Click` is now a one-liner that calls `RunVerification()`. `RunCustomVerifications` updated to write to `LblStatus`/log instead of `MessageBox`.
 
 ---
 

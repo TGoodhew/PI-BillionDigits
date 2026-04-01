@@ -955,9 +955,13 @@ Public Class Form1
             "If it exceeds this value, nodes are written to the NVMe cache (uses less RAM). " &
             "Auto-detected from available system RAM at startup: ≥16 GB → 200,000 (all RAM); ≥8 GB → 100,000; <8 GB → 1 (full disk). " &
             "Lower this if you get out-of-memory errors.")
+        TipMain.SetToolTip(ChkAutoVerify,
+            "When checked, verification runs automatically after computation completes. " &
+            "Results appear in the status bar — no dialog boxes.")
         TipMain.SetToolTip(BtnTest,
-            "Search the computed Pi digits for known sequences to verify correctness: " &
-            "999999 at position 762, 777777777 at position 24,658,601, and the first digits of e (27182818284).")
+            "Run verification now against the full computed Pi buffer. " &
+            "Checks: 999999 at position 762, 777777777 at position 24,658,601, and the first digits of e (27182818284). " &
+            "Results appear in the status bar.")
         TipMain.SetToolTip(LblStatus,
             "Current computation status and phase timing.")
         TipMain.SetToolTip(Label1,
@@ -1159,7 +1163,7 @@ Public Class Form1
                     ' never auto-exit even if --autoverify was somehow received.
                     If _headless AndAlso _autoVerify Then
                         Me.Invoke(Sub()
-                                      BtnTest_Click(Nothing, EventArgs.Empty)
+                                      RunVerification()
                                       Application.Exit()
                                   End Sub)
                     End If
@@ -3215,6 +3219,8 @@ Public Class Form1
             LstBoxPhases.Items.Add($"{stopWatch.Elapsed:hh\:mm\:ss\.ff} | Display skipped")
             WriteResultToFile(digitCount)
             If _displayNativePtr = IntPtr.Zero Then displayStr = Nothing
+            ' §82 auto-verify: run when display is off and checkbox is checked.
+            If ChkAutoVerify.Checked Then RunVerification()
             Return
         End If
 
@@ -3290,11 +3296,14 @@ Public Class Form1
             If useNative Then
                 ' Leave _displayNativePtr alive so BtnTest_Click can search it directly.
                 ' The buffer is freed when a new computation starts (BtnCompute_Click).
-                WriteToLog("[DisplayTimer] streaming complete — native pi buffer retained for Test button")
+                WriteToLog("[DisplayTimer] streaming complete — native pi buffer retained for Verify")
             Else
                 displayStr = Nothing
                 WriteToLog("[DisplayTimer] displayStr released (LOH block freed)")
             End If
+
+            ' §82 auto-verify: run immediately after streaming completes if checkbox is checked.
+            If ChkAutoVerify.Checked Then RunVerification()
             Return
         End If
 
@@ -3390,8 +3399,65 @@ Public Class Form1
     End Sub
 
     ''' <summary>
-    ''' Runs any --verify-at and --verify-contains checks supplied on the command line.
-    ''' Results are shown in a MessageBox (interactive) or written to the log (headless).
+    ''' Runs all built-in and custom verifications against the computed Pi digits.
+    ''' Results are written to LblStatus and the phase log — no modal dialogs.
+    ''' Called by BtnTest_Click (on demand) and automatically after streaming
+    ''' completes when ChkAutoVerify is checked.
+    ''' </summary>
+    Private Sub RunVerification()
+        Dim piText As String
+        If _displayNativePtr <> IntPtr.Zero Then
+            piText = Runtime.InteropServices.Marshal.PtrToStringAnsi(_displayNativePtr)
+            WriteToLog("[Verify] native pi buffer searched (buffer retained for display)")
+        Else
+            piText = RtbPiDigits.Text.Replace(".", "").Replace(vbCrLf, "")
+        End If
+
+        ' ── Built-in checks ──────────────────────────────────────────────────
+        Dim parts As New System.Collections.Generic.List(Of String)()
+        Dim allOk As Boolean = True
+
+        Dim pos1 As Integer = piText.IndexOf("999999")
+        If pos1 = 762 Then
+            parts.Add("999999@762 OK")
+        ElseIf pos1 >= 0 Then
+            parts.Add($"999999 at {pos1} (expected 762) FAIL")
+            allOk = False
+        Else
+            parts.Add("999999 not found")
+            allOk = False
+        End If
+
+        Dim pos2 As Integer = piText.IndexOf("777777777")
+        If pos2 = 24658601 Then
+            parts.Add("777777777@24,658,601 OK")
+        ElseIf pos2 >= 0 Then
+            parts.Add($"777777777 at {pos2} (expected 24658601) FAIL")
+            allOk = False
+        Else
+            parts.Add("777777777 not found")
+        End If
+
+        Dim pos3 As Integer = piText.IndexOf("27182818284")
+        If pos3 >= 0 Then
+            parts.Add($"e-digits@{pos3} OK")
+        Else
+            parts.Add("e-digits not found")
+        End If
+
+        Dim summary As String = If(allOk, "Verify OK: ", "Verify: ") & String.Join(" | ", parts)
+        LblStatus.Text = summary
+        WriteToLog("[Verify] " & summary)
+
+        ' ── Custom --verify-at / --verify-contains checks ────────────────────
+        If _verifyAt.Count > 0 OrElse _verifyContains.Count > 0 Then
+            RunCustomVerifications(piText)
+        End If
+    End Sub
+
+    ''' <summary>
+    ''' Runs --verify-at and --verify-contains checks supplied on the command line.
+    ''' Results are written to LblStatus and the phase log — no modal dialogs.
     ''' </summary>
     Private Sub RunCustomVerifications(piText As String)
         For Each chk In _verifyAt
@@ -3400,93 +3466,24 @@ Public Class Form1
             Dim actualPos As Long = CLng(piText.IndexOf(digits))
             Dim msg As String
             If actualPos >= 0 Then
-                msg = $"[verify-at] '{digits}' found at position {actualPos}. Expected: {expectedPos}. Correct: {actualPos = expectedPos}"
+                msg = $"[verify-at] '{digits}' at {actualPos} (expected {expectedPos}): {If(actualPos = expectedPos, "OK", "FAIL")}"
             Else
-                msg = $"[verify-at] '{digits}' NOT FOUND (expected at position {expectedPos})"
+                msg = $"[verify-at] '{digits}' NOT FOUND (expected at {expectedPos})"
             End If
-            If Not _headless Then
-                MessageBox.Show(msg, "Verify")
-            Else
-                WriteToLog("[DIALOG] " & msg)
-                LblStatus.Text = msg
-            End If
+            WriteToLog(msg)
+            LblStatus.Text = msg
         Next
 
         For Each needle In _verifyContains
             Dim pos As Long = CLng(piText.IndexOf(needle))
-            Dim msg As String
-            If pos >= 0 Then
-                msg = $"[verify-contains] '{needle}' found at position {pos}"
-            Else
-                msg = $"[verify-contains] '{needle}' NOT FOUND"
-            End If
-            If Not _headless Then
-                MessageBox.Show(msg, "Verify")
-            Else
-                WriteToLog("[DIALOG] " & msg)
-                LblStatus.Text = msg
-            End If
+            Dim msg As String = If(pos >= 0, $"[verify-contains] '{needle}' at {pos} OK", $"[verify-contains] '{needle}' NOT FOUND")
+            WriteToLog(msg)
+            LblStatus.Text = msg
         Next
     End Sub
 
     Private Sub BtnTest_Click(sender As Object, e As EventArgs) Handles BtnTest.Click
-        ' Search the full native buffer when available (complete digits regardless of
-        ' how far the display timer has streamed); fall back to the text box otherwise.
-        Dim piText As String
-        If _displayNativePtr <> IntPtr.Zero Then
-            ' Search the full computed buffer directly — all digits regardless of how far
-            ' the display timer has streamed.  Do NOT free the buffer here; the display
-            ' timer must continue reading from it after the test completes.
-            piText = Runtime.InteropServices.Marshal.PtrToStringAnsi(_displayNativePtr)
-            WriteToLog("[BtnTest] native pi buffer searched (buffer retained for display)")
-        Else
-            piText = RtbPiDigits.Text.Replace(".", "").Replace(vbCrLf, "")
-        End If
-
-        Dim pos1 As Integer = piText.IndexOf("999999")
-        Dim verify1 As String
-        If pos1 >= 0 Then
-            verify1 = $"Found '999999' at position {pos1}! Expected: 762. Correct: {pos1 = 762}"
-        Else
-            verify1 = "999999 not found!"
-        End If
-        If Not _headless Then
-            MessageBox.Show(verify1)
-        Else
-            WriteToLog("[DIALOG] Verify 999999: " & verify1)
-            LblStatus.Text = verify1
-        End If
-
-        Dim pos2 As Integer = piText.IndexOf("777777777")
-        Dim verify2 As String
-        If pos2 >= 0 Then
-            verify2 = $"Found '777777777' at position {pos2}! Expected: 24,658,601. Correct: {pos2 = 24658601}"
-        Else
-            verify2 = "777777777 not found - may need more digits!"
-        End If
-        If Not _headless Then
-            MessageBox.Show(verify2)
-        Else
-            WriteToLog("[DIALOG] Verify 777777777: " & verify2)
-        End If
-
-        Dim pos3 As Integer = piText.IndexOf("27182818284")
-        Dim verify3 As String
-        If pos3 >= 0 Then
-            verify3 = $"Found first digits of e '27182818284' at position {pos3}!"
-        Else
-            verify3 = "First digits of e not found in current digits!"
-        End If
-        If Not _headless Then
-            MessageBox.Show(verify3)
-        Else
-            WriteToLog("[DIALOG] Verify e digits: " & verify3)
-        End If
-
-        ' Run any additional checks supplied via --verify-at / --verify-contains
-        If _verifyAt.Count > 0 OrElse _verifyContains.Count > 0 Then
-            RunCustomVerifications(piText)
-        End If
+        RunVerification()
     End Sub
 
     Private Sub TxtDigitsofPI_TextChanged(sender As Object, e As EventArgs) Handles TxtDigitsofPI.TextChanged

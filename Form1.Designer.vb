@@ -29,6 +29,7 @@ Partial Class Form1
         LstBoxPhases = New ListBox()
         LblRamThreshold = New Label()
         NudRamThreshold = New NumericUpDown()
+        ChkAutoVerify = New CheckBox()
         BtnTest = New Button()
         LblDigitsDisplayed = New Label()
         LblRunningTime = New Label()
@@ -55,6 +56,7 @@ Partial Class Form1
         Panel1.Controls.Add(LstBoxPhases)
         Panel1.Controls.Add(LblRamThreshold)
         Panel1.Controls.Add(NudRamThreshold)
+        Panel1.Controls.Add(ChkAutoVerify)
         Panel1.Controls.Add(BtnTest)
         Panel1.Controls.Add(LblDigitsDisplayed)
         Panel1.Controls.Add(LblRunningTime)
@@ -81,12 +83,36 @@ Partial Class Form1
         LstBoxPhases.Name = "LstBoxPhases"
         LstBoxPhases.Size = New Size(1106, 181)
         LstBoxPhases.TabIndex = 39
-        ' 
+        '
+        ' ChkAutoVerify
+        '
+        ChkAutoVerify.AutoSize = True
+        ChkAutoVerify.Checked = True
+        ChkAutoVerify.CheckState = CheckState.Checked
+        ChkAutoVerify.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        ChkAutoVerify.Location = New Point(368, 84)
+        ChkAutoVerify.Name = "ChkAutoVerify"
+        ChkAutoVerify.Size = New Size(260, 36)
+        ChkAutoVerify.TabIndex = 42
+        ChkAutoVerify.Text = "Verify after compute"
+        ChkAutoVerify.UseVisualStyleBackColor = True
+        '
+        ' BtnTest
+        '
+        BtnTest.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        BtnTest.Location = New Point(648, 79)
+        BtnTest.Name = "BtnTest"
+        BtnTest.Size = New Size(134, 47)
+        BtnTest.TabIndex = 28
+        BtnTest.Text = "Verify Now"
+        BtnTest.TextAlign = ContentAlignment.MiddleCenter
+        BtnTest.UseVisualStyleBackColor = True
+        '
         ' LblRamThreshold
         '
         LblRamThreshold.AutoSize = True
         LblRamThreshold.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        LblRamThreshold.Location = New Point(552, 83)
+        LblRamThreshold.Location = New Point(810, 83)
         LblRamThreshold.Name = "LblRamThreshold"
         LblRamThreshold.Size = New Size(200, 38)
         LblRamThreshold.TabIndex = 40
@@ -95,7 +121,7 @@ Partial Class Form1
         ' NudRamThreshold
         '
         NudRamThreshold.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        NudRamThreshold.Location = New Point(770, 83)
+        NudRamThreshold.Location = New Point(1028, 83)
         NudRamThreshold.Minimum = New Decimal(New Integer() {1, 0, 0, 0})
         NudRamThreshold.Maximum = New Decimal(New Integer() {500000, 0, 0, 0})
         NudRamThreshold.Increment = New Decimal(New Integer() {1000, 0, 0, 0})
@@ -103,17 +129,6 @@ Partial Class Form1
         NudRamThreshold.Name = "NudRamThreshold"
         NudRamThreshold.Size = New Size(185, 39)
         NudRamThreshold.TabIndex = 41
-        '
-        ' BtnTest
-        '
-        BtnTest.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        BtnTest.Location = New Point(403, 79)
-        BtnTest.Name = "BtnTest"
-        BtnTest.Size = New Size(134, 47)
-        BtnTest.TabIndex = 28
-        BtnTest.Text = "Test"
-        BtnTest.TextAlign = ContentAlignment.MiddleCenter
-        BtnTest.UseVisualStyleBackColor = True
         ' 
         ' LblDigitsDisplayed
         ' 
@@ -275,5 +290,6 @@ Partial Class Form1
     Friend WithEvents LstBoxPhases As ListBox
     Friend WithEvents LblRamThreshold As Label
     Friend WithEvents NudRamThreshold As NumericUpDown
+    Friend WithEvents ChkAutoVerify As CheckBox
 
 End Class
