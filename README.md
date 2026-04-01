@@ -2066,7 +2066,21 @@ Replaced `gmp_lib.mpz_add(tempA, tempA, tempB)` with `GmpRaw_add(tempA.Pointer, 
 
 The `newP`/`newQ`/`tempA`/`tempB` init and clear calls in Phase 2 are unchanged: their struct headers are allocated by `gmp_lib.mpz_init` and their lifetimes span levels (stored as `MemP`/`MemQ`/`MemT` in `DiskNode`), so switching ownership models there would require also changing `BinarySplitChunk` and `LoadNodeFromDisk`.
 
-Trace results pending from the combined 1B-digit run (§88).
+**1B-digit trace results (§88 vs §87):**
+
+| Metric | §87 | §88 | Δ |
+|--------|-----|-----|---|
+| `SafeMpzMul` (excl) | 17.98% | 20.48% | +2.5 pp ¹ |
+| `GmpAllocFunc` (excl) | 23.4% | 23.5% | flat |
+| `GmpFreeFunc` (excl) | 22.42% | 22.42% | flat |
+| `LowLevelLifoSemaphore` (excl) | 13.9% | 14.09% | flat |
+| `gmp_lib.mpz_inits` (excl) | not in top 50 | 0.86% | Phase 2 remainder ² |
+| `gmp_lib.mpz_clears` (excl) | 0.58% | 0.75% | Phase 2 remainder ² |
+| Wall-clock | 27:47 | **27:28** | −19s |
+
+¹ The +2.5 pp SafeMpzMul exclusive is a sampling redistribution: `Thread.Sleep` dropped −2.6 pp (poll threads ran fewer cycles in a slightly faster run). `GmpAllocFunc`/`GmpFreeFunc` are flat — the irreducible thunk crossing dominates; eliminating the delegate dispatch layered on top had no measurable effect at 1B digits because the slow path is only triggered at the top few levels where each multiply takes hundreds of milliseconds.
+
+² `gmp_lib.mpz_inits`/`mpz_clears` now visible at 0.86%/0.75% exclusive are the Phase 2 `newP`/`newQ`/`tempA`/`tempB` wrapper calls intentionally left unchanged. Converting them requires a consistent ownership model from `BinarySplitChunk` through all Phase 2 levels — not worth the refactor risk. Issues #25 and #26 closed.
 
 ---
 

@@ -819,7 +819,7 @@ Public Class Form1
                     If i + 1 < args.Length Then
                         Dim lvl As Integer
                         If Integer.TryParse(args(i + 1), lvl) AndAlso lvl >= 0 AndAlso lvl <= 5 Then
-                            _logLevel = lvl
+                            System.Threading.Volatile.Write(_logLevel, lvl)  ' §27
                         End If
                         i += 1
                     End If
@@ -1179,7 +1179,7 @@ Public Class Form1
 
         ' Capture threshold and log level from UI (or keep CLI-supplied values in headless mode).
         _diskThreshold = CInt(NudRamThreshold.Value)
-        _logLevel = CInt(NudLogLevel.Value)
+        System.Threading.Volatile.Write(_logLevel, CInt(NudLogLevel.Value))  ' §27
 
         ' Pre-warm the thread pool to ProcessorCount threads before the compute
         ' thread starts.  Without this, the thread pool ramps up one thread at a
@@ -1826,7 +1826,8 @@ Public Class Form1
         ' Parallel.For (outer DOP=24), _safeMulDop=1 so sub-products run serially — eliminates
         ' the thread-pool park/unpark overhead. When called from the serial Phase 2 top levels
         ' or ComputePiGMP, _safeMulDop=ProcessorCount to use all cores.
-        Dim _smmDop As Integer = If(_safeMulDop > 0, _safeMulDop, Environment.ProcessorCount)
+        Dim _smmDop As Integer = System.Threading.Volatile.Read(_safeMulDop)  ' §27: cross-thread read
+        If _smmDop <= 0 Then _smmDop = Environment.ProcessorCount
         If _smmDop <= 1 Then
             ' Serial path: no thread pool involvement, no park/unpark overhead.
             For k As Integer = 0 To 8
@@ -2159,7 +2160,7 @@ Public Class Form1
                 '   pairCount = 8              → _safeMulDop = 3 (8 × 3 = 24 active threads)
                 ' No deadlock: outer tasks no longer block on Parallel.Invoke; inner
                 ' Parallel.For sub-tasks are short fast-path GmpRaw_mul calls with no nesting.
-                _safeMulDop = System.Math.Max(1, Environment.ProcessorCount \ CInt(System.Math.Max(1L, pairCount)))
+                System.Threading.Volatile.Write(_safeMulDop, System.Math.Max(1, Environment.ProcessorCount \ CInt(System.Math.Max(1L, pairCount))))  ' §27
                 Dim _p2opts As New System.Threading.Tasks.ParallelOptions() With {
                     .MaxDegreeOfParallelism = Environment.ProcessorCount
                 }
@@ -2249,7 +2250,7 @@ Public Class Form1
                 phase2PollThread.Join()
                 nextDiskNodes.AddRange(nextResults)
                 ' §69: Restore full DOP for serial Phase 2 top levels and ComputePiGMP.
-                _safeMulDop = Environment.ProcessorCount
+                System.Threading.Volatile.Write(_safeMulDop, Environment.ProcessorCount)  ' §27
 
             Else
                 ' ── Serial path (top levels: few pairs, very large operands) ─
