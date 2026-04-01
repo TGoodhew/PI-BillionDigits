@@ -659,6 +659,37 @@ Public Class Form1
     Private Shared Function GmpRaw_sizeinbase(op As IntPtr, base As Integer) As ULong
     End Function
 
+    ' §25: Additional raw DllImports for SafeMpzMul slow path — eliminates Math.Gmp.Native
+    ' delegate dispatch from init/clear/tdiv operations. Struct headers for locally-created
+    ' mpz_t objects are allocated via Marshal.AllocHGlobal(16); GmpRaw_init/init2 fills in
+    ' the limb buffer via GmpAllocFunc exactly as gmp_lib.mpz_init does internally.
+    ' Cleanup: GmpRaw_clear frees the limb buffer via GmpFreeFunc; Marshal.FreeHGlobal
+    ' frees the struct header — matching the AllocHGlobal on the way in.
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_init",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_init(rop As IntPtr)
+    End Sub
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_init2",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_init2(rop As IntPtr, n As ULong)
+    End Sub
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_clear",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_clear(rop As IntPtr)
+    End Sub
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_tdiv_r_2exp",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_tdiv_r_2exp(rop As IntPtr, op As IntPtr, n As UInteger)
+    End Sub
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_tdiv_q_2exp",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_tdiv_q_2exp(rop As IntPtr, op As IntPtr, n As UInteger)
+    End Sub
+
     Private Sub InitGmpVirtualAllocFunctions()
         ' Initialise pool buckets (fixed array — no ConcurrentDictionary overhead).
         For b As Integer = 0 To POOL_BUCKETS - 1
@@ -1719,13 +1750,18 @@ Public Class Form1
 
         ' Split opB into three pieces upfront: opB is small so all three pieces coexist cheaply.
         ' opA and opB are Q/P values from Chudnovsky binary split, always non-negative.
-        Dim B0 As New mpz_t(), B1 As New mpz_t(), B2 As New mpz_t(), Btmp As New mpz_t()
-        gmp_lib.mpz_inits(B0, B1, B2, Btmp, Nothing)
-        gmp_lib.mpz_tdiv_r_2exp(B0, opB, New mp_bitcnt_t(CUInt(bitsB)))
-        gmp_lib.mpz_tdiv_q_2exp(Btmp, opB, New mp_bitcnt_t(CUInt(bitsB)))
-        gmp_lib.mpz_tdiv_r_2exp(B1, Btmp, New mp_bitcnt_t(CUInt(bitsB)))
-        gmp_lib.mpz_tdiv_q_2exp(B2, Btmp, New mp_bitcnt_t(CUInt(bitsB)))
-        gmp_lib.mpz_clears(Btmp, Nothing)
+        ' §25: raw DllImport — struct headers via Marshal.AllocHGlobal(16), limb buffers via
+        ' GmpRaw_init (same path as gmp_lib.mpz_init). Cleanup: GmpRaw_clear + FreeHGlobal.
+        Dim B0 As New mpz_t(), B1 As New mpz_t(), B2 As New mpz_t()
+        B0.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(B0.Pointer)
+        B1.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(B1.Pointer)
+        B2.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(B2.Pointer)
+        Dim _Btmp As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(_Btmp)
+        GmpRaw_tdiv_r_2exp(B0.Pointer, opB.Pointer, CUInt(bitsB))
+        GmpRaw_tdiv_q_2exp(_Btmp, opB.Pointer, CUInt(bitsB))
+        GmpRaw_tdiv_r_2exp(B1.Pointer, _Btmp, CUInt(bitsB))
+        GmpRaw_tdiv_q_2exp(B2.Pointer, _Btmp, CUInt(bitsB))
+        GmpRaw_clear(_Btmp) : Runtime.InteropServices.Marshal.FreeHGlobal(_Btmp)
         If _logLevel >= 4 AndAlso CLng(szA) + CLng(szB) > 10_000_000L Then
             AppendLog(
                 $"[SafeMpzMul] B-pieces | " &
@@ -1736,13 +1772,14 @@ Public Class Form1
 
         ' §59: Pre-extract all three A pieces upfront so all 9 sub-products can run in parallel.
         ' mpz_init2(bitsA) pre-allocates _mp_alloc >= mA before direct limb copies (A1, A2).
+        ' §25: raw DllImport — same Marshal.AllocHGlobal(16) + GmpRaw_init2 pattern.
         Dim A0 As New mpz_t(), A1 As New mpz_t(), A2 As New mpz_t()
-        gmp_lib.mpz_init2(A0, New mp_bitcnt_t(CUInt(bitsA)))
-        gmp_lib.mpz_init2(A1, New mp_bitcnt_t(CUInt(bitsA)))
-        gmp_lib.mpz_init2(A2, New mp_bitcnt_t(CUInt(bitsA)))
+        A0.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init2(A0.Pointer, bitsA)
+        A1.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init2(A1.Pointer, bitsA)
+        A2.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init2(A2.Pointer, bitsA)
 
         ' A0 = opA mod 2^bitsA  (low mA limbs)
-        gmp_lib.mpz_tdiv_r_2exp(A0, opA, New mp_bitcnt_t(CUInt(bitsA)))
+        GmpRaw_tdiv_r_2exp(A0.Pointer, opA.Pointer, CUInt(bitsA))
 
         ' A1 = limbs [mA, 2*mA) — direct copy into pre-alloc'd buffer
         Dim _pre_opA_d As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
@@ -1772,10 +1809,12 @@ Public Class Form1
         Dim B_parts() As mpz_t = {B0, B1, B2}
 
         ' Allocate one result buffer per sub-product (k = i*3 + j, k ∈ 0..8).
+        ' §25: raw init — Marshal.AllocHGlobal(16) struct header + GmpRaw_init limb buffer.
         Dim prods(8) As mpz_t
         For k As Integer = 0 To 8
             prods(k) = New mpz_t()
-            gmp_lib.mpz_init(prods(k))
+            prods(k).Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+            GmpRaw_init(prods(k).Pointer)
         Next k
 
         ' §59: Run all 9 sub-products A_i × B_j simultaneously on the thread pool.
@@ -1825,8 +1864,10 @@ Public Class Form1
             AppendLog($"[SafeMpzMul] shared shifted pre-alloc FAILED for {_maxShiftedLimbs * 8L \ 1048576L:N0} MB — throwing OOM{vbCrLf}")
             Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shared shifted ({_maxShiftedLimbs * 8L \ 1048576L} MB)")
         End If
+        ' §25: raw init for shifted — struct header via Marshal.AllocHGlobal, limb buffer via GmpRaw_init.
         Dim shifted As New mpz_t()
-        gmp_lib.mpz_init(shifted)
+        shifted.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+        GmpRaw_init(shifted.Pointer)
         ' Replace shifted's initial 1-limb CRT buffer with the shared VirtualAlloc'd buffer.
         Dim _sv_shifted_hdr As IntPtr = shifted.Pointer
         Dim _shiftedInitAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted_hdr, 0))
@@ -1857,15 +1898,17 @@ Public Class Form1
                 GmpRaw_add(accumPtr, accumPtr, _sv_shifted_hdr)
             End If
             ' Free prod_k immediately after accumulation to limit peak RAM.
-            gmp_lib.mpz_clear(prods(k))
+            ' §25: raw clear matches raw init above.
+            GmpRaw_clear(prods(k).Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(prods(k).Pointer)
         Next k
-        ' §23: Free the shared buffer once, then put shifted into a clean 1-limb stub
-        ' so the subsequent mpz_clears call frees it without double-freeing _sharedSjBuf.
+        ' §23: Free the shared buffer once, then re-init shifted with a fresh 1-limb stub
+        ' so the final GmpRaw_clear below frees it cleanly without double-freeing _sharedSjBuf.
+        ' §25: raw re-init — zero the struct fields so GmpRaw_init allocates a fresh limb buffer.
         VirtualFree(_sharedSjBuf, UIntPtr.Zero, MEM_RELEASE)
         Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 0, 0)
         Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 4, 0)
         Runtime.InteropServices.Marshal.WriteInt64(_sv_shifted_hdr, 8, 0L)
-        gmp_lib.mpz_init(shifted)
+        GmpRaw_init(_sv_shifted_hdr)   ' allocates fresh 1-limb buffer; freed by GmpRaw_clear below
         ' §44: re-read accumPtr from result's stash after the serial accumulation loop.
         ' The accumulation loop contains no inner SafeMpzMul calls so locals are uncorrupted,
         ' but we re-read from the stash anyway for consistency with the §44 pattern.
@@ -1887,8 +1930,14 @@ Public Class Form1
         If resultSign < 0 Then GmpRaw_neg(savedResultPtr, savedResultPtr)
 
         ' §59: prods(0..8) are already cleared inside the accumulation loop.
-        ' shifted was mpz_init'd after its last use; A0/A1/A2 replaced A_part.
-        gmp_lib.mpz_clears(shifted, A0, A1, A2, B0, B1, B2, Nothing)
+        ' §25: raw clear + FreeHGlobal for all objects allocated with Marshal.AllocHGlobal headers.
+        GmpRaw_clear(shifted.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(shifted.Pointer)
+        GmpRaw_clear(A0.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(A0.Pointer)
+        GmpRaw_clear(A1.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(A1.Pointer)
+        GmpRaw_clear(A2.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(A2.Pointer)
+        GmpRaw_clear(B0.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(B0.Pointer)
+        GmpRaw_clear(B1.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(B1.Pointer)
+        GmpRaw_clear(B2.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(B2.Pointer)
         AppendLog(
             $"[SafeMpzMul] cleared: szA={szA:N0} szB={szB:N0}{vbCrLf}")
     End Sub
@@ -2171,7 +2220,7 @@ Public Class Form1
                         gmp_lib.mpz_clears(leftT, rightQ, Nothing)
                         gmp_lib.mpz_clears(leftP, rightT, Nothing)
 
-                        gmp_lib.mpz_add(tempA, tempA, tempB)
+                        GmpRaw_add(tempA.Pointer, tempA.Pointer, tempB.Pointer)  ' §26: bypass wrapper dispatch
                         gmp_lib.mpz_clears(tempB, Nothing)
 
                         ' Store result
@@ -2312,7 +2361,7 @@ Public Class Form1
                         Dim _szTB As Integer = Runtime.InteropServices.Marshal.ReadInt32(tempB.Pointer, 4)
                         WriteToLog($"[Combine] L{level} N{nodeIdx\2}: add newT  tempA={System.Math.Abs(_szTA):N0} tempB={System.Math.Abs(_szTB):N0} limbs")
                     End If
-                    gmp_lib.mpz_add(tempA, tempA, tempB)            ' T result in tempA's buffer
+                    GmpRaw_add(tempA.Pointer, tempA.Pointer, tempB.Pointer)  ' §26: bypass wrapper dispatch; T result in tempA's buffer
                     gmp_lib.mpz_clears(tempB, Nothing)              ' tempB done; tempA IS newT
                     If _logLevel >= 3 AndAlso isTopLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: combine complete")
 
