@@ -26,6 +26,8 @@ Partial Class Form1
         Timer1 = New Timer(components)
         Panel1 = New Panel()
         LstBoxPhases = New ListBox()
+        LblRamThreshold = New Label()
+        NudRamThreshold = New NumericUpDown()
         BtnTest = New Button()
         LblDigitsDisplayed = New Label()
         LblRunningTime = New Label()
@@ -40,6 +42,7 @@ Partial Class Form1
         LblStatus = New TextBox()
         BtnCompute = New Button()
         RtbPiDigits = New RichTextBox()
+        CType(NudRamThreshold, System.ComponentModel.ISupportInitialize).BeginInit()
         Panel1.SuspendLayout()
         SuspendLayout()
         ' 
@@ -49,6 +52,8 @@ Partial Class Form1
         ' Panel1
         ' 
         Panel1.Controls.Add(LstBoxPhases)
+        Panel1.Controls.Add(LblRamThreshold)
+        Panel1.Controls.Add(NudRamThreshold)
         Panel1.Controls.Add(BtnTest)
         Panel1.Controls.Add(LblDigitsDisplayed)
         Panel1.Controls.Add(LblRunningTime)
@@ -76,8 +81,30 @@ Partial Class Form1
         LstBoxPhases.Size = New Size(1106, 279)
         LstBoxPhases.TabIndex = 39
         ' 
+        ' LblRamThreshold
+        '
+        LblRamThreshold.AutoSize = True
+        LblRamThreshold.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        LblRamThreshold.Location = New Point(530, 91)
+        LblRamThreshold.Name = "LblRamThreshold"
+        LblRamThreshold.Size = New Size(200, 38)
+        LblRamThreshold.TabIndex = 40
+        LblRamThreshold.Text = "RAM Threshold:"
+        '
+        ' NudRamThreshold
+        '
+        NudRamThreshold.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        NudRamThreshold.Location = New Point(748, 91)
+        NudRamThreshold.Minimum = New Decimal(New Integer() {1, 0, 0, 0})
+        NudRamThreshold.Maximum = New Decimal(New Integer() {500000, 0, 0, 0})
+        NudRamThreshold.Increment = New Decimal(New Integer() {1000, 0, 0, 0})
+        NudRamThreshold.Value = New Decimal(New Integer() {200000, 0, 0, 0})
+        NudRamThreshold.Name = "NudRamThreshold"
+        NudRamThreshold.Size = New Size(185, 39)
+        NudRamThreshold.TabIndex = 41
+        '
         ' BtnTest
-        ' 
+        '
         BtnTest.Location = New Point(403, 91)
         BtnTest.Name = "BtnTest"
         BtnTest.Size = New Size(112, 34)
@@ -218,6 +245,7 @@ Partial Class Form1
         Name = "Form1"
         Text = "Calculate PI to 1 Billion"
         WindowState = FormWindowState.Maximized
+        CType(NudRamThreshold, System.ComponentModel.ISupportInitialize).EndInit()
         Panel1.ResumeLayout(False)
         Panel1.PerformLayout()
         ResumeLayout(False)
@@ -239,5 +267,7 @@ Partial Class Form1
     Friend WithEvents RtbPiDigits As RichTextBox
     Friend WithEvents BtnTest As Button
     Friend WithEvents LstBoxPhases As ListBox
+    Friend WithEvents LblRamThreshold As Label
+    Friend WithEvents NudRamThreshold As NumericUpDown
 
 End Class

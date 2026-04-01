@@ -65,6 +65,10 @@ Public Class Form1
     Private _verifyAt As New List(Of Tuple(Of String, Long))()   ' (digits, expectedPos)
     Private _verifyContains As New List(Of String)()
 
+    ' §73: RAM/Disk threshold — read from NudRamThreshold at compute start.
+    ' Controls whether Phase 1 chunks and Phase 2 levels stay in RAM or spill to disk.
+    Private _diskThreshold As Integer = 200_000
+
     ' §69: Controls SafeMpzMul inner Parallel.For DOP.
     ' Set to 1 before Phase 2 parallel Parallel.For so sub-products run serially —
     ' eliminates the thread-pool park/unpark cycle (18.77% LowLevelLifoSemaphore in
@@ -713,6 +717,7 @@ Public Class Form1
         '   --digits N       Set the digit count (no commas required)
         '   --autostart      Suppress all dialogs and auto-begin computation
         '   --autoverify     After computation, auto-run verify + exit
+        '   --threshold N    Override the RAM/disk threshold (nodes)
         Dim args() As String = Environment.GetCommandLineArgs()
         Dim i As Integer = 1
         Do While i < args.Length
@@ -747,6 +752,14 @@ Public Class Form1
                         End If
                         i += 1
                     End If
+                Case "--threshold"
+                    If i + 1 < args.Length Then
+                        Dim t As Integer
+                        If Integer.TryParse(args(i + 1), t) AndAlso t >= 1 Then
+                            _diskThreshold = t
+                        End If
+                        i += 1
+                    End If
             End Select
             i += 1
         Loop
@@ -754,6 +767,27 @@ Public Class Form1
         LblStatus.Text = "Ready"
         TxtDigitsofPI.Text = If(TxtDigitsofPI.Text <> "", TxtDigitsofPI.Text, "1,000,000")
         ChkboxDisplay.Checked = Not _headless
+
+        ' ── Auto-detect RAM threshold ─────────────────────────────────────────
+        ' If --threshold was not supplied on the CLI, estimate a safe default
+        ' based on available system RAM so the app works on any machine.
+        If _diskThreshold = 200_000 Then   ' only override if not set by CLI
+            Try
+                Dim availGB As Double = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (1024.0 ^ 3)
+                If availGB >= 16 Then
+                    _diskThreshold = 200_000   ' full RAM — all 137,739 chunks in memory
+                ElseIf availGB >= 8 Then
+                    _diskThreshold = 100_000   ' Phase 2 in RAM, Phase 1 streams to L0.bin
+                Else
+                    _diskThreshold = 1         ' full disk — safe on any machine
+                End If
+            Catch
+                _diskThreshold = 1   ' safe fallback if GC info unavailable
+            End Try
+        End If
+        NudRamThreshold.Value = System.Math.Max(NudRamThreshold.Minimum,
+                                System.Math.Min(NudRamThreshold.Maximum, _diskThreshold))
+        NudRamThreshold.Enabled = Not _headless
         RtbPiDigits.MaxLength = 0
         RtbPiDigits.ReadOnly = False
         RtbPiDigits.Font = New Font("Consolas", 10)
@@ -954,6 +988,9 @@ Public Class Form1
         End If
         BtnCompute.Enabled = False
         BtnPause.Enabled = True
+
+        ' Capture threshold from UI (or keep CLI-supplied value in headless mode).
+        _diskThreshold = CInt(NudRamThreshold.Value)
 
         ' Pre-warm the thread pool to ProcessorCount threads before the compute
         ' thread starts.  Without this, the thread pool ramps up one thread at a
@@ -1745,7 +1782,8 @@ Public Class Form1
 
         Const CHUNK_SIZE As Long = 512L
         Const STOP_AT As Long = 1L
-        Const DISK_THRESHOLD As Integer = 200_000  ' Keep all data in RAM (137,739 chunks < 200K; peak ~8 GB)
+        ' §73: threshold read from UI/CLI at compute start — adapts to available RAM.
+        Dim DISK_THRESHOLD As Integer = _diskThreshold
 
         Dim numChunks As Long = (numTerms + CHUNK_SIZE - 1) \ CHUNK_SIZE
 
