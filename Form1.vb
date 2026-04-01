@@ -1,20 +1,14 @@
 Option Strict On
 Option Explicit On
 
-' ── Logging detail level ─────────────────────────────────────────────────────
-' LOGGING_DETAIL = 0  Major [PHASE] markers and exceptions only.
-'                     Lowest I/O overhead; use for normal production runs.
-'
-' LOGGING_DETAIL = 1  Detail on the last combine level and all ComputePiGMP
-'                     steps only.  (RECOMMENDED for crash diagnosis — captures
-'                     the high-value final operations without logging every
-'                     intermediate level, which would slow the run noticeably.)
-'
-' LOGGING_DETAIL = 2  Per-operation trace on every BinarySplitChunk call and
-'                     every combine level.  Use only when debugging an early-
-'                     level crash; generates very large log files.
+' ── Logging level (runtime, set via --log-level N or the UI spinner) ─────────
+' 0  None        Errors and crashes only. Silent on success.
+' 1  Performance [PHASE] markers with timing (default).
+' 2  Stages      Per-phase step detail: file I/O, initial calc steps, node sizes.
+' 3  Last stage  Full per-operation trace for the final combine and ComputePiGMP.
+' 4  Full trace  Everything in 3, plus SafeMpzMul diagnostics and BinarySplitChunk.
+' 5  Allocator   Everything in 4, plus pool/affinity diagnostics.
 ' ────────────────────────────────────────────────────────────────────────────
-#Const LOGGING_DETAIL = 1
 
 Imports System.Numerics
 Imports System.IO
@@ -61,6 +55,7 @@ Public Class Form1
     ' Set by --autostart (suppress all dialogs) and --autoverify (run verify +
     ' Application.Exit after computation completes).
     Private _headless As Boolean = False
+    Private _logLevel As Integer = 1
     Private _autoVerify As Boolean = False
     ' Custom verify checks supplied via --verify-at "DIGITS:POSITION" and
     ' --verify-contains "DIGITS".  Populated during CLI arg parsing; consumed
@@ -731,6 +726,7 @@ Public Class Form1
         '   --autostart      Suppress all dialogs and auto-begin computation
         '   --autoverify     After computation, auto-run verify + exit
         '   --threshold N    Override the RAM/disk threshold (nodes)
+        '   --log-level N    Set runtime logging level 0–5 (default 1)
         Dim args() As String = Environment.GetCommandLineArgs()
         ' Log all received args so we can diagnose unexpected headless activation.
         ' args(0) is always the exe path; user args start at index 1.
@@ -783,6 +779,14 @@ Public Class Form1
                         Dim t As Integer
                         If Integer.TryParse(args(i + 1), t) AndAlso t >= 1 Then
                             _diskThreshold = t
+                        End If
+                        i += 1
+                    End If
+                Case "--log-level"
+                    If i + 1 < args.Length Then
+                        Dim lvl As Integer
+                        If Integer.TryParse(args(i + 1), lvl) AndAlso lvl >= 0 AndAlso lvl <= 5 Then
+                            _logLevel = lvl
                         End If
                         i += 1
                     End If
@@ -1139,13 +1143,8 @@ Public Class Form1
         LstBoxPhases.Items.Clear()
         LstBoxPhases.Items.Add($"Starting {DIGITS:N0} digits at {DateTime.Now:HH:mm:ss}")
         Try
-#If LOGGING_DETAIL = 2 Then
-            Dim loggingMode As String = "FULL DETAIL (every level + BinarySplitChunk)"
-#ElseIf LOGGING_DETAIL = 1 Then
-            Dim loggingMode As String = "FINAL LEVEL DETAIL (last combine level + ComputePiGMP)"
-#Else
-            Dim loggingMode As String = "MAJOR PHASES ONLY"
-#End If
+            Dim _levelNames() As String = {"None", "Performance", "Stages", "Last stage", "Full trace", "Allocator"}
+            Dim loggingMode As String = $"{_logLevel} ({If(_logLevel >= 0 AndAlso _logLevel < _levelNames.Length, _levelNames(_logLevel), "Custom")})"
             System.IO.File.WriteAllText(LOG_FILE,
                 $"=== PI Computation Started {DateTime.Now} ===" & vbCrLf &
                 $"=== Digits: {DIGITS:N0} ===" & vbCrLf &
@@ -1245,9 +1244,7 @@ Public Class Form1
                           ByRef Pab As mpz_t,
                           ByRef Qab As mpz_t,
                           ByRef Tab As mpz_t)
-#If LOGGING_DETAIL = 2 Then
-        WriteToLog($"[BinarySplitChunk] Enter  a={a:N0}  b={b:N0}  terms={b - a:N0}")
-#End If
+        If _logLevel >= 4 Then WriteToLog($"[BinarySplitChunk] Enter  a={a:N0}  b={b:N0}  terms={b - a:N0}")
 
         ' Issue #5 fix: pre-size both collections to avoid internal array resizes.
         ' maxDepth is an upper bound on the stack depth for this range.
@@ -1383,9 +1380,7 @@ Public Class Form1
         Pab = finalResult.P
         Qab = finalResult.Q
         Tab = finalResult.T
-#If LOGGING_DETAIL = 2 Then
-        WriteToLog($"[BinarySplitChunk] Exit   a={a:N0}  b={b:N0}  stackPeak={maxDepth}")
-#End If
+        If _logLevel >= 4 Then WriteToLog($"[BinarySplitChunk] Exit   a={a:N0}  b={b:N0}  stackPeak={maxDepth}")
     End Sub
 
     ' ════════════════════════════════════════════════════════════════════════
@@ -1405,11 +1400,7 @@ Public Class Form1
     ' per call (~137 K calls for 1 B digits).
     Private Sub SerializeNodeToDisk(p As mpz_t, q As mpz_t, t As mpz_t, filePath As String,
                                     Optional detailLog As Boolean = True)
-#If LOGGING_DETAIL = 2 Then
-        WriteToLog($"[Serialize] Writing {System.IO.Path.GetFileName(filePath)}")
-#ElseIf LOGGING_DETAIL = 1 Then
-        If detailLog Then WriteToLog($"[Serialize] Writing {System.IO.Path.GetFileName(filePath)}")
-#End If
+        If _logLevel >= 2 Then WriteToLog($"[Serialize] Writing {System.IO.Path.GetFileName(filePath)}")
         Dim staging(4194303) As Byte  ' 4 MB staging buffer (§56) — reused for all three fields
         Try
             Using fs As New FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 65536)
@@ -1419,15 +1410,10 @@ Public Class Form1
                     SerializeOneMpz(t, bw, staging)
                 End Using
             End Using
-#If LOGGING_DETAIL = 2 Then
-            Dim fileSize As Long = New FileInfo(filePath).Length
-            WriteToLog($"[Serialize] Done   {System.IO.Path.GetFileName(filePath)}  size={fileSize \ 1024:N0}KB")
-#ElseIf LOGGING_DETAIL = 1 Then
-            If detailLog Then
+            If _logLevel >= 2 Then
                 Dim fileSize As Long = New FileInfo(filePath).Length
                 WriteToLog($"[Serialize] Done   {System.IO.Path.GetFileName(filePath)}  size={fileSize \ 1024:N0}KB")
             End If
-#End If
         Catch ex As Exception
             WriteExceptionToLog($"SerializeNodeToDisk({filePath})", ex)
             LogPhase($"Error serializing node to {filePath}: {ex.Message}")
@@ -1461,12 +1447,10 @@ Public Class Form1
         Dim byteCount As Long = limbCount * 8L
         ' Read _mp_d (pointer to the limb array) at byte offset 8.
         Dim mpD As IntPtr = Marshal.ReadIntPtr(val.Pointer, 8)
-#If LOGGING_DETAIL >= 1 Then
-        If byteCount > 400L * 1024L * 1024L Then
+        If _logLevel >= 2 AndAlso byteCount > 400L * 1024L * 1024L Then
             AppendLog(
                 $"[SerializeOneMpz] large: _mp_size={mpSize:N0} byteCount={byteCount:N0}{vbCrLf}")
         End If
-#End If
         ' Stream raw limb bytes in 64 KB chunks using the SOH staging buffer.
         ' No intermediate allocation needed — data is read straight from _mp_d.
         Dim remaining As Long = byteCount
@@ -1501,15 +1485,10 @@ Public Class Form1
                                  ByRef q As mpz_t,
                                  ByRef t As mpz_t,
                                  Optional detailLog As Boolean = True)
-#If LOGGING_DETAIL = 2 Then
-        Dim fileSize As Long = If(System.IO.File.Exists(filePath), New FileInfo(filePath).Length, -1)
-        WriteToLog($"[Deserialize] Loading {System.IO.Path.GetFileName(filePath)}  size={fileSize \ 1024:N0}KB")
-#ElseIf LOGGING_DETAIL = 1 Then
-        If detailLog Then
+        If _logLevel >= 2 Then
             Dim fileSize As Long = If(System.IO.File.Exists(filePath), New FileInfo(filePath).Length, -1)
             WriteToLog($"[Deserialize] Loading {System.IO.Path.GetFileName(filePath)}  size={fileSize \ 1024:N0}KB")
         End If
-#End If
 
         p = New mpz_t()
         q = New mpz_t()
@@ -1532,11 +1511,7 @@ Public Class Form1
             LogPhase($"Error loading node from {filePath}: {ex.Message}")
             Throw
         End Try
-#If LOGGING_DETAIL = 2 Then
-        WriteToLog($"[Deserialize] Done {System.IO.Path.GetFileName(filePath)}")
-#ElseIf LOGGING_DETAIL = 1 Then
-        If detailLog Then WriteToLog($"[Deserialize] Done {System.IO.Path.GetFileName(filePath)}")
-#End If
+        If _logLevel >= 2 Then WriteToLog($"[Deserialize] Done {System.IO.Path.GetFileName(filePath)}")
     End Sub
 
     ''' <summary>
@@ -1650,24 +1625,20 @@ Public Class Form1
         Dim szB As Integer = System.Math.Abs(szB_signed)
 
         If szA + szB <= SAFE_LIMB_THRESHOLD Then
-#If LOGGING_DETAIL >= 1 Then
-            If CLng(szA) + CLng(szB) > 5_000_000L Then
+            If _logLevel >= 4 AndAlso CLng(szA) + CLng(szB) > 5_000_000L Then
                 AppendLog(
                     $"[SafeMpzMul] FAST-PRE  szA={szA:N0} szB={szB:N0} | " &
                     $"opA.Ptr={opA.Pointer.ToInt64():X} opA_sz={szA_signed:N0} opA_d={Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8):X} " &
                     $"opB.Ptr={opB.Pointer.ToInt64():X} opB_sz={szB_signed:N0}{vbCrLf}")
             End If
-#End If
             ' §78: Use raw P/Invoke to bypass Math.Gmp.Native's managed wrapper, which
             ' corrupts mpz_t.Pointer fields during native calls (same root cause as §42).
             GmpRaw_mul(result.Pointer, opA.Pointer, opB.Pointer)
-#If LOGGING_DETAIL >= 1 Then
-            If CLng(szA) + CLng(szB) > 5_000_000L Then
+            If _logLevel >= 4 AndAlso CLng(szA) + CLng(szB) > 5_000_000L Then
                 AppendLog(
                     $"[SafeMpzMul] FAST-POST result.Ptr={result.Pointer.ToInt64():X} result_sz={Runtime.InteropServices.Marshal.ReadInt32(result.Pointer, 4):N0} " &
                     $"result_d={Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8):X}{vbCrLf}")
             End If
-#End If
             Return
         End If
 
@@ -1722,10 +1693,8 @@ Public Class Form1
         ' Inner calls use `prod` as their result — they never touch outer result's struct.
         ' This slot survives all native GMP calls and managed-stack corruption.
         Runtime.InteropServices.Marshal.WriteInt64(savedResultPtr, 8, accumPtr.ToInt64())
-#If LOGGING_DETAIL >= 2 Then
-        AppendLog(
+        If _logLevel >= 4 Then AppendLog(
             $"[SafeMpzMul] accum pre-alloc OK: {_resultLimbs:N0} limbs ({_resultBytes \ 1048576L:N0} MB){vbCrLf}")
-#End If
 
         ' Split opB into three pieces upfront: opB is small so all three pieces coexist cheaply.
         ' opA and opB are Q/P values from Chudnovsky binary split, always non-negative.
@@ -1736,15 +1705,13 @@ Public Class Form1
         gmp_lib.mpz_tdiv_r_2exp(B1, Btmp, New mp_bitcnt_t(CUInt(bitsB)))
         gmp_lib.mpz_tdiv_q_2exp(B2, Btmp, New mp_bitcnt_t(CUInt(bitsB)))
         gmp_lib.mpz_clears(Btmp, Nothing)
-#If LOGGING_DETAIL >= 1 Then
-        If CLng(szA) + CLng(szB) > 10_000_000L Then
+        If _logLevel >= 4 AndAlso CLng(szA) + CLng(szB) > 10_000_000L Then
             AppendLog(
                 $"[SafeMpzMul] B-pieces | " &
                 $"B0.Ptr={B0.Pointer.ToInt64():X} B0_sz={Runtime.InteropServices.Marshal.ReadInt32(B0.Pointer, 4):N0} " &
                 $"B1.Ptr={B1.Pointer.ToInt64():X} B1_sz={Runtime.InteropServices.Marshal.ReadInt32(B1.Pointer, 4):N0} " &
                 $"B2.Ptr={B2.Pointer.ToInt64():X} B2_sz={Runtime.InteropServices.Marshal.ReadInt32(B2.Pointer, 4):N0}{vbCrLf}")
         End If
-#End If
 
         ' §59: Pre-extract all three A pieces upfront so all 9 sub-products can run in parallel.
         ' mpz_init2(bitsA) pre-allocates _mp_alloc >= mA before direct limb copies (A1, A2).
@@ -1888,10 +1855,8 @@ Public Class Form1
         result.Pointer = savedResultPtr
         Runtime.InteropServices.Marshal.FreeHGlobal(accumPtr)
         accumPtr = IntPtr.Zero
-#If LOGGING_DETAIL >= 1 Then
-        AppendLog(
+        If _logLevel >= 4 Then AppendLog(
             $"[SafeMpzMul] done: szA={szA:N0} szB={szB:N0} → {GmpRaw_sizeinbase(savedResultPtr, 10):N0} digits{vbCrLf}")
-#End If
 
         ' §42: negate via raw P/Invoke so result.Pointer corruption cannot affect the call.
         If resultSign < 0 Then GmpRaw_neg(savedResultPtr, savedResultPtr)
@@ -2073,7 +2038,7 @@ Public Class Form1
             Dim nextDiskNodes As New List(Of DiskNode)()
             Dim useDisk As Boolean = nextSize > DISK_THRESHOLD
             ' True only for the final combine pass (2 nodes → 1).  Controls
-            ' whether LOGGING_DETAIL=1 emits per-operation trace for this level.
+            ' whether _logLevel >= 3 emits per-operation trace for this level.
             Dim isLastLevel As Boolean = (currentSize <= 2)
             ' True for the top ~4 levels (≤16 nodes).  Enables per-multiply
             ' operand-size logging so we can identify which mpz_mul produces a
@@ -2284,9 +2249,8 @@ Public Class Form1
                     '   After the add, tempB is freed and tempA holds the T result.
                     ' Steps 1 & 2: newP = leftP*rightP and newQ = leftQ*rightQ are fully
                     ' independent (disjoint operands) — run both on the thread pool simultaneously.
-                    ' WriteToLog (used in LOGGING_DETAIL) is thread-safe via SyncLock _logLock.
-#If LOGGING_DETAIL >= 1 Then
-                    If isTopLevel Then
+                    ' WriteToLog is thread-safe via SyncLock _logLock.
+                    If _logLevel >= 3 AndAlso isTopLevel Then
                         Dim _szLP As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftP.Pointer, 4)
                         Dim _szRP As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightP.Pointer, 4)
                         WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newP  leftP={System.Math.Abs(_szLP):N0} rightP={System.Math.Abs(_szRP):N0} limbs")
@@ -2294,7 +2258,6 @@ Public Class Form1
                         Dim _szRQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightQ.Pointer, 4)
                         WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newQ  leftQ={System.Math.Abs(_szLQ):N0} rightQ={System.Math.Abs(_szRQ):N0} limbs")
                     End If
-#End If
                     System.Threading.Tasks.Parallel.Invoke(
                         Sub() SafeMpzMul(newP, leftP, rightP),
                         Sub() SafeMpzMul(newQ, leftQ, rightQ))
@@ -2303,8 +2266,7 @@ Public Class Form1
 
                     ' Steps 3 & 4: tempA = leftT*rightQ and tempB = leftP*rightT are fully
                     ' independent (disjoint operands) — run both on the thread pool simultaneously.
-#If LOGGING_DETAIL >= 1 Then
-                    If isTopLevel Then
+                    If _logLevel >= 3 AndAlso isTopLevel Then
                         Dim _szLT As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftT.Pointer, 4)
                         Dim _szRQ2 As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightQ.Pointer, 4)
                         WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempA  leftT={System.Math.Abs(_szLT):N0} rightQ={System.Math.Abs(_szRQ2):N0} limbs")
@@ -2312,25 +2274,20 @@ Public Class Form1
                         Dim _szRT As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightT.Pointer, 4)
                         WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempB  leftP={System.Math.Abs(_szLP2):N0} rightT={System.Math.Abs(_szRT):N0} limbs")
                     End If
-#End If
                     System.Threading.Tasks.Parallel.Invoke(
                         Sub() SafeMpzMul(tempA, leftT, rightQ),
                         Sub() SafeMpzMul(tempB, leftP, rightT))
                     gmp_lib.mpz_clears(leftT, rightQ, Nothing)      ' leftT, rightQ done
                     gmp_lib.mpz_clears(leftP, rightT, Nothing)      ' leftP, rightT done
 
-#If LOGGING_DETAIL >= 1 Then
-                    If isTopLevel Then
+                    If _logLevel >= 3 AndAlso isTopLevel Then
                         Dim _szTA As Integer = Runtime.InteropServices.Marshal.ReadInt32(tempA.Pointer, 4)
                         Dim _szTB As Integer = Runtime.InteropServices.Marshal.ReadInt32(tempB.Pointer, 4)
                         WriteToLog($"[Combine] L{level} N{nodeIdx\2}: add newT  tempA={System.Math.Abs(_szTA):N0} tempB={System.Math.Abs(_szTB):N0} limbs")
                     End If
-#End If
                     gmp_lib.mpz_add(tempA, tempA, tempB)            ' T result in tempA's buffer
                     gmp_lib.mpz_clears(tempB, Nothing)              ' tempB done; tempA IS newT
-#If LOGGING_DETAIL >= 1 Then
-                    If isTopLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: combine complete")
-#End If
+                    If _logLevel >= 3 AndAlso isTopLevel Then WriteToLog($"[Combine] L{level} N{nodeIdx\2}: combine complete")
 
                     ' Store result
                     ' tempA holds the T result (renamed conceptually to newT below)
@@ -2345,12 +2302,10 @@ Public Class Form1
 
                     If useDisk Then
                         resultNode.FilePath = $"{DISK_CACHE_DIR}L{level}_N{resultNode.Index}.bin"
-#If LOGGING_DETAIL >= 1 Then
-                        If isTopLevel Then
+                        If _logLevel >= 3 AndAlso isTopLevel Then
                             Dim _preSerNewQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(newQ.Pointer, 4)
                             WriteToLog($"[Combine] L{level} N{nodeIdx\2}: pre-serialize newQ._mp_size={_preSerNewQ:N0}")
                         End If
-#End If
                         SerializeNodeToDisk(newP, newQ, tempA, resultNode.FilePath, isLastLevel)
                         gmp_lib.mpz_clears(newP, newQ, tempA, Nothing)
                     Else
@@ -2464,19 +2419,19 @@ Public Class Form1
             Dim memAfterSplit As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
             LogPhase($"Memory after split: {memAfterSplit:N0}MB")
 
-#If LOGGING_DETAIL >= 1 Then
-            ' Log sizes of the top-level node(s) to detect unexpectedly large intermediates
-            Try
-                For nodeIdx As Integer = 0 To nodes.Count - 1
-                    Dim nd As Result = nodes(nodeIdx)
-                    Dim pDigits As Long = CLng(gmp_lib.mpz_sizeinbase(nd.P, 10))
-                    Dim qDigits As Long = CLng(gmp_lib.mpz_sizeinbase(nd.Q, 10))
-                    Dim tDigits As Long = CLng(gmp_lib.mpz_sizeinbase(nd.T, 10))
-                    WriteToLog($"[Node {nodeIdx}] P~{pDigits:N0} digits  Q~{qDigits:N0} digits  T~{tDigits:N0} digits")
-                Next
-            Catch
-            End Try
-#End If
+            If _logLevel >= 2 Then
+                ' Log sizes of the top-level node(s) to detect unexpectedly large intermediates
+                Try
+                    For nodeIdx As Integer = 0 To nodes.Count - 1
+                        Dim nd As Result = nodes(nodeIdx)
+                        Dim pDigits As Long = CLng(gmp_lib.mpz_sizeinbase(nd.P, 10))
+                        Dim qDigits As Long = CLng(gmp_lib.mpz_sizeinbase(nd.Q, 10))
+                        Dim tDigits As Long = CLng(gmp_lib.mpz_sizeinbase(nd.T, 10))
+                        WriteToLog($"[Node {nodeIdx}] P~{pDigits:N0} digits  Q~{qDigits:N0} digits  T~{tDigits:N0} digits")
+                    Next
+                Catch
+                End Try
+            End If
 
             If token.IsCancellationRequested Then Return ""
 
@@ -2551,13 +2506,9 @@ Public Class Form1
             gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpNumer, gmpPi, gmpOne, Nothing)
             gmpVariablesInitialized = True
 
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] mpz_ui_pow_ui: 10^{digits:N0}")
-#End If
+            If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_ui_pow_ui: 10^{digits:N0}")
             gmp_lib.mpz_ui_pow_ui(gmpOne, 10UI, CUInt(digits))
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] mpz_mul: gmpSqrtInput = gmpOne^2")
-#End If
+            If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_mul: gmpSqrtInput = gmpOne^2")
             SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)
             AppendLog(
                 $"[DIAG] gmpSqrtInput after SafeMpzMul(gmpOne^2): {gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10):N0} digits{vbCrLf}")
@@ -2566,23 +2517,19 @@ Public Class Form1
             ' Re-init to 0 so the Finally block can safely call mpz_clear on it.
             gmp_lib.mpz_clear(gmpOne)
             gmp_lib.mpz_init(gmpOne)
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] gmpOne freed (early): RAM now lower before sqrt")
-            WriteToLog($"[ComputePi] mpz_mul_ui: gmpSqrtInput *= 10005")
-#End If
+            If _logLevel >= 2 Then
+                WriteToLog($"[ComputePi] gmpOne freed (early): RAM now lower before sqrt")
+                WriteToLog($"[ComputePi] mpz_mul_ui: gmpSqrtInput *= 10005")
+            End If
             gmp_lib.mpz_mul_ui(gmpSqrtInput, gmpSqrtInput, 10005UI)
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] mpz_sqrt: sqrt({CLng(gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10)):N0}-digit number)")
-#End If
+            If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_sqrt: sqrt({CLng(gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10)):N0}-digit number)")
             gmp_lib.mpz_sqrt(gmpSqrt, gmpSqrtInput)
             gmp_lib.mpz_clear(gmpSqrtInput)
             LogPhase("Square root complete")
 
             If token.IsCancellationRequested Then Return ""
 
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] mpz_mul_ui: gmpNumer = gmpSqrt * 426880")
-#End If
+            If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_mul_ui: gmpNumer = gmpSqrt * 426880")
             gmp_lib.mpz_mul_ui(gmpNumer, gmpSqrt, 426880UI)
             ' gmpSqrt value is now encoded in gmpNumer — free its ~198 MB before
             ' the large multiply.  finalP is also not used in the final formula
@@ -2603,11 +2550,11 @@ Public Class Form1
                 End Using
             End Using
             gmp_lib.mpz_clear(finalT)   ' free ~548 MB; will be reloaded below
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] gmpSqrt+finalP freed + finalT spilled: RAM before big multiply")
-            WriteToLog($"[ComputePi] Three-pass multiply: splitting finalQ " &
-                       $"(Q~{CLng(gmp_lib.mpz_sizeinbase(finalQ, 10)):N0} digits)")
-#End If
+            If _logLevel >= 2 Then
+                WriteToLog($"[ComputePi] gmpSqrt+finalP freed + finalT spilled: RAM before big multiply")
+                WriteToLog($"[ComputePi] Three-pass multiply: splitting finalQ " &
+                           $"(Q~{CLng(gmp_lib.mpz_sizeinbase(finalQ, 10)):N0} digits)")
+            End If
             ' gmpNumer *= finalQ in a single call peaks at ~2.3 GB — too large.
             ' Split finalQ into three equal thirds (by bit position) and do three
             ' smaller multiplies (~1.24 GB peak each), spilling between passes.
@@ -2795,12 +2742,12 @@ Public Class Form1
                 WriteToLog($"[ComputePi] mpR2 pre-alloc skipped ({_r2Needed:N0} limbs, {_r2Bytes:N0} B < GMP threshold; init2 buffer sufficient)")
             End If
 
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procP_pre = Process.GetCurrentProcess()
-            Dim _ramP_pre As Long = _procP_pre.WorkingSet64 \ 1048576
-            Dim _vmP_pre As Long = _procP_pre.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] §61 serial multiply start: r0=N*Q0, r1=N*Q1, r2=N*Q2  RAM:{_ramP_pre:N0}MB  Committed:{_vmP_pre:N0}MB")
-#End If
+            If _logLevel >= 3 Then
+                Dim _procP_pre = Process.GetCurrentProcess()
+                Dim _ramP_pre As Long = _procP_pre.WorkingSet64 \ 1048576
+                Dim _vmP_pre As Long = _procP_pre.PrivateMemorySize64 \ 1048576
+                WriteToLog($"[ComputePi] §61 serial multiply start: r0=N*Q0, r1=N*Q1, r2=N*Q2  RAM:{_ramP_pre:N0}MB  Committed:{_vmP_pre:N0}MB")
+            End If
             WriteToLog($"[ComputePi] §61 r0 DIAG: rop.Ptr={mpR0.Pointer:X} rop_alloc={Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer,0):N0} rop_sz={Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer,4):N0} rop_d={Runtime.InteropServices.Marshal.ReadInt64(mpR0.Pointer,8):X}")
             WriteToLog($"[ComputePi] §61 r0 DIAG: opA.Ptr={gmpNumer.Pointer:X} opA_alloc={Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer,0):N0} opA_sz={Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer,4):N0} opA_d={Runtime.InteropServices.Marshal.ReadInt64(gmpNumer.Pointer,8):X}")
             WriteToLog($"[ComputePi] §61 r0 DIAG: opB.Ptr={finalQ.Pointer:X} opB_alloc={Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer,0):N0} opB_sz={Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer,4):N0} opB_d={Runtime.InteropServices.Marshal.ReadInt64(finalQ.Pointer,8):X}")
@@ -2824,15 +2771,13 @@ Public Class Form1
             WriteToLog("[ComputePi] §61 calling mpz_clear(mpR2)...")
             gmp_lib.mpz_clear(mpR2)
             WriteToLog("[ComputePi] §61 clear r2 done")
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procP_post = Process.GetCurrentProcess()
-            Dim _ramP_post As Long = _procP_post.WorkingSet64 \ 1048576
-            Dim _vmP_post As Long = _procP_post.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] §61 parallel multiply done; entering Combine  RAM:{_ramP_post:N0}MB  Committed:{_vmP_post:N0}MB")
-#End If
-#If LOGGING_DETAIL >= 2 Then
-            WriteToLog($"[ComputePi] r2 (= gmpNumer after swap) = {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
-#End If
+            If _logLevel >= 3 Then
+                Dim _procP_post = Process.GetCurrentProcess()
+                Dim _ramP_post As Long = _procP_post.WorkingSet64 \ 1048576
+                Dim _vmP_post As Long = _procP_post.PrivateMemorySize64 \ 1048576
+                WriteToLog($"[ComputePi] §61 parallel multiply done; entering Combine  RAM:{_ramP_post:N0}MB  Committed:{_vmP_post:N0}MB")
+            End If
+            If _logLevel >= 4 Then WriteToLog($"[ComputePi] r2 (= gmpNumer after swap) = {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
 
             ' ── Combine: gmpNumer = ((r2 << k) + r1) << k + r0 ──
             ' NOTE: mpz_t is a value type (struct) in GMP.NET.  Passing the same
@@ -2844,13 +2789,9 @@ Public Class Form1
             ' variable + mpz_swap to sidestep this.
 
             ' Step A: gmpNumer = r2 << k  (~390 MB → ~572 MB)
-#If LOGGING_DETAIL >= 2 Then
-            WriteToLog($"[ComputePi] Combine A: shift r2 ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) left {CLng(k1):N0} bits → result≈{(CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) + CLng(k1)) \ 8388608:N0} MB")
-#End If
+            If _logLevel >= 4 Then WriteToLog($"[ComputePi] Combine A: shift r2 ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) left {CLng(k1):N0} bits → result≈{(CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) + CLng(k1)) \ 8388608:N0} MB")
             Dim mpShiftA As New mpz_t()
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine A: mpz_init2(mpShiftA)")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine A: mpz_init2(mpShiftA)")
             ' Use mpz_init2 with a seed allocation >= GMP_LARGE_THRESHOLD so the
             ' limb buffer comes from VirtualAlloc (not the CRT heap).  When
             ' mpz_mul_2exp later grows the buffer it takes the large→large realloc
@@ -2883,65 +2824,51 @@ Public Class Form1
                     End If
                 End If
             End If
-#If LOGGING_DETAIL >= 1 Then
-            ' Dump the native __mpz_struct that GMP will use as the destination of
-            ' mpz_mul_2exp.  Layout on Windows x64:
-            '   [0] int  _mp_alloc  (number of limbs allocated)
-            '   [4] int  _mp_size   (actual used limbs, signed)
-            '   [8] ptr  _mp_d      (pointer to limb array)
-            ' _mp_alloc should be 65537 (= 1 + GMP_LARGE_THRESHOLD*8 / 64 bits).
-            ' If it is a very large value GMP's MPZ_REALLOC macro will short-circuit
-            ' (skip our GmpReallocFunc) and write 546 MB into the 512 KB buffer.
-            If mpShiftA.Pointer <> IntPtr.Zero Then
-                Dim _mpA_alloc As Integer = Runtime.InteropServices.Marshal.ReadInt32(mpShiftA.Pointer, 0)
-                Dim _mpA_size  As Integer = Runtime.InteropServices.Marshal.ReadInt32(mpShiftA.Pointer, 4)
-                Dim _mpA_mpd   As Long    = Runtime.InteropServices.Marshal.ReadInt64(mpShiftA.Pointer, 8)
-                WriteToLog($"[ComputePi] Combine A mpShiftA native struct: ptr={mpShiftA.Pointer:X} _mp_alloc={_mpA_alloc} _mp_size={_mpA_size} _mp_d={_mpA_mpd:X}")
-            Else
-                WriteToLog("[ComputePi] Combine A mpShiftA.Pointer is NULL — init2 failed silently")
+            If _logLevel >= 3 Then
+                ' Dump the native __mpz_struct that GMP will use as the destination of
+                ' mpz_mul_2exp.  Layout on Windows x64:
+                '   [0] int  _mp_alloc  (number of limbs allocated)
+                '   [4] int  _mp_size   (actual used limbs, signed)
+                '   [8] ptr  _mp_d      (pointer to limb array)
+                ' _mp_alloc should be 65537 (= 1 + GMP_LARGE_THRESHOLD*8 / 64 bits).
+                ' If it is a very large value GMP's MPZ_REALLOC macro will short-circuit
+                ' (skip our GmpReallocFunc) and write 546 MB into the 512 KB buffer.
+                If mpShiftA.Pointer <> IntPtr.Zero Then
+                    Dim _mpA_alloc As Integer = Runtime.InteropServices.Marshal.ReadInt32(mpShiftA.Pointer, 0)
+                    Dim _mpA_size  As Integer = Runtime.InteropServices.Marshal.ReadInt32(mpShiftA.Pointer, 4)
+                    Dim _mpA_mpd   As Long    = Runtime.InteropServices.Marshal.ReadInt64(mpShiftA.Pointer, 8)
+                    WriteToLog($"[ComputePi] Combine A mpShiftA native struct: ptr={mpShiftA.Pointer:X} _mp_alloc={_mpA_alloc} _mp_size={_mpA_size} _mp_d={_mpA_mpd:X}")
+                Else
+                    WriteToLog("[ComputePi] Combine A mpShiftA.Pointer is NULL — init2 failed silently")
+                End If
+                WriteToLog($"[ComputePi] Combine A: mpz_mul_2exp  k={CLng(k1):N0} bits  gmpNumer={CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits")
             End If
-            WriteToLog($"[ComputePi] Combine A: mpz_mul_2exp  k={CLng(k1):N0} bits  gmpNumer={CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits")
-#End If
             gmp_lib.mpz_mul_2exp(mpShiftA, gmpNumer, k1)
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine A: mpz_mul_2exp returned OK")
-#End If
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine A: mpz_swap")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine A: mpz_mul_2exp returned OK")
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine A: mpz_swap")
             gmp_lib.mpz_swap(gmpNumer, mpShiftA)
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine A: mpz_clear(mpShiftA)")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine A: mpz_clear(mpShiftA)")
             gmp_lib.mpz_clear(mpShiftA)     ' frees the old ~390 MB limb buffer
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procCA = Process.GetCurrentProcess()
-            Dim _ramCombA As Long = _procCA.WorkingSet64 \ 1048576
-            Dim _vmCombA As Long = _procCA.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Combine A done (r2<<k)  RAM:{_ramCombA:N0}MB  Committed:{_vmCombA:N0}MB")
-#End If
-#If LOGGING_DETAIL >= 2 Then
-            WriteToLog($"[ComputePi] Combine A result: {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
-#End If
+            If _logLevel >= 3 Then
+                Dim _procCA = Process.GetCurrentProcess()
+                Dim _ramCombA As Long = _procCA.WorkingSet64 \ 1048576
+                Dim _vmCombA As Long = _procCA.PrivateMemorySize64 \ 1048576
+                WriteToLog($"[ComputePi] Combine A done (r2<<k)  RAM:{_ramCombA:N0}MB  Committed:{_vmCombA:N0}MB")
+            End If
+            If _logLevel >= 4 Then WriteToLog($"[ComputePi] Combine A result: {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
 
             ' Step B: reload r1; gmpNumer += r1  (~572 MB + ~390 MB → ~572 MB)
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine B: mpz_init(mpR1) + deserialize")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine B: mpz_init(mpR1) + deserialize")
             ' §61: mpR1 already in RAM from the parallel multiply — no disk reload.
-#If LOGGING_DETAIL >= 2 Then
-            WriteToLog($"[ComputePi] Combine B: add gmpNumer ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) + r1 ({CLng(gmp_lib.mpz_sizeinbase(mpR1, 2)):N0} bits)")
-#End If
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procCBpre = Process.GetCurrentProcess()
-            Dim _ramCombBpre As Long = _procCBpre.WorkingSet64 \ 1048576
-            Dim _vmCombBpre As Long = _procCBpre.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Combine B r1 in RAM  RAM:{_ramCombBpre:N0}MB  Committed:{_vmCombBpre:N0}MB")
-#End If
+            If _logLevel >= 4 Then WriteToLog($"[ComputePi] Combine B: add gmpNumer ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) + r1 ({CLng(gmp_lib.mpz_sizeinbase(mpR1, 2)):N0} bits)")
+            If _logLevel >= 3 Then
+                Dim _procCBpre = Process.GetCurrentProcess()
+                Dim _ramCombBpre As Long = _procCBpre.WorkingSet64 \ 1048576
+                Dim _vmCombBpre As Long = _procCBpre.PrivateMemorySize64 \ 1048576
+                WriteToLog($"[ComputePi] Combine B r1 in RAM  RAM:{_ramCombBpre:N0}MB  Committed:{_vmCombBpre:N0}MB")
+            End If
             Dim mpAddB As New mpz_t()
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine B: mpz_init2(mpAddB)")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine B: mpz_init2(mpAddB)")
             gmp_lib.mpz_init2(mpAddB, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
             ' Pre-allocate the full result buffer directly into the native __mpz_struct.
             If mpAddB.Pointer <> IntPtr.Zero AndAlso gmpNumer.Pointer <> IntPtr.Zero AndAlso mpR1.Pointer <> IntPtr.Zero Then
@@ -2962,37 +2889,25 @@ Public Class Form1
                     End If
                 End If
             End If
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine B: mpz_add")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine B: mpz_add")
             gmp_lib.mpz_add(mpAddB, gmpNumer, mpR1)
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine B: mpz_swap")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine B: mpz_swap")
             gmp_lib.mpz_swap(gmpNumer, mpAddB)
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine B: mpz_clear(mpAddB) + mpz_clear(mpR1)")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine B: mpz_clear(mpAddB) + mpz_clear(mpR1)")
             gmp_lib.mpz_clear(mpAddB)
             gmp_lib.mpz_clear(mpR1)
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procCB = Process.GetCurrentProcess()
-            Dim _ramCombB As Long = _procCB.WorkingSet64 \ 1048576
-            Dim _vmCombB As Long = _procCB.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Combine B done (+r1)  RAM:{_ramCombB:N0}MB  Committed:{_vmCombB:N0}MB")
-#End If
-#If LOGGING_DETAIL >= 2 Then
-            WriteToLog($"[ComputePi] Combine B result: {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
-#End If
+            If _logLevel >= 3 Then
+                Dim _procCB = Process.GetCurrentProcess()
+                Dim _ramCombB As Long = _procCB.WorkingSet64 \ 1048576
+                Dim _vmCombB As Long = _procCB.PrivateMemorySize64 \ 1048576
+                WriteToLog($"[ComputePi] Combine B done (+r1)  RAM:{_ramCombB:N0}MB  Committed:{_vmCombB:N0}MB")
+            End If
+            If _logLevel >= 4 Then WriteToLog($"[ComputePi] Combine B result: {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
 
             ' Step C: gmpNumer = (r2<<k + r1) << k  (~572 MB → ~755 MB)
-#If LOGGING_DETAIL >= 2 Then
-            WriteToLog($"[ComputePi] Combine C: shift ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) left {CLng(k1):N0} bits → result≈{(CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) + CLng(k1)) \ 8388608:N0} MB")
-#End If
+            If _logLevel >= 4 Then WriteToLog($"[ComputePi] Combine C: shift ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) left {CLng(k1):N0} bits → result≈{(CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) + CLng(k1)) \ 8388608:N0} MB")
             Dim mpShiftC As New mpz_t()
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine C: mpz_init2(mpShiftC)")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine C: mpz_init2(mpShiftC)")
             gmp_lib.mpz_init2(mpShiftC, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
             ' Pre-allocate the full result buffer directly into the native __mpz_struct.
             If mpShiftC.Pointer <> IntPtr.Zero AndAlso gmpNumer.Pointer <> IntPtr.Zero Then
@@ -3013,46 +2928,32 @@ Public Class Form1
                     End If
                 End If
             End If
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine C: mpz_mul_2exp  k={CLng(k1):N0} bits")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine C: mpz_mul_2exp  k={CLng(k1):N0} bits")
             gmp_lib.mpz_mul_2exp(mpShiftC, gmpNumer, k1)
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine C: mpz_swap")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine C: mpz_swap")
             gmp_lib.mpz_swap(gmpNumer, mpShiftC)
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine C: mpz_clear(mpShiftC)")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine C: mpz_clear(mpShiftC)")
             gmp_lib.mpz_clear(mpShiftC)
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procCC = Process.GetCurrentProcess()
-            Dim _ramCombC As Long = _procCC.WorkingSet64 \ 1048576
-            Dim _vmCombC As Long = _procCC.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Combine C done ((r2<<k+r1)<<k)  RAM:{_ramCombC:N0}MB  Committed:{_vmCombC:N0}MB")
-#End If
-#If LOGGING_DETAIL >= 2 Then
-            WriteToLog($"[ComputePi] Combine C result: {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
-#End If
+            If _logLevel >= 3 Then
+                Dim _procCC = Process.GetCurrentProcess()
+                Dim _ramCombC As Long = _procCC.WorkingSet64 \ 1048576
+                Dim _vmCombC As Long = _procCC.PrivateMemorySize64 \ 1048576
+                WriteToLog($"[ComputePi] Combine C done ((r2<<k+r1)<<k)  RAM:{_ramCombC:N0}MB  Committed:{_vmCombC:N0}MB")
+            End If
+            If _logLevel >= 4 Then WriteToLog($"[ComputePi] Combine C result: {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
 
             ' Step D: reload r0; gmpNumer += r0  (~755 MB + ~390 MB → ~755 MB)
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine D: mpz_init(mpR0) + deserialize")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine D: mpz_init(mpR0) + deserialize")
             ' §61: mpR0 already in RAM from the parallel multiply — no disk reload.
-#If LOGGING_DETAIL >= 2 Then
-            WriteToLog($"[ComputePi] Combine D: add gmpNumer ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) + r0 ({CLng(gmp_lib.mpz_sizeinbase(mpR0, 2)):N0} bits)")
-#End If
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procCDpre = Process.GetCurrentProcess()
-            Dim _ramCombDpre As Long = _procCDpre.WorkingSet64 \ 1048576
-            Dim _vmCombDpre As Long = _procCDpre.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Combine D r0 in RAM  RAM:{_ramCombDpre:N0}MB  Committed:{_vmCombDpre:N0}MB")
-#End If
+            If _logLevel >= 4 Then WriteToLog($"[ComputePi] Combine D: add gmpNumer ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) + r0 ({CLng(gmp_lib.mpz_sizeinbase(mpR0, 2)):N0} bits)")
+            If _logLevel >= 3 Then
+                Dim _procCDpre = Process.GetCurrentProcess()
+                Dim _ramCombDpre As Long = _procCDpre.WorkingSet64 \ 1048576
+                Dim _vmCombDpre As Long = _procCDpre.PrivateMemorySize64 \ 1048576
+                WriteToLog($"[ComputePi] Combine D r0 in RAM  RAM:{_ramCombDpre:N0}MB  Committed:{_vmCombDpre:N0}MB")
+            End If
             Dim mpAddD As New mpz_t()
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine D: mpz_init2(mpAddD)")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine D: mpz_init2(mpAddD)")
             gmp_lib.mpz_init2(mpAddD, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
             ' Pre-allocate the full result buffer directly into the native __mpz_struct.
             If mpAddD.Pointer <> IntPtr.Zero AndAlso gmpNumer.Pointer <> IntPtr.Zero AndAlso mpR0.Pointer <> IntPtr.Zero Then
@@ -3073,28 +2974,20 @@ Public Class Form1
                     End If
                 End If
             End If
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine D: mpz_add")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine D: mpz_add")
             gmp_lib.mpz_add(mpAddD, gmpNumer, mpR0)
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine D: mpz_swap")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine D: mpz_swap")
             gmp_lib.mpz_swap(gmpNumer, mpAddD)
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] Combine D: mpz_clear(mpAddD) + mpz_clear(mpR0)")
-#End If
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine D: mpz_clear(mpAddD) + mpz_clear(mpR0)")
             gmp_lib.mpz_clear(mpAddD)
             gmp_lib.mpz_clear(mpR0)
-#If LOGGING_DETAIL >= 1 Then
-            Dim _procCD = Process.GetCurrentProcess()
-            Dim _ramCombD As Long = _procCD.WorkingSet64 \ 1048576
-            Dim _vmCombD As Long = _procCD.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] Combine D done (+r0)  RAM:{_ramCombD:N0}MB  Committed:{_vmCombD:N0}MB")
-#End If
-#If LOGGING_DETAIL >= 2 Then
-            WriteToLog($"[ComputePi] Combine D result (final gmpNumer): {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
-#End If
+            If _logLevel >= 3 Then
+                Dim _procCD = Process.GetCurrentProcess()
+                Dim _ramCombD As Long = _procCD.WorkingSet64 \ 1048576
+                Dim _vmCombD As Long = _procCD.PrivateMemorySize64 \ 1048576
+                WriteToLog($"[ComputePi] Combine D done (+r0)  RAM:{_ramCombD:N0}MB  Committed:{_vmCombD:N0}MB")
+            End If
+            If _logLevel >= 4 Then WriteToLog($"[ComputePi] Combine D result (final gmpNumer): {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
 
             LogPhase("Numerator complete")
 
@@ -3109,10 +3002,10 @@ Public Class Form1
                 System.IO.File.Delete(finalT_spillPath)
             Catch
             End Try
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] finalT reloaded from spill file")
-            WriteToLog($"[ComputePi] mpz_tdiv_q: pi = numer / T  (numer~{CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 10)):N0} digits  T~{CLng(gmp_lib.mpz_sizeinbase(finalT, 10)):N0} digits)")
-#End If
+            If _logLevel >= 2 Then
+                WriteToLog($"[ComputePi] finalT reloaded from spill file")
+                WriteToLog($"[ComputePi] mpz_tdiv_q: pi = numer / T  (numer~{CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 10)):N0} digits  T~{CLng(gmp_lib.mpz_sizeinbase(finalT, 10)):N0} digits)")
+            End If
             ' Pre-allocate gmpPi result buffer so MPZ_REALLOC short-circuits.
             ' gmpPi was initialised via mpz_inits (1-limb CRT buffer); the quotient
             ' is ~744 MB, so without pre-allocation GmpReallocFunc would be called.
@@ -3147,9 +3040,7 @@ Public Class Form1
 
             If token.IsCancellationRequested Then Return ""
 
-#If LOGGING_DETAIL >= 1 Then
-            WriteToLog($"[ComputePi] mpz_get_str: converting result to string")
-#End If
+            If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_get_str: converting result to string")
             Dim _strConvStart As DateTime = DateTime.Now
             Dim _strConvTimer As New System.Threading.Timer(
                 Sub(state As Object)
