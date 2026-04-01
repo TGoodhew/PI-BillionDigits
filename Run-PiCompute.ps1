@@ -45,7 +45,7 @@
     .\Run-PiCompute.ps1 -ReportOnly ".\pi_trace_20260331_121017.nettrace"
 #>
 param(
-    [string]$OutputDir  = (Join-Path $PSScriptRoot 'PiOutput'),
+    [string]$OutputDir  = 'C:\PiOutput',
     [long]  $Digits     = 1000000000,
     [switch]$Trace,
     [string]$ReportOnly = ""

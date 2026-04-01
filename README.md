@@ -2052,15 +2052,15 @@ Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately bef
 
 **Branch:** PerfWork
 
-**Change:** `_outputDir` in `Form1.vb` changed from the portable `%LOCALAPPDATA%\PI-BillionDigits` path (introduced in §71) back to the fixed `C:\PiOutput`.
+**Change:** `_outputDir` in `Form1.vb` and the `-OutputDir` default in `Run-PiCompute.ps1` both changed from the portable `%LOCALAPPDATA%\PI-BillionDigits` / `.\PiOutput` paths (introduced in §71) back to the fixed `C:\PiOutput`.
 
 Both output files derive from `_outputDir`:
 - `pi_digits.txt` → `C:\PiOutput\pi_digits.txt`
 - `pi_phase_log.txt` → `C:\PiOutput\pi_phase_log.txt`
 
-The directory is auto-created at compute time if it does not exist (via `Directory.CreateDirectory` in `StreamPiToScreen`).
+The directory is auto-created at compute time if it does not exist (via `Directory.CreateDirectory` in `StreamPiToScreen`). The script also creates it if missing before launching the exe.
 
-**Why:** The machine used for production runs always has `C:\PiOutput` available and the user prefers output there. The portable `%LOCALAPPDATA%` path caused the log file to be written to an unexpected location, making it appear as though logging was not working.
+**Why:** The machine used for production runs always has `C:\PiOutput` available and the user prefers output there. The script's `.\PiOutput` default was resolving relative to the source tree, so output appeared under the project folder rather than `C:\PiOutput`.
 
 ## Section 67 — `--verify-at` and `--verify-contains` CLI Options
 
