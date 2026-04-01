@@ -2048,6 +2048,26 @@ Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately bef
 
 ---
 
+## Section 81 — Display Streaming Performance Improvements (issue #16)
+
+**Branch:** PerfWork
+
+**Problem:** `DisplayTimer_Tick` called `Marshal.ReadByte` in a loop (one P/Invoke per byte), rebuilt a `StringBuilder` character by character, called `ScrollToCaret` every 500-char tick, and used a fixed chunk size of 500 chars — severely limiting throughput.
+
+**Changes:**
+
+1. **Bulk copy in native path** — `Marshal.ReadByte` loop replaced by a single `Marshal.Copy` into a pre-allocated `_displayBuf()` byte array, followed by `Encoding.ASCII.GetString`. One P/Invoke per tick instead of one per byte. `_displayBuf` is a Form-level field reused across all ticks (no per-tick allocation).
+
+2. **Adaptive chunk size** — `_displayChunkSize` starts at 4,096 chars and is doubled each tick if the tick completes in under 60 ms, halved if it exceeds 90 ms, capped at 1,000,000. This converges quickly to the maximum throughput the machine can sustain without UI jank.
+
+3. **Scroll throttle** — `ScrollToCaret` (which forces a layout pass) is now called at most once per 10,000 chars displayed instead of every tick, tracked by `_displayScrollAccum`.
+
+4. **`mpz_get_str` wall-time logging** — a `Stopwatch` now wraps the `mpz_get_str` call; the elapsed time is written to the phase log so the conversion cost is visible alongside the compute phases.
+
+5. **`_displayChunkSize` and `_displayScrollAccum` reset** in `StreamPiToScreen` so each new computation starts fresh.
+
+---
+
 ## Section 79 — Fix Pool Corruption: Pre-Alloc Blocks Must Use PoolGet Not VirtualAlloc
 
 **Branch:** PerfWork

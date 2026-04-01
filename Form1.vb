@@ -44,11 +44,16 @@ Public Class Form1
     Private displayIdx As Integer = 0
     Private displayTotal As Long = 0
     ' Native streaming: pointer into the GMP-allocated char buffer + length.
-    ' When non-zero, DisplayTimer_Tick reads bytes directly via Marshal.ReadByte
-    ' instead of indexing displayStr, avoiding the ~1 GB managed string entirely.
+    ' When non-zero, DisplayTimer_Tick reads bytes via Marshal.Copy bulk copy.
     Private _displayNativePtr As IntPtr = IntPtr.Zero
     Private _displayNativeLen As Long = 0
     Private _displayNativeBufSize As Long = 0   ' GmpAllocFunc alloc size; >= GMP_LARGE_THRESHOLD → VirtualAlloc'd
+    ' §81 display perf: pre-allocated byte buffer reused across ticks (avoids per-tick allocation).
+    Private _displayBuf() As Byte = New Byte(65535) {}   ' initial 64 KB; grown as adaptive chunk size increases
+    ' §81 adaptive chunk size: starts at 4096, adjusted each tick to target ~80 ms of UI work.
+    Private _displayChunkSize As Integer = 4096
+    ' §81 scroll throttle: accumulates chars since last ScrollToCaret; scroll only every 10,000 chars.
+    Private _displayScrollAccum As Integer = 0
     Private WithEvents displayTimer As New System.Windows.Forms.Timer()
     Private gmpC3Const As mpz_t = Nothing
 
@@ -3148,11 +3153,15 @@ Public Class Form1
                                    End Sub)
                 End Sub, Nothing, 1000, 1000)
             Dim piCharPtr As char_ptr
+            Dim _strConvSw As New Diagnostics.Stopwatch()
+            _strConvSw.Start()
             Try
                 piCharPtr = gmp_lib.mpz_get_str(char_ptr.Zero, 10, gmpPi)
             Finally
                 _strConvTimer.Dispose()
             End Try
+            _strConvSw.Stop()
+            WriteToLog($"[ComputePi] mpz_get_str completed in {_strConvSw.Elapsed:mm\:ss\.fff}")
             ' Capture the actual digit count BEFORE clearing gmpPi.
             ' mpz_sizeinbase returns an estimate within +1; add 2 to match GMP's internal
             ' alloc of (sizeinbase + 2) bytes.  Used to set _displayNativeLen correctly and
@@ -3216,6 +3225,8 @@ Public Class Form1
         displayStr = piString   ' empty string in native mode — display reads from _displayNativePtr
         displayIdx = 0
         displayTotal = 0
+        _displayChunkSize = 4096       ' §81: reset adaptive chunk size for new stream
+        _displayScrollAccum = 0        ' §81: reset scroll throttle counter
         displayTimer.Enabled = True
     End Sub
 
@@ -3287,44 +3298,85 @@ Public Class Form1
             Return
         End If
 
-        ' Display streaming chunk: 500 chars/tick at 100 ms interval = ~5,000 chars/sec.
-        ' Sufficient for interactive viewing; irrelevant for headless runs (display is off).
-        Const chunkSize As Integer = 500
-        Dim chunkEnd As Integer = System.Math.Min(displayIdx + chunkSize, totalLen)
+        ' §81 Display streaming: adaptive chunk size targets ~80 ms of UI work per tick.
+        ' Native path uses Marshal.Copy bulk copy + Encoding.ASCII.GetString (one P/Invoke
+        ' per tick instead of one per byte).  Managed path unchanged (rare fallback).
+        Dim tickSw As New Diagnostics.Stopwatch()
+        tickSw.Start()
 
-        Dim chunk As New System.Text.StringBuilder()
+        Dim chunkEnd As Integer = System.Math.Min(displayIdx + _displayChunkSize, totalLen)
+        Dim appendText As String = ""
+
         If useNative Then
-            ' First tick: prepend "3." before streaming the rest of the digits.
+            Dim sb As System.Text.StringBuilder = Nothing
+            ' First tick: prepend "3." then bulk-copy the rest of the chunk.
             If displayIdx = 0 Then
-                chunk.Append(ChrW(Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, 0)))
-                chunk.Append("."c)
+                sb = New System.Text.StringBuilder(_displayChunkSize + 2)
+                sb.Append(ChrW(Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, 0)))
+                sb.Append("."c)
                 displayIdx = 1
+                chunkEnd = System.Math.Min(displayIdx + _displayChunkSize, totalLen)
             End If
-            While displayIdx < chunkEnd
-                Dim b As Byte = Runtime.InteropServices.Marshal.ReadByte(_displayNativePtr, displayIdx)
-                If b = 0 Then
-                    displayIdx = totalLen   ' null terminator reached — signal completion
-                    Exit While
+
+            Dim count As Integer = chunkEnd - displayIdx
+            If count > 0 Then
+                ' Grow the reusable byte buffer if the adaptive chunk size has outgrown it.
+                If count > _displayBuf.Length Then
+                    ReDim _displayBuf(count - 1)
                 End If
-                chunk.Append(ChrW(b))
-                displayIdx += 1
-            End While
+                Runtime.InteropServices.Marshal.Copy(
+                    New IntPtr(_displayNativePtr.ToInt64() + displayIdx), _displayBuf, 0, count)
+                ' Detect early null terminator (wrong-result / short buffer guard).
+                Dim nullPos As Integer = Array.IndexOf(_displayBuf, CByte(0), 0, count)
+                If nullPos >= 0 Then
+                    count = nullPos
+                    displayIdx = totalLen   ' signal completion on next tick
+                Else
+                    displayIdx += count
+                End If
+                Dim decoded As String = System.Text.Encoding.ASCII.GetString(_displayBuf, 0, count)
+                If sb IsNot Nothing Then
+                    sb.Append(decoded)
+                    appendText = sb.ToString()
+                Else
+                    appendText = decoded
+                End If
+            ElseIf sb IsNot Nothing Then
+                appendText = sb.ToString()
+            End If
         Else
+            ' Managed fallback: character-by-character (piString is only used for small/test runs).
+            Dim chunk As New System.Text.StringBuilder(_displayChunkSize)
             While displayIdx < chunkEnd
                 Dim ch As Char = displayStr(displayIdx)
-                If Char.IsDigit(ch) OrElse ch = "."c Then
-                    chunk.Append(ch)
-                End If
+                If Char.IsDigit(ch) OrElse ch = "."c Then chunk.Append(ch)
                 displayIdx += 1
             End While
+            appendText = chunk.ToString()
         End If
 
-        If chunk.Length > 0 Then
-            displayTotal += chunk.Length
-            RtbPiDigits.AppendText(chunk.ToString())
-            RtbPiDigits.SelectionStart = RtbPiDigits.TextLength
-            RtbPiDigits.ScrollToCaret()
+        If appendText.Length > 0 Then
+            displayTotal += appendText.Length
+            RtbPiDigits.AppendText(appendText)
+            ' §81 scroll throttle: only call ScrollToCaret every 10,000 chars to avoid
+            ' a layout pass on every tick.
+            _displayScrollAccum += appendText.Length
+            If _displayScrollAccum >= 10000 Then
+                RtbPiDigits.SelectionStart = RtbPiDigits.TextLength
+                RtbPiDigits.ScrollToCaret()
+                _displayScrollAccum = 0
+            End If
             LblDigitsDisplayed.Text = $"{displayTotal:N0}"
+        End If
+
+        ' §81 adaptive chunk size: grow if tick finished under 60 ms, shrink if over 90 ms.
+        ' Capped at 1,000,000 to prevent a single tick freezing the UI thread.
+        tickSw.Stop()
+        Dim tickMs As Long = tickSw.ElapsedMilliseconds
+        If tickMs < 60 AndAlso _displayChunkSize < 1000000 Then
+            _displayChunkSize = CInt(System.Math.Min(CLng(_displayChunkSize) * 2L, 1000000L))
+        ElseIf tickMs > 90 AndAlso _displayChunkSize > 256 Then
+            _displayChunkSize = System.Math.Max(_displayChunkSize \ 2, 256)
         End If
     End Sub
 
