@@ -97,6 +97,103 @@ A high-level overview of everything that was changed from the original implement
 - Headless / automation mode (§63): `--digits N --autostart --autoverify` runs end-to-end without any UI dialogs; suppressed dialogs written to the phase log with a `[DIALOG]` prefix.
 - Custom digit verification (§67): `--verify-at "DIGITS:POSITION"` and `--verify-contains "DIGITS"` CLI options for automated correctness checks.
 
+### P-Core Affinity on Hybrid CPUs
+
+Intel 12th-gen+ (Alder Lake, Raptor Lake) and AMD Zen 4c CPUs expose two classes of cores: **P-cores** (full-power, high IPC, preferred for GMP math) and **E-cores** (lower power, lower single-thread performance, shared L2). Without affinity pinning, the Windows thread pool schedules tasks onto whichever logical processors are available — including E-cores — which can unpredictably slow down bandwidth-bound GMP operations.
+
+**How it works (§66):**
+
+The Win32 API `GetLogicalProcessorInformationEx(RelationProcessorCore, ...)` returns one `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` record per physical core. The `EfficiencyClass` byte in each record tells you whether the core is a P-core (`EfficiencyClass > 0`) or an E-core (`EfficiencyClass = 0`). Accumulate a bitmask for each class, then call `SetProcessAffinityMask` if both classes are present.
+
+**P/Invoke declarations:**
+```vb
+<DllImport("kernel32.dll", SetLastError:=True)>
+Private Shared Function SetProcessAffinityMask(
+    hProcess As IntPtr,
+    dwProcessAffinityMask As IntPtr) As Boolean
+End Function
+
+<DllImport("kernel32.dll", SetLastError:=True)>
+Private Shared Function GetLogicalProcessorInformationEx(
+    relationshipType As Integer,
+    buffer As IntPtr,
+    ByRef returnedLength As UInteger) As Boolean
+End Function
+
+Private Const RelationProcessorCore As Integer = 0
+```
+
+**Detection and pinning:**
+```vb
+Private Shared Sub SetPCoreAffinity()
+    Try
+        ' Step 1: two-call pattern — first call returns required buffer size
+        Dim bufferSize As UInteger = 0
+        GetLogicalProcessorInformationEx(RelationProcessorCore, IntPtr.Zero, bufferSize)
+        If bufferSize = 0 Then Return
+
+        Dim buffer As IntPtr = Marshal.AllocHGlobal(CInt(bufferSize))
+        Try
+            If Not GetLogicalProcessorInformationEx(RelationProcessorCore, buffer, bufferSize) Then Return
+
+            ' Step 2: parse variable-length records.
+            ' SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX layout (RelationProcessorCore):
+            '   +0   Relationship   : DWORD  (4 bytes)
+            '   +4   Size           : DWORD  (4 bytes) — record length, varies
+            '   +8   Flags          : BYTE   (1 byte)
+            '   +9   EfficiencyClass: BYTE   (1 byte)  — 0=E-core, >0=P-core
+            '  +10   Reserved[20]   : BYTE  (20 bytes)
+            '  +30   GroupCount     : WORD   (2 bytes)
+            '  +32   GroupMask[0].Mask : ULONG_PTR (8 bytes on x64) — logical processor bitmask
+            Dim pCoreMask As Long = 0L
+            Dim eCoreMask As Long = 0L
+            Dim offset As Integer = 0
+
+            Do While offset < CInt(bufferSize)
+                Dim recordSize As Integer = Marshal.ReadInt32(buffer, offset + 4)
+                If recordSize <= 0 Then Exit Do
+
+                Dim efficiencyClass As Byte = Marshal.ReadByte(buffer, offset + 9)
+                Dim mask As Long = Marshal.ReadInt64(buffer, offset + 32)
+
+                If efficiencyClass > 0 Then
+                    pCoreMask = pCoreMask Or mask   ' P-core logical processors
+                Else
+                    eCoreMask = eCoreMask Or mask   ' E-core logical processors
+                End If
+
+                offset += recordSize  ' advance to next record
+            Loop
+
+            ' Step 3: only pin if this is actually a hybrid CPU
+            If pCoreMask <> 0L AndAlso eCoreMask <> 0L Then
+                SetProcessAffinityMask(GetCurrentProcess(), New IntPtr(pCoreMask))
+                ' Log: $"Hybrid CPU. P-core mask=0x{pCoreMask:X}  E-core mask=0x{eCoreMask:X}"
+            Else
+                ' Uniform CPU — all cores same class, leave affinity unchanged
+            End If
+        Finally
+            Marshal.FreeHGlobal(buffer)
+        End Try
+    Catch ex As Exception
+        ' Log and continue — affinity is an optimisation, not a correctness requirement
+    End Try
+End Sub
+```
+
+**Call site — invoke once before the first `Parallel.For`:**
+```vb
+SetPCoreAffinity()
+ThreadPool.SetMinThreads(Environment.ProcessorCount, Environment.ProcessorCount)
+```
+
+**Key points:**
+- The two-call pattern (size query with `IntPtr.Zero`, then data query) is required — the buffer size varies with the number of cores.
+- `Size` at offset +4 is the actual record length and must be used to advance the offset; do not assume a fixed struct size.
+- On a non-hybrid machine all records have the same `EfficiencyClass`, so `eCoreMask` stays 0 and the affinity mask is left unchanged — the function is safe to call unconditionally.
+- `GetCurrentProcess()` returns a pseudo-handle that is always valid; no `CloseHandle` required.
+- The affinity mask is inherited by all threads including thread pool workers, so one call from the UI/compute thread is sufficient.
+
 ### Automation
 
 **Headless mode (§63):** All three `MessageBox.Show` dialogs are gated behind `If Not _headless Then`. In headless mode the text is written to the phase log with a `[DIALOG]` prefix so automated runs leave a full audit trail without blocking.
