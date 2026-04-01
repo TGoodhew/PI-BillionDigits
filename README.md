@@ -94,6 +94,16 @@ A high-level overview of everything that was changed from the original implement
 - `LOGGING_DETAIL` compile-time constant: 0 = phases only, 1 = detail on final combine + all ComputePiGMP steps (default), 2 = full trace (§2).
 - Native buffer streaming: the billion-digit result is kept as a native `char*` rather than a managed string, avoiding a 1 GB managed allocation and GC pressure during display (§13).
 - Thread priority `AboveNormal` + `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` to prevent Windows from throttling the compute thread (§27).
+- Headless / automation mode (§63): `--digits N --autostart --autoverify` runs end-to-end without any UI dialogs; suppressed dialogs written to the phase log with a `[DIALOG]` prefix.
+- Custom digit verification (§67): `--verify-at "DIGITS:POSITION"` and `--verify-contains "DIGITS"` CLI options for automated correctness checks.
+
+### Automation
+
+**Headless mode (§63):** All three `MessageBox.Show` dialogs are gated behind `If Not _headless Then`. In headless mode the text is written to the phase log with a `[DIALOG]` prefix so automated runs leave a full audit trail without blocking.
+
+**`Run-PiCompute.ps1` (§63):** PowerShell script that clean-builds and launches the exe with `--digits 1000000000 --autostart --autoverify`. Supports `-Trace` (wraps the run in `dotnet-trace` to collect a CPU sampling `.nettrace` + plain-text `_report.txt`) and `-ReportOnly <path>` (re-generates the report from an existing trace without rebuilding).
+
+**P-core affinity + thread pool pre-warm (§66):** On hybrid CPUs (Intel P+E core), `GetLogicalProcessorInformationEx` is used to detect P-cores by `EfficiencyClass` and restrict the process affinity mask to those cores only. `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` pre-warms the thread pool before Phase 1 to eliminate first-task latency.
 
 ---
 
@@ -1793,3 +1803,102 @@ Key design points:
 **Change:** Replaced the serial `While nodeIdx < diskNodes.Count - 1` inner loop in the Phase 2 combine pass with a `Parallel.For` over pair indices when `pairCount >= 4`. Each pair is fully independent: it loads from two unique disk files, uses only thread-local `mpz_t` objects, and writes to a unique output file. Results are written into a pre-sized `nextResults(pairCount-1)` array by pair index (no locking needed), then `nextDiskNodes.AddRange(nextResults)` populates the list in order. The serial path is retained for `pairCount < 4` (the top levels where operands are very large and there are too few pairs for parallelism to help without excessive RAM pressure). The `LOGGING_DETAIL` diagnostic blocks and the per-100-pair `LogPhase` call remain in the serial path only.
 
 **Why:** At the lower combine levels there are thousands of independent node pairs per level — e.g. ~68,869 pairs at Level 1, ~34 at Level 12. Each pair's four `SafeMpzMul` calls are entirely independent of all other pairs. On a 24-logical-processor machine this is the same situation as Phase 1: a serial loop leaves 23 cores idle. The `pairCount >= 4` threshold keeps the top 1–2 levels serial where loading multiple pairs simultaneously would multiply already-large (~hundreds of MB to GB) operands across threads and risk OOM.
+
+---
+
+## Section 63 — Headless / Automation Mode + PowerShell Script
+
+**Branch:** PerfWork / AdvPerfWork
+
+**Change:** Added three CLI arguments parsed in `Form1_Load`:
+
+- `--digits N` — sets the digit count programmatically (bypasses the UI spinner).
+- `--autostart` — triggers `BtnCompute_Click` from `Form1_Shown` so the computation starts without any user interaction.
+- `--autoverify` — triggers `BtnTest_Click` automatically after computation completes.
+
+All three `MessageBox.Show` dialogs (compute complete, verify result, error) are gated: in headless mode the dialog text is written to the phase log with a `[DIALOG]` prefix instead of blocking the process.
+
+Headless defaults applied at startup: `ChkboxDisplay.Checked = False`, `TxtChunkSize.Text = "500000"`, `ChkboxWriteToFile.Checked = True`.
+
+Added `Run-PiCompute.ps1`:
+- `dotnet clean` → `dotnet build --configuration Release` → launch exe with `--digits 1000000000 --autostart --autoverify`.
+- `-Trace` switch: wraps the run with `dotnet-trace collect` (providers: `Microsoft-DotNETCore-SampleProfiler:0xF00000000000:5` + `Microsoft-DotNETRuntime:0x1F000080018:5`), then calls `dotnet-trace report topN -n 50 --inclusive` and saves a `_report.txt` alongside the `.nettrace`.
+- `-ReportOnly <path>`: skips build/run; re-generates the topN report from an existing `.nettrace`.
+- Output directory hardcoded to `c:\PiOutput`; created if missing.
+- `.gitignore` updated to exclude `*.nettrace`, `*.nettrace.etlx`, `*.etlx`, `*.etl`, `*.etl.zip`, `*.speedscope.json`, `*.diagsession`, `*.vspx`, `*.psess`, `*_report.txt`, `pi_trace_*`.
+
+**Why:** Enabling unattended runs allows long (multi-hour) computations to be launched from a script or CI pipeline without leaving a blocking dialog open. The PowerShell script consolidates the clean/build/run/trace workflow into a single command.
+
+---
+
+## Section 64 — Skip Display Loop When Display Is Off
+
+**Branch:** PerfWork / AdvPerfWork
+
+**Change:** `StreamPiToScreen` now fast-paths at entry: if `ChkboxDisplay.Checked = False`, it calls `WriteResultToFile()` directly and returns without entering the streaming loop. `WriteResultToFile(digitCount As Long)` is extracted as a shared helper used by both the fast path and the display loop's final step.
+
+**Why:** In headless mode (or any interactive run with Display unchecked) the streaming loop was still iterating over the native buffer one chunk at a time for no visible effect, wasting several seconds.
+
+---
+
+## Section 65 — Bucketed VirtualAlloc Pool (GMP Allocator v3)
+
+**Branch:** AdvPerfWork
+
+**Change:** Replaced the per-call `VirtualAlloc`/`VirtualFree` allocator with a power-of-2 bucketed pool:
+
+- 64 fixed `ConcurrentStack(Of IntPtr)` slots, one per bit-length bucket (bucket `b` holds blocks of exactly `2^b` bytes).
+- `PoolBucket(sz)` computes `ceil(log2(sz))` via a shift loop — no `Math.Log`, no dictionary lookup.
+- `PoolGet`: if `sz ≤ POOL_MAX_BLOCK (16 MB)`, pops from the matching bucket (or calls `VirtualAlloc(2^b)` on miss). Blocks above 16 MB bypass the pool entirely (their sizes are unique per combine level and would never hit).
+- `PoolReturn`: if `sz ≤ POOL_MAX_BLOCK` and `stack.Count < POOL_CAP (32)`, pushes back; otherwise `VirtualFree`.
+- `FlushGmpPool()` drains all 64 stacks via `VirtualFree`, called between Phase 2 levels and in the `ComputePiGMP` Finally block to prevent committed-memory accumulation.
+- Pool stacks initialised in `InitGmpVirtualAllocFunctions`.
+
+**Why (v1 → v2 → v3 evolution):**
+- v1 (§6): per-call `VirtualAlloc`/`VirtualFree` — correct but ~41% of wall-clock time in allocator overhead per dotnet-trace.
+- v2: `ConcurrentDictionary(sz → stack)` pool — `Monitor.Wait` lock contention at 5.55% of runtime (visible in trace 3 as `LowLevelLock` and `ConcurrentDictionary.GetOrAdd`).
+- v3: fixed 64-bucket array — no dictionary, no Monitor; only lock-free `ConcurrentStack` push/pop.
+
+Crash fix during pool development: top-level combine blocks (e.g. Level 16–17, 107 MB–268 MB) exceeded `POOL_MAX_BLOCK`, so `VirtualAlloc` returned NULL when committed memory hit ~38 GB from un-flushed pool blocks. Fixed by the `POOL_MAX_BLOCK` bypass and per-level `FlushGmpPool()`.
+
+---
+
+## Section 66 — P-Core Affinity Detection + Thread Pool Pre-Warm
+
+**Branch:** AdvPerfWork
+
+**Change:** Added `SetPCoreAffinity()` called from `BtnCompute_Click` before Phase 1:
+
+- Calls `GetLogicalProcessorInformationEx(RelationProcessorCore, ...)` to enumerate all logical processor groups.
+- Each `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` entry for a processor core exposes `EfficiencyClass` (0 = E-core, 1+ = P-core on Intel hybrid CPUs; on non-hybrid CPUs all cores report the same class).
+- Accumulates a bitmask of all P-core logical processors; if the set is non-empty and not equal to all processors, calls `SetProcessAffinityMask` to restrict the process.
+- Logs the detected counts and final affinity mask with an `[Affinity]` prefix.
+- No-op on non-hybrid machines (all cores report the same `EfficiencyClass`).
+
+Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately before Phase 1 to pre-warm the .NET thread pool, eliminating the ramp-up latency for the first `Parallel.For` tasks.
+
+**Why:** On Intel 12th-gen+ hybrid CPUs, Windows may schedule .NET thread pool threads onto E-cores. E-cores have lower single-thread IPC and share L3 differently, degrading GMP FFT performance which is memory-bandwidth-bound. Pinning to P-cores ensures consistent throughput. Thread pool pre-warming eliminates the ~100 ms first-task latency seen at Phase 1 start in trace runs.
+
+---
+
+## Section 67 — `--verify-at` and `--verify-contains` CLI Options
+
+**Branch:** AdvPerfWork
+
+**Change:** Added two repeatable CLI arguments parsed in `Form1_Load`:
+
+- `--verify-at "DIGITS:POSITION"` — after computation, checks that the digit sequence `DIGITS` appears at exactly position `POSITION` (0-based, including the leading `3`). Multiple `--verify-at` arguments are all checked.
+- `--verify-contains "DIGITS"` — checks that `DIGITS` appears anywhere in the output. Multiple `--verify-contains` arguments are all checked.
+
+Both options populate `_verifyAt As List(Of Tuple(Of String, Long))` and `_verifyContains As List(Of String)` at startup. The new helper `RunCustomVerifications(piText As String)` is called at the end of `BtnTest_Click` (after the built-in fixed digit checks) when either list is non-empty.
+
+Results in interactive mode: `MessageBox.Show`. In headless mode: written to the phase log with a `[DIALOG]` prefix and `LblStatus.Text` is updated.
+
+**Example usage:**
+```
+PI-BillionDigits.exe --digits 1000000000 --autostart --autoverify ^
+    --verify-at "999999:762" ^
+    --verify-contains "27182818284"
+```
+
+**Why:** The built-in test checks three fixed digit sequences hardcoded in `BtnTest_Click`. For automated regression testing or validating known Pi digit positions, it is useful to pass expected values on the command line without modifying the source. The `--verify-at` form gives an exact-position assertion (fails if the sequence is found elsewhere); `--verify-contains` is a looser sanity check useful for sequences like Euler's number embedded in Pi.
