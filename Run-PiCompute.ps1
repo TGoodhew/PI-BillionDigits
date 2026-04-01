@@ -199,8 +199,8 @@ if ($Test) {
         $runLog = Join-Path $runDir "pi_phase_log.txt"
         $verifyLine = ""
         if (Test-Path $runLog) {
-            $verifyLine = (Select-String -Path $runLog -Pattern '^\[Verify\]' |
-                          Select-Object -Last 1).Line
+            $match = Select-String -Path $runLog -Pattern '^\[Verify\]' | Select-Object -Last 1
+            if ($match) { $verifyLine = $match.Line }
         }
 
         # ── Determine pass/fail for each known sequence ───────────────────
