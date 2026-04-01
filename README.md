@@ -2048,6 +2048,37 @@ Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately bef
 
 ---
 
+## Section 84 — Power-of-10 Test Suite (issue #18)
+
+**Branch:** PerfWork
+
+### `--output-dir D` CLI argument (Form1.vb)
+
+Added `--output-dir D` to the exe's CLI arg parser. Sets `_outputDir` at startup, overriding the default `C:\PiOutput`. All derived paths (pi_digits.txt, pi_phase_log.txt, NodeCache) inherit the new directory. This allows multiple simultaneous or sequential runs to write to isolated directories.
+
+### `-Test` switch (Run-PiCompute.ps1)
+
+Runs the exe at every power of 10 from 10 up to `-Digits` (default 1,000,000,000). Each run writes to its own subdirectory (`test_10`, `test_100`, …) under `-OutputDir` via `--output-dir`.
+
+**Verification pass/fail rules:**
+
+| Sequence | Expected position | Checked when |
+|---|---|---|
+| `999999` | 762 | digits ≥ 768 |
+| `777777777` | 24,658,601 | digits ≥ 24,658,610 |
+| `27182818284` (e-digits) | unknown | always — informational only |
+
+Runs with too few digits to contain a sequence report `N/A` (not a failure). The e-digits check never causes a FAIL — its position in Pi is not known to be within 1B digits.
+
+**Output:** a combined timing and pass/fail table printed to the console and saved as `test_suite_report_YYYYMMDD_HHMMSS.txt` in `-OutputDir`.
+
+```
+.\Run-PiCompute.ps1 -Test                      # full suite, 10 → 1B
+.\Run-PiCompute.ps1 -Test -Digits 1000000      # suite up to 1M only
+```
+
+---
+
 ## Section 83 — Runtime Logging Level (issue #15)
 
 **Branch:** PerfWork

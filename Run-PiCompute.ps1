@@ -32,6 +32,19 @@
     directory, suitable for pasting into Claude for analysis.
     Requires: dotnet tool install --global dotnet-trace
 
+.PARAMETER Test
+    Run the app at every power of 10 from 10 up to -Digits (default 1,000,000,000).
+    Each run is isolated in its own subdirectory under OutputDir (test_10, test_100, …).
+    After all runs a combined pass/fail and timing table is printed and saved to
+    OutputDir\test_suite_report.txt.
+
+    Verification pass/fail rules (known digit positions in Pi):
+      999999        expected at position 762  — checked when digits >= 768
+      777777777     expected at position 24,658,601 — checked when digits >= 24,658,610
+      e-digits      27182818284 — position unknown; reported as Found/Not found (informational)
+
+    Mutually exclusive with -Trace.
+
 .PARAMETER LogLevel
     Logging detail level passed to the exe as --log-level N.  Defaults to 1.
       0  None        Errors and crashes only. Silent on success.
@@ -53,6 +66,8 @@
     .\Run-PiCompute.ps1 -LogLevel 0
     .\Run-PiCompute.ps1 -LogLevel 3
     .\Run-PiCompute.ps1 -Trace -LogLevel 2
+    .\Run-PiCompute.ps1 -Test
+    .\Run-PiCompute.ps1 -Test -Digits 1000000
     .\Run-PiCompute.ps1 -ReportOnly ".\pi_trace_20260331_121017.nettrace"
 #>
 param(
@@ -60,6 +75,7 @@ param(
     [long]  $Digits     = 1000000000,
     [int]   $LogLevel   = 1,
     [switch]$Trace,
+    [switch]$Test,
     [string]$ReportOnly = ""
 )
 
@@ -121,6 +137,109 @@ if ($exeCandidates.Count -eq 0) {
 }
 $exePath = $exeCandidates[0].FullName
 Write-Host "Exe     : $exePath"
+
+# ── 3a. Test suite (powers of 10) ────────────────────────────────────────────
+if ($Test) {
+    # Build the power-of-10 sequence up to $Digits
+    $testRuns = [System.Collections.Generic.List[long]]::new()
+    $n = 10L
+    while ($n -le $Digits) { $testRuns.Add($n); $n *= 10L }
+
+    $reportFile  = Join-Path $OutputDir "test_suite_report_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+    $reportLines = [System.Collections.Generic.List[string]]::new()
+
+    $header = "{0,-18} {1,10}  {2,-14} {3,-22} {4,-16} {5}" -f `
+              "Digits","Time(s)","999999@762","777777777@24658601","e-digits","Result"
+    $separator = "-" * 90
+    Write-Host ""
+    Write-Host "=== Test Suite ($($testRuns.Count) runs, up to $($Digits.ToString('N0')) digits) ===" -ForegroundColor Cyan
+    Write-Host $separator
+    Write-Host $header
+    Write-Host $separator
+    $reportLines.Add("=== PI-BillionDigits Test Suite ===")
+    $reportLines.Add("Started : $(Get-Date)")
+    $reportLines.Add("Exe     : $exePath")
+    $reportLines.Add("")
+    $reportLines.Add($separator)
+    $reportLines.Add($header)
+    $reportLines.Add($separator)
+
+    $allPassed = $true
+
+    foreach ($d in $testRuns) {
+        $runDir = Join-Path $OutputDir ("test_" + $d.ToString())
+        if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir | Out-Null }
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        & $exePath --digits $d --autostart --autoverify --log-level 1 --output-dir $runDir
+        $sw.Stop()
+        $elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+
+        # ── Parse verify result from the run's phase log ──────────────────
+        $runLog = Join-Path $runDir "pi_phase_log.txt"
+        $verifyLine = ""
+        if (Test-Path $runLog) {
+            $verifyLine = (Select-String -Path $runLog -Pattern '^\[Verify\]' |
+                          Select-Object -Last 1).Line
+        }
+
+        # ── Determine pass/fail for each known sequence ───────────────────
+        # 999999 expected at position 762 (checkable when digits >= 768)
+        if ($d -lt 768) {
+            $check1 = "N/A"
+        } elseif ($verifyLine -match '999999@762 OK') {
+            $check1 = "PASS"
+        } elseif ($verifyLine -match '999999') {
+            $check1 = "FAIL"
+            $allPassed = $false
+        } else {
+            $check1 = "FAIL(no log)"
+            $allPassed = $false
+        }
+
+        # 777777777 expected at position 24,658,601 (checkable when digits >= 24,658,610)
+        if ($d -lt 24658610) {
+            $check2 = "N/A"
+        } elseif ($verifyLine -match '777777777@24,658,601 OK') {
+            $check2 = "PASS"
+        } elseif ($verifyLine -match '777777777') {
+            $check2 = "FAIL"
+            $allPassed = $false
+        } else {
+            $check2 = "FAIL(no log)"
+            $allPassed = $false
+        }
+
+        # e-digits: informational — position not guaranteed within 1B
+        if ($verifyLine -match 'e-digits@(\d+) OK') {
+            $check3 = "Found@" + $Matches[1]
+        } else {
+            $check3 = "Not found"
+        }
+
+        $overallRun = if ($check1 -eq "FAIL" -or $check1 -eq "FAIL(no log)" -or
+                          $check2 -eq "FAIL" -or $check2 -eq "FAIL(no log)") { "FAIL" } else { "PASS" }
+
+        $colour = if ($overallRun -eq "PASS") { "Green" } else { "Red" }
+        $row = "{0,-18} {1,10}  {2,-14} {3,-22} {4,-16} {5}" -f `
+               $d.ToString('N0'), $elapsed, $check1, $check2, $check3, $overallRun
+        Write-Host $row -ForegroundColor $colour
+        $reportLines.Add($row)
+    }
+
+    Write-Host $separator
+    $reportLines.Add($separator)
+    $overall = if ($allPassed) { "ALL PASSED" } else { "FAILURES DETECTED" }
+    $overallColour = if ($allPassed) { "Green" } else { "Red" }
+    $summaryLine = "Overall: $overall   Completed: $(Get-Date)"
+    Write-Host $summaryLine -ForegroundColor $overallColour
+    $reportLines.Add($summaryLine)
+
+    $reportLines | Out-File -FilePath $reportFile -Encoding utf8
+    Write-Host ""
+    Write-Host "Report saved: $reportFile" -ForegroundColor Cyan
+    exit 0
+}
 
 # ── 3. Run (with or without trace) ───────────────────────────────────────────
 Write-Host ""

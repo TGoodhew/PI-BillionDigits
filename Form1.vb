@@ -727,6 +727,7 @@ Public Class Form1
         '   --autoverify     After computation, auto-run verify + exit
         '   --threshold N    Override the RAM/disk threshold (nodes)
         '   --log-level N    Set runtime logging level 0–5 (default 1)
+        '   --output-dir D   Override output directory for digits, log, and node cache
         Dim args() As String = Environment.GetCommandLineArgs()
         ' Log all received args so we can diagnose unexpected headless activation.
         ' args(0) is always the exe path; user args start at index 1.
@@ -788,6 +789,11 @@ Public Class Form1
                         If Integer.TryParse(args(i + 1), lvl) AndAlso lvl >= 0 AndAlso lvl <= 5 Then
                             _logLevel = lvl
                         End If
+                        i += 1
+                    End If
+                Case "--output-dir"
+                    If i + 1 < args.Length AndAlso args(i + 1).Length > 0 Then
+                        _outputDir = args(i + 1)
                         i += 1
                     End If
             End Select
