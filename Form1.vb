@@ -719,6 +719,19 @@ Public Class Form1
         '   --autoverify     After computation, auto-run verify + exit
         '   --threshold N    Override the RAM/disk threshold (nodes)
         Dim args() As String = Environment.GetCommandLineArgs()
+        ' Log all received args so we can diagnose unexpected headless activation.
+        ' args(0) is always the exe path; user args start at index 1.
+        Try
+            Dim logDir As String = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "PI-BillionDigits")
+            System.IO.Directory.CreateDirectory(logDir)
+            System.IO.File.WriteAllText(
+                System.IO.Path.Combine(logDir, "startup_args.txt"),
+                $"Started: {DateTime.Now}" & vbCrLf &
+                $"Args ({args.Length}): " & String.Join(" | ", args) & vbCrLf)
+        Catch
+        End Try
         Dim i As Integer = 1
         Do While i < args.Length
             Select Case args(i).ToLower()
@@ -1083,8 +1096,10 @@ Public Class Form1
                     If _displayNativePtr <> IntPtr.Zero OrElse result <> "" Then
                         Me.Invoke(Sub() StreamPiToScreen(result))
                     End If
-                    ' --autoverify: run verify logic headlessly then exit
-                    If _autoVerify Then
+                    ' --autoverify: run verify logic headlessly then exit.
+                    ' Requires both _headless AND _autoVerify so interactive runs
+                    ' never auto-exit even if --autoverify was somehow received.
+                    If _headless AndAlso _autoVerify Then
                         Me.Invoke(Sub()
                                       BtnTest_Click(Nothing, EventArgs.Empty)
                                       Application.Exit()
