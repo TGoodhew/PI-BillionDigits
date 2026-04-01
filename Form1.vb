@@ -2677,8 +2677,12 @@ Public Class Form1
             gmp_lib.mpz_clear(tmpHigh)
             WriteToLog($"[3PM-DBG] Q split complete")
 
-            ' §61: Run all three products simultaneously — gmpNumer is read-only in all three
-            ' calls; each result is a distinct mpz_t so there is no shared mutable state.
+            ' §61: Compute the three products r0=N*Q0, r1=N*Q1, r2=N*Q2.
+            ' These were previously run via Parallel.Invoke, but GMP's mpz_mul may
+            ' temporarily modify its input operands internally (normalisation, sign
+            ' handling).  Concurrent access to the same mpz_t from multiple threads —
+            ' even read-only — is unsafe per the GMP documentation.  All three calls
+            ' share gmpNumer, so they must run sequentially.
             ' Q0 (finalQ), Q1 (mpQ1), Q2 (mpQ2) stay in RAM — no disk spilling needed.
             ' r0, r1, r2 also stay in RAM; Combine B and D use them directly without reloading.
             Dim mpR0 As New mpz_t()
@@ -2689,12 +2693,11 @@ Public Class Form1
             Dim _procP_pre = Process.GetCurrentProcess()
             Dim _ramP_pre As Long = _procP_pre.WorkingSet64 \ 1048576
             Dim _vmP_pre As Long = _procP_pre.PrivateMemorySize64 \ 1048576
-            WriteToLog($"[ComputePi] §61 parallel multiply start: r0=N*Q0, r1=N*Q1, r2=N*Q2  RAM:{_ramP_pre:N0}MB  Committed:{_vmP_pre:N0}MB")
+            WriteToLog($"[ComputePi] §61 serial multiply start: r0=N*Q0, r1=N*Q1, r2=N*Q2  RAM:{_ramP_pre:N0}MB  Committed:{_vmP_pre:N0}MB")
 #End If
-            System.Threading.Tasks.Parallel.Invoke(
-                Sub() SafeMpzMul(mpR0, gmpNumer, finalQ),
-                Sub() SafeMpzMul(mpR1, gmpNumer, mpQ1),
-                Sub() SafeMpzMul(mpR2, gmpNumer, mpQ2))
+            SafeMpzMul(mpR0, gmpNumer, finalQ)
+            SafeMpzMul(mpR1, gmpNumer, mpQ1)
+            SafeMpzMul(mpR2, gmpNumer, mpQ2)
             gmp_lib.mpz_clears(finalQ, mpQ1, mpQ2, Nothing)
             ' Swap r2 into gmpNumer (same pattern as the old serial Pass 2 end).
             ' The old gmpNumer buffer (~208 MB, the 426880*sqrt value) is freed by the swap.
