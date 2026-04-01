@@ -1914,13 +1914,16 @@ Public Class Form1
                     End Sub)
                 phase2PollThread.IsBackground = True
                 phase2PollThread.Start()
-                ' §69: Outer DOP raised from ProcessorCount\2 → ProcessorCount (24).
-                ' SafeMpzMul inner DOP is set to 1 (serial) below so there is no nested
-                ' thread-pool parallelism: 24 outer tasks × 2 Parallel.Invoke tasks = 48
-                ' concurrent tasks on 24 threads — no oversubscription.
+                ' §69 revised (trace 5): Outer DOP = ProcessorCount\2. Each outer task calls
+                ' Parallel.Invoke(newP, newQ) then Parallel.Invoke(tempA, tempB), requiring
+                ' a free thread for the second Invoke task. With outer=ProcessorCount all
+                ' threads are occupied by outer tasks — Parallel.Invoke deadlocks on itself
+                ' causing Task.WaitAll to hit 19.33% in trace 5. ProcessorCount\2 leaves half
+                ' the threads free so both Invoke tasks always run immediately in parallel.
+                ' SafeMpzMul inner DOP remains 1 (serial) to avoid nested oversubscription.
                 _safeMulDop = 1
                 Dim _p2opts As New System.Threading.Tasks.ParallelOptions() With {
-                    .MaxDegreeOfParallelism = Environment.ProcessorCount
+                    .MaxDegreeOfParallelism = System.Math.Max(1, Environment.ProcessorCount \ 2)
                 }
                 Parallel.For(0L, pairCount, _p2opts,
                     Sub(pairIdx As Long)
