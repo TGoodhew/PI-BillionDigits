@@ -2068,6 +2068,19 @@ Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately bef
 
 No deadlock risk: outer tasks no longer block on `Parallel.Invoke`; the inner `Parallel.For` sub-tasks are short fast-path `GmpRaw_mul` calls with no further nesting. The serial path (pairCount < 4) is unchanged — it retains its `Parallel.Invoke` and uses `_safeMulDop = ProcessorCount` (restored after each parallel level).
 
+**1B-digit trace results (§87 vs §86 baseline):**
+
+| Metric | §86 | §87 | Δ |
+|--------|-----|-----|---|
+| `LowLevelLifoSemaphore.WaitForSignal` (excl) | 22.55% | 13.9% | −8.65 pp |
+| `Parallel.Invoke` (incl) | 20.45% | not in top 50 | eliminated |
+| `SafeMpzMul` (excl) | 19.24% | 17.98% | −1.26 pp |
+| `GmpAllocFunc` (excl) | 17.6% | 23.4% | +5.8 pp ¹ |
+| `GmpFreeFunc` (excl) | 16.49% | 22.43% | +5.94 pp ¹ |
+| Wall-clock (1B digits) | ~28 min | 27:47 | marginal |
+
+¹ `GmpAllocFunc`/`GmpFreeFunc` appear higher only because they're a larger fraction of what remains — absolute thunk cost is unchanged. The bottleneck has fully shifted to the managed→native P/Invoke crossing (~46% combined exclusive). Issue #24 closed.
+
 ---
 
 ## Section 86 — SafeMpzMul: Shared Shifted Buffer (issue #23)
