@@ -2048,6 +2048,18 @@ Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately bef
 
 ---
 
+## Section 76 — Fix Three-Pass Multiply Pre-Alloc Crash on Small Digit Counts
+
+**Branch:** PerfWork
+
+**Symptom:** App crashed immediately after `[ComputePi] §61 serial multiply start` log entry on any run with a small digit count (e.g. 1,000,000 digits). No log entry from the native crash handler.
+
+**Root cause:** The pre-alloc blocks for `tmpHigh`, `mpQ1`, `mpQ2`, `mpR0`, `mpR1`, and `mpR2` unconditionally replaced the `mpz_init2` limb buffer (524 KB, VirtualAlloc'd) with a smaller VirtualAlloc'd buffer sized to the actual result. For small digit counts, this replacement buffer was below `GMP_LARGE_THRESHOLD` (524,288 bytes). For example with 1M digits: `mpQ1` result = 35,733 limbs × 8 = 285,864 bytes. When `mpz_clears` later freed these objects, `GmpFreeFunc` saw `_mp_alloc * 8 < GMP_LARGE_THRESHOLD` and routed to `_savedGmpFree` (CRT `free()`). Calling CRT `free()` on a VirtualAlloc'd pointer is undefined behaviour; in .NET Core it terminates the process immediately without firing managed exception handlers or `SetUnhandledExceptionFilter`.
+
+**Fix:** Each pre-alloc block now guards the buffer replacement with `If _xBytes >= GMP_LARGE_THRESHOLD`. Below the threshold the `mpz_init2` buffer (65,536 limbs = 524,288 bytes, VirtualAlloc'd) is already large enough for the result — no replacement is needed and `GmpFreeFunc` correctly routes the free through `VirtualFree`. Above the threshold the behaviour is unchanged.
+
+**Why the 1B-digit run was unaffected:** All six buffers are hundreds of MB for a 1B-digit run, well above `GMP_LARGE_THRESHOLD`, so the guard condition is always true and the code path is identical to before.
+
 ## Section 75 — Button Text Centering, Uniform Size, and Equal Row Spacing
 
 **Branch:** PerfWork
