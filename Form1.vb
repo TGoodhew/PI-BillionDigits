@@ -2688,7 +2688,58 @@ Public Class Form1
             Dim mpR0 As New mpz_t()
             Dim mpR1 As New mpz_t()
             Dim mpR2 As New mpz_t()
-            gmp_lib.mpz_inits(mpR0, mpR1, mpR2, Nothing)
+            ' Pre-alloc mpR0, mpR1, mpR2 — same pattern as tmpHigh/mpQ1/mpQ2.
+            ' In the fast path (szA+szB ≤ SAFE_LIMB_THRESHOLD), SafeMpzMul calls
+            ' gmp_lib.mpz_mul(result, ...) directly on a 1-limb CRT buffer, which
+            ' triggers GmpReallocFunc for S→L — crashing on freshly VirtualAlloc'd pages.
+            ' Pre-alloc bypasses GmpReallocFunc entirely (MPZ_REALLOC short-circuits).
+            Dim _numerSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
+            Dim _q0Sz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer, 4)))
+            Dim _q1SzR As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(mpQ1.Pointer, 4)))
+            Dim _q2SzR As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(mpQ2.Pointer, 4)))
+
+            gmp_lib.mpz_init2(mpR0, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
+            Dim _r0Needed As Long = _numerSz + _q0Sz + 2L
+            Dim _r0Bytes As Long = _r0Needed * 8L
+            Dim _r0Buf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_r0Bytes)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If _r0Buf <> IntPtr.Zero Then
+                Dim _r0Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpR0.Pointer, 8))
+                VirtualFree(_r0Old, UIntPtr.Zero, MEM_RELEASE)
+                Runtime.InteropServices.Marshal.WriteInt32(mpR0.Pointer, 0, CInt(_r0Needed))
+                Runtime.InteropServices.Marshal.WriteInt64(mpR0.Pointer, 8, _r0Buf.ToInt64())
+                WriteToLog($"[ComputePi] mpR0 pre-alloc {_r0Needed:N0} limbs ({_r0Bytes \ 1048576L:N0} MB)")
+            Else
+                WriteToLog($"[ComputePi] mpR0 pre-alloc FAILED for {_r0Bytes \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+            End If
+
+            gmp_lib.mpz_init2(mpR1, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
+            Dim _r1Needed As Long = _numerSz + _q1SzR + 2L
+            Dim _r1Bytes As Long = _r1Needed * 8L
+            Dim _r1Buf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_r1Bytes)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If _r1Buf <> IntPtr.Zero Then
+                Dim _r1Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpR1.Pointer, 8))
+                VirtualFree(_r1Old, UIntPtr.Zero, MEM_RELEASE)
+                Runtime.InteropServices.Marshal.WriteInt32(mpR1.Pointer, 0, CInt(_r1Needed))
+                Runtime.InteropServices.Marshal.WriteInt64(mpR1.Pointer, 8, _r1Buf.ToInt64())
+                WriteToLog($"[ComputePi] mpR1 pre-alloc {_r1Needed:N0} limbs ({_r1Bytes \ 1048576L:N0} MB)")
+            Else
+                WriteToLog($"[ComputePi] mpR1 pre-alloc FAILED for {_r1Bytes \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+            End If
+
+            gmp_lib.mpz_init2(mpR2, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
+            Dim _r2Needed As Long = _numerSz + _q2SzR + 2L
+            Dim _r2Bytes As Long = _r2Needed * 8L
+            Dim _r2Buf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_r2Bytes)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If _r2Buf <> IntPtr.Zero Then
+                Dim _r2Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpR2.Pointer, 8))
+                VirtualFree(_r2Old, UIntPtr.Zero, MEM_RELEASE)
+                Runtime.InteropServices.Marshal.WriteInt32(mpR2.Pointer, 0, CInt(_r2Needed))
+                Runtime.InteropServices.Marshal.WriteInt64(mpR2.Pointer, 8, _r2Buf.ToInt64())
+                WriteToLog($"[ComputePi] mpR2 pre-alloc {_r2Needed:N0} limbs ({_r2Bytes \ 1048576L:N0} MB)")
+            Else
+                WriteToLog($"[ComputePi] mpR2 pre-alloc FAILED for {_r2Bytes \ 1048576L:N0} MB — will rely on GmpReallocFunc")
+            End If
+
 #If LOGGING_DETAIL >= 1 Then
             Dim _procP_pre = Process.GetCurrentProcess()
             Dim _ramP_pre As Long = _procP_pre.WorkingSet64 \ 1048576
