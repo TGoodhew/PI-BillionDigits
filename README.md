@@ -198,7 +198,22 @@ ThreadPool.SetMinThreads(Environment.ProcessorCount, Environment.ProcessorCount)
 
 **Headless mode (§63):** All three `MessageBox.Show` dialogs are gated behind `If Not _headless Then`. In headless mode the text is written to the phase log with a `[DIALOG]` prefix so automated runs leave a full audit trail without blocking.
 
-**`Run-PiCompute.ps1` (§63):** PowerShell script that clean-builds and launches the exe with `--digits 1000000000 --autostart --autoverify`. Supports `-Trace` (wraps the run in `dotnet-trace` to collect a CPU sampling `.nettrace` + plain-text `_report.txt`) and `-ReportOnly <path>` (re-generates the report from an existing trace without rebuilding).
+**`Run-PiCompute.ps1` (§63, §70):** PowerShell script that clean-builds and launches the exe. Machine-independent: the exe path is auto-detected by globbing `bin\Release\**\PI-BillionDigits.exe` after the build (no hardcoded TFM folder), and the output directory defaults to `.\PiOutput` next to the script (overridable via `-OutputDir`). Parameters: `-Digits N` (default 1B), `-OutputDir <path>`, `-Trace`, `-ReportOnly <path>`.
+
+**Quick start:**
+```powershell
+# Standard run
+.\Run-PiCompute.ps1
+
+# Custom digit count and output location
+.\Run-PiCompute.ps1 -Digits 100000000 -OutputDir "D:\PiResults"
+
+# With CPU trace
+.\Run-PiCompute.ps1 -Trace
+
+# Re-generate report from existing trace
+.\Run-PiCompute.ps1 -ReportOnly ".\pi_trace_20260331_121017.nettrace"
+```
 
 **P-core affinity + thread pool pre-warm (§66):** On hybrid CPUs (Intel P+E core), `GetLogicalProcessorInformationEx` is used to detect P-cores by `EfficiencyClass` and restrict the process affinity mask to those cores only. `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` pre-warms the thread pool before Phase 1 to eliminate first-task latency.
 
@@ -1943,11 +1958,27 @@ All three `MessageBox.Show` dialogs (compute complete, verify result, error) are
 Headless defaults applied at startup: `ChkboxDisplay.Checked = False`, `TxtChunkSize.Text = "500000"`, `ChkboxWriteToFile.Checked = True`.
 
 Added `Run-PiCompute.ps1`:
-- `dotnet clean` → `dotnet build --configuration Release` → launch exe with `--digits 1000000000 --autostart --autoverify`.
+- `dotnet clean` → `dotnet build --configuration Release` → launch exe with `--digits $Digits --autostart --autoverify`.
 - `-Trace` switch: wraps the run with `dotnet-trace collect` (providers: `Microsoft-DotNETCore-SampleProfiler:0xF00000000000:5` + `Microsoft-DotNETRuntime:0x1F000080018:5`), then calls `dotnet-trace report topN -n 50 --inclusive` and saves a `_report.txt` alongside the `.nettrace`.
 - `-ReportOnly <path>`: skips build/run; re-generates the topN report from an existing `.nettrace`.
-- Output directory hardcoded to `c:\PiOutput`; created if missing.
+- Output directory hardcoded to `c:\PiOutput`; created if missing. (Replaced in §70 — see below.)
 - `.gitignore` updated to exclude `*.nettrace`, `*.nettrace.etlx`, `*.etlx`, `*.etl`, `*.etl.zip`, `*.speedscope.json`, `*.diagsession`, `*.vspx`, `*.psess`, `*_report.txt`, `pi_trace_*`.
+
+---
+
+## Section 70 — Make Run-PiCompute.ps1 Machine-Independent
+
+**Branch:** AdvPerfWork
+
+**Change:** Three portability improvements to `Run-PiCompute.ps1`:
+
+1. **Auto-detect exe path** — after the build, `Get-ChildItem -Recurse` globs `bin\Release\**\PI-BillionDigits.exe` and takes the most recently written match. No hardcoded TFM folder (`net10.0-windows10.0.26100.0`) — works correctly when the target framework version changes or on machines with a different Windows SDK.
+
+2. **Relative output directory** — `$piOutputDir` replaced by `-OutputDir` parameter defaulting to `.\PiOutput` (i.e. a `PiOutput` folder next to the script). No longer requires write access to `c:\`. Override with `-OutputDir "D:\SomeOtherPath"` without editing the script body.
+
+3. **Configurable digit count** — `-Digits` parameter (default `1000000000`) passed through to the exe, replacing the hardcoded `--digits 1000000000`. Useful for quick test runs at lower digit counts.
+
+**Why:** The original hardcoded `c:\PiOutput` and `bin\Release\net10.0-windows10.0.26100.0` paths break silently on any machine where the system drive letter differs, the user lacks root-write permission, or the .NET SDK target framework version is updated. All machine-specific values are now computed defaults that work on a clean clone without any manual configuration.
 
 **Why:** Enabling unattended runs allows long (multi-hour) computations to be launched from a script or CI pipeline without leaving a blocking dialog open. The PowerShell script consolidates the clean/build/run/trace workflow into a single command.
 

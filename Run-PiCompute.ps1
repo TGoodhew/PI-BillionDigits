@@ -9,9 +9,22 @@
     No dialogs will appear during the run.  All suppressed dialog text
     is written to the phase log with a [DIALOG] prefix for review.
 
-    Output files (always written to c:\PiOutput):
+    The build output directory is auto-detected by globbing for
+    PI-BillionDigits.exe under bin\Release after the build — no hardcoded
+    TFM folder name.  The output directory defaults to .\PiOutput next to
+    the script, and can be overridden with -OutputDir.
+
+    Output files (written to OutputDir):
         pi_digits.txt      — computed Pi digits
         pi_phase_log.txt   — phase timings + suppressed dialog text
+
+.PARAMETER OutputDir
+    Directory for pi_digits.txt and pi_phase_log.txt.
+    Defaults to "PiOutput" next to the script.
+    Created automatically if it does not exist.
+
+.PARAMETER Digits
+    Number of Pi digits to compute.  Defaults to 1,000,000,000.
 
 .PARAMETER Trace
     Wrap the run in dotnet-trace to collect CPU sampling + runtime events.
@@ -26,10 +39,14 @@
 
 .EXAMPLE
     .\Run-PiCompute.ps1
+    .\Run-PiCompute.ps1 -OutputDir "D:\PiResults"
+    .\Run-PiCompute.ps1 -Digits 100000000
     .\Run-PiCompute.ps1 -Trace
-    .\Run-PiCompute.ps1 -ReportOnly "C:\...\pi_trace_20260331_121017.nettrace"
+    .\Run-PiCompute.ps1 -ReportOnly ".\pi_trace_20260331_121017.nettrace"
 #>
 param(
+    [string]$OutputDir  = (Join-Path $PSScriptRoot 'PiOutput'),
+    [long]  $Digits     = 1000000000,
     [switch]$Trace,
     [string]$ReportOnly = ""
 )
@@ -54,23 +71,20 @@ if ($ReportOnly -ne "") {
 
 $projectDir  = $PSScriptRoot
 $projectFile = Join-Path $projectDir 'PI-BillionDigits.vbproj'
-$buildDir    = Join-Path $projectDir 'bin\Release\net10.0-windows10.0.26100.0'
-$exePath     = Join-Path $buildDir   'PI-BillionDigits.exe'
-$piOutputDir = 'c:\PiOutput'
-$digitsFile  = Join-Path $piOutputDir 'pi_digits.txt'
-$logFile     = Join-Path $piOutputDir 'pi_phase_log.txt'
+$digitsFile  = Join-Path $OutputDir  'pi_digits.txt'
+$logFile     = Join-Path $OutputDir  'pi_phase_log.txt'
 
 Write-Host "=== PI-BillionDigits headless run ===" -ForegroundColor Cyan
 Write-Host "Project : $projectFile"
-Write-Host "Digits  : $digitsFile"
-Write-Host "Log     : $logFile"
+Write-Host "Output  : $OutputDir"
+Write-Host "Digits  : $Digits"
 if ($Trace) { Write-Host "Mode    : CPU trace enabled" -ForegroundColor Magenta }
 Write-Host ""
 
 # ── Ensure output directory exists ───────────────────────────────────────────
-if (-not (Test-Path $piOutputDir)) {
-    Write-Host "Creating output directory: $piOutputDir"
-    New-Item -ItemType Directory -Path $piOutputDir | Out-Null
+if (-not (Test-Path $OutputDir)) {
+    Write-Host "Creating output directory: $OutputDir"
+    New-Item -ItemType Directory -Path $OutputDir | Out-Null
 }
 
 # ── 1. Clean ─────────────────────────────────────────────────────────────────
@@ -84,7 +98,16 @@ Write-Host "--- dotnet build ---" -ForegroundColor Yellow
 dotnet build $projectFile --configuration Release --no-incremental
 if ($LASTEXITCODE -ne 0) { throw "dotnet build failed (exit $LASTEXITCODE)" }
 
-if (-not (Test-Path $exePath)) { throw "Exe not found after build: $exePath" }
+# ── Auto-detect exe path ─────────────────────────────────────────────────────
+$exeCandidates = Get-ChildItem -Path (Join-Path $projectDir 'bin\Release') `
+                               -Filter 'PI-BillionDigits.exe' `
+                               -Recurse -ErrorAction SilentlyContinue |
+                 Sort-Object LastWriteTime -Descending
+if ($exeCandidates.Count -eq 0) {
+    throw "PI-BillionDigits.exe not found under bin\Release after build."
+}
+$exePath = $exeCandidates[0].FullName
+Write-Host "Exe     : $exePath"
 
 # ── 3. Run (with or without trace) ───────────────────────────────────────────
 Write-Host ""
@@ -104,7 +127,7 @@ if ($Trace) {
     dotnet-trace collect `
         --output $traceFile `
         --providers "Microsoft-DotNETCore-SampleProfiler:0xF00000000000:5,Microsoft-DotNETRuntime:0x1F000080018:5" `
-        -- $exePath --digits 1000000000 --autostart --autoverify
+        -- $exePath --digits $Digits --autostart --autoverify
 
     if ($LASTEXITCODE -ne 0) { Write-Warning "dotnet trace exited with code $LASTEXITCODE" }
 
@@ -120,8 +143,8 @@ if ($Trace) {
         Write-Warning "Trace file not found — report skipped."
     }
 } else {
-    Write-Host "--- Launching (1,000,000,000 digits, autostart, autoverify) ---" -ForegroundColor Yellow
-    & $exePath --digits 1000000000 --autostart --autoverify
+    Write-Host "--- Launching ($Digits digits, autostart, autoverify) ---" -ForegroundColor Yellow
+    & $exePath --digits $Digits --autostart --autoverify
 }
 
 Write-Host ""
