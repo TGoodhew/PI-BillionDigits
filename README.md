@@ -2048,6 +2048,31 @@ Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately bef
 
 ---
 
+## Section 77 — Granular Per-Call Logging in §61 Multiply Block
+
+**Branch:** PerfWork
+
+**Change:** Added `WriteToLog` calls immediately before and after each of the six operations in the §61 serial multiply block (`Form1.vb` lines ~2779–2789):
+
+```
+[ComputePi] §61 calling r0 = N*Q0...
+[ComputePi] §61 r0 done
+[ComputePi] §61 calling r1 = N*Q1...
+[ComputePi] §61 r1 done
+[ComputePi] §61 calling r2 = N*Q2...
+[ComputePi] §61 r2 done
+[ComputePi] §61 calling mpz_clears(finalQ, mpQ1, mpQ2)...
+[ComputePi] §61 clears done
+[ComputePi] §61 calling mpz_swap(gmpNumer, mpR2)...
+[ComputePi] §61 swap done
+[ComputePi] §61 calling mpz_clear(mpR2)...
+[ComputePi] §61 clear r2 done
+```
+
+These logs are unconditional (not guarded by `LOGGING_DETAIL`) so they appear regardless of build configuration.
+
+**Why:** After the §76 fix, the app still crashes at the same log point on small (1M-digit) runs. The crash occurs somewhere in the six-operation block but without per-call markers it is impossible to tell which operation is responsible. The new markers will appear in the log before whichever operation crashes, pinpointing the exact call.
+
 ## Section 76 — Fix Three-Pass Multiply Pre-Alloc Crash on Small Digit Counts
 
 **Branch:** PerfWork

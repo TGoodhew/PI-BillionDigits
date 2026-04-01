@@ -2776,14 +2776,26 @@ Public Class Form1
             Dim _vmP_pre As Long = _procP_pre.PrivateMemorySize64 \ 1048576
             WriteToLog($"[ComputePi] §61 serial multiply start: r0=N*Q0, r1=N*Q1, r2=N*Q2  RAM:{_ramP_pre:N0}MB  Committed:{_vmP_pre:N0}MB")
 #End If
+            WriteToLog("[ComputePi] §61 calling r0 = N*Q0...")
             SafeMpzMul(mpR0, gmpNumer, finalQ)
+            WriteToLog("[ComputePi] §61 r0 done")
+            WriteToLog("[ComputePi] §61 calling r1 = N*Q1...")
             SafeMpzMul(mpR1, gmpNumer, mpQ1)
+            WriteToLog("[ComputePi] §61 r1 done")
+            WriteToLog("[ComputePi] §61 calling r2 = N*Q2...")
             SafeMpzMul(mpR2, gmpNumer, mpQ2)
+            WriteToLog("[ComputePi] §61 r2 done")
+            WriteToLog("[ComputePi] §61 calling mpz_clears(finalQ, mpQ1, mpQ2)...")
             gmp_lib.mpz_clears(finalQ, mpQ1, mpQ2, Nothing)
+            WriteToLog("[ComputePi] §61 clears done")
             ' Swap r2 into gmpNumer (same pattern as the old serial Pass 2 end).
             ' The old gmpNumer buffer (~208 MB, the 426880*sqrt value) is freed by the swap.
+            WriteToLog("[ComputePi] §61 calling mpz_swap(gmpNumer, mpR2)...")
             gmp_lib.mpz_swap(gmpNumer, mpR2)
+            WriteToLog("[ComputePi] §61 swap done")
+            WriteToLog("[ComputePi] §61 calling mpz_clear(mpR2)...")
             gmp_lib.mpz_clear(mpR2)
+            WriteToLog("[ComputePi] §61 clear r2 done")
 #If LOGGING_DETAIL >= 1 Then
             Dim _procP_post = Process.GetCurrentProcess()
             Dim _ramP_post As Long = _procP_post.WorkingSet64 \ 1048576
