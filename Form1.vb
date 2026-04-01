@@ -880,6 +880,55 @@ Public Class Form1
         Else
             WriteToLog("[DIALOG] Process Info: " & processInfoMsg.Replace(vbCrLf, " | "))
         End If
+
+        ' ── Tooltips ─────────────────────────────────────────────────────────
+        TipMain.AutoPopDelay = 10000   ' 10 s — long tooltips need time to read
+        TipMain.InitialDelay = 400
+        TipMain.ReshowDelay = 200
+        TipMain.SetToolTip(BtnCompute,
+            "Start computing Pi to the number of digits shown.")
+        TipMain.SetToolTip(BtnPause,
+            "Cancel the current computation. All progress will be lost.")
+        TipMain.SetToolTip(TxtDigitsofPI,
+            "Number of Pi digits to compute. For a full run use 1,000,000,000.")
+        TipMain.SetToolTip(Label2,
+            "Number of Pi digits to compute. For a full run use 1,000,000,000.")
+        TipMain.SetToolTip(ChkboxDisplay,
+            "Stream computed digits to the display panel below. " &
+            "Uncheck for faster headless runs — digits are still written to file if 'Write to File' is checked.")
+        TipMain.SetToolTip(ChkboxWriteToFile,
+            "Write the computed digits to a text file in the output directory when computation completes.")
+        TipMain.SetToolTip(NudRamThreshold,
+            "Controls when computation levels are kept in RAM vs written to disk. " &
+            "If the node count at a level is ≤ this value, that level stays in RAM (faster). " &
+            "If it exceeds this value, nodes are written to the NVMe cache (uses less RAM). " &
+            "Auto-detected from available system RAM at startup: ≥16 GB → 200,000 (all RAM); ≥8 GB → 100,000; <8 GB → 1 (full disk). " &
+            "Lower this if you get out-of-memory errors.")
+        TipMain.SetToolTip(LblRamThreshold,
+            "Controls when computation levels are kept in RAM vs written to disk. " &
+            "If the node count at a level is ≤ this value, that level stays in RAM (faster). " &
+            "If it exceeds this value, nodes are written to the NVMe cache (uses less RAM). " &
+            "Auto-detected from available system RAM at startup: ≥16 GB → 200,000 (all RAM); ≥8 GB → 100,000; <8 GB → 1 (full disk). " &
+            "Lower this if you get out-of-memory errors.")
+        TipMain.SetToolTip(BtnTest,
+            "Search the computed Pi digits for known sequences to verify correctness: " &
+            "999999 at position 762, 777777777 at position 24,658,601, and the first digits of e (27182818284).")
+        TipMain.SetToolTip(LblStatus,
+            "Current computation status and phase timing.")
+        TipMain.SetToolTip(Label1,
+            "Current computation status and phase timing.")
+        TipMain.SetToolTip(LblRunningTime,
+            "Elapsed wall-clock time since computation started.")
+        TipMain.SetToolTip(Label4,
+            "Elapsed wall-clock time since computation started.")
+        TipMain.SetToolTip(LblDigitsDisplayed,
+            "Number of digits streamed to the display panel so far.")
+        TipMain.SetToolTip(Label3,
+            "Number of digits streamed to the display panel so far.")
+        TipMain.SetToolTip(LstBoxPhases,
+            "Phase-by-phase timing log for the current run.")
+        TipMain.SetToolTip(RtbPiDigits,
+            "Computed Pi digits streamed here in real time (when Display is checked).")
     End Sub
 
     Private Sub Form1_Shown(sender As Object, e As EventArgs) Handles MyBase.Shown

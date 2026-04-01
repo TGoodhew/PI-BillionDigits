@@ -24,6 +24,7 @@ Partial Class Form1
     Private Sub InitializeComponent()
         components = New ComponentModel.Container()
         Timer1 = New Timer(components)
+        TipMain = New ToolTip(components)
         Panel1 = New Panel()
         LstBoxPhases = New ListBox()
         LblRamThreshold = New Label()
@@ -250,6 +251,7 @@ Partial Class Form1
         Panel1.PerformLayout()
         ResumeLayout(False)
     End Sub
+    Friend WithEvents TipMain As ToolTip
     Friend WithEvents Timer1 As Timer
     Friend WithEvents Panel1 As Panel
     Friend WithEvents LblDigitsDisplayed As Label
