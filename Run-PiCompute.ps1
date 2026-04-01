@@ -170,8 +170,12 @@ if ($Test) {
         $runDir = Join-Path $OutputDir ("test_" + $d.ToString())
         if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir | Out-Null }
 
+        # Use Start-Process -Wait: the exe is a WinForms GUI app and & returns immediately.
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        & $exePath --digits $d --autostart --autoverify --log-level 1 --output-dir $runDir
+        Start-Process -FilePath $exePath `
+            -ArgumentList @("--digits", $d, "--autostart", "--autoverify",
+                            "--log-level", $LogLevel, "--output-dir", $runDir) `
+            -NoNewWindow -Wait
         $sw.Stop()
         $elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 1)
 
