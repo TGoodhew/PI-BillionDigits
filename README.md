@@ -1980,9 +1980,23 @@ Added `Run-PiCompute.ps1`:
 
 **Why:** The original hardcoded `c:\PiOutput` and `bin\Release\net10.0-windows10.0.26100.0` paths break silently on any machine where the system drive letter differs, the user lacks root-write permission, or the .NET SDK target framework version is updated. All machine-specific values are now computed defaults that work on a clean clone without any manual configuration.
 
-**Why:** Enabling unattended runs allows long (multi-hour) computations to be launched from a script or CI pipeline without leaving a blocking dialog open. The PowerShell script consolidates the clean/build/run/trace workflow into a single command.
-
 ---
+
+## Section 71 — Portable Output Paths + Remove Vestigial Chunk Size UI
+
+**Branch:** AdvPerfWork
+
+**Change:** Three related clean-up items addressing issue #5:
+
+**1. Machine-independent output paths in Form1.vb**
+
+All hardcoded `c:\PiOutput` paths replaced with a single `Shared _outputDir` field defaulting to `%LOCALAPPDATA%\PI-BillionDigits` (always writable, no admin rights, works on any drive letter). `outputFile`, `LOG_FILE`, and `DISK_CACHE_DIR` are now computed `ReadOnly Property` values derived from `_outputDir`. The two `File.AppendAllText("c:\PiOutput\pi_phase_log.txt", ...)` calls in `StreamPiToScreen` and `DisplayTimer_Tick` that bypassed the logging subsystem are replaced with `WriteToLog(...)` calls.
+
+**2. Remove Chunk Size UI control**
+
+`TxtChunkSize` (TextBox) and its `Label5` ("Chunk Size:") label removed from the form. The control originally configured Phase 1 chunk size, which has been a compile-time constant (`Const CHUNK_SIZE As Long = 512`) since §49. Its only remaining effect was controlling `DisplayTimer_Tick` streaming speed (chars per 100 ms tick), which is now a code constant (`Const chunkSize As Integer = 500`). The headless default-setting line (`TxtChunkSize.Text = "500000"`) is also removed.
+
+**Why:** `TxtChunkSize` was presenting a misleading "Chunk Size" label to users that no longer did what it implied (Phase 1 computation granularity). Its actual effect (display streaming rate) is invisible to users running headless or with display off, and the default of 500 chars/tick is appropriate for interactive viewing of smaller runs. Removing it declutters the UI and eliminates a potential source of confusion.
 
 ## Section 64 — Skip Display Loop When Display Is Off
 

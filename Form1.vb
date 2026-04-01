@@ -31,7 +31,17 @@ Public Class Form1
     Private phaseStopWatch As New Stopwatch()
     Private cts As CancellationTokenSource
     Private DIGITS As Long
-    Private Const outputFile As String = "c:\PiOutput\pi_digits.txt"
+    ' Output directory: defaults to %LOCALAPPDATA%\PI-BillionDigits — always writable,
+    ' no admin rights required, works on any machine regardless of drive letter.
+    ' All output paths (digits file, log file, node cache) derive from this one field.
+    Private Shared _outputDir As String = System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "PI-BillionDigits")
+    Private ReadOnly Property outputFile As String
+        Get
+            Return System.IO.Path.Combine(_outputDir, "pi_digits.txt")
+        End Get
+    End Property
     Private displayStr As String = ""
     Private displayIdx As Integer = 0
     Private displayTotal As Long = 0
@@ -81,7 +91,11 @@ Public Class Form1
     End Sub
 
     ' Disk-based node storage for massive computations
-    Private Const DISK_CACHE_DIR As String = "c:\PiOutput\NodeCache\"
+    Private Shared ReadOnly Property DISK_CACHE_DIR As String
+        Get
+            Return System.IO.Path.Combine(_outputDir, "NodeCache") & System.IO.Path.DirectorySeparatorChar
+        End Get
+    End Property
 
     ' ── Issue #4 fix: DiskNode changed from Class to Structure ──────────────
     ' Value types stored in List(Of DiskNode) live inside the list's internal
@@ -750,7 +764,6 @@ Public Class Form1
         displayTimer.Interval = 100
         displayTimer.Enabled = False
         RtbPiDigits.Dock = DockStyle.Fill
-        TxtChunkSize.Text = If(_headless, "500000", "500")
         If _headless Then ChkboxWriteToFile.Checked = True
         LstBoxPhases.Items.Clear()
 
@@ -861,7 +874,11 @@ Public Class Form1
     '  Logging helpers
     ' ════════════════════════════════════════════════════════════════════════
 
-    Private Const LOG_FILE As String = "c:\PiOutput\pi_phase_log.txt"
+    Private Shared ReadOnly Property LOG_FILE As String
+        Get
+            Return System.IO.Path.Combine(_outputDir, "pi_phase_log.txt")
+        End Get
+    End Property
 
     ''' <summary>
     ''' Low-level log writer. Thread-safe, no UI interaction.
@@ -959,7 +976,7 @@ Public Class Form1
 #Else
             Dim loggingMode As String = "MAJOR PHASES ONLY"
 #End If
-            System.IO.File.WriteAllText("c:\PiOutput\pi_phase_log.txt",
+            System.IO.File.WriteAllText(LOG_FILE,
                 $"=== PI Computation Started {DateTime.Now} ===" & vbCrLf &
                 $"=== Digits: {DIGITS:N0} ===" & vbCrLf &
                 $"=== Logging: {loggingMode} ===" & vbCrLf)
@@ -1776,7 +1793,7 @@ Public Class Form1
         ' metadata overhead at the start of every run).  Each thread serializes
         ' to a MemoryStream outside the lock; only the file-position record and
         ' write happen under SyncLock, keeping lock hold-time minimal.
-        Const L0_BIN_PATH As String = DISK_CACHE_DIR & "L0.bin"
+        Dim L0_BIN_PATH As String = DISK_CACHE_DIR & "L0.bin"
         Dim l0Stream As FileStream = Nothing
         Dim l0Lock As New Object()
         If numChunks > DISK_THRESHOLD Then
@@ -2909,12 +2926,7 @@ Public Class Form1
     Private Sub StreamPiToScreen(piString As String)
         Dim digitCount As Long = If(_displayNativePtr <> IntPtr.Zero, _displayNativeLen, CLng(piString.Length))
         LstBoxPhases.Items.Add($"{stopWatch.Elapsed:hh\:mm\:ss\.ff} | Streaming started")
-        Try
-            System.IO.File.AppendAllText("c:\PiOutput\pi_phase_log.txt",
-                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") &
-                $" | Streaming started ({digitCount:N0} digits)" & vbCrLf)
-        Catch
-        End Try
+        WriteToLog($"Streaming started ({digitCount:N0} digits)")
 
         ' Fast path: display is off — skip the timer loop entirely and go straight
         ' to file write (if requested), then re-enable the Compute button.
@@ -2991,12 +3003,7 @@ Public Class Form1
             Timer1.Stop()
 
             LstBoxPhases.Items.Add($"{stopWatch.Elapsed:hh\:mm\:ss\.ff} | Streaming complete")
-            Try
-                System.IO.File.AppendAllText("c:\PiOutput\pi_phase_log.txt",
-                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") &
-                    " | Streaming complete" & vbCrLf)
-            Catch
-            End Try
+            WriteToLog("Streaming complete")
 
             WriteResultToFile(CLng(totalLen))
 
@@ -3011,10 +3018,9 @@ Public Class Form1
             Return
         End If
 
-        Dim chunkSize As Integer = 500
-        If Integer.TryParse(TxtChunkSize.Text, chunkSize) = False Then chunkSize = 500
-        If chunkSize < 1 Then chunkSize = 1
-        If chunkSize > 1000000 Then chunkSize = 1000000
+        ' Display streaming chunk: 500 chars/tick at 100 ms interval = ~5,000 chars/sec.
+        ' Sufficient for interactive viewing; irrelevant for headless runs (display is off).
+        Const chunkSize As Integer = 500
         Dim chunkEnd As Integer = System.Math.Min(displayIdx + chunkSize, totalLen)
 
         Dim chunk As New System.Text.StringBuilder()
