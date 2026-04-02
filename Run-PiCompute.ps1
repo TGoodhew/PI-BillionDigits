@@ -76,6 +76,7 @@ param(
     [string]$OutputDir  = 'C:\PiOutput',
     [long]  $Digits     = 1000000000,
     [int]   $LogLevel   = 1,
+    [long]  $Threshold  = 0,
     [switch]$Trace,
     [switch]$Test,
     [string]$ReportOnly = ""
@@ -109,6 +110,7 @@ Write-Host "Project  : $projectFile"
 Write-Host "Output   : $OutputDir"
 Write-Host "Digits   : $Digits"
 Write-Host "LogLevel : $LogLevel"
+if ($Threshold -gt 0) { Write-Host "Threshold: $($Threshold.ToString('N0')) nodes (RAM only)" -ForegroundColor Yellow }
 if ($Trace) { Write-Host "Mode     : CPU trace enabled" -ForegroundColor Magenta }
 Write-Host ""
 
@@ -177,20 +179,21 @@ if ($Test) {
             $runTraceFile  = Join-Path $runDir "trace.nettrace"
             $runReportFile = Join-Path $runDir "trace_report.txt"
             Write-Host "  [trace] $runTraceFile" -ForegroundColor DarkMagenta
+            $traceArgs = @("--digits", $d, "--autostart", "--autoverify", "--log-level", $LogLevel, "--output-dir", $runDir)
+            if ($Threshold -gt 0) { $traceArgs += @("--threshold", $Threshold) }
             dotnet-trace collect `
                 --output $runTraceFile `
                 --providers "Microsoft-DotNETCore-SampleProfiler:0xF00000000000:5,Microsoft-DotNETRuntime:0x1F000080018:5" `
-                -- $exePath --digits $d --autostart --autoverify --log-level $LogLevel --output-dir $runDir
+                -- $exePath @traceArgs
             if (Test-Path $runTraceFile) {
                 dotnet-trace report $runTraceFile topN -n 20 --inclusive |
                     Out-File -FilePath $runReportFile -Encoding utf8
             }
         } else {
             # Use Start-Process -Wait: the exe is a WinForms GUI app and & returns immediately.
-            Start-Process -FilePath $exePath `
-                -ArgumentList @("--digits", $d, "--autostart", "--autoverify",
-                                "--log-level", $LogLevel, "--output-dir", $runDir) `
-                -NoNewWindow -Wait
+            $runArgs = @("--digits", $d, "--autostart", "--autoverify", "--log-level", $LogLevel, "--output-dir", $runDir)
+            if ($Threshold -gt 0) { $runArgs += @("--threshold", $Threshold) }
+            Start-Process -FilePath $exePath -ArgumentList $runArgs -NoNewWindow -Wait
         }
         $sw.Stop()
         $elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 1)
@@ -294,10 +297,12 @@ if ($Trace) {
     Write-Host "Report : $reportFile"
     Write-Host ""
 
+    $mainArgs = @("--digits", $Digits, "--autostart", "--autoverify", "--log-level", $LogLevel)
+    if ($Threshold -gt 0) { $mainArgs += @("--threshold", $Threshold) }
     dotnet-trace collect `
         --output $traceFile `
         --providers "Microsoft-DotNETCore-SampleProfiler:0xF00000000000:5,Microsoft-DotNETRuntime:0x1F000080018:5" `
-        -- $exePath --digits $Digits --autostart --autoverify --log-level $LogLevel
+        -- $exePath @mainArgs
 
     if ($LASTEXITCODE -ne 0) { Write-Warning "dotnet trace exited with code $LASTEXITCODE" }
 
@@ -314,7 +319,9 @@ if ($Trace) {
     }
 } else {
     Write-Host "--- Launching ($Digits digits, autostart, autoverify, log-level $LogLevel) ---" -ForegroundColor Yellow
-    & $exePath --digits $Digits --autostart --autoverify --log-level $LogLevel
+    $mainArgs = @("--digits", $Digits, "--autostart", "--autoverify", "--log-level", $LogLevel)
+    if ($Threshold -gt 0) { $mainArgs += @("--threshold", $Threshold) }
+    & $exePath @mainArgs
 }
 
 Write-Host ""

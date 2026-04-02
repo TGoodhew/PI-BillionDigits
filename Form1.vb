@@ -1750,18 +1750,42 @@ Public Class Form1
 
         ' Split opB into three pieces upfront: opB is small so all three pieces coexist cheaply.
         ' opA and opB are Q/P values from Chudnovsky binary split, always non-negative.
-        ' §25: raw DllImport — struct headers via Marshal.AllocHGlobal(16), limb buffers via
-        ' GmpRaw_init (same path as gmp_lib.mpz_init). Cleanup: GmpRaw_clear + FreeHGlobal.
+        ' §90: Zero-copy limb-window pieces — struct headers point directly into opB's limb array.
+        ' No init/tdiv needed; safe for bitsB > UInt32.Max. GMP reads pieces but never rewrites them.
+        ' Cleanup: FreeHGlobal(header) only — GmpRaw_clear would free opB's buffer (catastrophic).
         Dim B0 As New mpz_t(), B1 As New mpz_t(), B2 As New mpz_t()
-        B0.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(B0.Pointer)
-        B1.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(B1.Pointer)
-        B2.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(B2.Pointer)
-        Dim _Btmp As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(_Btmp)
-        GmpRaw_tdiv_r_2exp(B0.Pointer, opB.Pointer, CUInt(bitsB))
-        GmpRaw_tdiv_q_2exp(_Btmp, opB.Pointer, CUInt(bitsB))
-        GmpRaw_tdiv_r_2exp(B1.Pointer, _Btmp, CUInt(bitsB))
-        GmpRaw_tdiv_q_2exp(B2.Pointer, _Btmp, CUInt(bitsB))
-        GmpRaw_clear(_Btmp) : Runtime.InteropServices.Marshal.FreeHGlobal(_Btmp)
+        B0.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+        B1.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+        B2.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+        Dim _opB_d As Long = Runtime.InteropServices.Marshal.ReadInt64(opB.Pointer, 8)
+        ' B0 = limbs [0, mB) of opB
+        Dim _B0_szT As Integer = CInt(System.Math.Min(CLng(szB), CLng(mB)))
+        While _B0_szT > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_opB_d + CLng(_B0_szT - 1) * 8L)) = 0L
+            _B0_szT -= 1
+        End While
+        Runtime.InteropServices.Marshal.WriteInt32(B0.Pointer, 0, CInt(mB))
+        Runtime.InteropServices.Marshal.WriteInt32(B0.Pointer, 4, _B0_szT)
+        Runtime.InteropServices.Marshal.WriteInt64(B0.Pointer, 8, _opB_d)
+        ' B1 = limbs [mB, 2*mB) of opB
+        Dim _B1_d As Long = _opB_d + CLng(mB) * 8L
+        Dim _B1_szT As Integer = CInt(System.Math.Min(CLng(szB) - CLng(mB), CLng(mB)))
+        If _B1_szT < 0 Then _B1_szT = 0
+        While _B1_szT > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_B1_d + CLng(_B1_szT - 1) * 8L)) = 0L
+            _B1_szT -= 1
+        End While
+        Runtime.InteropServices.Marshal.WriteInt32(B1.Pointer, 0, CInt(mB))
+        Runtime.InteropServices.Marshal.WriteInt32(B1.Pointer, 4, _B1_szT)
+        Runtime.InteropServices.Marshal.WriteInt64(B1.Pointer, 8, _B1_d)
+        ' B2 = limbs [2*mB, szB) of opB
+        Dim _B2_d As Long = _opB_d + 2L * CLng(mB) * 8L
+        Dim _B2_limbs As Long = System.Math.Max(0L, CLng(szB) - 2L * CLng(mB))
+        Dim _B2_szT As Integer = CInt(_B2_limbs)
+        While _B2_szT > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_B2_d + CLng(_B2_szT - 1) * 8L)) = 0L
+            _B2_szT -= 1
+        End While
+        Runtime.InteropServices.Marshal.WriteInt32(B2.Pointer, 0, CInt(_B2_limbs))
+        Runtime.InteropServices.Marshal.WriteInt32(B2.Pointer, 4, _B2_szT)
+        Runtime.InteropServices.Marshal.WriteInt64(B2.Pointer, 8, _B2_d)
         If _logLevel >= 4 AndAlso CLng(szA) + CLng(szB) > 10_000_000L Then
             AppendLog(
                 $"[SafeMpzMul] B-pieces | " &
@@ -1770,40 +1794,42 @@ Public Class Form1
                 $"B2.Ptr={B2.Pointer.ToInt64():X} B2_sz={Runtime.InteropServices.Marshal.ReadInt32(B2.Pointer, 4):N0}{vbCrLf}")
         End If
 
-        ' §59: Pre-extract all three A pieces upfront so all 9 sub-products can run in parallel.
-        ' mpz_init2(bitsA) pre-allocates _mp_alloc >= mA before direct limb copies (A1, A2).
-        ' §25: raw DllImport — same Marshal.AllocHGlobal(16) + GmpRaw_init2 pattern.
+        ' §90: Zero-copy limb-window pieces for A — headers point directly into opA's limb array.
+        ' No init2/tdiv/CopyMemory needed; safe for bitsA > UInt32.Max.
+        ' Cleanup: FreeHGlobal(header) only — GmpRaw_clear would free opA's buffer (catastrophic).
         Dim A0 As New mpz_t(), A1 As New mpz_t(), A2 As New mpz_t()
-        A0.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init2(A0.Pointer, bitsA)
-        A1.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init2(A1.Pointer, bitsA)
-        A2.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init2(A2.Pointer, bitsA)
-
-        ' A0 = opA mod 2^bitsA  (low mA limbs)
-        GmpRaw_tdiv_r_2exp(A0.Pointer, opA.Pointer, CUInt(bitsA))
-
-        ' A1 = limbs [mA, 2*mA) — direct copy into pre-alloc'd buffer
+        A0.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+        A1.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+        A2.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
         Dim _pre_opA_d As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
-        Dim _A1_src As IntPtr = New IntPtr(_pre_opA_d + CLng(mA) * 8L)
-        Dim _A1_dst As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(A1.Pointer, 8))
-        CopyMemory(_A1_dst, _A1_src, New UIntPtr(CULng(mA) * 8UL))
-        Dim _A1_sz As Integer = CInt(mA)
-        Dim _A1_dstL As Long = _A1_dst.ToInt64()
-        While _A1_sz > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_A1_dstL + CLng(_A1_sz - 1) * 8L)) = 0L
-            _A1_sz -= 1
+        ' A0 = limbs [0, mA) of opA
+        Dim _A0_szT As Integer = CInt(System.Math.Min(CLng(szA), CLng(mA)))
+        While _A0_szT > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_pre_opA_d + CLng(_A0_szT - 1) * 8L)) = 0L
+            _A0_szT -= 1
         End While
-        Runtime.InteropServices.Marshal.WriteInt32(A1.Pointer, 4, _A1_sz)
-
-        ' A2 = limbs [2*mA, szA) — direct copy
-        Dim _A2_limbs As Long = CLng(szA) - 2L * CLng(mA)
-        Dim _A2_src As IntPtr = New IntPtr(_pre_opA_d + 2L * CLng(mA) * 8L)
-        Dim _A2_dst As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(A2.Pointer, 8))
-        CopyMemory(_A2_dst, _A2_src, New UIntPtr(CULng(_A2_limbs) * 8UL))
-        Dim _A2_sz As Integer = CInt(_A2_limbs)
-        Dim _A2_dstL As Long = _A2_dst.ToInt64()
-        While _A2_sz > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_A2_dstL + CLng(_A2_sz - 1) * 8L)) = 0L
-            _A2_sz -= 1
+        Runtime.InteropServices.Marshal.WriteInt32(A0.Pointer, 0, CInt(mA))
+        Runtime.InteropServices.Marshal.WriteInt32(A0.Pointer, 4, _A0_szT)
+        Runtime.InteropServices.Marshal.WriteInt64(A0.Pointer, 8, _pre_opA_d)
+        ' A1 = limbs [mA, 2*mA) of opA
+        Dim _A1_d As Long = _pre_opA_d + CLng(mA) * 8L
+        Dim _A1_szT As Integer = CInt(System.Math.Min(CLng(szA) - CLng(mA), CLng(mA)))
+        If _A1_szT < 0 Then _A1_szT = 0
+        While _A1_szT > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_A1_d + CLng(_A1_szT - 1) * 8L)) = 0L
+            _A1_szT -= 1
         End While
-        Runtime.InteropServices.Marshal.WriteInt32(A2.Pointer, 4, _A2_sz)
+        Runtime.InteropServices.Marshal.WriteInt32(A1.Pointer, 0, CInt(mA))
+        Runtime.InteropServices.Marshal.WriteInt32(A1.Pointer, 4, _A1_szT)
+        Runtime.InteropServices.Marshal.WriteInt64(A1.Pointer, 8, _A1_d)
+        ' A2 = limbs [2*mA, szA) of opA
+        Dim _A2_d As Long = _pre_opA_d + 2L * CLng(mA) * 8L
+        Dim _A2_limbs As Long = System.Math.Max(0L, CLng(szA) - 2L * CLng(mA))
+        Dim _A2_szT As Integer = CInt(_A2_limbs)
+        While _A2_szT > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_A2_d + CLng(_A2_szT - 1) * 8L)) = 0L
+            _A2_szT -= 1
+        End While
+        Runtime.InteropServices.Marshal.WriteInt32(A2.Pointer, 0, CInt(_A2_limbs))
+        Runtime.InteropServices.Marshal.WriteInt32(A2.Pointer, 4, _A2_szT)
+        Runtime.InteropServices.Marshal.WriteInt64(A2.Pointer, 8, _A2_d)
 
         Dim A_parts() As mpz_t = {A0, A1, A2}
         Dim B_parts() As mpz_t = {B0, B1, B2}
@@ -1888,14 +1914,15 @@ Public Class Form1
             Else
                 ' §23: reset _mp_size only — shared buffer already covers the maximum size.
                 Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 4, 0)
-                If shiftBits <= CULng(UInt32.MaxValue) Then
-                    GmpRaw_mul_2exp(_sv_shifted_hdr, _sv_prod, CUInt(shiftBits))
-                Else
-                    Dim _shift1 As ULong = shiftBits \ 2UL
-                    Dim _shift2 As ULong = shiftBits - _shift1
-                    GmpRaw_mul_2exp(_sv_shifted_hdr, _sv_prod, CUInt(_shift1))
-                    GmpRaw_mul_2exp(_sv_shifted_hdr, _sv_shifted_hdr, CUInt(_shift2))
-                End If
+                ' §90: chunk-based shift — handles shiftBits > UInt32.Max (e.g. ~22B bits at 5B digits).
+                Dim _shiftSrc As IntPtr = _sv_prod
+                Dim _shiftRem As ULong = shiftBits
+                While _shiftRem > 0UL
+                    Dim _chunk As UInteger = CUInt(System.Math.Min(_shiftRem, CULng(UInt32.MaxValue)))
+                    GmpRaw_mul_2exp(_sv_shifted_hdr, _shiftSrc, _chunk)
+                    _shiftSrc = _sv_shifted_hdr
+                    _shiftRem -= CULng(_chunk)
+                End While
                 GmpRaw_add(accumPtr, accumPtr, _sv_shifted_hdr)
             End If
             ' Free prod_k immediately after accumulation to limit peak RAM.
@@ -1931,14 +1958,17 @@ Public Class Form1
         If resultSign < 0 Then GmpRaw_neg(savedResultPtr, savedResultPtr)
 
         ' §59: prods(0..8) are already cleared inside the accumulation loop.
-        ' §25: raw clear + FreeHGlobal for all objects allocated with Marshal.AllocHGlobal headers.
         GmpRaw_clear(shifted.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(shifted.Pointer)
-        GmpRaw_clear(A0.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(A0.Pointer)
-        GmpRaw_clear(A1.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(A1.Pointer)
-        GmpRaw_clear(A2.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(A2.Pointer)
-        GmpRaw_clear(B0.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(B0.Pointer)
-        GmpRaw_clear(B1.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(B1.Pointer)
-        GmpRaw_clear(B2.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(B2.Pointer)
+        ' §90: zero-copy pieces — only free the 16-byte struct headers; _mp_d aliases opA/opB so
+        ' GmpRaw_clear must NOT be called (it would free opA/opB's limb buffer — catastrophic).
+        ' Null out Pointer before FreeHGlobal: mpz_t's GC finalizer calls mpz_clear if Pointer≠null,
+        ' which would pass opA/opB's _mp_d to GmpFreeFunc — a concurrent double-free.
+        Dim _A0p = A0.Pointer : A0.Pointer = IntPtr.Zero : Runtime.InteropServices.Marshal.FreeHGlobal(_A0p)
+        Dim _A1p = A1.Pointer : A1.Pointer = IntPtr.Zero : Runtime.InteropServices.Marshal.FreeHGlobal(_A1p)
+        Dim _A2p = A2.Pointer : A2.Pointer = IntPtr.Zero : Runtime.InteropServices.Marshal.FreeHGlobal(_A2p)
+        Dim _B0p = B0.Pointer : B0.Pointer = IntPtr.Zero : Runtime.InteropServices.Marshal.FreeHGlobal(_B0p)
+        Dim _B1p = B1.Pointer : B1.Pointer = IntPtr.Zero : Runtime.InteropServices.Marshal.FreeHGlobal(_B1p)
+        Dim _B2p = B2.Pointer : B2.Pointer = IntPtr.Zero : Runtime.InteropServices.Marshal.FreeHGlobal(_B2p)
         AppendLog(
             $"[SafeMpzMul] cleared: szA={szA:N0} szB={szB:N0}{vbCrLf}")
     End Sub
@@ -2584,7 +2614,19 @@ Public Class Form1
             gmpVariablesInitialized = True
 
             If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_ui_pow_ui: 10^{digits:N0}")
-            gmp_lib.mpz_ui_pow_ui(gmpOne, 10UI, CUInt(digits))
+            If CULng(digits) <= CULng(UInt32.MaxValue) Then
+                gmp_lib.mpz_ui_pow_ui(gmpOne, 10UI, CUInt(digits))
+            Else
+                ' §90: digits > 2^32 — split into two halves, each fits in UInt32, then multiply.
+                Dim _powHalfA As Long = digits \ 2L
+                Dim _powHalfB As Long = digits - _powHalfA
+                Dim _gmpPowA As New mpz_t(), _gmpPowB As New mpz_t()
+                gmp_lib.mpz_inits(_gmpPowA, _gmpPowB, Nothing)
+                gmp_lib.mpz_ui_pow_ui(_gmpPowA, 10UI, CUInt(_powHalfA))
+                gmp_lib.mpz_ui_pow_ui(_gmpPowB, 10UI, CUInt(_powHalfB))
+                SafeMpzMul(gmpOne, _gmpPowA, _gmpPowB)
+                gmp_lib.mpz_clears(_gmpPowA, _gmpPowB, Nothing)
+            End If
             If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_mul: gmpSqrtInput = gmpOne^2")
             SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)
             AppendLog(

@@ -4,6 +4,52 @@
 
 PI-BillionDigits is a Windows Forms application that computes Pi to an arbitrary number of decimal digits — up to and including one billion — and displays the result. It is written in VB.NET targeting .NET 10 and uses the [Math.Gmp.Native](https://www.nuget.org/packages/Math.Gmp.Native.NET/) wrapper around the GNU Multiple Precision Arithmetic Library (GMP) for all big-integer arithmetic.
 
+## UPDATE: Tested up to 5 billion digits
+
+The application has been extended beyond its original 1-billion-digit target and successfully tested at **5,000,000,000 decimal digits** of Pi.
+
+### What changed
+
+The original implementation hit three 32-bit integer limits that are not reached at 1 billion digits but are exceeded at 5 billion:
+
+**1. `mpz_ui_pow_ui` argument overflow**
+Computing `10^N` for the final decimal scaling calls `mpz_ui_pow_ui(result, 10, N)`. GMP's `mp_bitcnt_t` is a 32-bit `unsigned long` on Windows (MSVC LLP64), so `N` is silently truncated when `N > 4,294,967,295`. At 5 billion digits this wraps to 705,032,704, producing the wrong scale factor. Fix: split into two halves (`mpz_ui_pow_ui(a, 10, N/2)` × `mpz_ui_pow_ui(b, 10, N-N/2)`) and combine with `SafeMpzMul`.
+
+**2. Shift-accumulation overflow in `SafeMpzMul`**
+During the 3×3 sub-product accumulation loop, each sub-product is shifted left by up to `2×bitsA + 2×bitsB` bits before being added to the accumulator. At 5 billion digits the maximum shift reaches ~22 billion bits — roughly 5× UInt32.MaxValue. The previous two-step split (`shift/2` twice) still overflowed because each half is ~11 billion bits. Fix: a chunk-based loop that applies at most `UInt32.MaxValue` bits per `mul_2exp` call, repeating until the full shift is applied.
+
+**3. Piece-extraction overflow in `SafeMpzMul`**
+The 3-way operand split extracts three sub-pieces (A0, A1, A2 and B0, B1, B2) from each input. The previous code used `mpz_init2(piece, bitsA)` to pre-allocate the piece buffer and `mpz_tdiv_r_2exp(piece, op, bitsA)` to extract the limbs — both of which take a 32-bit bit count on Windows. At 5 billion digits `bitsA ≈ 5.5 billion > UInt32.MaxValue`, so `init2` allocated far too few limbs and `tdiv` extracted the wrong range. Fix: **zero-copy limb windows** — each piece struct header is wired to point directly into the source operand's existing limb array at the correct offset, with no allocation and no data copying. This is safe because GMP only reads the piece values as multiplication inputs and never writes to them.
+
+### Performance impact of the zero-copy change
+
+The zero-copy piece extraction is also a **performance improvement at 1 billion digits**, because it eliminates:
+- Two `CopyMemory` calls of ~230 MB each per top-level `SafeMpzMul` entry (the old A1/A2 extraction copies)
+- Six `GmpRaw_init`/`GmpRaw_init2` calls and their matching allocations/frees
+- Four `mpz_tdiv_r/q_2exp` calls
+
+Profiling (dotnet-trace topN) shows `SafeMpzMul` exclusive time dropped from **17.98% → 14.82%** at 1 billion digits.
+
+### How to run at 5 billion digits
+
+The `Run-PiCompute.ps1` script now accepts a `-Threshold` parameter that overrides the RAM/disk threshold. At 5 billion digits the number of Phase 1 chunks (~688,000) exceeds the default threshold; pass a large value to keep everything in RAM and avoid disk I/O during the combine phase.
+
+**Requirements:** ~25–30 GB available RAM, 64-bit Windows, .NET 10.
+
+```powershell
+.\Run-PiCompute.ps1 -Digits 5000000000 -Threshold 1000000 -LogLevel 2
+```
+
+To also capture a CPU profile:
+
+```powershell
+.\Run-PiCompute.ps1 -Digits 5000000000 -Threshold 1000000 -LogLevel 2 -Trace
+```
+
+The run takes several hours. Progress is written to `C:\PiOutput\pi_phase_log.txt` as it proceeds.
+
+---
+
 ## How it works
 
 The computation uses the **Chudnovsky algorithm** with **binary splitting**, which is the standard approach for computing billions of digits of Pi efficiently.
