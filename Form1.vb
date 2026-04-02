@@ -2354,9 +2354,16 @@ Public Class Form1
                     '   tempB are all still live, which was pushing peak RAM from
                     '   ~1,781 MB to ~2,215 MB and triggering a GMP abort().
                     '   After the add, tempB is freed and tempA holds the T result.
-                    ' Steps 1 & 2: newP = leftP*rightP and newQ = leftQ*rightQ are fully
-                    ' independent (disjoint operands) — run both on the thread pool simultaneously.
-                    ' WriteToLog is thread-safe via SyncLock _logLock.
+                    ' Steps 1 & 2: newP = leftP*rightP and newQ = leftQ*rightQ.
+                    ' §91: When pairCount=1 (a single pair at the very top of the combine tree)
+                    ' the operands are the largest in the entire computation. Each SafeMpzMul
+                    ' already saturates all cores via its inner Parallel.For (DOP=ProcessorCount).
+                    ' Running both simultaneously via Parallel.Invoke doubles peak FFT scratch
+                    ' (18 concurrent GmpRaw_mul × 200-250 MB each = 3-4 GB extra), which can
+                    ' cause GmpAllocFunc to fail at 5B+ digits. Run sequentially instead — no
+                    ' throughput loss since all cores are busy inside the single SafeMpzMul.
+                    ' At pairCount >= 2 the operands are smaller (earlier combine levels) and
+                    ' Parallel.Invoke remains beneficial.
                     If _logLevel >= 3 AndAlso isTopLevel Then
                         Dim _szLP As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftP.Pointer, 4)
                         Dim _szRP As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightP.Pointer, 4)
@@ -2365,14 +2372,19 @@ Public Class Form1
                         Dim _szRQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightQ.Pointer, 4)
                         WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newQ  leftQ={System.Math.Abs(_szLQ):N0} rightQ={System.Math.Abs(_szRQ):N0} limbs")
                     End If
-                    System.Threading.Tasks.Parallel.Invoke(
-                        Sub() SafeMpzMul(newP, leftP, rightP),
-                        Sub() SafeMpzMul(newQ, leftQ, rightQ))
+                    If pairCount >= 2L Then
+                        System.Threading.Tasks.Parallel.Invoke(
+                            Sub() SafeMpzMul(newP, leftP, rightP),
+                            Sub() SafeMpzMul(newQ, leftQ, rightQ))
+                    Else
+                        SafeMpzMul(newP, leftP, rightP)
+                        SafeMpzMul(newQ, leftQ, rightQ)
+                    End If
                     gmp_lib.mpz_clears(rightP, Nothing)             ' rightP done
                     gmp_lib.mpz_clears(leftQ, Nothing)              ' leftQ done
 
-                    ' Steps 3 & 4: tempA = leftT*rightQ and tempB = leftP*rightT are fully
-                    ' independent (disjoint operands) — run both on the thread pool simultaneously.
+                    ' Steps 3 & 4: tempA = leftT*rightQ and tempB = leftP*rightT.
+                    ' §91: Same sequential-at-pairCount=1 rule as steps 1 & 2.
                     If _logLevel >= 3 AndAlso isTopLevel Then
                         Dim _szLT As Integer = Runtime.InteropServices.Marshal.ReadInt32(leftT.Pointer, 4)
                         Dim _szRQ2 As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightQ.Pointer, 4)
@@ -2381,9 +2393,14 @@ Public Class Form1
                         Dim _szRT As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightT.Pointer, 4)
                         WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempB  leftP={System.Math.Abs(_szLP2):N0} rightT={System.Math.Abs(_szRT):N0} limbs")
                     End If
-                    System.Threading.Tasks.Parallel.Invoke(
-                        Sub() SafeMpzMul(tempA, leftT, rightQ),
-                        Sub() SafeMpzMul(tempB, leftP, rightT))
+                    If pairCount >= 2L Then
+                        System.Threading.Tasks.Parallel.Invoke(
+                            Sub() SafeMpzMul(tempA, leftT, rightQ),
+                            Sub() SafeMpzMul(tempB, leftP, rightT))
+                    Else
+                        SafeMpzMul(tempA, leftT, rightQ)
+                        SafeMpzMul(tempB, leftP, rightT)
+                    End If
                     gmp_lib.mpz_clears(leftT, rightQ, Nothing)      ' leftT, rightQ done
                     gmp_lib.mpz_clears(leftP, rightT, Nothing)      ' leftP, rightT done
 
