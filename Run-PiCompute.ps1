@@ -46,6 +46,18 @@
     Combine with -Trace to run dotnet-trace on every power-of-10 run; per-run
     trace reports are appended to the combined report.
 
+.PARAMETER CheckpointFromLevel
+    Serialize combine nodes at this level and above to disk regardless of -Threshold.
+    Use this on a run that might crash so checkpoint files are available for -ResumeFromLevel.
+    Example: -CheckpointFromLevel 15 writes nodes for levels 15, 16, 17, 18, 19 to disk.
+    Files are written as L{level-1}_N{index}.bin in the NodeCache directory.
+
+.PARAMETER ResumeFromLevel
+    Skip Phase 1 and levels 1..N-1.  Load the L{N-1}_N*.bin checkpoint files written
+    by a previous run with -CheckpointFromLevel N and continue Phase 2 from level N.
+    The -Digits value must match the original run so numChunks is computed correctly.
+    Example: -ResumeFromLevel 15 reads L14_N*.bin files and resumes Phase 2 at level 15.
+
 .PARAMETER LogLevel
     Logging detail level passed to the exe as --log-level N.  Defaults to 1.
       0  None        Errors and crashes only. Silent on success.
@@ -71,15 +83,19 @@
     .\Run-PiCompute.ps1 -Test -Digits 1000000
     .\Run-PiCompute.ps1 -Test -Trace
     .\Run-PiCompute.ps1 -ReportOnly ".\pi_trace_20260331_121017.nettrace"
+    .\Run-PiCompute.ps1 -Digits 5000000000 -Threshold 1000000 -CheckpointFromLevel 15 -LogLevel 2
+    .\Run-PiCompute.ps1 -Digits 5000000000 -ResumeFromLevel 15 -LogLevel 2
 #>
 param(
-    [string]$OutputDir  = 'C:\PiOutput',
-    [long]  $Digits     = 1000000000,
-    [int]   $LogLevel   = 1,
-    [long]  $Threshold  = 0,
+    [string]$OutputDir           = 'C:\PiOutput',
+    [long]  $Digits              = 1000000000,
+    [int]   $LogLevel            = 1,
+    [long]  $Threshold           = 0,
+    [int]   $CheckpointFromLevel = 0,
+    [int]   $ResumeFromLevel     = 0,
     [switch]$Trace,
     [switch]$Test,
-    [string]$ReportOnly = ""
+    [string]$ReportOnly          = ""
 )
 
 Set-StrictMode -Version Latest
@@ -110,7 +126,9 @@ Write-Host "Project  : $projectFile"
 Write-Host "Output   : $OutputDir"
 Write-Host "Digits   : $Digits"
 Write-Host "LogLevel : $LogLevel"
-if ($Threshold -gt 0) { Write-Host "Threshold: $($Threshold.ToString('N0')) nodes (RAM only)" -ForegroundColor Yellow }
+if ($Threshold           -gt 0) { Write-Host "Threshold: $($Threshold.ToString('N0')) nodes (RAM only)" -ForegroundColor Yellow }
+if ($CheckpointFromLevel -gt 0) { Write-Host "Checkpoint: from level $CheckpointFromLevel" -ForegroundColor Yellow }
+if ($ResumeFromLevel     -gt 0) { Write-Host "Resume   : from level $ResumeFromLevel" -ForegroundColor Cyan }
 if ($Trace) { Write-Host "Mode     : CPU trace enabled" -ForegroundColor Magenta }
 Write-Host ""
 
@@ -180,7 +198,9 @@ if ($Test) {
             $runReportFile = Join-Path $runDir "trace_report.txt"
             Write-Host "  [trace] $runTraceFile" -ForegroundColor DarkMagenta
             $traceArgs = @("--digits", $d, "--autostart", "--autoverify", "--log-level", $LogLevel, "--output-dir", $runDir)
-            if ($Threshold -gt 0) { $traceArgs += @("--threshold", $Threshold) }
+            if ($Threshold           -gt 0) { $traceArgs += @("--threshold",             $Threshold) }
+            if ($CheckpointFromLevel -gt 0) { $traceArgs += @("--checkpoint-from-level", $CheckpointFromLevel) }
+            if ($ResumeFromLevel     -gt 0) { $traceArgs += @("--resume-from-level",     $ResumeFromLevel) }
             dotnet-trace collect `
                 --output $runTraceFile `
                 --providers "Microsoft-DotNETCore-SampleProfiler:0xF00000000000:5,Microsoft-DotNETRuntime:0x1F000080018:5" `
@@ -192,7 +212,9 @@ if ($Test) {
         } else {
             # Use Start-Process -Wait: the exe is a WinForms GUI app and & returns immediately.
             $runArgs = @("--digits", $d, "--autostart", "--autoverify", "--log-level", $LogLevel, "--output-dir", $runDir)
-            if ($Threshold -gt 0) { $runArgs += @("--threshold", $Threshold) }
+            if ($Threshold           -gt 0) { $runArgs += @("--threshold",             $Threshold) }
+            if ($CheckpointFromLevel -gt 0) { $runArgs += @("--checkpoint-from-level", $CheckpointFromLevel) }
+            if ($ResumeFromLevel     -gt 0) { $runArgs += @("--resume-from-level",     $ResumeFromLevel) }
             Start-Process -FilePath $exePath -ArgumentList $runArgs -NoNewWindow -Wait
         }
         $sw.Stop()
@@ -298,7 +320,9 @@ if ($Trace) {
     Write-Host ""
 
     $mainArgs = @("--digits", $Digits, "--autostart", "--autoverify", "--log-level", $LogLevel)
-    if ($Threshold -gt 0) { $mainArgs += @("--threshold", $Threshold) }
+    if ($Threshold           -gt 0) { $mainArgs += @("--threshold",             $Threshold) }
+    if ($CheckpointFromLevel -gt 0) { $mainArgs += @("--checkpoint-from-level", $CheckpointFromLevel) }
+    if ($ResumeFromLevel     -gt 0) { $mainArgs += @("--resume-from-level",     $ResumeFromLevel) }
     dotnet-trace collect `
         --output $traceFile `
         --providers "Microsoft-DotNETCore-SampleProfiler:0xF00000000000:5,Microsoft-DotNETRuntime:0x1F000080018:5" `
@@ -320,7 +344,9 @@ if ($Trace) {
 } else {
     Write-Host "--- Launching ($Digits digits, autostart, autoverify, log-level $LogLevel) ---" -ForegroundColor Yellow
     $mainArgs = @("--digits", $Digits, "--autostart", "--autoverify", "--log-level", $LogLevel)
-    if ($Threshold -gt 0) { $mainArgs += @("--threshold", $Threshold) }
+    if ($Threshold           -gt 0) { $mainArgs += @("--threshold",             $Threshold) }
+    if ($CheckpointFromLevel -gt 0) { $mainArgs += @("--checkpoint-from-level", $CheckpointFromLevel) }
+    if ($ResumeFromLevel     -gt 0) { $mainArgs += @("--resume-from-level",     $ResumeFromLevel) }
     & $exePath @mainArgs
 }
 

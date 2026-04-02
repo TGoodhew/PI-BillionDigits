@@ -57,6 +57,11 @@ Public Class Form1
     Private _headless As Boolean = False
     Private Shared _logLevel As Integer = 1
     Private _autoVerify As Boolean = False
+    ' §93: Checkpoint/resume support.
+    ' --checkpoint-from-level N: serialize nodes at level >= N regardless of threshold.
+    ' --resume-from-level N: skip Phase 1 + levels 1..N-1; reload checkpoint files for level N.
+    Private _checkpointFromLevel As Integer = Integer.MaxValue   ' disabled by default
+    Private _resumeFromLevel As Integer = 0                      ' 0 = full run from scratch
     ' Custom verify checks supplied via --verify-at "DIGITS:POSITION" and
     ' --verify-contains "DIGITS".  Populated during CLI arg parsing; consumed
     ' by RunCustomVerifications() which is called from BtnTest_Click.
@@ -754,12 +759,14 @@ Public Class Form1
     Private Sub Form1_Load(sender As Object, e As EventArgs) Handles MyBase.Load
         ' ── Parse command-line arguments ─────────────────────────────────────
         ' Supported flags:
-        '   --digits N       Set the digit count (no commas required)
-        '   --autostart      Suppress all dialogs and auto-begin computation
-        '   --autoverify     After computation, auto-run verify + exit
-        '   --threshold N    Override the RAM/disk threshold (nodes)
-        '   --log-level N    Set runtime logging level 0–5 (default 1)
-        '   --output-dir D   Override output directory for digits, log, and node cache
+        '   --digits N                  Set the digit count (no commas required)
+        '   --autostart                 Suppress all dialogs and auto-begin computation
+        '   --autoverify                After computation, auto-run verify + exit
+        '   --threshold N               Override the RAM/disk threshold (nodes)
+        '   --log-level N               Set runtime logging level 0–5 (default 1)
+        '   --output-dir D              Override output directory for digits, log, and node cache
+        '   --checkpoint-from-level N   Serialize nodes at level >= N to disk (for resume)
+        '   --resume-from-level N       Skip Phase 1 + levels 1..N-1; load checkpoint files for level N
         Dim args() As String = Environment.GetCommandLineArgs()
         ' Log all received args so we can diagnose unexpected headless activation.
         ' args(0) is always the exe path; user args start at index 1.
@@ -812,6 +819,22 @@ Public Class Form1
                         Dim t As Integer
                         If Integer.TryParse(args(i + 1), t) AndAlso t >= 1 Then
                             _diskThreshold = t
+                        End If
+                        i += 1
+                    End If
+                Case "--checkpoint-from-level"
+                    If i + 1 < args.Length Then
+                        Dim cfl As Integer
+                        If Integer.TryParse(args(i + 1), cfl) AndAlso cfl >= 1 Then
+                            _checkpointFromLevel = cfl
+                        End If
+                        i += 1
+                    End If
+                Case "--resume-from-level"
+                    If i + 1 < args.Length Then
+                        Dim rfl As Integer
+                        If Integer.TryParse(args(i + 1), rfl) AndAlso rfl >= 1 Then
+                            _resumeFromLevel = rfl
                         End If
                         i += 1
                     End If
@@ -2003,29 +2026,83 @@ Public Class Form1
 
         LogPhase($"Processing {numChunks:N0} chunks of {CHUNK_SIZE} terms each (streaming to disk)...")
 
-        ' Clear old cache
-        Try
-            If System.IO.Directory.Exists(DISK_CACHE_DIR) Then
-                Dim oldFiles = System.IO.Directory.GetFiles(DISK_CACHE_DIR, "*.bin")
-                Dim oldCount As Integer = oldFiles.Length
-                If oldCount > 0 Then
-                    Me.BeginInvoke(Sub() LblStatus.Text = $"Clearing {oldCount:N0} cached files from previous run...")
-                    For idx As Integer = 0 To oldFiles.Length - 1
-                        System.IO.File.Delete(oldFiles(idx))
-                        If (idx + 1) Mod 1000 = 0 Then
-                            Dim snap As Integer = idx + 1
-                            Me.BeginInvoke(Sub() LblStatus.Text = $"Clearing cache: {snap:N0} / {oldCount:N0} files deleted...")
-                        End If
-                    Next
+        ' Clear old cache (skipped when resuming — checkpoint files must be preserved)
+        If _resumeFromLevel = 0 Then
+            Try
+                If System.IO.Directory.Exists(DISK_CACHE_DIR) Then
+                    Dim oldFiles = System.IO.Directory.GetFiles(DISK_CACHE_DIR, "*.bin")
+                    Dim oldCount As Integer = oldFiles.Length
+                    If oldCount > 0 Then
+                        Me.BeginInvoke(Sub() LblStatus.Text = $"Clearing {oldCount:N0} cached files from previous run...")
+                        For idx As Integer = 0 To oldFiles.Length - 1
+                            System.IO.File.Delete(oldFiles(idx))
+                            If (idx + 1) Mod 1000 = 0 Then
+                                Dim snap As Integer = idx + 1
+                                Me.BeginInvoke(Sub() LblStatus.Text = $"Clearing cache: {snap:N0} / {oldCount:N0} files deleted...")
+                            End If
+                        Next
+                    End If
                 End If
-            End If
-        Catch
-        End Try
+            Catch
+            End Try
+        End If
 
         ' Issue #4: List(Of DiskNode) now holds value types — no per-element heap allocation.
         Dim diskNodes As New List(Of DiskNode)()
         Dim currentSize As Long = numChunks
         Dim level As Integer = 0
+
+        ' ── §93: Resume path — skip Phase 1 and load checkpoint files ────────
+        ' When --resume-from-level N is supplied, the checkpoint files written by
+        ' a previous run with --checkpoint-from-level N are loaded directly as the
+        ' diskNodes list for level N.  The Phase 2 While loop then continues from
+        ' level N onwards exactly as a normal run would.
+        ' currentSize is reconstructed from numChunks: the same formula the While
+        ' loop uses means we arrive at the correct node count for the resume level.
+        If _resumeFromLevel > 0 Then
+            ' Compute the expected node count at the resume level.
+            Dim resumeSize As Long = numChunks
+            For lvl As Integer = 1 To _resumeFromLevel - 1
+                resumeSize = (resumeSize + 1) \ 2
+            Next
+            LogPhase($"RESUMING from level {_resumeFromLevel}: expecting {resumeSize:N0} checkpoint nodes in {DISK_CACHE_DIR}")
+            If Not System.IO.Directory.Exists(DISK_CACHE_DIR) Then
+                Throw New System.IO.DirectoryNotFoundException(
+                    $"Checkpoint directory not found: {DISK_CACHE_DIR}")
+            End If
+            ' Gather checkpoint files for the resume level and sort by node index.
+            Dim cpFilesRaw = System.IO.Directory.GetFiles(
+                DISK_CACHE_DIR, $"L{_resumeFromLevel - 1}_N*.bin")
+            Dim cpFiles = cpFilesRaw.OrderBy(Function(f)
+                    Dim stem As String = System.IO.Path.GetFileNameWithoutExtension(f)
+                    Dim sep As Integer = stem.LastIndexOf("_N", StringComparison.Ordinal)
+                    Dim n As Integer = 0
+                    If sep >= 0 Then Integer.TryParse(stem.Substring(sep + 2), n)
+                    Return n
+                End Function).ToArray()
+            If cpFiles.Length = 0 Then
+                Throw New System.IO.FileNotFoundException(
+                    $"No checkpoint files found for level {_resumeFromLevel - 1} " &
+                    $"(pattern: L{_resumeFromLevel - 1}_N*.bin) in {DISK_CACHE_DIR}")
+            End If
+            LogPhase($"Found {cpFiles.Length:N0} checkpoint file(s) for level {_resumeFromLevel - 1}")
+            For Each f As String In cpFiles
+                Dim node As DiskNode
+                node.FilePath = f
+                node.FileOffset = 0
+                node.MemP = Nothing
+                node.MemQ = Nothing
+                node.MemT = Nothing
+                node.Level = _resumeFromLevel - 1
+                node.Index = diskNodes.Count
+                node.IsInMemory = False
+                diskNodes.Add(node)
+            Next
+            currentSize = diskNodes.Count
+            level = _resumeFromLevel - 1
+            LogPhase($"Resume ready: {currentSize:N0} nodes loaded at level {level}, continuing Phase 2")
+            GoTo Phase2
+        End If
 
         ' ── Phase 1: compute all chunks in parallel ──────────────────────────
         ' All numChunks chunks are fully independent — each BinarySplitChunk
@@ -2137,11 +2214,15 @@ Public Class Form1
         End If
 
         ' ── Phase 2: combine levels until one node remains ──────────────────
+Phase2:
         While currentSize > STOP_AT
             level += 1
             Dim nextSize As Long = (currentSize + 1) \ 2
             Dim nextDiskNodes As New List(Of DiskNode)()
-            Dim useDisk As Boolean = nextSize > DISK_THRESHOLD
+            ' §93: --checkpoint-from-level forces disk serialization at and above
+            ' the specified level, regardless of threshold. This ensures checkpoint
+            ' files exist for a subsequent --resume-from-level run.
+            Dim useDisk As Boolean = nextSize > DISK_THRESHOLD OrElse level >= _checkpointFromLevel
             ' True only for the final combine pass (2 nodes → 1).  Controls
             ' whether _logLevel >= 3 emits per-operation trace for this level.
             Dim isLastLevel As Boolean = (currentSize <= 2)
