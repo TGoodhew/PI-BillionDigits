@@ -1510,10 +1510,10 @@ Public Class Form1
     ' before GC/FlushGmpPool so that in-memory nodes are still live.
     ' meta.txt is written last; its presence on disk signals a complete snapshot.
     ' numTerms and numChunks are embedded in meta.txt for validation on resume.
-    Private Sub WriteLevelSnapshot(level As Integer,
-                                   nodes As List(Of DiskNode),
-                                   numTerms As Long,
-                                   numChunks As Long)
+    Private Function WriteLevelSnapshot(level As Integer,
+                                       nodes As List(Of DiskNode),
+                                       numTerms As Long,
+                                       numChunks As Long) As Boolean
         Dim snapDir As String = System.IO.Path.Combine(DISK_CACHE_DIR, $"snap_L{level}") &
                                 System.IO.Path.DirectorySeparatorChar
         LogPhase($"[Snapshot] Writing level {level} snapshot: {nodes.Count:N0} nodes → {snapDir}")
@@ -1538,7 +1538,7 @@ Public Class Form1
 
             If failCount > 0L Then
                 LogPhase($"[Snapshot] WARNING: {failCount:N0} node(s) failed — snapshot incomplete, skipping meta.txt")
-                Return
+                Return False
             End If
 
             ' Write meta.txt last — its presence marks the snapshot as complete.
@@ -1551,11 +1551,13 @@ Public Class Form1
                 $"nodeCount={nodes.Count}" & vbCrLf &
                 $"timestamp={DateTime.Now:yyyy-MM-dd HH:mm:ss}" & vbCrLf)
             LogPhase($"[Snapshot] Level {level} snapshot complete")
+            Return True
         Catch ex As Exception
             WriteExceptionToLog($"WriteLevelSnapshot(level={level})", ex)
             LogPhase($"[Snapshot] ERROR writing snapshot: {ex.Message} — continuing without checkpoint")
+            Return False
         End Try
-    End Sub
+    End Function
 
     ' §94: Scan NodeCache for the highest-level complete snapshot that matches
     ' the current run parameters (digits + numChunks).  Returns the level number
@@ -1644,13 +1646,19 @@ Public Class Form1
             AppendLog(
                 $"[SerializeOneMpz] large: _mp_size={mpSize:N0} byteCount={byteCount:N0}{vbCrLf}")
         End If
-        ' Stream raw limb bytes in 64 KB chunks using the SOH staging buffer.
+        ' Stream raw limb bytes in 4 MB chunks using the staging buffer.
         ' No intermediate allocation needed — data is read straight from _mp_d.
+        ' §96: Use 64-bit pointer arithmetic (mpD.ToInt64() + offset) to avoid the
+        ' IntPtr.Add(mpD, CInt(offset)) overflow that occurs when offset exceeds
+        ' Int32.MaxValue (2 GB) for large fields at 5B+ digits.  RemoveIntegerChecks=True
+        ' means CInt() wraps silently to a negative value, making IntPtr.Add point 2 GB
+        ' before mpD — an invalid address — causing a fatal AccessViolationException.
         Dim remaining As Long = byteCount
         Dim offset As Long = 0L
+        Dim mpDBase As Long = mpD.ToInt64()
         While remaining > 0
             Dim chunkSize As Integer = CInt(System.Math.Min(remaining, CLng(staging.Length)))
-            Marshal.Copy(IntPtr.Add(mpD, CInt(offset)), staging, 0, chunkSize)
+            Marshal.Copy(New IntPtr(mpDBase + offset), staging, 0, chunkSize)
             bw.Write(staging, 0, chunkSize)
             offset += chunkSize
             remaining -= chunkSize
@@ -2741,8 +2749,9 @@ Phase2:
             ' Skipped for the final level (1–2 nodes; Phase 3 is fast).
             ' After confirming the new snapshot, delete the previous level's snapshot.
             If _autoCheckpoint AndAlso Not isLastLevel Then
-                WriteLevelSnapshot(level, diskNodes, numTerms, numChunks)
-                DeleteSnapshotDir(level - 1)
+                If WriteLevelSnapshot(level, diskNodes, numTerms, numChunks) Then  ' §96
+                    DeleteSnapshotDir(level - 1)
+                End If
             End If
 
             Dim memNow As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
