@@ -2533,6 +2533,16 @@ Phase2:
 
             Else
                 ' ── Serial path (top levels: few pairs, very large operands) ─
+                ' §95: Cap inner DOP at 3 for serial-path levels.
+                ' At these levels operands are large enough for SafeMpzMul to recurse
+                ' 3 levels deep (each level splits into 9 sub-products).  With the
+                ' default DOP=ProcessorCount=24, up to 24^3=13,824 sub-product tasks
+                ' can run concurrently, each allocating a 300–1,000 MB accum buffer.
+                ' Observed crash at Level 19 (5B digits): 81 concurrent depth-3 tasks
+                ' × ~320 MB each = ~26 GB just for intermediates, exhausting VirtualAlloc.
+                ' DOP=3 gives 3^3=27 concurrent leaf tasks — saturates 24 cores while
+                ' bounding peak intermediate memory to ~9 GB (vs ~26 GB at DOP=24).
+                System.Threading.Volatile.Write(_safeMulDop, 3)  ' §95
                 Dim nodeIdx As Long = 0
                 While nodeIdx < diskNodes.Count - 1
 
