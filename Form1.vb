@@ -62,6 +62,12 @@ Public Class Form1
     ' --resume-from-level N: skip Phase 1 + levels 1..N-1; reload checkpoint files for level N.
     Private _checkpointFromLevel As Integer = Integer.MaxValue   ' disabled by default
     Private _resumeFromLevel As Integer = 0                      ' 0 = full run from scratch
+    ' §94: Level-boundary auto-checkpoint/resume.
+    ' --auto-checkpoint: write a RAM snapshot at the end of each Phase 2 level and
+    '   auto-resume from the highest valid snapshot on the next run.  All combine
+    '   work still runs in RAM; the snapshot is written as a batch after each level
+    '   completes, before GC/FlushGmpPool while nodes are still live.
+    Private _autoCheckpoint As Boolean = False
     ' Custom verify checks supplied via --verify-at "DIGITS:POSITION" and
     ' --verify-contains "DIGITS".  Populated during CLI arg parsing; consumed
     ' by RunCustomVerifications() which is called from BtnTest_Click.
@@ -767,6 +773,7 @@ Public Class Form1
         '   --output-dir D              Override output directory for digits, log, and node cache
         '   --checkpoint-from-level N   Serialize nodes at level >= N to disk (for resume)
         '   --resume-from-level N       Skip Phase 1 + levels 1..N-1; load checkpoint files for level N
+        '   --auto-checkpoint           Write RAM snapshot at end of each level; auto-resume on next run
         Dim args() As String = Environment.GetCommandLineArgs()
         ' Log all received args so we can diagnose unexpected headless activation.
         ' args(0) is always the exe path; user args start at index 1.
@@ -838,6 +845,8 @@ Public Class Form1
                         End If
                         i += 1
                     End If
+                Case "--auto-checkpoint"
+                    _autoCheckpoint = True
                 Case "--log-level"
                     If i + 1 < args.Length Then
                         Dim lvl As Integer
@@ -1496,6 +1505,118 @@ Public Class Form1
         End Try
     End Sub
 
+    ' §94: Write a complete snapshot of diskNodes to NodeCache\snap_L{level}\.
+    ' Called after diskNodes = nextDiskNodes at the end of each Phase 2 level,
+    ' before GC/FlushGmpPool so that in-memory nodes are still live.
+    ' meta.txt is written last; its presence on disk signals a complete snapshot.
+    ' numTerms and numChunks are embedded in meta.txt for validation on resume.
+    Private Sub WriteLevelSnapshot(level As Integer,
+                                   nodes As List(Of DiskNode),
+                                   numTerms As Long,
+                                   numChunks As Long)
+        Dim snapDir As String = System.IO.Path.Combine(DISK_CACHE_DIR, $"snap_L{level}") &
+                                System.IO.Path.DirectorySeparatorChar
+        LogPhase($"[Snapshot] Writing level {level} snapshot: {nodes.Count:N0} nodes → {snapDir}")
+        Try
+            System.IO.Directory.CreateDirectory(snapDir)
+            Dim failCount As Long = 0L
+            Parallel.For(0, nodes.Count,
+                Sub(idx As Integer)
+                    Dim node As DiskNode = nodes(idx)
+                    Dim destPath As String = snapDir & $"N{node.Index}.bin"
+                    Try
+                        If node.IsInMemory Then
+                            SerializeNodeToDisk(node.MemP, node.MemQ, node.MemT, destPath)
+                        Else
+                            System.IO.File.Copy(node.FilePath, destPath, overwrite:=True)
+                        End If
+                    Catch ex As Exception
+                        Interlocked.Increment(failCount)
+                        WriteToLog($"[Snapshot] WARN: failed to write N{node.Index}.bin: {ex.Message}")
+                    End Try
+                End Sub)
+
+            If failCount > 0L Then
+                LogPhase($"[Snapshot] WARNING: {failCount:N0} node(s) failed — snapshot incomplete, skipping meta.txt")
+                Return
+            End If
+
+            ' Write meta.txt last — its presence marks the snapshot as complete.
+            Dim metaPath As String = snapDir & "meta.txt"
+            System.IO.File.WriteAllText(metaPath,
+                $"digits={DIGITS}" & vbCrLf &
+                $"numTerms={numTerms}" & vbCrLf &
+                $"numChunks={numChunks}" & vbCrLf &
+                $"level={level}" & vbCrLf &
+                $"nodeCount={nodes.Count}" & vbCrLf &
+                $"timestamp={DateTime.Now:yyyy-MM-dd HH:mm:ss}" & vbCrLf)
+            LogPhase($"[Snapshot] Level {level} snapshot complete")
+        Catch ex As Exception
+            WriteExceptionToLog($"WriteLevelSnapshot(level={level})", ex)
+            LogPhase($"[Snapshot] ERROR writing snapshot: {ex.Message} — continuing without checkpoint")
+        End Try
+    End Sub
+
+    ' §94: Scan NodeCache for the highest-level complete snapshot that matches
+    ' the current run parameters (digits + numChunks).  Returns the level number
+    ' or -1 if no valid snapshot is found.
+    Private Function TryFindBestSnapshot(numChunks As Long) As Integer
+        If Not System.IO.Directory.Exists(DISK_CACHE_DIR) Then Return -1
+        Dim bestLevel As Integer = -1
+        For Each subDir As String In System.IO.Directory.GetDirectories(DISK_CACHE_DIR, "snap_L*")
+            Dim dirName As String = System.IO.Path.GetFileName(subDir)
+            Dim lvl As Integer = 0
+            If Not Integer.TryParse(dirName.Substring(6), lvl) Then Continue For
+            Dim metaPath As String = System.IO.Path.Combine(subDir, "meta.txt")
+            If Not System.IO.File.Exists(metaPath) Then Continue For
+            Try
+                Dim meta As New Dictionary(Of String, String)()
+                For Each line As String In System.IO.File.ReadAllLines(metaPath)
+                    Dim eq As Integer = line.IndexOf("="c)
+                    If eq > 0 Then meta(line.Substring(0, eq)) = line.Substring(eq + 1)
+                Next
+                Dim snapDigits As Long = 0L, snapChunks As Long = 0L
+                Dim snapNodeCount As Integer = 0, snapLevel As Integer = 0
+                If Not meta.ContainsKey("digits") OrElse Not Long.TryParse(meta("digits"), snapDigits) Then Continue For
+                If Not meta.ContainsKey("numChunks") OrElse Not Long.TryParse(meta("numChunks"), snapChunks) Then Continue For
+                If Not meta.ContainsKey("nodeCount") OrElse Not Integer.TryParse(meta("nodeCount"), snapNodeCount) Then Continue For
+                If Not meta.ContainsKey("level") OrElse Not Integer.TryParse(meta("level"), snapLevel) Then Continue For
+                If snapDigits <> DIGITS OrElse snapChunks <> numChunks Then
+                    WriteToLog($"[Snapshot] Skipping snap_L{lvl}: digits/chunks mismatch")
+                    Continue For
+                End If
+                ' Verify all node files are present.
+                Dim allPresent As Boolean = True
+                For nodeIdx As Integer = 0 To snapNodeCount - 1
+                    If Not System.IO.File.Exists(System.IO.Path.Combine(subDir, $"N{nodeIdx}.bin")) Then
+                        allPresent = False : Exit For
+                    End If
+                Next
+                If Not allPresent Then
+                    WriteToLog($"[Snapshot] Skipping snap_L{lvl}: missing node files")
+                    Continue For
+                End If
+                If lvl > bestLevel Then bestLevel = lvl
+            Catch ex As Exception
+                WriteToLog($"[Snapshot] Skipping snap_L{lvl}: error reading meta — {ex.Message}")
+            End Try
+        Next
+        Return bestLevel
+    End Function
+
+    ' §94: Delete a snapshot directory (called after the next level's snapshot is confirmed).
+    Private Sub DeleteSnapshotDir(level As Integer)
+        Dim dir As String = System.IO.Path.Combine(DISK_CACHE_DIR, $"snap_L{level}")
+        Try
+            If System.IO.Directory.Exists(dir) Then
+                System.IO.Directory.Delete(dir, recursive:=True)
+                WriteToLog($"[Snapshot] Deleted old snapshot snap_L{level}")
+            End If
+        Catch ex As Exception
+            WriteToLog($"[Snapshot] WARN: could not delete snap_L{level}: {ex.Message}")
+        End Try
+    End Sub
+
     ''' <summary>
     ''' Streams one mpz_t's raw GMP limb data into the BinaryWriter without any
     ''' intermediate allocation.  Reads _mp_size and _mp_d directly from the
@@ -2026,7 +2147,11 @@ Public Class Form1
 
         LogPhase($"Processing {numChunks:N0} chunks of {CHUNK_SIZE} terms each (streaming to disk)...")
 
-        ' Clear old cache (skipped when resuming — checkpoint files must be preserved)
+        ' Clear old cache (skipped when resuming — checkpoint files must be preserved).
+        ' §94: Also delete stale snap_L* snapshot subdirectories on a fresh non-auto-
+        ' checkpoint run so leftover snapshots from a prior different run don't confuse
+        ' a future --auto-checkpoint run.  When _autoCheckpoint is True the auto-detect
+        ' step below validates metadata before using any snapshot, so no cleanup needed.
         If _resumeFromLevel = 0 Then
             Try
                 If System.IO.Directory.Exists(DISK_CACHE_DIR) Then
@@ -2042,6 +2167,12 @@ Public Class Form1
                             End If
                         Next
                     End If
+                    ' §94: Remove stale snapshot dirs when starting a fresh non-checkpoint run.
+                    If Not _autoCheckpoint Then
+                        For Each snapSubDir As String In System.IO.Directory.GetDirectories(DISK_CACHE_DIR, "snap_L*")
+                            Try : System.IO.Directory.Delete(snapSubDir, recursive:=True) : Catch : End Try
+                        Next
+                    End If
                 End If
             Catch
             End Try
@@ -2052,40 +2183,74 @@ Public Class Form1
         Dim currentSize As Long = numChunks
         Dim level As Integer = 0
 
-        ' ── §93: Resume path — skip Phase 1 and load checkpoint files ────────
-        ' When --resume-from-level N is supplied, the checkpoint files written by
-        ' a previous run with --checkpoint-from-level N are loaded directly as the
-        ' diskNodes list for level N.  The Phase 2 While loop then continues from
-        ' level N onwards exactly as a normal run would.
-        ' currentSize is reconstructed from numChunks: the same formula the While
-        ' loop uses means we arrive at the correct node count for the resume level.
+        ' ── §94: Auto-checkpoint resume — scan for highest valid snapshot ────
+        ' When --auto-checkpoint is set and --resume-from-level was not supplied
+        ' explicitly, find the best snapshot and set _resumeFromLevel so the
+        ' existing resume path below handles the actual load.
+        If _autoCheckpoint AndAlso _resumeFromLevel = 0 Then
+            Dim bestSnap As Integer = TryFindBestSnapshot(numChunks)
+            If bestSnap >= 1 Then
+                _resumeFromLevel = bestSnap + 1
+                LogPhase($"[Snapshot] Auto-resume: found snap_L{bestSnap}, resuming from level {_resumeFromLevel}")
+            End If
+        End If
+
+        ' ── §93 / §94: Resume path — skip Phase 1 and load node files ────────
+        ' Handles both --resume-from-level N (§93 hot-path disk files) and
+        ' --auto-checkpoint auto-detect (§94 snapshot folder files).
+        ' currentSize is reconstructed from numChunks using the same halving
+        ' formula the Phase 2 While loop uses.
         If _resumeFromLevel > 0 Then
             ' Compute the expected node count at the resume level.
             Dim resumeSize As Long = numChunks
             For lvl As Integer = 1 To _resumeFromLevel - 1
                 resumeSize = (resumeSize + 1) \ 2
             Next
-            LogPhase($"RESUMING from level {_resumeFromLevel}: expecting {resumeSize:N0} checkpoint nodes in {DISK_CACHE_DIR}")
+            LogPhase($"RESUMING from level {_resumeFromLevel}: expecting {resumeSize:N0} nodes")
             If Not System.IO.Directory.Exists(DISK_CACHE_DIR) Then
                 Throw New System.IO.DirectoryNotFoundException(
                     $"Checkpoint directory not found: {DISK_CACHE_DIR}")
             End If
-            ' Gather checkpoint files for the resume level and sort by node index.
-            Dim cpFilesRaw = System.IO.Directory.GetFiles(
-                DISK_CACHE_DIR, $"L{_resumeFromLevel - 1}_N*.bin")
+
+            ' §94: Prefer snapshot folder (snap_L{N}\N{idx}.bin) when auto-checkpoint
+            ' is active; fall back to flat hot-path files (L{N}_N{idx}.bin) otherwise.
+            Dim snapFolder As String = System.IO.Path.Combine(
+                DISK_CACHE_DIR, $"snap_L{_resumeFromLevel - 1}")
+            Dim useSnapFolder As Boolean = _autoCheckpoint AndAlso
+                                           System.IO.Directory.Exists(snapFolder)
+
+            Dim cpFilesRaw() As String
+            If useSnapFolder Then
+                cpFilesRaw = System.IO.Directory.GetFiles(snapFolder, "N*.bin")
+            Else
+                cpFilesRaw = System.IO.Directory.GetFiles(
+                    DISK_CACHE_DIR, $"L{_resumeFromLevel - 1}_N*.bin")
+            End If
+
+            ' Sort by node index — snapshot files are "N{idx}.bin",
+            ' hot-path files are "L{lvl}_N{idx}.bin".
             Dim cpFiles = cpFilesRaw.OrderBy(Function(f)
                     Dim stem As String = System.IO.Path.GetFileNameWithoutExtension(f)
-                    Dim sep As Integer = stem.LastIndexOf("_N", StringComparison.Ordinal)
                     Dim n As Integer = 0
-                    If sep >= 0 Then Integer.TryParse(stem.Substring(sep + 2), n)
+                    Dim sep As Integer = stem.LastIndexOf("_N", StringComparison.Ordinal)
+                    If sep >= 0 Then
+                        Integer.TryParse(stem.Substring(sep + 2), n)   ' hot-path: L{l}_N{idx}
+                    ElseIf stem.StartsWith("N", StringComparison.OrdinalIgnoreCase) Then
+                        Integer.TryParse(stem.Substring(1), n)          ' snapshot:  N{idx}
+                    End If
                     Return n
                 End Function).ToArray()
+
             If cpFiles.Length = 0 Then
+                Dim pattern As String = If(useSnapFolder,
+                    $"N*.bin in {snapFolder}",
+                    $"L{_resumeFromLevel - 1}_N*.bin in {DISK_CACHE_DIR}")
                 Throw New System.IO.FileNotFoundException(
-                    $"No checkpoint files found for level {_resumeFromLevel - 1} " &
-                    $"(pattern: L{_resumeFromLevel - 1}_N*.bin) in {DISK_CACHE_DIR}")
+                    $"No checkpoint files found ({pattern})")
             End If
-            LogPhase($"Found {cpFiles.Length:N0} checkpoint file(s) for level {_resumeFromLevel - 1}")
+
+            LogPhase($"Found {cpFiles.Length:N0} checkpoint file(s) for level {_resumeFromLevel - 1}" &
+                     If(useSnapFolder, " [snapshot]", " [hot-path]"))
             For Each f As String In cpFiles
                 Dim node As DiskNode
                 node.FilePath = f
@@ -2100,7 +2265,7 @@ Public Class Form1
             Next
             currentSize = diskNodes.Count
             level = _resumeFromLevel - 1
-            LogPhase($"Resume ready: {currentSize:N0} nodes loaded at level {level}, continuing Phase 2")
+            LogPhase($"Resume ready: {currentSize:N0} nodes at level {level}, continuing Phase 2")
             GoTo Phase2
         End If
 
@@ -2356,7 +2521,10 @@ Phase2:
                         End If
 
                         nextResults(CInt(pairIdx)) = resultNode
-                        Interlocked.Increment(completedPairs)
+                        Dim _done As Long = Interlocked.Increment(completedPairs)
+                        If _done Mod 1000 = 0 Then
+                            LogPhase($"  Processed {_done:N0}/{pairCount:N0} pairs")
+                        End If
                     End Sub)
                 phase2PollThread.Join()
                 nextDiskNodes.AddRange(nextResults)
@@ -2541,6 +2709,14 @@ Phase2:
 
             diskNodes = nextDiskNodes
             currentSize = nextSize
+
+            ' §94: Auto-checkpoint — write level snapshot before GC/FlushGmpPool while nodes
+            ' are still live.  Skipped for the final level (1–2 nodes; Phase 3 is fast).
+            ' After confirming the new snapshot, delete the previous level's snapshot.
+            If _autoCheckpoint AndAlso Not isLastLevel Then
+                WriteLevelSnapshot(level, diskNodes, numTerms, numChunks)
+                DeleteSnapshotDir(level - 1)
+            End If
 
             ' §61: Non-blocking GC between levels; blocking compacting only at the final level.
             ' Aggressive+blocking was pausing all threads for hundreds of ms at each of 17 levels.

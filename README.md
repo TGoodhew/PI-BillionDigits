@@ -32,21 +32,17 @@ Profiling (dotnet-trace topN) shows `SafeMpzMul` exclusive time dropped from **1
 
 ### How to run at 5 billion digits
 
-The `Run-PiCompute.ps1` script now accepts a `-Threshold` parameter that overrides the RAM/disk threshold. At 5 billion digits the number of Phase 1 chunks (~688,000) exceeds the default threshold; pass a large value to keep everything in RAM and avoid disk I/O during the combine phase.
+The `Run-PiCompute.ps1` script accepts a `-Threshold` parameter that overrides the RAM/disk threshold. At 5 billion digits the number of Phase 1 chunks (~688,000) exceeds the default threshold; pass a large value to keep everything in RAM and avoid disk I/O during the combine phase.
 
 **Requirements:** ~25–30 GB available RAM, 64-bit Windows, .NET 10.
 
-```powershell
-.\Run-PiCompute.ps1 -Digits 5000000000 -Threshold 1000000 -LogLevel 2
-```
-
-To also capture a CPU profile:
+Use `-AutoCheckpoint` so that if the run is interrupted (the combine phase takes several hours), the next run automatically resumes from the last completed level rather than starting over:
 
 ```powershell
-.\Run-PiCompute.ps1 -Digits 5000000000 -Threshold 1000000 -LogLevel 2 -Trace
+.\Run-PiCompute.ps1 -Digits 5000000000 -Threshold 1000000 -AutoCheckpoint -LogLevel 2
 ```
 
-The run takes several hours. Progress is written to `C:\PiOutput\pi_phase_log.txt` as it proceeds.
+The run takes several hours. Progress is written to `C:\PiOutput\pi_phase_log.txt` as it proceeds. If interrupted, re-run the same command — it will detect the latest snapshot in `C:\PiOutput\NodeCache\snap_L{N}\` and resume from there automatically.
 
 ---
 
@@ -244,15 +240,18 @@ ThreadPool.SetMinThreads(Environment.ProcessorCount, Environment.ProcessorCount)
 
 **Headless mode (§63):** All three `MessageBox.Show` dialogs are gated behind `If Not _headless Then`. In headless mode the text is written to the phase log with a `[DIALOG]` prefix so automated runs leave a full audit trail without blocking.
 
-**`Run-PiCompute.ps1` (§63, §70):** PowerShell script that clean-builds and launches the exe. Machine-independent: the exe path is auto-detected by globbing `bin\Release\**\PI-BillionDigits.exe` after the build (no hardcoded TFM folder), and the output directory defaults to `.\PiOutput` next to the script (overridable via `-OutputDir`). Parameters: `-Digits N` (default 1B), `-OutputDir <path>`, `-Trace`, `-ReportOnly <path>`.
+**`Run-PiCompute.ps1` (§63, §70, §94):** PowerShell script that clean-builds and launches the exe. Machine-independent: the exe path is auto-detected by globbing `bin\Release\**\PI-BillionDigits.exe` after the build (no hardcoded TFM folder), and the output directory defaults to `C:\PiOutput` (overridable via `-OutputDir`). Parameters: `-Digits N` (default 1B), `-OutputDir <path>`, `-Threshold N`, `-CheckpointFromLevel N`, `-ResumeFromLevel N`, `-AutoCheckpoint`, `-Trace`, `-ReportOnly <path>`.
 
 **Quick start:**
 ```powershell
-# Standard run
+# Standard 1B run
 .\Run-PiCompute.ps1
 
 # Custom digit count and output location
 .\Run-PiCompute.ps1 -Digits 100000000 -OutputDir "D:\PiResults"
+
+# 5B run with auto-checkpoint (resumes automatically if interrupted)
+.\Run-PiCompute.ps1 -Digits 5000000000 -Threshold 1000000 -AutoCheckpoint -LogLevel 2
 
 # With CPU trace
 .\Run-PiCompute.ps1 -Trace
@@ -2445,3 +2444,54 @@ PI-BillionDigits.exe --digits 1000000000 --autostart --autoverify ^
 ```
 
 **Why:** The built-in test checks three fixed digit sequences hardcoded in `BtnTest_Click`. For automated regression testing or validating known Pi digit positions, it is useful to pass expected values on the command line without modifying the source. The `--verify-at` form gives an exact-position assertion (fails if the sequence is found elsewhere); `--verify-contains` is a looser sanity check useful for sequences like Euler's number embedded in Pi.
+
+---
+
+## Section 94 — Level-Boundary Auto-Checkpoint / Resume
+
+**Branch:** PerfWork
+
+**Problem:** Phase 2 combine levels for 5B+ digit runs take hours each. If the run is interrupted (crash, user abort, power loss) all progress is lost and the run must restart from scratch.
+
+**Previous approach (§93):** `--checkpoint-from-level N` forced disk serialization of every combine result as it was produced, changing that level from RAM mode to disk mode. This added per-pair I/O into the hot path and required manually specifying `--resume-from-level N` on the next run.
+
+**New approach (`--auto-checkpoint`):** All combine work continues to run entirely in RAM — the hot path is unchanged. At the *end* of each Phase 2 level, after `diskNodes = nextDiskNodes` and while all nodes are still live, the completed node list is written to disk as a batch snapshot. On the next run with `--auto-checkpoint`, the highest valid snapshot is detected automatically and Phase 1 plus all completed levels are skipped.
+
+### Snapshot layout
+
+```
+C:\PiOutput\NodeCache\
+  snap_L3\           ← snapshot written after level 3 finishes
+    N0.bin
+    N1.bin
+    ...
+    meta.txt         ← written last; its presence marks the snapshot complete
+  snap_L2\           ← deleted once snap_L3 is confirmed written
+```
+
+Node files are written in parallel via `Parallel.For`. For in-memory nodes, `SerializeNodeToDisk` is called directly against the live GMP objects. For disk-mode nodes (rare; only when `--checkpoint-from-level` is also active), `File.Copy` is used — no GMP interpretation needed. Only the most recent level's snapshot is kept; the previous level's directory is deleted after the new one is confirmed complete.
+
+`meta.txt` records `digits`, `numTerms`, `numChunks`, `level`, `nodeCount`, and `timestamp`. On resume, `digits` and `numChunks` are validated against the current run parameters — a mismatch (different digit count) causes the snapshot to be silently skipped and a fresh run to start.
+
+### New methods
+
+- `WriteLevelSnapshot(level, nodes, numTerms, numChunks)` — parallel batch write; non-fatal on error (logs warning, computation continues).
+- `TryFindBestSnapshot(numChunks)` — scans `NodeCache\snap_L*\` directories, validates metadata and node file presence, returns highest valid level number.
+- `DeleteSnapshotDir(level)` — removes a snapshot directory after the next level's snapshot is confirmed.
+
+### Resume path
+
+Snapshot nodes are loaded as `IsInMemory = False` with `FilePath` pointing at `snap_L{N}\N{idx}.bin`. The existing Phase 2 combine loop loads them on demand via `LoadNodeFromDisk` — no changes to combine logic. The existing `--resume-from-level` path is preserved and takes priority over auto-detect when specified explicitly.
+
+### Usage
+
+```powershell
+# Use on every 5B run — interrupted runs resume automatically
+.\Run-PiCompute.ps1 -Digits 5000000000 -Threshold 1000000 -AutoCheckpoint -LogLevel 2
+```
+
+If the run is interrupted at any point during Phase 2, re-run the same command. It finds the highest complete `snap_L{N}` snapshot and resumes from level N+1, skipping Phase 1 and all levels up to N.
+
+**Snapshot write cost:** writing ~6 GB of Level 3 nodes to NVMe takes roughly 6 seconds — negligible relative to the hours of combine time per level.
+
+**Why not §93?** The §93 approach trades RAM performance for recoverability at every pair, making the affected level significantly slower. §94 pays the snapshot cost only once per level, after all the work is already done.

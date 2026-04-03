@@ -58,6 +58,15 @@
     The -Digits value must match the original run so numChunks is computed correctly.
     Example: -ResumeFromLevel 15 reads L14_N*.bin files and resumes Phase 2 at level 15.
 
+.PARAMETER AutoCheckpoint
+    Write a RAM snapshot to NodeCache\snap_L{N}\ at the end of each Phase 2 level.
+    All combine work still runs in RAM; the snapshot is written as a batch after each
+    level completes.  On the next run with -AutoCheckpoint the highest valid snapshot
+    is detected automatically and the run resumes from that level — no -ResumeFromLevel
+    needed.  Only the most recent level's snapshot is kept (previous level deleted after
+    next level confirms).
+    Example: -AutoCheckpoint  (use on every run; interrupted runs resume automatically)
+
 .PARAMETER LogLevel
     Logging detail level passed to the exe as --log-level N.  Defaults to 1.
       0  None        Errors and crashes only. Silent on success.
@@ -85,6 +94,7 @@
     .\Run-PiCompute.ps1 -ReportOnly ".\pi_trace_20260331_121017.nettrace"
     .\Run-PiCompute.ps1 -Digits 5000000000 -Threshold 1000000 -CheckpointFromLevel 15 -LogLevel 2
     .\Run-PiCompute.ps1 -Digits 5000000000 -ResumeFromLevel 15 -LogLevel 2
+    .\Run-PiCompute.ps1 -Digits 5000000000 -AutoCheckpoint -LogLevel 2
 #>
 param(
     [string]$OutputDir           = 'C:\PiOutput',
@@ -93,6 +103,7 @@ param(
     [long]  $Threshold           = 0,
     [int]   $CheckpointFromLevel = 0,
     [int]   $ResumeFromLevel     = 0,
+    [switch]$AutoCheckpoint,
     [switch]$Trace,
     [switch]$Test,
     [string]$ReportOnly          = ""
@@ -129,7 +140,8 @@ Write-Host "LogLevel : $LogLevel"
 if ($Threshold           -gt 0) { Write-Host "Threshold: $($Threshold.ToString('N0')) nodes (RAM only)" -ForegroundColor Yellow }
 if ($CheckpointFromLevel -gt 0) { Write-Host "Checkpoint: from level $CheckpointFromLevel" -ForegroundColor Yellow }
 if ($ResumeFromLevel     -gt 0) { Write-Host "Resume   : from level $ResumeFromLevel" -ForegroundColor Cyan }
-if ($Trace) { Write-Host "Mode     : CPU trace enabled" -ForegroundColor Magenta }
+if ($AutoCheckpoint)            { Write-Host "Mode     : Auto-checkpoint enabled" -ForegroundColor Green }
+if ($Trace)                     { Write-Host "Mode     : CPU trace enabled" -ForegroundColor Magenta }
 Write-Host ""
 
 # ── Ensure output directory exists ───────────────────────────────────────────
@@ -323,6 +335,7 @@ if ($Trace) {
     if ($Threshold           -gt 0) { $mainArgs += @("--threshold",             $Threshold) }
     if ($CheckpointFromLevel -gt 0) { $mainArgs += @("--checkpoint-from-level", $CheckpointFromLevel) }
     if ($ResumeFromLevel     -gt 0) { $mainArgs += @("--resume-from-level",     $ResumeFromLevel) }
+    if ($AutoCheckpoint)            { $mainArgs += "--auto-checkpoint" }
     dotnet-trace collect `
         --output $traceFile `
         --providers "Microsoft-DotNETCore-SampleProfiler:0xF00000000000:5,Microsoft-DotNETRuntime:0x1F000080018:5" `
@@ -347,6 +360,7 @@ if ($Trace) {
     if ($Threshold           -gt 0) { $mainArgs += @("--threshold",             $Threshold) }
     if ($CheckpointFromLevel -gt 0) { $mainArgs += @("--checkpoint-from-level", $CheckpointFromLevel) }
     if ($ResumeFromLevel     -gt 0) { $mainArgs += @("--resume-from-level",     $ResumeFromLevel) }
+    if ($AutoCheckpoint)            { $mainArgs += "--auto-checkpoint" }
     & $exePath @mainArgs
 }
 
