@@ -2720,14 +2720,6 @@ Phase2:
             diskNodes = nextDiskNodes
             currentSize = nextSize
 
-            ' §94: Auto-checkpoint — write level snapshot before GC/FlushGmpPool while nodes
-            ' are still live.  Skipped for the final level (1–2 nodes; Phase 3 is fast).
-            ' After confirming the new snapshot, delete the previous level's snapshot.
-            If _autoCheckpoint AndAlso Not isLastLevel Then
-                WriteLevelSnapshot(level, diskNodes, numTerms, numChunks)
-                DeleteSnapshotDir(level - 1)
-            End If
-
             ' §61: Non-blocking GC between levels; blocking compacting only at the final level.
             ' Aggressive+blocking was pausing all threads for hundreds of ms at each of 17 levels.
             ' At lower levels an Optimized non-blocking collect is sufficient to reclaim the
@@ -2745,6 +2737,16 @@ Phase2:
             ' never be reclaimed.  Flushing here keeps committed memory proportional
             ' to the current working set instead of accumulating across all levels.
             FlushGmpPool()
+
+            ' §94: Auto-checkpoint — write level snapshot after GC/FlushGmpPool so that
+            ' scratch memory from the completed multiplications is freed before the snapshot
+            ' write adds serialization overhead.  Nodes are still live at this point.
+            ' Skipped for the final level (1–2 nodes; Phase 3 is fast).
+            ' After confirming the new snapshot, delete the previous level's snapshot.
+            If _autoCheckpoint AndAlso Not isLastLevel Then
+                WriteLevelSnapshot(level, diskNodes, numTerms, numChunks)
+                DeleteSnapshotDir(level - 1)
+            End If
 
             Dim memNow As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
             LogPhase($"Combine level {level}: {currentSize:N0} nodes remaining (RAM: {memNow:N0}MB)")
