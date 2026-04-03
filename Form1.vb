@@ -1585,15 +1585,12 @@ Public Class Form1
                     WriteToLog($"[Snapshot] Skipping snap_L{lvl}: digits/chunks mismatch")
                     Continue For
                 End If
-                ' Verify all node files are present.
-                Dim allPresent As Boolean = True
-                For nodeIdx As Integer = 0 To snapNodeCount - 1
-                    If Not System.IO.File.Exists(System.IO.Path.Combine(subDir, $"N{nodeIdx}.bin")) Then
-                        allPresent = False : Exit For
-                    End If
-                Next
-                If Not allPresent Then
-                    WriteToLog($"[Snapshot] Skipping snap_L{lvl}: missing node files")
+                ' Verify node file count matches metadata.
+                ' Node indices are not guaranteed to be 0..N-1 (parallel path uses pairIdx),
+                ' so count N*.bin files rather than probing for each sequential index.
+                Dim actualCount As Integer = System.IO.Directory.GetFiles(subDir, "N*.bin").Length
+                If actualCount <> snapNodeCount Then
+                    WriteToLog($"[Snapshot] Skipping snap_L{lvl}: expected {snapNodeCount} node files, found {actualCount}")
                     Continue For
                 End If
                 If lvl > bestLevel Then bestLevel = lvl

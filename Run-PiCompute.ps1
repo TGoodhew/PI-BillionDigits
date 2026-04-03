@@ -361,7 +361,7 @@ if ($Trace) {
     if ($CheckpointFromLevel -gt 0) { $mainArgs += @("--checkpoint-from-level", $CheckpointFromLevel) }
     if ($ResumeFromLevel     -gt 0) { $mainArgs += @("--resume-from-level",     $ResumeFromLevel) }
     if ($AutoCheckpoint)            { $mainArgs += "--auto-checkpoint" }
-    & $exePath @mainArgs
+    Start-Process -FilePath $exePath -ArgumentList $mainArgs -NoNewWindow -Wait
 }
 
 Write-Host ""
