@@ -2905,35 +2905,40 @@ Phase2:
             gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpNumer, gmpPi, gmpOne, Nothing)
             gmpVariablesInitialized = True
 
-            If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_ui_pow_ui: 10^{digits:N0}")
+            ' §97: Unconditional step markers so the last log entry pinpoints the crashing call.
+            LogPhase($"[ComputePi] Step 1: computing 10^{digits:N0}")
             If CULng(digits) <= CULng(UInt32.MaxValue) Then
+                LogPhase($"[ComputePi] Step 1a: mpz_ui_pow_ui(10^{digits:N0}) — single call")
                 gmp_lib.mpz_ui_pow_ui(gmpOne, 10UI, CUInt(digits))
+                LogPhase($"[ComputePi] Step 1a done")
             Else
                 ' §90: digits > 2^32 — split into two halves, each fits in UInt32, then multiply.
                 Dim _powHalfA As Long = digits \ 2L
                 Dim _powHalfB As Long = digits - _powHalfA
                 Dim _gmpPowA As New mpz_t(), _gmpPowB As New mpz_t()
                 gmp_lib.mpz_inits(_gmpPowA, _gmpPowB, Nothing)
+                LogPhase($"[ComputePi] Step 1a: mpz_ui_pow_ui(10^{_powHalfA:N0})")
                 gmp_lib.mpz_ui_pow_ui(_gmpPowA, 10UI, CUInt(_powHalfA))
+                LogPhase($"[ComputePi] Step 1a done")
+                LogPhase($"[ComputePi] Step 1b: mpz_ui_pow_ui(10^{_powHalfB:N0})")
                 gmp_lib.mpz_ui_pow_ui(_gmpPowB, 10UI, CUInt(_powHalfB))
+                LogPhase($"[ComputePi] Step 1b done")
+                LogPhase($"[ComputePi] Step 1c: SafeMpzMul gmpOne = powA * powB")
                 SafeMpzMul(gmpOne, _gmpPowA, _gmpPowB)
+                LogPhase($"[ComputePi] Step 1c done")
                 gmp_lib.mpz_clears(_gmpPowA, _gmpPowB, Nothing)
             End If
-            If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_mul: gmpSqrtInput = gmpOne^2")
+            LogPhase($"[ComputePi] Step 2: SafeMpzMul gmpSqrtInput = gmpOne^2")
             SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)
-            AppendLog(
-                $"[DIAG] gmpSqrtInput after SafeMpzMul(gmpOne^2): {gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10):N0} digits{vbCrLf}")
+            LogPhase($"[ComputePi] Step 2 done: gmpSqrtInput={CLng(gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10)):N0} digits")
             ' gmpOne is no longer needed — free its ~208 MB buffer now so it is
             ' not held alive through the sqrt, numerator multiply, and division.
             ' Re-init to 0 so the Finally block can safely call mpz_clear on it.
             gmp_lib.mpz_clear(gmpOne)
             gmp_lib.mpz_init(gmpOne)
-            If _logLevel >= 2 Then
-                WriteToLog($"[ComputePi] gmpOne freed (early): RAM now lower before sqrt")
-                WriteToLog($"[ComputePi] mpz_mul_ui: gmpSqrtInput *= 10005")
-            End If
+            LogPhase($"[ComputePi] Step 3: mpz_mul_ui gmpSqrtInput *= 10005")
             gmp_lib.mpz_mul_ui(gmpSqrtInput, gmpSqrtInput, 10005UI)
-            If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_sqrt: sqrt({CLng(gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10)):N0}-digit number)")
+            LogPhase($"[ComputePi] Step 4: mpz_sqrt of {CLng(gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10)):N0}-digit number")
             gmp_lib.mpz_sqrt(gmpSqrt, gmpSqrtInput)
             gmp_lib.mpz_clear(gmpSqrtInput)
             LogPhase("Square root complete")
@@ -2953,6 +2958,7 @@ Phase2:
             ' multiply pushes the peak to ~2,310 MB (crashes).  By spilling we
             ' drop the baseline to ~770 MB so the multiply peaks at ~1,762 MB.
             ' finalT is reloaded immediately after finalQ is freed.
+            LogPhase($"[ComputePi] Step 5: spilling finalT to disk")
             Dim finalT_spillPath As String = $"{DISK_CACHE_DIR}finalT_spill.bin"
             Dim stagingT(65535) As Byte
             Using fs As New FileStream(finalT_spillPath, FileMode.Create, FileAccess.Write)
@@ -2961,11 +2967,7 @@ Phase2:
                 End Using
             End Using
             gmp_lib.mpz_clear(finalT)   ' free ~548 MB; will be reloaded below
-            If _logLevel >= 2 Then
-                WriteToLog($"[ComputePi] gmpSqrt+finalP freed + finalT spilled: RAM before big multiply")
-                WriteToLog($"[ComputePi] Three-pass multiply: splitting finalQ " &
-                           $"(Q~{CLng(gmp_lib.mpz_sizeinbase(finalQ, 10)):N0} digits)")
-            End If
+            LogPhase($"[ComputePi] Step 5 done: finalT spilled, finalQ={CLng(gmp_lib.mpz_sizeinbase(finalQ, 10)):N0} digits")
             ' gmpNumer *= finalQ in a single call peaks at ~2.3 GB — too large.
             ' Split finalQ into three equal thirds (by bit position) and do three
             ' smaller multiplies (~1.24 GB peak each), spilling between passes.
