@@ -10,7 +10,7 @@
     is written to the phase log with a [DIALOG] prefix for review.
 
     The build output directory is auto-detected by globbing for
-    PI-BillionDigits.exe under bin\Release after the build — no hardcoded
+    PI-BillionDigits.exe under bin\Debug after the build — no hardcoded
     TFM folder name.  The output directory defaults to .\PiOutput next to
     the script, and can be overridden with -OutputDir.
 
@@ -152,22 +152,22 @@ if (-not (Test-Path $OutputDir)) {
 
 # ── 1. Clean ─────────────────────────────────────────────────────────────────
 Write-Host "--- dotnet clean ---" -ForegroundColor Yellow
-dotnet clean $projectFile --configuration Release
+dotnet clean $projectFile --configuration Debug
 if ($LASTEXITCODE -ne 0) { throw "dotnet clean failed (exit $LASTEXITCODE)" }
 
 # ── 2. Build ─────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "--- dotnet build ---" -ForegroundColor Yellow
-dotnet build $projectFile --configuration Release --no-incremental
+dotnet build $projectFile --configuration Debug --no-incremental
 if ($LASTEXITCODE -ne 0) { throw "dotnet build failed (exit $LASTEXITCODE)" }
 
 # ── Auto-detect exe path ─────────────────────────────────────────────────────
-$exeCandidates = @(Get-ChildItem -Path (Join-Path $projectDir 'bin\Release') `
+$exeCandidates = @(Get-ChildItem -Path (Join-Path $projectDir 'bin\Debug') `
                                -Filter 'PI-BillionDigits.exe' `
                                -Recurse -ErrorAction SilentlyContinue |
                  Sort-Object LastWriteTime -Descending)
 if ($exeCandidates.Count -eq 0) {
-    throw "PI-BillionDigits.exe not found under bin\Release after build."
+    throw "PI-BillionDigits.exe not found under bin\Debug after build."
 }
 $exePath = $exeCandidates[0].FullName
 Write-Host "Exe     : $exePath"
