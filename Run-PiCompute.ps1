@@ -9,8 +9,12 @@
     No dialogs will appear during the run.  All suppressed dialog text
     is written to the phase log with a [DIALOG] prefix for review.
 
+    Builds in Debug by default.  Pass -UseRelease to build and run the
+    Release configuration instead.
+
     The build output directory is auto-detected by globbing for
-    PI-BillionDigits.exe under bin\Debug after the build — no hardcoded
+    PI-BillionDigits.exe under bin\Debug (or bin\Release with -UseRelease)
+    after the build — no hardcoded
     TFM folder name.  The output directory defaults to .\PiOutput next to
     the script, and can be overridden with -OutputDir.
 
@@ -76,6 +80,10 @@
       4  Full trace  Everything in 3, plus SafeMpzMul diagnostics and BinarySplitChunk.
       5  Allocator   Everything in 4, plus pool/affinity diagnostics.
 
+.PARAMETER UseRelease
+    Build and run the Release configuration instead of Debug.
+    Default is Debug.
+
 .PARAMETER ReportOnly
     Path to an existing .nettrace file.  Skips clean/build/run and goes
     straight to generating the topN report.  Use this to process a trace
@@ -104,6 +112,7 @@ param(
     [int]   $CheckpointFromLevel = 0,
     [int]   $ResumeFromLevel     = 0,
     [switch]$AutoCheckpoint,
+    [switch]$UseRelease,
     [switch]$Trace,
     [switch]$Test,
     [string]$ReportOnly          = ""
@@ -111,6 +120,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$config = if ($UseRelease) { 'Release' } else { 'Debug' }
 
 # ── ReportOnly: skip everything except report generation ─────────────────────
 if ($ReportOnly -ne "") {
@@ -134,6 +145,7 @@ $logFile     = Join-Path $OutputDir  'pi_phase_log.txt'
 
 Write-Host "=== PI-BillionDigits headless run ===" -ForegroundColor Cyan
 Write-Host "Project  : $projectFile"
+Write-Host "Config   : $config"
 Write-Host "Output   : $OutputDir"
 Write-Host "Digits   : $Digits"
 Write-Host "LogLevel : $LogLevel"
@@ -152,22 +164,22 @@ if (-not (Test-Path $OutputDir)) {
 
 # ── 1. Clean ─────────────────────────────────────────────────────────────────
 Write-Host "--- dotnet clean ---" -ForegroundColor Yellow
-dotnet clean $projectFile --configuration Debug
+dotnet clean $projectFile --configuration $config
 if ($LASTEXITCODE -ne 0) { throw "dotnet clean failed (exit $LASTEXITCODE)" }
 
 # ── 2. Build ─────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "--- dotnet build ---" -ForegroundColor Yellow
-dotnet build $projectFile --configuration Debug --no-incremental
+dotnet build $projectFile --configuration $config --no-incremental
 if ($LASTEXITCODE -ne 0) { throw "dotnet build failed (exit $LASTEXITCODE)" }
 
 # ── Auto-detect exe path ─────────────────────────────────────────────────────
-$exeCandidates = @(Get-ChildItem -Path (Join-Path $projectDir 'bin\Debug') `
+$exeCandidates = @(Get-ChildItem -Path (Join-Path $projectDir "bin\$config") `
                                -Filter 'PI-BillionDigits.exe' `
                                -Recurse -ErrorAction SilentlyContinue |
                  Sort-Object LastWriteTime -Descending)
 if ($exeCandidates.Count -eq 0) {
-    throw "PI-BillionDigits.exe not found under bin\Debug after build."
+    throw "PI-BillionDigits.exe not found under bin\$config after build."
 }
 $exePath = $exeCandidates[0].FullName
 Write-Host "Exe     : $exePath"
