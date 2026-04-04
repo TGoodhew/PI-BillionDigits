@@ -1751,12 +1751,13 @@ Public Class Form1
             Dim mpD As IntPtr = Marshal.ReadIntPtr(val.Pointer, 8)
             Dim remaining As Long = byteCount
             Dim offset As Long = 0L
+            Dim mpDBase As Long = mpD.ToInt64()  ' §98: 64-bit arithmetic to avoid Int32 overflow at >2GB
             While remaining > 0
                 Dim toRead As Integer = CInt(System.Math.Min(remaining, CLng(staging.Length)))
                 Dim bytesRead As Integer = br.Read(staging, 0, toRead)
                 If bytesRead <= 0 Then _
                     Throw New EndOfStreamException($"Unexpected end of stream in DeserializeOneMpz (small)")
-                Marshal.Copy(staging, 0, IntPtr.Add(mpD, CInt(offset)), bytesRead)
+                Marshal.Copy(staging, 0, New IntPtr(mpDBase + offset), bytesRead)
                 offset += bytesRead
                 remaining -= bytesRead
             End While
@@ -1786,12 +1787,13 @@ Public Class Form1
             Marshal.WriteIntPtr(val.Pointer, 8, limbs)            ' _mp_d
             Dim remaining As Long = byteCount
             Dim offset As Long = 0L
+            Dim limbsBase As Long = limbs.ToInt64()  ' §98: 64-bit arithmetic to avoid Int32 overflow at >2GB
             While remaining > 0
                 Dim toRead As Integer = CInt(System.Math.Min(remaining, CLng(staging.Length)))
                 Dim bytesRead As Integer = br.Read(staging, 0, toRead)
                 If bytesRead <= 0 Then _
                     Throw New EndOfStreamException($"Unexpected end of stream in DeserializeOneMpz (large)")
-                Marshal.Copy(staging, 0, IntPtr.Add(limbs, CInt(offset)), bytesRead)
+                Marshal.Copy(staging, 0, New IntPtr(limbsBase + offset), bytesRead)
                 offset += bytesRead
                 remaining -= bytesRead
             End While
