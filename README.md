@@ -2495,3 +2495,38 @@ If the run is interrupted at any point during Phase 2, re-run the same command. 
 **Snapshot write cost:** writing ~6 GB of Level 3 nodes to NVMe takes roughly 6 seconds — negligible relative to the hours of combine time per level.
 
 **Why not §93?** The §93 approach trades RAM performance for recoverability at every pair, making the affected level significantly slower. §94 pays the snapshot cost only once per level, after all the work is already done.
+
+---
+
+## §100 — SafeMpzSqrt, SafeMpzDiv, SafeMpzReciprocal, BigShiftRight, BigShiftLeft
+
+### Problem
+
+At 5 billion digits the `mpz_sqrt` call in `ComputePi` (Step 4) crashes because the input is 10^10,000,000,005 — approximately 519 million GMP limbs. GMP's `mpn_mul_fft` uses a static lookup table indexed by `mpn_fft_best_k`, and the table overflows beyond ~33.5 million limbs (`SAFE_LIMB_THRESHOLD = 33_554_431`). The same class of overflow previously caused crashes in `mpz_mul` (fixed via `SafeMpzMul` in §17–45) and `mpz_ui_pow_ui` (fixed via `SafeMpzPow10` in §99).
+
+### Solution
+
+Replace the `gmp_lib.mpz_sqrt(gmpSqrt, gmpSqrtInput)` call with `SafeMpzSqrt(gmpSqrt, gmpSqrtInput)`.
+
+Five helper routines were added:
+
+**`BigShiftRight(rop, op, bits As Long)`** — right-shifts `op` by an arbitrary number of bits (including values exceeding `UInt32.Max` ≈ 4.3 billion). Splits the shift into chunks of at most 2,100,000,000 bits, calling the raw GMP P/Invoke `GmpRaw_tdiv_q_2exp` each time. `rop` may alias `op`.
+
+**`BigShiftLeft(rop, op, bits As Long)`** — same for left shift, using `GmpRaw_mul_2exp`.
+
+**`SafeMpzReciprocal(r, b, kBits As Long)`** — computes `floor(2^kBits / b)` using Newton iteration with progressive precision. Seeds from the top 64 bits of `b`, then doubles working precision from ~62 bits to `rBits+2` bits. At each step, `b` is ceiling-truncated (ensuring `r` stays a strict underestimate throughout). Large multiplications within the loop use `SafeMpzMul` or `GmpRaw_mul` depending on operand size.
+
+**`SafeMpzDiv(q, a, b)`** — computes `floor(a / b)` using Barrett reduction. For operand sizes within the safe threshold it calls `mpz_tdiv_q` directly. For larger operands: computes the Newton reciprocal via `SafeMpzReciprocal`, forms `q ≈ a·r / 2^kBits` via `SafeMpzMul`, then adjusts by ±1 until `0 ≤ remainder < b`.
+
+**`SafeMpzSqrt(result, n)`** — computes `floor(sqrt(n))` using Newton iteration. For inputs within the safe threshold it calls `mpz_sqrt` directly. For larger inputs:
+- Seeds by right-shifting `n` by `seedShift` bits (even, chosen so the shifted value has ≤ 700M bits), computing `mpz_sqrt` of the seed (safe, ≤ 5.5M limbs), then left-shifting the result back.
+- Refines via Newton: at each step doubles the working precision from `SEED_BITS` to `bitsS+2` bits. Uses `BigShiftRight`/`BigShiftLeft` to keep operands at the target precision, and `SafeMpzDiv` (or `mpz_tdiv_q` when safe) for the division step.
+- Final adjustment: verifies `x² ≤ n < (x+1)²`, correcting by ±1 if needed (at most 1 correction expected).
+
+### Usage
+
+`SafeMpzSqrt` is a drop-in replacement for `gmp_lib.mpz_sqrt`. It is called only once per PI computation (Step 4 of `ComputePi`). For the 5B-digit run the Newton refinement performs approximately 6 full-precision steps.
+
+### Why not use GMP's integer square root directly?
+
+GMP's `mpz_sqrt` internally calls `mpn_sqrtrem` which calls `mpn_mul_fft` for the Schönhage-Strassen squarings used in Newton refinement — and those calls read from the same static table that overflows. There is no GMP API to compute a large integer square root without triggering this path.

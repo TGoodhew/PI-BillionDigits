@@ -2125,6 +2125,318 @@ Public Class Form1
     End Sub
 
     ' ════════════════════════════════════════════════════════════════════════
+    ' §100 BigShiftRight / BigShiftLeft / SafeMpzReciprocal / SafeMpzDiv / SafeMpzSqrt
+    '
+    ' GMP's mpz_sqrt (and the division it uses internally) calls mpn_mul_fft.
+    ' That routine has a static FFT-size table whose index overflows when the
+    ' operand exceeds ~33 M limbs — exactly the crash seen at 5 B digits when
+    ' computing sqrt(10^10,000,000,000 * 10005).
+    '
+    ' Fix: implement SafeMpzSqrt via Newton iteration that routes every large
+    ' multiplication through SafeMpzMul (which already handles arbitrarily large
+    ' operands via 3×3 recursive splitting).  Division is handled by
+    ' SafeMpzDiv (Barrett-style Newton reciprocal), which also uses only
+    ' SafeMpzMul internally.
+    ' ════════════════════════════════════════════════════════════════════════
+
+    ' Compute floor(op / 2^bits) → rop.  Handles bits > UInt32.Max.  rop may alias op.
+    Private Shared Sub BigShiftRight(rop As mpz_t, op As mpz_t, bits As Long)
+        If bits <= 0L Then
+            If rop.Pointer <> op.Pointer Then gmp_lib.mpz_set(rop, op)
+            Return
+        End If
+        Dim src As IntPtr = op.Pointer
+        Dim dst As IntPtr = rop.Pointer
+        Dim bitsLeft As Long = bits
+        Do
+            Dim chunk As UInteger = CUInt(System.Math.Min(bitsLeft, 2_100_000_000L))
+            GmpRaw_tdiv_q_2exp(dst, src, chunk)
+            src = dst
+            bitsLeft -= CLng(chunk)
+        Loop While bitsLeft > 0L
+    End Sub
+
+    ' Compute op * 2^bits → rop.  Handles bits > UInt32.Max.  rop may alias op.
+    Private Shared Sub BigShiftLeft(rop As mpz_t, op As mpz_t, bits As Long)
+        If bits <= 0L Then
+            If rop.Pointer <> op.Pointer Then gmp_lib.mpz_set(rop, op)
+            Return
+        End If
+        Dim src As IntPtr = op.Pointer
+        Dim dst As IntPtr = rop.Pointer
+        Dim bitsLeft As Long = bits
+        Do
+            Dim chunk As UInteger = CUInt(System.Math.Min(bitsLeft, 2_100_000_000L))
+            GmpRaw_mul_2exp(dst, src, chunk)
+            src = dst
+            bitsLeft -= CLng(chunk)
+        Loop While bitsLeft > 0L
+    End Sub
+
+    ' Compute r = floor(2^kBits / b) for b > 0, kBits > sizeinbase(b,2).
+    ' Newton iteration with progressive precision; r is always an underestimate.
+    ' All large multiplications use SafeMpzMul — no direct mpn_mul_fft calls.
+    Private Shared Sub SafeMpzReciprocal(r As mpz_t, b As mpz_t, kBits As Long)
+        Const SAFE As Integer = 33_554_431
+        Dim bBits As Long = CLng(gmp_lib.mpz_sizeinbase(b, 2))
+        Dim rBits As Long = kBits - bBits + 1L   ' r has at most rBits significant bits
+        If rBits <= 0L Then
+            gmp_lib.mpz_set_ui(r, 0UI)
+            Return
+        End If
+
+        ' ── Seed: ~64-bit approximation from top 64 bits of b ──────────────
+        Dim bHiShift As Long = System.Math.Max(0L, bBits - 64L)
+        Dim bHi As New mpz_t()
+        gmp_lib.mpz_init(bHi)
+        If bHiShift > 0L Then
+            BigShiftRight(bHi, b, bHiShift)
+            gmp_lib.mpz_add_ui(bHi, bHi, 1UI)   ' ceiling → underestimate of reciprocal guaranteed
+        Else
+            gmp_lib.mpz_set(bHi, b)
+        End If
+        ' rSeed = floor(2^64 / bHi)  [safe: both operands tiny]
+        Dim rSeed As New mpz_t()
+        gmp_lib.mpz_init(rSeed)
+        gmp_lib.mpz_set_ui(rSeed, 1UI)
+        gmp_lib.mpz_mul_2exp(rSeed, rSeed, New mp_bitcnt_t(64UI))
+        gmp_lib.mpz_tdiv_q(rSeed, rSeed, bHi)
+        gmp_lib.mpz_clear(bHi)
+        ' Scale to r's domain: rSeed * 2^(kBits-64-bHiShift) ≈ 2^kBits / b (underestimate)
+        Dim seedScale As Long = kBits - 64L - bHiShift
+        If seedScale > 0L Then
+            BigShiftLeft(rSeed, rSeed, seedScale)
+        ElseIf seedScale < 0L Then
+            BigShiftRight(rSeed, rSeed, -seedScale)
+        End If
+        If gmp_lib.mpz_sgn(rSeed) > 0 Then gmp_lib.mpz_sub_ui(rSeed, rSeed, 2UI)  ' strict underestimate
+        If gmp_lib.mpz_sgn(rSeed) <= 0 Then gmp_lib.mpz_set_ui(rSeed, 1UI)
+        gmp_lib.mpz_swap(r, rSeed)
+        gmp_lib.mpz_clear(rSeed)
+
+        ' ── Newton: r ← 2r - ceil(b/2^bShift) · r² / 2^(kBits-bShift) ────
+        ' Progressive precision: prec doubles each step from ~62 → rBits+2.
+        ' Ceiling truncation of b maintains r as a strict underestimate throughout.
+        Dim prec As Long = 62L
+        Do While prec < rBits + 2L
+            prec = System.Math.Min(prec * 2L + 4L, rBits + 2L)
+
+            ' Truncate r to prec bits
+            Dim rNow As Long = CLng(gmp_lib.mpz_sizeinbase(r, 2))
+            If rNow > prec Then BigShiftRight(r, r, rNow - prec)
+
+            ' bTrunc = ceil(b / 2^bShift), bShift = max(0, bBits - prec - 2)
+            Dim bShift As Long = System.Math.Max(0L, bBits - prec - 2L)
+            Dim bTrunc As New mpz_t()
+            gmp_lib.mpz_init(bTrunc)
+            If bShift > 0L Then
+                BigShiftRight(bTrunc, b, bShift)
+                gmp_lib.mpz_add_ui(bTrunc, bTrunc, 1UI)
+            Else
+                gmp_lib.mpz_set(bTrunc, b)
+            End If
+
+            ' rSq = r²
+            Dim rSq As New mpz_t()
+            gmp_lib.mpz_init(rSq)
+            Dim szR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
+            If CLng(szR) * 2L <= SAFE Then
+                GmpRaw_mul(rSq.Pointer, r.Pointer, r.Pointer)
+            Else
+                SafeMpzMul(rSq, r, r)
+            End If
+
+            ' p = bTrunc · rSq
+            Dim p As New mpz_t()
+            gmp_lib.mpz_init(p)
+            Dim szBt As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(bTrunc.Pointer, 4))
+            Dim szRsq As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(rSq.Pointer, 4))
+            If CLng(szBt) + CLng(szRsq) <= SAFE Then
+                GmpRaw_mul(p.Pointer, bTrunc.Pointer, rSq.Pointer)
+            Else
+                SafeMpzMul(p, bTrunc, rSq)
+            End If
+            gmp_lib.mpz_clear(rSq)
+            gmp_lib.mpz_clear(bTrunc)
+
+            ' p >>= (kBits - bShift);  r = 2r - p
+            BigShiftRight(p, p, kBits - bShift)
+            gmp_lib.mpz_add(r, r, r)    ' r = 2r  (in-place; GMP allows rop=op1=op2)
+            gmp_lib.mpz_sub(r, r, p)
+            gmp_lib.mpz_clear(p)
+
+            ' Guard: reset if r went non-positive (shouldn't happen but defends against
+            ' accumulated rounding pushing the seed over 2^kBits/b in early iterations)
+            If gmp_lib.mpz_sgn(r) <= 0 Then
+                gmp_lib.mpz_set_ui(r, 1UI)
+                prec = 1L
+            End If
+        Loop
+    End Sub
+
+    ' Compute q = floor(a / b).  Safe for any operand size.
+    ' Uses Barrett-style Newton reciprocal + SafeMpzMul — no direct GMP division
+    ' for large inputs (which would crash via mpn_mul_fft overflow at 5B digits).
+    Private Shared Sub SafeMpzDiv(q As mpz_t, a As mpz_t, b As mpz_t)
+        Const SAFE As Integer = 33_554_431
+        Dim szA As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(a.Pointer, 4))
+        Dim szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
+        If CLng(szA) + CLng(szB) <= SAFE Then
+            gmp_lib.mpz_tdiv_q(q, a, b)
+            Return
+        End If
+
+        Dim aBits As Long = CLng(gmp_lib.mpz_sizeinbase(a, 2))
+        ' r = floor(2^kBits / b), kBits = aBits+3 (Barrett: quotient_bits + divisor_bits + margin)
+        Dim kBits As Long = aBits + 3L
+        Dim r As New mpz_t()
+        gmp_lib.mpz_init(r)
+        SafeMpzReciprocal(r, b, kBits)
+
+        ' q_approx = floor(a · r / 2^kBits)
+        Dim ar As New mpz_t()
+        gmp_lib.mpz_init(ar)
+        SafeMpzMul(ar, a, r)
+        gmp_lib.mpz_clear(r)
+        BigShiftRight(ar, ar, kBits)
+        gmp_lib.mpz_swap(q, ar)
+        gmp_lib.mpz_clear(ar)
+
+        ' Adjustment: remainder = a - q·b; fix until 0 ≤ remainder < b  (at most 2 corrections)
+        Dim qb As New mpz_t()
+        gmp_lib.mpz_init(qb)
+        SafeMpzMul(qb, q, b)
+        Dim remainder As New mpz_t()
+        gmp_lib.mpz_init(remainder)
+        gmp_lib.mpz_sub(remainder, a, qb)
+        gmp_lib.mpz_clear(qb)
+        Do While gmp_lib.mpz_sgn(remainder) < 0        ' q too large
+            gmp_lib.mpz_sub_ui(q, q, 1UI)
+            gmp_lib.mpz_add(remainder, remainder, b)
+        Loop
+        Do While gmp_lib.mpz_cmp(remainder, b) >= 0   ' q too small
+            gmp_lib.mpz_add_ui(q, q, 1UI)
+            gmp_lib.mpz_sub(remainder, remainder, b)
+        Loop
+        gmp_lib.mpz_clear(remainder)
+    End Sub
+
+    ' Compute result = floor(sqrt(n)).  Safe for any size n.
+    ' §100: GMP's mpz_sqrt crashes at 5B digits (519M-limb input triggers
+    ' mpn_mul_fft table overflow).  This Newton implementation routes every
+    ' large multiplication through SafeMpzMul and every large division through
+    ' SafeMpzDiv — neither calls mpn_mul_fft directly.
+    '
+    ' Algorithm: progressive-precision Newton, working in sqrt(n)'s domain.
+    ' At each step with current precision kBitsX:
+    '   target   = min(2·kBitsX + 4, bitsS + 2)
+    '   nShift   = max(0, bitsN - 2·target)  [keep even]
+    '   xHalf    = nShift / 2
+    '   nTrunc   = n >> nShift           (~2·target bits)
+    '   xTrunc   = x >> xHalf            (~target bits, sqrt(nTrunc) domain)
+    '   q        = floor(nTrunc / xTrunc) (~target bits)
+    '   xNew     = ((xTrunc + q) >> 1) << xHalf  [scaled back to sqrt(n) domain]
+    ' Convergence: Newton quadratic convergence, ~6 large iterations for 5B digits.
+    Private Shared Sub SafeMpzSqrt(result As mpz_t, n As mpz_t)
+        Const SAFE As Integer = 33_554_431
+        Dim szN As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(n.Pointer, 4))
+        If CLng(szN) <= SAFE Then
+            gmp_lib.mpz_sqrt(result, n)
+            Return
+        End If
+
+        Dim bitsN As Long = CLng(gmp_lib.mpz_sizeinbase(n, 2))
+        Dim bitsS As Long = (bitsN + 1L) >> 1   ' bits in floor(sqrt(n))
+
+        ' Seed: mpz_sqrt at safe scale — result ≤ SEED_BITS bits = ~5.5M limbs
+        Const SEED_BITS As Long = 350_000_000L
+        Dim seedShift As Long = System.Math.Max(0L, bitsN - 2L * SEED_BITS)
+        If (seedShift And 1L) <> 0L Then seedShift += 1L  ' must be even
+
+        Dim x As New mpz_t()
+        gmp_lib.mpz_init(x)
+        If seedShift = 0L Then
+            gmp_lib.mpz_sqrt(x, n)
+        Else
+            Dim nSeed As New mpz_t()
+            gmp_lib.mpz_init(nSeed)
+            BigShiftRight(nSeed, n, seedShift)
+            gmp_lib.mpz_sqrt(x, nSeed)   ' safe: nSeed has 2·SEED_BITS bits
+            gmp_lib.mpz_clear(nSeed)
+            BigShiftLeft(x, x, seedShift >> 1)   ' x ≈ sqrt(n), correct to SEED_BITS bits
+        End If
+
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] seed ready ({CLng(gmp_lib.mpz_sizeinbase(x, 10)):N0} digits); beginning Newton refinement{vbCrLf}")
+
+        ' Newton refinement — doubles precision each step
+        Dim kBitsX As Long = SEED_BITS
+        Do While kBitsX < bitsS + 2L
+            Dim target As Long = System.Math.Min(kBitsX * 2L + 4L, bitsS + 2L)
+            Dim nShift As Long = System.Math.Max(0L, bitsN - 2L * target)
+            If (nShift And 1L) <> 0L Then nShift += 1L
+            Dim xHalf As Long = nShift >> 1
+
+            Dim nTrunc As New mpz_t()
+            gmp_lib.mpz_init(nTrunc)
+            If nShift > 0L Then BigShiftRight(nTrunc, n, nShift) Else gmp_lib.mpz_set(nTrunc, n)
+
+            Dim xTrunc As New mpz_t()
+            gmp_lib.mpz_init(xTrunc)
+            If xHalf > 0L Then BigShiftRight(xTrunc, x, xHalf) Else gmp_lib.mpz_set(xTrunc, x)
+
+            Dim q As New mpz_t()
+            gmp_lib.mpz_init(q)
+            Dim szNT As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(nTrunc.Pointer, 4))
+            Dim szXT As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(xTrunc.Pointer, 4))
+            If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] Newton step: target={target:N0} bits, div {szNT:N0}/{szXT:N0} limbs{vbCrLf}")
+            If CLng(szNT) + CLng(szXT) <= SAFE Then
+                gmp_lib.mpz_tdiv_q(q, nTrunc, xTrunc)
+            Else
+                SafeMpzDiv(q, nTrunc, xTrunc)
+            End If
+            gmp_lib.mpz_clear(nTrunc)
+
+            gmp_lib.mpz_add(xTrunc, xTrunc, q)
+            gmp_lib.mpz_clear(q)
+            GmpRaw_tdiv_q_2exp(xTrunc.Pointer, xTrunc.Pointer, 1UI)   ' >> 1
+
+            If xHalf > 0L Then BigShiftLeft(xTrunc, xTrunc, xHalf)
+            gmp_lib.mpz_swap(x, xTrunc)
+            gmp_lib.mpz_clear(xTrunc)
+            kBitsX = target
+        Loop
+
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] Newton done; final adjustment{vbCrLf}")
+
+        ' Final adjustment: ensure result = floor(sqrt(n)) exactly (off by at most 1)
+        Dim xSq As New mpz_t()
+        gmp_lib.mpz_init(xSq)
+        SafeMpzMul(xSq, x, x)
+        Do While gmp_lib.mpz_cmp(xSq, n) > 0   ' x² > n → x too large
+            gmp_lib.mpz_sub_ui(x, x, 1UI)
+            SafeMpzMul(xSq, x, x)
+        Loop
+        gmp_lib.mpz_clear(xSq)
+
+        Dim x1 As New mpz_t()
+        gmp_lib.mpz_init(x1)
+        gmp_lib.mpz_add_ui(x1, x, 1UI)
+        Dim x1Sq As New mpz_t()
+        gmp_lib.mpz_init(x1Sq)
+        SafeMpzMul(x1Sq, x1, x1)
+        Do While gmp_lib.mpz_cmp(x1Sq, n) <= 0   ' (x+1)² ≤ n → x too small
+            gmp_lib.mpz_swap(x, x1)
+            gmp_lib.mpz_add_ui(x1, x, 1UI)
+            SafeMpzMul(x1Sq, x1, x1)
+        Loop
+        gmp_lib.mpz_clear(x1)
+        gmp_lib.mpz_clear(x1Sq)
+
+        gmp_lib.mpz_swap(result, x)
+        gmp_lib.mpz_clear(x)
+    End Sub
+
+    ' ════════════════════════════════════════════════════════════════════════
     '  Chudnovsky binary splitting — tree merge level
     ' ════════════════════════════════════════════════════════════════════════
 
@@ -2968,8 +3280,8 @@ Phase2:
             gmp_lib.mpz_init(gmpOne)
             LogPhase($"[ComputePi] Step 3: mpz_mul_ui gmpSqrtInput *= 10005")
             gmp_lib.mpz_mul_ui(gmpSqrtInput, gmpSqrtInput, 10005UI)
-            LogPhase($"[ComputePi] Step 4: mpz_sqrt of {CLng(gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10)):N0}-digit number")
-            gmp_lib.mpz_sqrt(gmpSqrt, gmpSqrtInput)
+            LogPhase($"[ComputePi] Step 4: SafeMpzSqrt of {CLng(gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10)):N0}-digit number")
+            SafeMpzSqrt(gmpSqrt, gmpSqrtInput)
             gmp_lib.mpz_clear(gmpSqrtInput)
             LogPhase("Square root complete")
 
