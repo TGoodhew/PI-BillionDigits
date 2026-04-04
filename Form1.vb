@@ -2788,6 +2788,49 @@ Phase2:
     End Sub
 
     ' ════════════════════════════════════════════════════════════════════════
+    '  §99: Safe 10^n via repeated squaring using SafeMpzMul
+    ' ════════════════════════════════════════════════════════════════════════
+    ''' <summary>
+    ''' Computes result = 10^exponent using binary (repeated squaring) with
+    ''' SafeMpzMul for every multiplication, avoiding the GMP 32-bit mpn_mul_fft
+    ''' overflow that crashes mpz_ui_pow_ui when the intermediate values exceed
+    ''' ~33M limbs (~2GB).  At 5B digits, 10^2,500,000,000 ≈ 130M limbs — well
+    ''' above the threshold.
+    ''' </summary>
+    Private Sub SafeMpzPow10(result As mpz_t, exponent As Long)
+        ' Seed: result = 1
+        gmp_lib.mpz_set_ui(result, 1UI)
+
+        If exponent = 0L Then Return
+
+        ' base = 10
+        Dim base As New mpz_t()
+        gmp_lib.mpz_init_set_ui(base, 10UI)
+
+        Dim exp As Long = exponent
+        Do
+            If (exp And 1L) = 1L Then
+                ' result *= base
+                Dim tmp As New mpz_t()
+                gmp_lib.mpz_init(tmp)
+                SafeMpzMul(tmp, result, base)
+                gmp_lib.mpz_swap(result, tmp)
+                gmp_lib.mpz_clear(tmp)
+            End If
+            exp >>= 1
+            If exp = 0L Then Exit Do
+            ' base = base^2
+            Dim tmp2 As New mpz_t()
+            gmp_lib.mpz_init(tmp2)
+            SafeMpzMul(tmp2, base, base)
+            gmp_lib.mpz_swap(base, tmp2)
+            gmp_lib.mpz_clear(tmp2)
+        Loop
+
+        gmp_lib.mpz_clear(base)
+    End Sub
+
+    ' ════════════════════════════════════════════════════════════════════════
     '  Main computation entry point
     ' ════════════════════════════════════════════════════════════════════════
 
@@ -2907,29 +2950,14 @@ Phase2:
             gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpNumer, gmpPi, gmpOne, Nothing)
             gmpVariablesInitialized = True
 
-            ' §97: Unconditional step markers so the last log entry pinpoints the crashing call.
-            LogPhase($"[ComputePi] Step 1: computing 10^{digits:N0}")
-            If CULng(digits) <= CULng(UInt32.MaxValue) Then
-                LogPhase($"[ComputePi] Step 1a: mpz_ui_pow_ui(10^{digits:N0}) — single call")
-                gmp_lib.mpz_ui_pow_ui(gmpOne, 10UI, CUInt(digits))
-                LogPhase($"[ComputePi] Step 1a done")
-            Else
-                ' §90: digits > 2^32 — split into two halves, each fits in UInt32, then multiply.
-                Dim _powHalfA As Long = digits \ 2L
-                Dim _powHalfB As Long = digits - _powHalfA
-                Dim _gmpPowA As New mpz_t(), _gmpPowB As New mpz_t()
-                gmp_lib.mpz_inits(_gmpPowA, _gmpPowB, Nothing)
-                LogPhase($"[ComputePi] Step 1a: mpz_ui_pow_ui(10^{_powHalfA:N0})")
-                gmp_lib.mpz_ui_pow_ui(_gmpPowA, 10UI, CUInt(_powHalfA))
-                LogPhase($"[ComputePi] Step 1a done")
-                LogPhase($"[ComputePi] Step 1b: mpz_ui_pow_ui(10^{_powHalfB:N0})")
-                gmp_lib.mpz_ui_pow_ui(_gmpPowB, 10UI, CUInt(_powHalfB))
-                LogPhase($"[ComputePi] Step 1b done")
-                LogPhase($"[ComputePi] Step 1c: SafeMpzMul gmpOne = powA * powB")
-                SafeMpzMul(gmpOne, _gmpPowA, _gmpPowB)
-                LogPhase($"[ComputePi] Step 1c done")
-                gmp_lib.mpz_clears(_gmpPowA, _gmpPowB, Nothing)
-            End If
+            ' §99: Use SafeMpzPow10 (repeated squaring via SafeMpzMul) for all digit counts.
+            ' mpz_ui_pow_ui uses GMP's internal repeated squaring which hits the 32-bit
+            ' mpn_mul_fft overflow once intermediates exceed ~33M limbs (~2GB).  At 5B digits
+            ' 10^2,500,000,000 ≈ 130M limbs — well above that threshold.  SafeMpzPow10 routes
+            ' every squaring through SafeMpzMul which splits around the 33M-limb boundary.
+            LogPhase($"[ComputePi] Step 1: SafeMpzPow10(10^{digits:N0})")
+            SafeMpzPow10(gmpOne, digits)
+            LogPhase($"[ComputePi] Step 1 done: gmpOne={CLng(gmp_lib.mpz_sizeinbase(gmpOne, 10)):N0} digits")
             LogPhase($"[ComputePi] Step 2: SafeMpzMul gmpSqrtInput = gmpOne^2")
             SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)
             LogPhase($"[ComputePi] Step 2 done: gmpSqrtInput={CLng(gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10)):N0} digits")
