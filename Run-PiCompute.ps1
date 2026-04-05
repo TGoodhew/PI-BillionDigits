@@ -71,6 +71,15 @@
     next level confirms).
     Example: -AutoCheckpoint  (use on every run; interrupted runs resume automatically)
 
+.PARAMETER BackupCheckpoint
+    After the run completes or crashes, copy all snap_L* snapshot directories from
+    NodeCache into OutputDir\SnapshotStore\.  The store directory is never touched by
+    the app, so backups there survive the next run's cache clear.
+    Existing store entries with the same name are overwritten.
+    Combine with -AutoCheckpoint to both save checkpoints during the run and back them
+    up afterwards.
+    Example: -AutoCheckpoint -BackupCheckpoint
+
 .PARAMETER LogLevel
     Logging detail level passed to the exe as --log-level N.  Defaults to 1.
       0  None        Errors and crashes only. Silent on success.
@@ -103,6 +112,7 @@
     .\Run-PiCompute.ps1 -Digits 5000000000 -Threshold 1000000 -CheckpointFromLevel 15 -LogLevel 2
     .\Run-PiCompute.ps1 -Digits 5000000000 -ResumeFromLevel 15 -LogLevel 2
     .\Run-PiCompute.ps1 -Digits 5000000000 -AutoCheckpoint -LogLevel 2
+    .\Run-PiCompute.ps1 -Digits 5000000000 -AutoCheckpoint -BackupCheckpoint -LogLevel 2
 #>
 param(
     [string]$OutputDir           = 'C:\PiOutput',
@@ -112,6 +122,7 @@ param(
     [int]   $CheckpointFromLevel = 0,
     [int]   $ResumeFromLevel     = 0,
     [switch]$AutoCheckpoint,
+    [switch]$BackupCheckpoint,
     [switch]$UseRelease,
     [switch]$Trace,
     [switch]$Test,
@@ -153,6 +164,7 @@ if ($Threshold           -gt 0) { Write-Host "Threshold: $($Threshold.ToString('
 if ($CheckpointFromLevel -gt 0) { Write-Host "Checkpoint: from level $CheckpointFromLevel" -ForegroundColor Yellow }
 if ($ResumeFromLevel     -gt 0) { Write-Host "Resume   : from level $ResumeFromLevel" -ForegroundColor Cyan }
 if ($AutoCheckpoint)            { Write-Host "Mode     : Auto-checkpoint enabled" -ForegroundColor Green }
+if ($BackupCheckpoint)          { Write-Host "Backup   : Checkpoints backed up to SnapshotStore after run" -ForegroundColor Green }
 if ($Trace)                     { Write-Host "Mode     : CPU trace enabled" -ForegroundColor Magenta }
 Write-Host ""
 
@@ -328,6 +340,26 @@ if ($Test) {
     exit 0
 }
 
+# ── BackupCheckpoint helper ──────────────────────────────────────────────────
+function Invoke-CheckpointBackup {
+    param([string]$NodeCacheDir, [string]$StoreDir)
+    $snaps = @(Get-ChildItem $NodeCacheDir -Directory -Filter 'snap_L*' -ErrorAction SilentlyContinue)
+    if ($snaps.Count -eq 0) {
+        Write-Host "BackupCheckpoint: no snap_L* directories found in $NodeCacheDir" -ForegroundColor Yellow
+        return
+    }
+    if (-not (Test-Path $StoreDir)) {
+        New-Item -ItemType Directory -Path $StoreDir | Out-Null
+    }
+    foreach ($snap in $snaps) {
+        $dest = Join-Path $StoreDir $snap.Name
+        if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+        Copy-Item -Path $snap.FullName -Destination $dest -Recurse
+        $count = (Get-ChildItem $dest -File).Count
+        Write-Host "BackupCheckpoint: $($snap.Name) → $dest ($count files)" -ForegroundColor Green
+    }
+}
+
 # ── 3. Run (with or without trace) ───────────────────────────────────────────
 Write-Host ""
 Write-Host "Suppressed dialogs will appear in $logFile with [DIALOG] prefix."
@@ -343,7 +375,7 @@ if ($Trace) {
     Write-Host "Report : $reportFile"
     Write-Host ""
 
-    $mainArgs = @("--digits", $Digits, "--autostart", "--autoverify", "--log-level", $LogLevel)
+    $mainArgs = @("--digits", $Digits, "--autostart", "--autoverify", "--log-level", $LogLevel, "--output-dir", $OutputDir)
     if ($Threshold           -gt 0) { $mainArgs += @("--threshold",             $Threshold) }
     if ($CheckpointFromLevel -gt 0) { $mainArgs += @("--checkpoint-from-level", $CheckpointFromLevel) }
     if ($ResumeFromLevel     -gt 0) { $mainArgs += @("--resume-from-level",     $ResumeFromLevel) }
@@ -354,6 +386,11 @@ if ($Trace) {
         -- $exePath @mainArgs
 
     if ($LASTEXITCODE -ne 0) { Write-Warning "dotnet trace exited with code $LASTEXITCODE" }
+
+    if ($BackupCheckpoint) {
+        Invoke-CheckpointBackup -NodeCacheDir (Join-Path $OutputDir 'NodeCache') `
+                                -StoreDir     (Join-Path $OutputDir 'SnapshotStore')
+    }
 
     # ── 4. Generate plain-text report ────────────────────────────────────────
     if (Test-Path $traceFile) {
@@ -368,12 +405,17 @@ if ($Trace) {
     }
 } else {
     Write-Host "--- Launching ($Digits digits, autostart, autoverify, log-level $LogLevel) ---" -ForegroundColor Yellow
-    $mainArgs = @("--digits", $Digits, "--autostart", "--autoverify", "--log-level", $LogLevel)
+    $mainArgs = @("--digits", $Digits, "--autostart", "--autoverify", "--log-level", $LogLevel, "--output-dir", $OutputDir)
     if ($Threshold           -gt 0) { $mainArgs += @("--threshold",             $Threshold) }
     if ($CheckpointFromLevel -gt 0) { $mainArgs += @("--checkpoint-from-level", $CheckpointFromLevel) }
     if ($ResumeFromLevel     -gt 0) { $mainArgs += @("--resume-from-level",     $ResumeFromLevel) }
     if ($AutoCheckpoint)            { $mainArgs += "--auto-checkpoint" }
     Start-Process -FilePath $exePath -ArgumentList $mainArgs -NoNewWindow -Wait
+
+    if ($BackupCheckpoint) {
+        Invoke-CheckpointBackup -NodeCacheDir (Join-Path $OutputDir 'NodeCache') `
+                                -StoreDir     (Join-Path $OutputDir 'SnapshotStore')
+    }
 }
 
 Write-Host ""

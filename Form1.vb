@@ -2148,11 +2148,15 @@ Public Class Form1
         Dim src As IntPtr = op.Pointer
         Dim dst As IntPtr = rop.Pointer
         Dim bitsLeft As Long = bits
+        Dim chunkNum As Integer = 0
         Do
             Dim chunk As UInteger = CUInt(System.Math.Min(bitsLeft, 2_100_000_000L))
+            chunkNum += 1
+            AppendLog($"[BigShiftRight] §D chunk {chunkNum}: shift {chunk:N0} bits, bitsLeft={bitsLeft:N0}{vbCrLf}")
             GmpRaw_tdiv_q_2exp(dst, src, chunk)
             src = dst
             bitsLeft -= CLng(chunk)
+            AppendLog($"[BigShiftRight] §D chunk {chunkNum} done{vbCrLf}")
         Loop While bitsLeft > 0L
     End Sub
 
@@ -2338,8 +2342,10 @@ Public Class Form1
     '   xNew     = ((xTrunc + q) >> 1) << xHalf  [scaled back to sqrt(n) domain]
     ' Convergence: Newton quadratic convergence, ~6 large iterations for 5B digits.
     Private Shared Sub SafeMpzSqrt(result As mpz_t, n As mpz_t)
+        AppendLog($"[SafeMpzSqrt] §D1 entered: n.Pointer=0x{n.Pointer:X} result.Pointer=0x{result.Pointer:X}{vbCrLf}")
         Const SAFE As Integer = 33_554_431
         Dim szN As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(n.Pointer, 4))
+        AppendLog($"[SafeMpzSqrt] §D2 szN={szN:N0}{vbCrLf}")
         If CLng(szN) <= SAFE Then
             gmp_lib.mpz_sqrt(result, n)
             Return
@@ -2352,21 +2358,27 @@ Public Class Form1
         Const SEED_BITS As Long = 350_000_000L
         Dim seedShift As Long = System.Math.Max(0L, bitsN - 2L * SEED_BITS)
         If (seedShift And 1L) <> 0L Then seedShift += 1L  ' must be even
+        AppendLog($"[SafeMpzSqrt] §D3 bitsN={bitsN:N0} bitsS={bitsS:N0} seedShift={seedShift:N0}{vbCrLf}")
 
         Dim x As New mpz_t()
         gmp_lib.mpz_init(x)
+        AppendLog($"[SafeMpzSqrt] §D4 x initialised{vbCrLf}")
         If seedShift = 0L Then
             gmp_lib.mpz_sqrt(x, n)
         Else
             Dim nSeed As New mpz_t()
             gmp_lib.mpz_init(nSeed)
+            AppendLog($"[SafeMpzSqrt] §D5 nSeed initialised; about to BigShiftRight by {seedShift:N0} bits{vbCrLf}")
             BigShiftRight(nSeed, n, seedShift)
+            AppendLog($"[SafeMpzSqrt] §D6 BigShiftRight done; about to mpz_sqrt{vbCrLf}")
             gmp_lib.mpz_sqrt(x, nSeed)   ' safe: nSeed has 2·SEED_BITS bits
+            AppendLog($"[SafeMpzSqrt] §D7 mpz_sqrt done; about to BigShiftLeft by {seedShift >> 1:N0} bits{vbCrLf}")
             gmp_lib.mpz_clear(nSeed)
             BigShiftLeft(x, x, seedShift >> 1)   ' x ≈ sqrt(n), correct to SEED_BITS bits
+            AppendLog($"[SafeMpzSqrt] §D8 BigShiftLeft done{vbCrLf}")
         End If
 
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] seed ready ({CLng(gmp_lib.mpz_sizeinbase(x, 10)):N0} digits); beginning Newton refinement{vbCrLf}")
+        AppendLog($"[SafeMpzSqrt] seed ready ({CLng(gmp_lib.mpz_sizeinbase(x, 10)):N0} digits); beginning Newton refinement{vbCrLf}")
 
         ' Newton refinement — doubles precision each step
         Dim kBitsX As Long = SEED_BITS
