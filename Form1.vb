@@ -1603,6 +1603,109 @@ Public Class Form1
         Return bestLevel
     End Function
 
+    ' §103: Save finalP/finalQ/finalT to snap_Phase3/ before Phase 3 begins.
+    ' Allows Phase 3 to be re-run from this checkpoint without repeating Phase 1/2.
+    Private Sub SavePhase3Snapshot(snapDir As String, digits As Long, numTerms As Long,
+                                    finalP As mpz_t, finalQ As mpz_t, finalT As mpz_t)
+        Try
+            LogPhase("[ComputePi] Saving snap_Phase3 checkpoint (P, Q, T)...")
+            If System.IO.Directory.Exists(snapDir) Then
+                System.IO.Directory.Delete(snapDir, recursive:=True)
+            End If
+            System.IO.Directory.CreateDirectory(snapDir)
+            Dim staging(4194303) As Byte   ' 4 MB staging buffer
+            Using fs As New FileStream(System.IO.Path.Combine(snapDir, "P.bin"),
+                                       FileMode.Create, FileAccess.Write)
+                Using bw As New BinaryWriter(fs)
+                    SerializeOneMpz(finalP, bw, staging)
+                End Using
+            End Using
+            Using fs As New FileStream(System.IO.Path.Combine(snapDir, "Q.bin"),
+                                       FileMode.Create, FileAccess.Write)
+                Using bw As New BinaryWriter(fs)
+                    SerializeOneMpz(finalQ, bw, staging)
+                End Using
+            End Using
+            Using fs As New FileStream(System.IO.Path.Combine(snapDir, "T.bin"),
+                                       FileMode.Create, FileAccess.Write)
+                Using bw As New BinaryWriter(fs)
+                    SerializeOneMpz(finalT, bw, staging)
+                End Using
+            End Using
+            Dim metaContent As String =
+                $"digits={digits}{vbLf}" &
+                $"numTerms={numTerms}{vbLf}" &
+                $"P_digits={CLng(gmp_lib.mpz_sizeinbase(finalP, 10)):N0}{vbLf}" &
+                $"Q_digits={CLng(gmp_lib.mpz_sizeinbase(finalQ, 10)):N0}{vbLf}" &
+                $"T_digits={CLng(gmp_lib.mpz_sizeinbase(finalT, 10)):N0}{vbLf}"
+            System.IO.File.WriteAllText(System.IO.Path.Combine(snapDir, "meta.txt"), metaContent)
+            LogPhase($"[ComputePi] snap_Phase3 saved OK" &
+                     $" (P~{CLng(gmp_lib.mpz_sizeinbase(finalP, 10)):N0}" &
+                     $" Q~{CLng(gmp_lib.mpz_sizeinbase(finalQ, 10)):N0}" &
+                     $" T~{CLng(gmp_lib.mpz_sizeinbase(finalT, 10)):N0} digits)")
+        Catch ex As Exception
+            LogPhase($"[ComputePi] snap_Phase3 save FAILED: {ex.Message} — continuing without checkpoint")
+        End Try
+    End Sub
+
+    ' §103: Load finalP/finalQ/finalT from snap_Phase3/ if it exists and matches digits.
+    ' Returns True and populates outP/outQ/outT on success; returns False on any mismatch or error.
+    ' outP/outQ/outT must already be mpz_init'd by the caller.
+    Private Function TryLoadPhase3Snapshot(snapDir As String, digits As Long,
+                                            outP As mpz_t, outQ As mpz_t, outT As mpz_t) As Boolean
+        Try
+            If Not System.IO.Directory.Exists(snapDir) Then Return False
+            Dim pPath As String = System.IO.Path.Combine(snapDir, "P.bin")
+            Dim qPath As String = System.IO.Path.Combine(snapDir, "Q.bin")
+            Dim tPath As String = System.IO.Path.Combine(snapDir, "T.bin")
+            Dim metaPath As String = System.IO.Path.Combine(snapDir, "meta.txt")
+            If Not (System.IO.File.Exists(pPath) AndAlso System.IO.File.Exists(qPath) AndAlso
+                    System.IO.File.Exists(tPath) AndAlso System.IO.File.Exists(metaPath)) Then
+                WriteToLog("[Phase3Snap] snap_Phase3 missing one or more files — skipping")
+                Return False
+            End If
+            ' Verify digits match
+            Dim meta As New Dictionary(Of String, String)()
+            For Each metaLine As String In System.IO.File.ReadAllLines(metaPath)
+                Dim eq As Integer = metaLine.IndexOf("="c)
+                If eq > 0 Then meta(metaLine.Substring(0, eq)) = metaLine.Substring(eq + 1)
+            Next
+            Dim snapDigits As Long = 0L
+            If Not meta.ContainsKey("digits") OrElse
+               Not Long.TryParse(meta("digits"), snapDigits) OrElse
+               snapDigits <> digits Then
+                WriteToLog($"[Phase3Snap] snap_Phase3 digits mismatch (want {digits:N0}, " &
+                           $"have {If(meta.ContainsKey("digits"), meta("digits"), "?")}) — skipping")
+                Return False
+            End If
+            ' Deserialize — DeserializeOneMpz handles large limb counts via PoolGet path.
+            Dim staging(4194303) As Byte   ' 4 MB staging buffer
+            LogPhase("[ComputePi] snap_Phase3 found — loading P, Q, T (skipping Phase 1/2)...")
+            Using fs As New FileStream(pPath, FileMode.Open, FileAccess.Read)
+                Using br As New BinaryReader(fs)
+                    DeserializeOneMpz(outP, br, staging)
+                End Using
+            End Using
+            LogPhase($"[ComputePi] snap_Phase3 P loaded (~{CLng(gmp_lib.mpz_sizeinbase(outP, 10)):N0} digits)")
+            Using fs As New FileStream(qPath, FileMode.Open, FileAccess.Read)
+                Using br As New BinaryReader(fs)
+                    DeserializeOneMpz(outQ, br, staging)
+                End Using
+            End Using
+            LogPhase($"[ComputePi] snap_Phase3 Q loaded (~{CLng(gmp_lib.mpz_sizeinbase(outQ, 10)):N0} digits)")
+            Using fs As New FileStream(tPath, FileMode.Open, FileAccess.Read)
+                Using br As New BinaryReader(fs)
+                    DeserializeOneMpz(outT, br, staging)
+                End Using
+            End Using
+            LogPhase($"[ComputePi] snap_Phase3 T loaded (~{CLng(gmp_lib.mpz_sizeinbase(outT, 10)):N0} digits)")
+            Return True
+        Catch ex As Exception
+            WriteToLog($"[Phase3Snap] Load FAILED: {ex.Message} — will run Phase 1/2")
+            Return False
+        End Try
+    End Function
+
     ' §94: Delete a snapshot directory (called after the next level's snapshot is confirmed).
     Private Sub DeleteSnapshotDir(level As Integer)
         Dim dir As String = System.IO.Path.Combine(DISK_CACHE_DIR, $"snap_L{level}")
@@ -3249,6 +3352,25 @@ Phase2:
 
             If token.IsCancellationRequested Then Return ""
 
+            ' §103: Declare finalP/Q/T here so both the snap_Phase3-load path and the
+            ' Phase 1/2 path can populate them before Phase 3 begins.
+            Dim finalP As mpz_t = Nothing
+            Dim finalQ As mpz_t = Nothing
+            Dim finalT As mpz_t = Nothing
+            Dim p3SnapDir As String = System.IO.Path.Combine(DISK_CACHE_DIR, "snap_Phase3")
+
+            ' §103: If --auto-checkpoint is active and snap_Phase3 exists, load P/Q/T
+            ' and jump straight to Phase 3, skipping the 10+ hour Phase 1/2 run.
+            If _autoCheckpoint Then
+                Dim _p3P As New mpz_t(), _p3Q As New mpz_t(), _p3T As New mpz_t()
+                gmp_lib.mpz_inits(_p3P, _p3Q, _p3T, Nothing)
+                If TryLoadPhase3Snapshot(p3SnapDir, digits, _p3P, _p3Q, _p3T) Then
+                    finalP = _p3P : finalQ = _p3Q : finalT = _p3T
+                    GoTo Phase3Start
+                End If
+                gmp_lib.mpz_clears(_p3P, _p3Q, _p3T, Nothing)
+            End If
+
             ' Issue #6: BinarySplitGMP now returns List(Of Result) — no Tuple allocations.
             Dim nodes As List(Of Result) = Nothing
             BinarySplitGMP(numTerms, nodes)
@@ -3338,10 +3460,15 @@ Phase2:
 
             LogPhase("Final combine complete - 1 node remaining")
 
-            Dim finalP As mpz_t = nodes(0).P
-            Dim finalQ As mpz_t = nodes(0).Q
-            Dim finalT As mpz_t = nodes(0).T
+            finalP = nodes(0).P
+            finalQ = nodes(0).Q
+            finalT = nodes(0).T
 
+            ' §103: Save snap_Phase3 now — before Phase 3 begins — so a Phase 3 crash
+            ' can resume from here without re-running the 10+ hour Phase 1/2.
+            SavePhase3Snapshot(p3SnapDir, digits, numTerms, finalP, finalQ, finalT)
+
+Phase3Start:
             gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpNumer, gmpPi, gmpOne, Nothing)
             gmpVariablesInitialized = True
 

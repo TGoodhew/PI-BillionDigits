@@ -340,12 +340,19 @@ if ($Test) {
     exit 0
 }
 
-# ── BackupCheckpoint helper ──────────────────────────────────────────────────
+# ── CheckpointBackup / Restore helpers ──────────────────────────────────────
+# Backup: copy all snap_L* and snap_Phase3 dirs from NodeCache → SnapshotStore.
+# Restore: copy any missing/incomplete snaps from SnapshotStore → NodeCache.
+# Together these ensure the backup always reflects the latest run, and the next
+# run always starts with the best available checkpoint — even if the app deleted
+# NodeCache entries during normal operation.
+
 function Invoke-CheckpointBackup {
     param([string]$NodeCacheDir, [string]$StoreDir)
-    $snaps = @(Get-ChildItem $NodeCacheDir -Directory -Filter 'snap_L*' -ErrorAction SilentlyContinue)
+    $snaps = @(Get-ChildItem $NodeCacheDir -Directory -ErrorAction SilentlyContinue |
+               Where-Object { $_.Name -like 'snap_L*' -or $_.Name -eq 'snap_Phase3' })
     if ($snaps.Count -eq 0) {
-        Write-Host "BackupCheckpoint: no snap_L* directories found in $NodeCacheDir" -ForegroundColor Yellow
+        Write-Host "BackupCheckpoint: no snap_L* / snap_Phase3 dirs found in $NodeCacheDir" -ForegroundColor Yellow
         return
     }
     if (-not (Test-Path $StoreDir)) {
@@ -356,11 +363,46 @@ function Invoke-CheckpointBackup {
         if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
         Copy-Item -Path $snap.FullName -Destination $dest -Recurse
         $count = @(Get-ChildItem $dest -File).Count
-        Write-Host "BackupCheckpoint: $($snap.Name) → $dest ($count files)" -ForegroundColor Green
+        Write-Host "BackupCheckpoint: $($snap.Name) → SnapshotStore ($count files)" -ForegroundColor Green
     }
 }
 
-# ── 3. Run (with or without trace) ───────────────────────────────────────────
+function Invoke-CheckpointRestore {
+    param([string]$NodeCacheDir, [string]$StoreDir)
+    if (-not (Test-Path $StoreDir)) { return }
+    $saves = @(Get-ChildItem $StoreDir -Directory -ErrorAction SilentlyContinue |
+               Where-Object { $_.Name -like 'snap_L*' -or $_.Name -eq 'snap_Phase3' })
+    if ($saves.Count -eq 0) { return }
+    if (-not (Test-Path $NodeCacheDir)) {
+        New-Item -ItemType Directory -Path $NodeCacheDir | Out-Null
+    }
+    foreach ($save in $saves) {
+        $dest = Join-Path $NodeCacheDir $save.Name
+        $storeCount = @(Get-ChildItem $save.FullName -File).Count
+        $cacheCount  = if (Test-Path $dest) { @(Get-ChildItem $dest -File).Count } else { 0 }
+        if ($storeCount -gt 0 -and $cacheCount -ge $storeCount) {
+            Write-Host "RestoreCheckpoint: $($save.Name) — NodeCache current ($cacheCount files), skipping" -ForegroundColor DarkGray
+            continue
+        }
+        if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+        Copy-Item -Path $save.FullName -Destination $dest -Recurse
+        $restored = @(Get-ChildItem $dest -File).Count
+        Write-Host "RestoreCheckpoint: $($save.Name) ← SnapshotStore ($restored files restored)" -ForegroundColor Cyan
+    }
+}
+
+# ── 3. Restore checkpoints from SnapshotStore before running ─────────────────
+# Ensures that snap_Phase3 / snap_L* saved from a previous run (or backed up
+# after a crash) are present in NodeCache before the app starts.  Safe to call
+# even on a fresh run: it silently no-ops when SnapshotStore is empty.
+if ($BackupCheckpoint) {
+    Write-Host ""
+    Write-Host "--- Restoring checkpoints from SnapshotStore ---" -ForegroundColor Yellow
+    Invoke-CheckpointRestore -NodeCacheDir (Join-Path $OutputDir 'NodeCache') `
+                             -StoreDir     (Join-Path $OutputDir 'SnapshotStore')
+}
+
+# ── 4. Run (with or without trace) ───────────────────────────────────────────
 Write-Host ""
 Write-Host "Suppressed dialogs will appear in $logFile with [DIALOG] prefix."
 Write-Host ""
