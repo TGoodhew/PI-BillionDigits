@@ -2,6 +2,13 @@
 bin/
 obj/
 
+# Native project build artifacts (intermediate/standalone builds)
+GmpNativeAlloc/GmpNativeAlloc/
+GmpNativeAlloc/*/obj/
+
+# Claude Code session data
+.claude/
+
 # Visual Studio user-specific files
 *.user
 *.suo
