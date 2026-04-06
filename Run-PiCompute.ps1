@@ -355,7 +355,7 @@ function Invoke-CheckpointBackup {
         $dest = Join-Path $StoreDir $snap.Name
         if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
         Copy-Item -Path $snap.FullName -Destination $dest -Recurse
-        $count = (Get-ChildItem $dest -File).Count
+        $count = @(Get-ChildItem $dest -File).Count
         Write-Host "BackupCheckpoint: $($snap.Name) → $dest ($count files)" -ForegroundColor Green
     }
 }

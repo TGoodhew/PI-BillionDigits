@@ -2150,6 +2150,13 @@ Public Class Form1
     ' Pattern: identical to the tmpHigh / mpQ1 / mpQ2 pre-alloc blocks in ComputePiGMP.
     ' If neededLimbs is already satisfied, or neededBytes < GMP_LARGE_THRESHOLD, returns
     ' immediately (GmpReallocFunc handles small→small transitions fine).
+    ' Pre-allocate m's limb buffer to neededLimbs via our pool/VirtualAlloc so that
+    ' GMP's MPZ_REALLOC macro skips _mpz_realloc (whose overflow check aborts when
+    ' new_alloc > INT_MAX/8 ≈ 268 M limbs on Windows 64-bit with 32-bit mp_size_t).
+    '
+    ' Existing limb data is copied into the new buffer so this is safe for the
+    ' aliased case (rop.Pointer == op.Pointer) used by BigShiftLeft.  When m has
+    ' no data (_mp_size = 0), the copy is a zero-byte no-op.
     Private Shared Sub PreAllocMpzToLimbs(m As mpz_t, neededLimbs As Long)
         If neededLimbs <= 0L Then Return
         Dim currentAlloc As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(m.Pointer, 0)))
@@ -2165,6 +2172,13 @@ Public Class Form1
         If newBuf = IntPtr.Zero Then
             AppendLog($"[PreAlloc] PoolGet({neededBytes:N0} B) FAILED — will rely on GmpReallocFunc{vbCrLf}")
             Return
+        End If
+
+        ' Copy any existing limb data into the new buffer (needed for aliased BigShiftLeft).
+        Dim szAbsLimbs As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(m.Pointer, 4)))
+        Dim dataBytes As Long = szAbsLimbs * 8L
+        If dataBytes > 0L Then
+            CopyMemory(newBuf, currentBuf, New UIntPtr(CULng(dataBytes)))
         End If
 
         If currentBytes < GMP_LARGE_THRESHOLD Then
@@ -2213,11 +2227,24 @@ Public Class Form1
     End Sub
 
     ' Compute op * 2^bits → rop.  Handles bits > UInt32.Max.  rop may alias op.
+    '
+    ' §102 fix: GMP's mpz_mul_2exp calls _mpz_realloc before writing data.
+    ' On Windows (32-bit mp_size_t), _mpz_realloc aborts if new_alloc > 268M limbs
+    ' even though INT_MAX = 2.1B.  The abort check fires BEFORE our GmpReallocFunc.
+    ' Fix: pre-alloc rop to the full result size before the first GmpRaw_mul_2exp
+    ' call, so MPZ_REALLOC sees alloc >= needed and skips _mpz_realloc entirely.
     Private Shared Sub BigShiftLeft(rop As mpz_t, op As mpz_t, bits As Long)
         If bits <= 0L Then
             If rop.Pointer <> op.Pointer Then gmp_lib.mpz_set(rop, op)
             Return
         End If
+
+        ' Pre-alloc rop for the first chunk result before calling GmpRaw_mul_2exp.
+        Dim opLimbs As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(op.Pointer, 4)))
+        Dim firstChunkBits As Long = System.Math.Min(bits, 2_100_000_000L)
+        Dim firstResultLimbs As Long = opLimbs + (firstChunkBits + 63L) \ 64L + 1L   ' +1 safety margin
+        If firstResultLimbs > 0L Then PreAllocMpzToLimbs(rop, firstResultLimbs)
+
         Dim src As IntPtr = op.Pointer
         Dim dst As IntPtr = rop.Pointer
         Dim bitsLeft As Long = bits
