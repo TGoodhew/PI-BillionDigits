@@ -174,12 +174,35 @@ if (-not (Test-Path $OutputDir)) {
     New-Item -ItemType Directory -Path $OutputDir | Out-Null
 }
 
-# ── 1. Clean ─────────────────────────────────────────────────────────────────
+# ── 1. Build native C DLL (GmpNativeAlloc) via VS MSBuild ────────────────────
+# The dotnet CLI cannot load VC++ targets, so the native project is built
+# separately using the full Visual Studio MSBuild before dotnet build runs.
+$msbuildCandidates = @(
+    'C:\Program Files\Microsoft Visual Studio\18\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe',
+    'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe',
+    'C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\amd64\MSBuild.exe',
+    'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\amd64\MSBuild.exe'
+)
+$msbuildExe = $msbuildCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+$nativeVcxproj = Join-Path $projectDir 'GmpNativeAlloc\GmpNativeAlloc.vcxproj'
+$slnFile       = Join-Path $projectDir 'PI-BillionDigits.sln'
+
+if ($msbuildExe -and (Test-Path $nativeVcxproj)) {
+    Write-Host "--- MSBuild GmpNativeAlloc ($config|x64) ---" -ForegroundColor Yellow
+    & $msbuildExe $slnFile /p:Configuration=$config '/p:Platform=Any CPU' /v:minimal /t:GmpNativeAlloc
+    if ($LASTEXITCODE -ne 0) { throw "MSBuild GmpNativeAlloc failed (exit $LASTEXITCODE)" }
+} else {
+    Write-Host "WARNING: VS MSBuild not found or native project missing — skipping GmpNativeAlloc build." -ForegroundColor Yellow
+    Write-Host "         GmpNativeAlloc.dll must already be present in the output directory." -ForegroundColor Yellow
+}
+
+# ── 2. Clean ─────────────────────────────────────────────────────────────────
+Write-Host ""
 Write-Host "--- dotnet clean ---" -ForegroundColor Yellow
 dotnet clean $projectFile --configuration $config
 if ($LASTEXITCODE -ne 0) { throw "dotnet clean failed (exit $LASTEXITCODE)" }
 
-# ── 2. Build ─────────────────────────────────────────────────────────────────
+# ── 3. Build ─────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "--- dotnet build ---" -ForegroundColor Yellow
 dotnet build $projectFile --configuration $config --no-incremental

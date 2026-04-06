@@ -88,12 +88,9 @@
     </None>
   </ItemGroup>
 
-  <!-- Issue #30: Native C DLL that replaces managed VirtualAlloc pool. -->
-  <ItemGroup>
-    <ProjectReference Include="$(MSBuildThisFileDirectory)GmpNativeAlloc\GmpNativeAlloc.vcxproj">
-      <Project>{C7A1F9E2-3B4D-4F8A-9C6E-D0F2A8B3E5C1}</Project>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-    </ProjectReference>
-  </ItemGroup>
+  <!-- Issue #30: Build dependency on native C DLL is expressed in the .sln file
+       (ProjectDependencies section) so that Visual Studio builds GmpNativeAlloc
+       first.  Run-PiCompute.ps1 invokes VS MSBuild for the native project before
+       dotnet build.  No ProjectReference here — dotnet CLI cannot load VC++ targets. -->
 
 </Project>
