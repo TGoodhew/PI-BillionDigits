@@ -804,34 +804,119 @@ Public Class Form1
     Private Shared Sub GmpRaw_pow_ui(rop As IntPtr, base As IntPtr, exp As UInteger)
     End Sub
 
+    ' §35: Raw DllImports for cold-path functions in SafeMpzReciprocal/Div/Sqrt.
+    ' Eliminates Math.Gmp.Native delegate dispatch from these operations.
+    ' Note: mpz_sgn is a GMP macro (reads _mp_size at offset +4) — NOT an exported
+    ' function.  Replace gmp_lib.mpz_sgn(x) with Math.Sign(Marshal.ReadInt32(x.Pointer, 4)).
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_tdiv_q",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_tdiv_q(rop As IntPtr, op1 As IntPtr, op2 As IntPtr)
+    End Sub
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_cmp",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Function GmpRaw_cmp(op1 As IntPtr, op2 As IntPtr) As Integer
+    End Function
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_swap",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_swap(rop1 As IntPtr, rop2 As IntPtr)
+    End Sub
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_set",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_set(rop As IntPtr, op As IntPtr)
+    End Sub
+
+    ' §30: Native pool DLL exports — replace managed VirtualAlloc pool delegates.
+    <DllImport("GmpNativeAlloc.dll", EntryPoint:="GmpNativeAlloc_LoadGmp",
+               CallingConvention:=CallingConvention.Winapi)>
+    Private Shared Function GmpNativeAlloc_LoadGmp(
+        logLevel As Integer,
+        <Runtime.InteropServices.MarshalAs(Runtime.InteropServices.UnmanagedType.LPStr)>
+        optLogPath As String) As Boolean
+    End Function
+
+    <DllImport("GmpNativeAlloc.dll", EntryPoint:="GmpNativeAlloc_Install",
+               CallingConvention:=CallingConvention.Winapi)>
+    Private Shared Sub GmpNativeAlloc_Install()
+    End Sub
+
+    <DllImport("GmpNativeAlloc.dll", EntryPoint:="GmpNativeAlloc_Flush",
+               CallingConvention:=CallingConvention.Winapi)>
+    Private Shared Sub GmpNativeAlloc_Flush()
+    End Sub
+
+    <DllImport("GmpNativeAlloc.dll", EntryPoint:="GmpNativeAlloc_FreeRaw",
+               CallingConvention:=CallingConvention.Winapi)>
+    Private Shared Sub GmpNativeAlloc_FreeRaw(ptr As IntPtr, sz As Long)
+    End Sub
+
+    <DllImport("GmpNativeAlloc.dll", EntryPoint:="GmpNativeAlloc_PoolGet",
+               CallingConvention:=CallingConvention.Winapi)>
+    Private Shared Function GmpNativeAlloc_PoolGet(sz As Long) As IntPtr
+    End Function
+
+    <DllImport("GmpNativeAlloc.dll", EntryPoint:="GmpNativeAlloc_PoolReturn",
+               CallingConvention:=CallingConvention.Winapi)>
+    Private Shared Sub GmpNativeAlloc_PoolReturn(ptr As IntPtr, sz As Long)
+    End Sub
+
+    ' §32B: Batch GMP operations — single managed→native crossing per term/combine.
+    <DllImport("GmpNativeAlloc.dll", EntryPoint:="GmpBatch_ComputeTerm",
+               CallingConvention:=CallingConvention.Winapi)>
+    Private Shared Sub GmpBatch_ComputeTerm(
+        a As Long,
+        pPtr As IntPtr, qPtr As IntPtr, tPtr As IntPtr,
+        c3Ptr As IntPtr)
+    End Sub
+
+    <DllImport("GmpNativeAlloc.dll", EntryPoint:="GmpBatch_CombineNodes",
+               CallingConvention:=CallingConvention.Winapi)>
+    Private Shared Sub GmpBatch_CombineNodes(
+        resPPtr As IntPtr, resQPtr As IntPtr, resTPtr As IntPtr,
+        lPPtr As IntPtr,   lQPtr As IntPtr,   lTPtr As IntPtr,
+        rPPtr As IntPtr,   rQPtr As IntPtr,   rTPtr As IntPtr,
+        tempAPtr As IntPtr, tempBPtr As IntPtr)
+    End Sub
+
     Private Sub InitGmpVirtualAllocFunctions()
-        ' Initialise pool buckets (fixed array — no ConcurrentDictionary overhead).
-        For b As Integer = 0 To POOL_BUCKETS - 1
-            _gmpPool(b) = New ConcurrentStack(Of IntPtr)()
-        Next
-
-        ' Step 1: Force gmp_lib's static initializer to run NOW, while the native
-        ' GMP table still points to the default CRT malloc/realloc/free.
-        ' gmp_lib initializes lazily (first access).  If it runs AFTER our thunks
-        ' are installed it would read our thunk pointers into allocate_func_ptr, and
-        ' .NET 10's GetDelegateForFunctionPointer would return our allocate_function
-        ' delegate instead of creating _allocate_function_x64 — crashing on the cast.
-        ' Calling mp_get_memory_functions here is the cleanest trigger; it also gives
-        ' us the saved CRT delegates we need for small-allocation fallback.
+        ' §30: Replaced managed VirtualAlloc pool with native SLIST-based pool.
+        ' The native DLL (GmpNativeAlloc.dll) installs its own alloc/realloc/free
+        ' callbacks directly into GMP's native function table — zero managed→native
+        ' thunk overhead per GMP alloc/free.
+        '
+        ' Step 1: Force Math.Gmp.Native's lazy static initializer to run NOW so it
+        ' captures the default CRT malloc/realloc/free delegates BEFORE we install
+        ' our native hooks.  This prevents .NET's GetDelegateForFunctionPointer from
+        ' seeing our hook pointers and creating a broken wrapper on first access.
         gmp_lib.mp_get_memory_functions(_savedGmpAlloc, _savedGmpRealloc, _savedGmpFree)
+        AppendLog($"[GmpPool] Managed GMP lazy-init triggered (saved CRT alloc delegates){vbCrLf}")
 
-        ' Step 2: Install our thunks ONLY in GMP's native function pointer table.
-        ' Math.Gmp.Native's allocate_func_ptr lambda is already set (from step 1)
-        ' and captures the original CRT malloc IntPtr — it will NOT be touched here.
-        ' So gmp_lib.allocate / mpz_t.Initializing / mpz_init continue to use CRT
-        ' malloc normally for managed-side __mpz_struct allocations.
-        _gmpAlloc = New allocate_function(AddressOf GmpAllocFunc)
-        _gmpRealloc = New reallocate_function(AddressOf GmpReallocFunc)
-        _gmpFree = New free_function(AddressOf GmpFreeFunc)
-        GmpSetMemoryFunctionsNative(
-            Marshal.GetFunctionPointerForDelegate(_gmpAlloc),
-            Marshal.GetFunctionPointerForDelegate(_gmpRealloc),
-            Marshal.GetFunctionPointerForDelegate(_gmpFree))
+        ' Step 2: Load GMP function pointers into the native DLL and install hooks.
+        ' LogLevel 1 (init only) keeps overhead low; raise to 2+ for pool diagnostics.
+        Dim logPath As String = System.IO.Path.Combine(
+            System.IO.Path.GetDirectoryName(Application.ExecutablePath),
+            "gmpnativealloc.log")
+        Dim loaded As Boolean = GmpNativeAlloc_LoadGmp(_logLevel, logPath)
+        If Not loaded Then
+            AppendLog($"[GmpPool] GmpNativeAlloc_LoadGmp FAILED — falling back to managed pool{vbCrLf}")
+            ' Fallback: install managed pool delegates (legacy path)
+            For b As Integer = 0 To POOL_BUCKETS - 1
+                _gmpPool(b) = New ConcurrentStack(Of IntPtr)()
+            Next
+            _gmpAlloc = New allocate_function(AddressOf GmpAllocFunc)
+            _gmpRealloc = New reallocate_function(AddressOf GmpReallocFunc)
+            _gmpFree = New free_function(AddressOf GmpFreeFunc)
+            GmpSetMemoryFunctionsNative(
+                Marshal.GetFunctionPointerForDelegate(_gmpAlloc),
+                Marshal.GetFunctionPointerForDelegate(_gmpRealloc),
+                Marshal.GetFunctionPointerForDelegate(_gmpFree))
+            Return
+        End If
+        AppendLog($"[GmpPool] GmpNativeAlloc_LoadGmp OK — log: {logPath}{vbCrLf}")
+        GmpNativeAlloc_Install()
+        AppendLog($"[GmpPool] GmpNativeAlloc_Install OK — native SLIST pool active{vbCrLf}")
     End Sub
 
     ' ── Native crash handler (Issue #10 / native-code crash capture) ────────
@@ -1461,36 +1546,14 @@ Public Class Form1
                     gmp_lib.mpz_inits(res.P, res.Q, res.T, Nothing)
 
                     If currentWorkItem.a = 0 Then
-                        ' §108: GmpRaw_* bypasses Math.Gmp.Native delegate dispatch
+                        ' §108/§32B: a=0 special case: P=Q=1, T=13591409
                         GmpRaw_set_ui(res.P.Pointer, 1UI)
                         GmpRaw_set_ui(res.Q.Pointer, 1UI)
                         GmpRaw_set_ui(res.T.Pointer, 13591409UI)
                     Else
-                        Dim aBig As New mpz_t()
-                        Dim t1 As New mpz_t()
-                        Dim t2 As New mpz_t()
-                        gmp_lib.mpz_inits(aBig, t1, t2, Nothing)
-                        ' §108: ~11 gmp_lib thunks per term → direct GmpRaw_* P/Invokes
-                        GmpRaw_set_si(aBig.Pointer, CInt(currentWorkItem.a))
-
-                        GmpRaw_mul_ui(t1.Pointer, aBig.Pointer, 6UI)
-                        GmpRaw_sub_ui(t1.Pointer, t1.Pointer, 5UI)
-                        GmpRaw_mul_ui(t2.Pointer, aBig.Pointer, 2UI)
-                        GmpRaw_sub_ui(t2.Pointer, t2.Pointer, 1UI)
-                        GmpRaw_mul(res.P.Pointer, t1.Pointer, t2.Pointer)
-                        GmpRaw_mul_ui(t1.Pointer, aBig.Pointer, 6UI)
-                        GmpRaw_sub_ui(t1.Pointer, t1.Pointer, 1UI)
-                        GmpRaw_mul(res.P.Pointer, res.P.Pointer, t1.Pointer)
-
-                        GmpRaw_pow_ui(res.Q.Pointer, aBig.Pointer, 3UI)
-                        GmpRaw_mul(res.Q.Pointer, res.Q.Pointer, gmpC3Const.Pointer)
-
-                        GmpRaw_mul_ui(t1.Pointer, aBig.Pointer, 545140134UI)
-                        GmpRaw_add_ui(t1.Pointer, t1.Pointer, 13591409UI)
-                        GmpRaw_mul(res.T.Pointer, res.P.Pointer, t1.Pointer)
-                        If (currentWorkItem.a And 1L) = 1L Then GmpRaw_neg(res.T.Pointer, res.T.Pointer)
-
-                        gmp_lib.mpz_clears(aBig, t1, t2, Nothing)
+                        ' §32B: Single managed→native crossing for all 11 GMP ops.
+                        ' GmpBatch_ComputeTerm allocates/frees its own temps via the native pool.
+                        GmpBatch_ComputeTerm(currentWorkItem.a, res.P.Pointer, res.Q.Pointer, res.T.Pointer, gmpC3Const.Pointer)
                     End If
 
                     results(currentWorkItem.resultIndex) = res
@@ -1509,12 +1572,12 @@ Public Class Form1
                     Dim tempB As New mpz_t()
                     gmp_lib.mpz_inits(res.P, res.Q, res.T, tempA, tempB, Nothing)
 
-                    ' §108: GmpRaw_* bypasses wrapper dispatch on the combine hot path
-                    GmpRaw_mul(res.P.Pointer, leftRes.P.Pointer, rightRes.P.Pointer)
-                    GmpRaw_mul(res.Q.Pointer, leftRes.Q.Pointer, rightRes.Q.Pointer)
-                    GmpRaw_mul(tempA.Pointer, leftRes.T.Pointer, rightRes.Q.Pointer)
-                    GmpRaw_mul(tempB.Pointer, leftRes.P.Pointer, rightRes.T.Pointer)
-                    GmpRaw_add(res.T.Pointer, tempA.Pointer, tempB.Pointer)
+                    ' §32B: Single managed→native crossing for all 5 combine GMP ops.
+                    GmpBatch_CombineNodes(
+                        res.P.Pointer, res.Q.Pointer, res.T.Pointer,
+                        leftRes.P.Pointer, leftRes.Q.Pointer, leftRes.T.Pointer,
+                        rightRes.P.Pointer, rightRes.Q.Pointer, rightRes.T.Pointer,
+                        tempA.Pointer, tempB.Pointer)
 
                     gmp_lib.mpz_clears(leftRes.P, leftRes.Q, leftRes.T, Nothing)
                     gmp_lib.mpz_clears(rightRes.P, rightRes.Q, rightRes.T, Nothing)
@@ -2164,11 +2227,10 @@ Public Class Form1
         Dim _oldResultAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(savedResultPtr, 0))
         Dim _oldResultPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(savedResultPtr, 8))
         Dim _oldResultSz As Long = CLng(_oldResultAlloc) * 8L
-        If _oldResultSz >= GMP_LARGE_THRESHOLD Then
-            VirtualFree(_oldResultPtr, UIntPtr.Zero, MEM_RELEASE)
-        Else
-            _savedGmpFree(New void_ptr(_oldResultPtr), New size_t(CULng(_oldResultSz)))
-        End If
+        ' §30: All GMP limb buffers now come from native pool (VirtualAlloc-backed).
+        ' GmpNativeAlloc_FreeRaw returns them to the SLIST or VirtualFrees directly.
+        ' Replaces the old large/small branching (_savedGmpFree vs VirtualFree).
+        GmpNativeAlloc_FreeRaw(_oldResultPtr, _oldResultSz)
         ' Blank result's struct _mp_alloc and _mp_size; _mp_d will hold the accumPtr stash (§44).
         Runtime.InteropServices.Marshal.WriteInt32(savedResultPtr, 0, 0)
         Runtime.InteropServices.Marshal.WriteInt32(savedResultPtr, 4, 0)
@@ -2345,36 +2407,83 @@ Public Class Form1
         Dim _sv_shifted_hdr As IntPtr = shifted.Pointer
         Dim _shiftedInitAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted_hdr, 0))
         Dim _shiftedInitPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_shifted_hdr, 8))
-        _savedGmpFree(New void_ptr(_shiftedInitPtr), New size_t(CULng(_shiftedInitAlloc) * 8UL))
+        ' §30: Free the initial 1-limb buffer allocated by GmpRaw_init via native pool.
+        GmpNativeAlloc_FreeRaw(_shiftedInitPtr, CLng(_shiftedInitAlloc) * 8L)
         Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 0, CInt(_maxShiftedLimbs))
         Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 4, 0)
         Runtime.InteropServices.Marshal.WriteInt64(_sv_shifted_hdr, 8, _sharedSjBuf.ToInt64())
 
-        For k As Integer = 0 To 8
-            Dim ki As Integer = k \ 3
-            Dim kj As Integer = k Mod 3
-            Dim shiftBits As ULong = CULng(ki) * bitsA + CULng(kj) * bitsB
-            Dim _sv_prod As IntPtr = prods(k).Pointer
-            If shiftBits = 0UL Then
-                GmpRaw_add(accumPtr, accumPtr, _sv_prod)
-            Else
-                ' §23: reset _mp_size only — shared buffer already covers the maximum size.
-                Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 4, 0)
-                ' §90: chunk-based shift — handles shiftBits > UInt32.Max (e.g. ~22B bits at 5B digits).
-                Dim _shiftSrc As IntPtr = _sv_prod
-                Dim _shiftRem As ULong = shiftBits
-                While _shiftRem > 0UL
-                    Dim _chunk As UInteger = CUInt(System.Math.Min(_shiftRem, CULng(UInt32.MaxValue)))
-                    GmpRaw_mul_2exp(_sv_shifted_hdr, _shiftSrc, _chunk)
-                    _shiftSrc = _sv_shifted_hdr
-                    _shiftRem -= CULng(_chunk)
-                End While
-                GmpRaw_add(accumPtr, accumPtr, _sv_shifted_hdr)
-            End If
-            ' Free prod_k immediately after accumulation to limit peak RAM.
-            ' §25: raw clear matches raw init above.
-            GmpRaw_clear(prods(k).Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(prods(k).Pointer)
-        Next k
+        ' §39: When mA=mB=m sub-products sharing the same (i+j) have identical shift
+        ' = (i+j)*m*64.  Group into 5 columns and shift once per column instead of 9
+        ' times individually.  Saves 4 large shift operations at the cost of 4 adds.
+        ' Column 0: prod(0)              shift 0
+        ' Column 1: prod(1)+prod(3)      shift 1*bitsA
+        ' Column 2: prod(2)+prod(4)+prod(6) shift 2*bitsA
+        ' Column 3: prod(5)+prod(7)      shift 3*bitsA
+        ' Column 4: prod(8)              shift 4*bitsA
+        If mA = mB Then
+            If _logLevel >= 4 Then AppendLog($"[SafeMpzMul] §39 column-group fast path (mA=mB={mA:N0}){vbCrLf}")
+            ' Per-column: base product index and list of additional product indices to add first
+            Dim _col_base As Integer() = {0, 1, 2, 5, 8}
+            Dim _col_extra As Integer()() = New Integer()() {
+                New Integer() {},
+                New Integer() {3},
+                New Integer() {4, 6},
+                New Integer() {7},
+                New Integer() {}
+            }
+            For _col As Integer = 0 To 4
+                Dim _bk As Integer = _col_base(_col)
+                ' Add extra sub-products into the base slot
+                For Each _ak As Integer In _col_extra(_col)
+                    GmpRaw_add(prods(_bk).Pointer, prods(_bk).Pointer, prods(_ak).Pointer)
+                    GmpRaw_clear(prods(_ak).Pointer)
+                    Dim _tmp_ak = prods(_ak).Pointer : prods(_ak).Pointer = IntPtr.Zero : Runtime.InteropServices.Marshal.FreeHGlobal(_tmp_ak)
+                Next
+                ' Shift column sum and add to accumulator
+                Dim _colShift As ULong = CULng(_col) * bitsA
+                Dim _sv_bk As IntPtr = prods(_bk).Pointer
+                If _colShift = 0UL Then
+                    GmpRaw_add(accumPtr, accumPtr, _sv_bk)
+                Else
+                    Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 4, 0)
+                    Dim _shiftSrc As IntPtr = _sv_bk
+                    Dim _shiftRem As ULong = _colShift
+                    While _shiftRem > 0UL
+                        Dim _chunk As UInteger = CUInt(System.Math.Min(_shiftRem, CULng(UInt32.MaxValue)))
+                        GmpRaw_mul_2exp(_sv_shifted_hdr, _shiftSrc, _chunk)
+                        _shiftSrc = _sv_shifted_hdr
+                        _shiftRem -= CULng(_chunk)
+                    End While
+                    GmpRaw_add(accumPtr, accumPtr, _sv_shifted_hdr)
+                End If
+                GmpRaw_clear(_sv_bk)
+                prods(_bk).Pointer = IntPtr.Zero : Runtime.InteropServices.Marshal.FreeHGlobal(_sv_bk)
+            Next _col
+        Else
+            ' §23/§90: Original per-product accumulation for asymmetric case (mA ≠ mB).
+            For k As Integer = 0 To 8
+                Dim ki As Integer = k \ 3
+                Dim kj As Integer = k Mod 3
+                Dim shiftBits As ULong = CULng(ki) * bitsA + CULng(kj) * bitsB
+                Dim _sv_prod As IntPtr = prods(k).Pointer
+                If shiftBits = 0UL Then
+                    GmpRaw_add(accumPtr, accumPtr, _sv_prod)
+                Else
+                    Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 4, 0)
+                    Dim _shiftSrc As IntPtr = _sv_prod
+                    Dim _shiftRem As ULong = shiftBits
+                    While _shiftRem > 0UL
+                        Dim _chunk As UInteger = CUInt(System.Math.Min(_shiftRem, CULng(UInt32.MaxValue)))
+                        GmpRaw_mul_2exp(_sv_shifted_hdr, _shiftSrc, _chunk)
+                        _shiftSrc = _sv_shifted_hdr
+                        _shiftRem -= CULng(_chunk)
+                    End While
+                    GmpRaw_add(accumPtr, accumPtr, _sv_shifted_hdr)
+                End If
+                GmpRaw_clear(prods(k).Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(prods(k).Pointer)
+            Next k
+        End If
         ' §23: Free the shared buffer once, then re-init shifted with a fresh 1-limb stub
         ' so the final GmpRaw_clear below frees it cleanly without double-freeing _sharedSjBuf.
         ' §25: raw re-init — zero the struct fields so GmpRaw_init allocates a fresh limb buffer.
@@ -2463,7 +2572,8 @@ Public Class Form1
         Dim currentBuf As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(m.Pointer, 8))
         Dim currentBytes As Long = currentAlloc * 8L
 
-        Dim newBuf As IntPtr = PoolGet(neededBytes)
+        ' §30: Use native pool for allocation. GmpNativeAlloc_PoolGet handles all sizes.
+        Dim newBuf As IntPtr = GmpNativeAlloc_PoolGet(neededBytes)
         If newBuf = IntPtr.Zero Then
             AppendLog($"[PreAlloc] PoolGet({neededBytes:N0} B) FAILED — will rely on GmpReallocFunc{vbCrLf}")
             Return
@@ -2476,14 +2586,8 @@ Public Class Form1
             CopyMemory(newBuf, currentBuf, New UIntPtr(CULng(dataBytes)))
         End If
 
-        If currentBytes < GMP_LARGE_THRESHOLD Then
-            ' Current buffer is CRT-alloc'd (small) — free via GMP's saved CRT free.
-            _savedGmpFree(New void_ptr(currentBuf), New size_t(CULng(currentBytes)))
-        ElseIf currentBytes > POOL_MAX_BLOCK Then
-            VirtualFree(currentBuf, UIntPtr.Zero, MEM_RELEASE)
-        Else
-            PoolReturn(currentBuf, currentBytes)
-        End If
+        ' §30: All pool buffers are VirtualAlloc-backed; GmpNativeAlloc_FreeRaw handles all cases.
+        GmpNativeAlloc_FreeRaw(currentBuf, currentBytes)
 
         Runtime.InteropServices.Marshal.WriteInt32(m.Pointer, 0, CInt(neededLimbs))
         Runtime.InteropServices.Marshal.WriteInt64(m.Pointer, 8, newBuf.ToInt64())
@@ -2500,7 +2604,7 @@ Public Class Form1
     ' bypassing GmpReallocFunc entirely).  Subsequent chunks are always Large→Large.
     Private Shared Sub BigShiftRight(rop As mpz_t, op As mpz_t, bits As Long)
         If bits <= 0L Then
-            If rop.Pointer <> op.Pointer Then gmp_lib.mpz_set(rop, op)
+            If rop.Pointer <> op.Pointer Then GmpRaw_set(rop.Pointer, op.Pointer)  ' §35
             Return
         End If
 
@@ -2536,7 +2640,7 @@ Public Class Form1
     ' short-circuits without ever calling _mpz_realloc.
     Private Shared Sub BigShiftLeft(rop As mpz_t, op As mpz_t, bits As Long)
         If bits <= 0L Then
-            If rop.Pointer <> op.Pointer Then gmp_lib.mpz_set(rop, op)
+            If rop.Pointer <> op.Pointer Then GmpRaw_set(rop.Pointer, op.Pointer)  ' §35
             Return
         End If
 
@@ -2578,14 +2682,14 @@ Public Class Form1
             BigShiftRight(bHi, b, bHiShift)
             gmp_lib.mpz_add_ui(bHi, bHi, 1UI)   ' ceiling → underestimate of reciprocal guaranteed
         Else
-            gmp_lib.mpz_set(bHi, b)
+            GmpRaw_set(bHi.Pointer, b.Pointer)  ' §35
         End If
         ' rSeed = floor(2^64 / bHi)  [safe: both operands tiny]
         Dim rSeed As New mpz_t()
         gmp_lib.mpz_init(rSeed)
         gmp_lib.mpz_set_ui(rSeed, 1UI)
         gmp_lib.mpz_mul_2exp(rSeed, rSeed, New mp_bitcnt_t(64UI))
-        gmp_lib.mpz_tdiv_q(rSeed, rSeed, bHi)
+        GmpRaw_tdiv_q(rSeed.Pointer, rSeed.Pointer, bHi.Pointer)  ' §35
         gmp_lib.mpz_clear(bHi)
         ' Scale to r's domain: rSeed * 2^(kBits-64-bHiShift) ≈ 2^kBits / b (underestimate)
         Dim seedScale As Long = kBits - 64L - bHiShift
@@ -2594,14 +2698,24 @@ Public Class Form1
         ElseIf seedScale < 0L Then
             BigShiftRight(rSeed, rSeed, -seedScale)
         End If
-        If gmp_lib.mpz_sgn(rSeed) > 0 Then gmp_lib.mpz_sub_ui(rSeed, rSeed, 2UI)  ' strict underestimate
-        If gmp_lib.mpz_sgn(rSeed) <= 0 Then gmp_lib.mpz_set_ui(rSeed, 1UI)
-        gmp_lib.mpz_swap(r, rSeed)
+        ' §35: mpz_sgn is a GMP macro — read _mp_size field (offset +4) directly.
+        If System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(rSeed.Pointer, 4)) > 0 Then gmp_lib.mpz_sub_ui(rSeed, rSeed, 2UI)
+        If System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(rSeed.Pointer, 4)) <= 0 Then gmp_lib.mpz_set_ui(rSeed, 1UI)
+        GmpRaw_swap(r.Pointer, rSeed.Pointer)  ' §35
         gmp_lib.mpz_clear(rSeed)
 
         ' ── Newton: r ← 2r - ceil(b/2^bShift) · r² / 2^(kBits-bShift) ────
         ' Progressive precision: prec doubles each step from ~62 → rBits+2.
         ' Ceiling truncation of b maintains r as a strict underestimate throughout.
+        ' §36: Allocate bTrunc/rSq/p once outside the loop — eliminates ~18 large
+        '      VirtualAlloc/Free per sqrt call (each Newton step would otherwise init
+        '      and clear these, each touching the allocator twice for large operands).
+        Dim bTrunc As New mpz_t()
+        gmp_lib.mpz_init(bTrunc)
+        Dim rSq As New mpz_t()
+        gmp_lib.mpz_init(rSq)
+        Dim p As New mpz_t()
+        gmp_lib.mpz_init(p)
         Dim prec As Long = 62L
         Do While prec < rBits + 2L
             prec = System.Math.Min(prec * 2L + 4L, rBits + 2L)
@@ -2612,18 +2726,14 @@ Public Class Form1
 
             ' bTrunc = ceil(b / 2^bShift), bShift = max(0, bBits - prec - 2)
             Dim bShift As Long = System.Math.Max(0L, bBits - prec - 2L)
-            Dim bTrunc As New mpz_t()
-            gmp_lib.mpz_init(bTrunc)
             If bShift > 0L Then
                 BigShiftRight(bTrunc, b, bShift)
                 gmp_lib.mpz_add_ui(bTrunc, bTrunc, 1UI)
             Else
-                gmp_lib.mpz_set(bTrunc, b)
+                GmpRaw_set(bTrunc.Pointer, b.Pointer)  ' §35
             End If
 
             ' rSq = r²
-            Dim rSq As New mpz_t()
-            gmp_lib.mpz_init(rSq)
             Dim szR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
             If CLng(szR) * 2L <= SAFE Then
                 GmpRaw_mul(rSq.Pointer, r.Pointer, r.Pointer)
@@ -2632,8 +2742,6 @@ Public Class Form1
             End If
 
             ' p = bTrunc · rSq
-            Dim p As New mpz_t()
-            gmp_lib.mpz_init(p)
             Dim szBt As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(bTrunc.Pointer, 4))
             Dim szRsq As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(rSq.Pointer, 4))
             If CLng(szBt) + CLng(szRsq) <= SAFE Then
@@ -2641,22 +2749,22 @@ Public Class Form1
             Else
                 SafeMpzMul(p, bTrunc, rSq)
             End If
-            gmp_lib.mpz_clear(rSq)
-            gmp_lib.mpz_clear(bTrunc)
 
             ' p >>= (kBits - bShift);  r = 2r - p
             BigShiftRight(p, p, kBits - bShift)
             gmp_lib.mpz_add(r, r, r)    ' r = 2r  (in-place; GMP allows rop=op1=op2)
             gmp_lib.mpz_sub(r, r, p)
-            gmp_lib.mpz_clear(p)
 
             ' Guard: reset if r went non-positive (shouldn't happen but defends against
             ' accumulated rounding pushing the seed over 2^kBits/b in early iterations)
-            If gmp_lib.mpz_sgn(r) <= 0 Then
+            ' §35: mpz_sgn is a GMP macro — read _mp_size field directly.
+            If System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4)) <= 0 Then
                 gmp_lib.mpz_set_ui(r, 1UI)
                 prec = 1L
             End If
         Loop
+        ' §36: Clear loop-external temporaries once after loop completes.
+        gmp_lib.mpz_clears(bTrunc, rSq, p, Nothing)
     End Sub
 
     ' Compute q = floor(a / b).  Safe for any operand size.
@@ -2667,7 +2775,7 @@ Public Class Form1
         Dim szA As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(a.Pointer, 4))
         Dim szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
         If CLng(szA) + CLng(szB) <= SAFE Then
-            gmp_lib.mpz_tdiv_q(q, a, b)
+            GmpRaw_tdiv_q(q.Pointer, a.Pointer, b.Pointer)  ' §35
             Return
         End If
 
@@ -2684,7 +2792,7 @@ Public Class Form1
         SafeMpzMul(ar, a, r)
         gmp_lib.mpz_clear(r)
         BigShiftRight(ar, ar, kBits)
-        gmp_lib.mpz_swap(q, ar)
+        GmpRaw_swap(q.Pointer, ar.Pointer)  ' §35
         gmp_lib.mpz_clear(ar)
 
         ' Adjustment: remainder = a - q·b; fix until 0 ≤ remainder < b  (at most 2 corrections)
@@ -2695,11 +2803,12 @@ Public Class Form1
         gmp_lib.mpz_init(remainder)
         gmp_lib.mpz_sub(remainder, a, qb)
         gmp_lib.mpz_clear(qb)
-        Do While gmp_lib.mpz_sgn(remainder) < 0        ' q too large
+        ' §35: mpz_sgn is a GMP macro — read _mp_size field directly.
+        Do While System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4)) < 0  ' q too large
             gmp_lib.mpz_sub_ui(q, q, 1UI)
             gmp_lib.mpz_add(remainder, remainder, b)
         Loop
-        Do While gmp_lib.mpz_cmp(remainder, b) >= 0   ' q too small
+        Do While GmpRaw_cmp(remainder.Pointer, b.Pointer) >= 0   ' §35: q too small
             gmp_lib.mpz_add_ui(q, q, 1UI)
             gmp_lib.mpz_sub(remainder, remainder, b)
         Loop
@@ -2800,11 +2909,11 @@ Public Class Form1
 
             Dim nTrunc As New mpz_t()
             gmp_lib.mpz_init(nTrunc)
-            If nShift > 0L Then BigShiftRight(nTrunc, n, nShift) Else gmp_lib.mpz_set(nTrunc, n)
+            If nShift > 0L Then BigShiftRight(nTrunc, n, nShift) Else GmpRaw_set(nTrunc.Pointer, n.Pointer)  ' §35
 
             Dim xTrunc As New mpz_t()
             gmp_lib.mpz_init(xTrunc)
-            If xHalf > 0L Then BigShiftRight(xTrunc, x, xHalf) Else gmp_lib.mpz_set(xTrunc, x)
+            If xHalf > 0L Then BigShiftRight(xTrunc, x, xHalf) Else GmpRaw_set(xTrunc.Pointer, x.Pointer)  ' §35
 
             Dim q As New mpz_t()
             gmp_lib.mpz_init(q)
@@ -2812,7 +2921,7 @@ Public Class Form1
             Dim szXT As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(xTrunc.Pointer, 4))
             If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] Newton step {_newtonStep}: target={target:N0} bits, div {szNT:N0}/{szXT:N0} limbs{vbCrLf}")
             If CLng(szNT) + CLng(szXT) <= SAFE Then
-                gmp_lib.mpz_tdiv_q(q, nTrunc, xTrunc)
+                GmpRaw_tdiv_q(q.Pointer, nTrunc.Pointer, xTrunc.Pointer)  ' §35
             Else
                 SafeMpzDiv(q, nTrunc, xTrunc)
             End If
@@ -2823,7 +2932,7 @@ Public Class Form1
             GmpRaw_tdiv_q_2exp(xTrunc.Pointer, xTrunc.Pointer, 1UI)   ' >> 1
 
             If xHalf > 0L Then BigShiftLeft(xTrunc, xTrunc, xHalf)
-            gmp_lib.mpz_swap(x, xTrunc)
+            GmpRaw_swap(x.Pointer, xTrunc.Pointer)  ' §35
             gmp_lib.mpz_clear(xTrunc)
             kBitsX = target
 
@@ -2855,7 +2964,7 @@ Public Class Form1
         Dim xSq As New mpz_t()
         gmp_lib.mpz_init(xSq)
         SafeMpzMul(xSq, x, x)
-        Do While gmp_lib.mpz_cmp(xSq, n) > 0   ' x² > n → x too large
+        Do While GmpRaw_cmp(xSq.Pointer, n.Pointer) > 0   ' §35: x² > n → x too large
             gmp_lib.mpz_sub_ui(x, x, 1UI)
             SafeMpzMul(xSq, x, x)
         Loop
@@ -2867,15 +2976,15 @@ Public Class Form1
         Dim x1Sq As New mpz_t()
         gmp_lib.mpz_init(x1Sq)
         SafeMpzMul(x1Sq, x1, x1)
-        Do While gmp_lib.mpz_cmp(x1Sq, n) <= 0   ' (x+1)² ≤ n → x too small
-            gmp_lib.mpz_swap(x, x1)
+        Do While GmpRaw_cmp(x1Sq.Pointer, n.Pointer) <= 0   ' §35: (x+1)² ≤ n → x too small
+            GmpRaw_swap(x.Pointer, x1.Pointer)  ' §35
             gmp_lib.mpz_add_ui(x1, x, 1UI)
             SafeMpzMul(x1Sq, x1, x1)
         Loop
         gmp_lib.mpz_clear(x1)
         gmp_lib.mpz_clear(x1Sq)
 
-        gmp_lib.mpz_swap(result, x)
+        GmpRaw_swap(result.Pointer, x.Pointer)  ' §35
         gmp_lib.mpz_clear(x)
     End Sub
 
@@ -2895,7 +3004,11 @@ Public Class Form1
     Private Sub BinarySplitGMP(numTerms As Long,
                                 ByRef nodes As List(Of Result))
 
-        Const CHUNK_SIZE As Long = 512L
+        ' §38: Adaptive chunk size — clamp(numTerms\10000, 512, 8192).
+        ' At 5B digits (~360M terms): 360M\10000=36000 → clamped to 8192.
+        ' Fewer, larger chunks → fewer serialise/deserialise round-trips.
+        Dim CHUNK_SIZE As Long = CLng(System.Math.Max(512L, System.Math.Min(8192L, numTerms \ 10000L)))
+        If _logLevel >= 2 Then AppendLog($"[BinarySplit] §38 adaptive CHUNK_SIZE={CHUNK_SIZE:N0} for {numTerms:N0} terms{vbCrLf}")
         Const STOP_AT As Long = 1L
         ' §73: threshold read from UI/CLI at compute start — adapts to available RAM.
         Dim DISK_THRESHOLD As Integer = _diskThreshold
@@ -3513,7 +3626,7 @@ Phase2:
             ' same size in level N+1, so pooling them only commits pages that can
             ' never be reclaimed.  Flushing here keeps committed memory proportional
             ' to the current working set instead of accumulating across all levels.
-            FlushGmpPool()
+            GmpNativeAlloc_Flush()  ' §30: native pool flush (replaced managed FlushGmpPool)
 
             ' §94: Auto-checkpoint — write level snapshot after GC/FlushGmpPool so that
             ' scratch memory from the completed multiplications is freed before the snapshot
@@ -4376,7 +4489,7 @@ NumeratorDone:
             ' Return all pooled limb blocks to the OS now that computation is done.
             ' _displayNativePtr is NOT in the pool (GMP never calls GmpFreeFunc on
             ' the mpz_get_str result buffer) so it remains valid for display/verify.
-            FlushGmpPool()
+            GmpNativeAlloc_Flush()  ' §30: native pool flush (replaced managed FlushGmpPool)
         End Try
     End Function
 

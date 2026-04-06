@@ -1,0 +1,10 @@
+LIBRARY GmpNativeAlloc
+EXPORTS
+    GmpNativeAlloc_LoadGmp
+    GmpNativeAlloc_Install
+    GmpNativeAlloc_Flush
+    GmpNativeAlloc_FreeRaw
+    GmpNativeAlloc_PoolGet
+    GmpNativeAlloc_PoolReturn
+    GmpBatch_ComputeTerm
+    GmpBatch_CombineNodes
