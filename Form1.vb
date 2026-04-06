@@ -1603,6 +1603,43 @@ Public Class Form1
         Return bestLevel
     End Function
 
+    ' §104: Immediately copy a NodeCache snapshot to SnapshotStore after it is
+    ' written, so the backup is current before Phase 2 loads and deletes the files.
+    Private Sub BackupSnapshotToStore(snapName As String)
+        Try
+            Dim storeDir As String = System.IO.Path.Combine(_outputDir, "SnapshotStore")
+            Dim src As String = System.IO.Path.Combine(DISK_CACHE_DIR, snapName)
+            Dim dst As String = System.IO.Path.Combine(storeDir, snapName)
+            If Not System.IO.Directory.Exists(src) Then Return
+            If Not System.IO.Directory.Exists(storeDir) Then
+                System.IO.Directory.CreateDirectory(storeDir)
+            End If
+            If System.IO.Directory.Exists(dst) Then
+                System.IO.Directory.Delete(dst, recursive:=True)
+            End If
+            System.IO.Directory.CreateDirectory(dst)
+            For Each srcFile As String In System.IO.Directory.GetFiles(src)
+                System.IO.File.Copy(srcFile, System.IO.Path.Combine(dst, System.IO.Path.GetFileName(srcFile)))
+            Next
+            WriteToLog($"[Snapshot] Backed up {snapName} to SnapshotStore")
+        Catch ex As Exception
+            WriteToLog($"[Snapshot] WARN: backup of {snapName} to SnapshotStore failed: {ex.Message}")
+        End Try
+    End Sub
+
+    ' §104: Remove a superseded snapshot from SnapshotStore.
+    Private Sub DeleteSnapshotFromStore(level As Integer)
+        Try
+            Dim dst As String = System.IO.Path.Combine(_outputDir, "SnapshotStore", $"snap_L{level}")
+            If System.IO.Directory.Exists(dst) Then
+                System.IO.Directory.Delete(dst, recursive:=True)
+                WriteToLog($"[Snapshot] Removed superseded SnapshotStore entry snap_L{level}")
+            End If
+        Catch ex As Exception
+            WriteToLog($"[Snapshot] WARN: could not remove SnapshotStore snap_L{level}: {ex.Message}")
+        End Try
+    End Sub
+
     ' §103: Save finalP/finalQ/finalT to snap_Phase3/ before Phase 3 begins.
     ' Allows Phase 3 to be re-run from this checkpoint without repeating Phase 1/2.
     Private Sub SavePhase3Snapshot(snapDir As String, digits As Long, numTerms As Long,
@@ -1643,6 +1680,8 @@ Public Class Form1
                      $" (P~{CLng(gmp_lib.mpz_sizeinbase(finalP, 10)):N0}" &
                      $" Q~{CLng(gmp_lib.mpz_sizeinbase(finalQ, 10)):N0}" &
                      $" T~{CLng(gmp_lib.mpz_sizeinbase(finalT, 10)):N0} digits)")
+            ' §104: Back up snap_Phase3 immediately — don't wait for end-of-run script backup.
+            BackupSnapshotToStore("snap_Phase3")
         Catch ex As Exception
             LogPhase($"[ComputePi] snap_Phase3 save FAILED: {ex.Message} — continuing without checkpoint")
         End Try
@@ -3250,7 +3289,9 @@ Phase2:
             ' After confirming the new snapshot, delete the previous level's snapshot.
             If _autoCheckpoint AndAlso Not isLastLevel Then
                 If WriteLevelSnapshot(level, diskNodes, numTerms, numChunks) Then  ' §96
-                    DeleteSnapshotDir(level - 1)
+                    BackupSnapshotToStore($"snap_L{level}")   ' §104: immediate SnapshotStore backup
+                    DeleteSnapshotFromStore(level - 1)        ' §104: remove superseded backup
+                    DeleteSnapshotDir(level - 1)              ' remove superseded NodeCache entry
                 End If
             End If
 
