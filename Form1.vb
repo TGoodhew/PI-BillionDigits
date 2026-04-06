@@ -772,6 +772,38 @@ Public Class Form1
     Private Shared Sub GmpRaw_tdiv_q_2exp(rop As IntPtr, op As IntPtr, n As UInteger)
     End Sub
 
+    ' §108: Additional raw DllImports for BinarySplitChunk hot path (~11 thunked calls per term).
+    ' Eliminates Math.Gmp.Native delegate dispatch on the term-generation inner loop.
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_set_ui",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_set_ui(rop As IntPtr, op As UInteger)
+    End Sub
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_set_si",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_set_si(rop As IntPtr, op As Integer)
+    End Sub
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_mul_ui",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_mul_ui(rop As IntPtr, op1 As IntPtr, op2 As UInteger)
+    End Sub
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_add_ui",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_add_ui(rop As IntPtr, op1 As IntPtr, op2 As UInteger)
+    End Sub
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_sub_ui",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_sub_ui(rop As IntPtr, op1 As IntPtr, op2 As UInteger)
+    End Sub
+
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_pow_ui",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_pow_ui(rop As IntPtr, base As IntPtr, exp As UInteger)
+    End Sub
+
     Private Sub InitGmpVirtualAllocFunctions()
         ' Initialise pool buckets (fixed array — no ConcurrentDictionary overhead).
         For b As Integer = 0 To POOL_BUCKETS - 1
@@ -1429,32 +1461,34 @@ Public Class Form1
                     gmp_lib.mpz_inits(res.P, res.Q, res.T, Nothing)
 
                     If currentWorkItem.a = 0 Then
-                        gmp_lib.mpz_set_ui(res.P, 1UI)
-                        gmp_lib.mpz_set_ui(res.Q, 1UI)
-                        gmp_lib.mpz_set_ui(res.T, 13591409UI)
+                        ' §108: GmpRaw_* bypasses Math.Gmp.Native delegate dispatch
+                        GmpRaw_set_ui(res.P.Pointer, 1UI)
+                        GmpRaw_set_ui(res.Q.Pointer, 1UI)
+                        GmpRaw_set_ui(res.T.Pointer, 13591409UI)
                     Else
                         Dim aBig As New mpz_t()
                         Dim t1 As New mpz_t()
                         Dim t2 As New mpz_t()
                         gmp_lib.mpz_inits(aBig, t1, t2, Nothing)
-                        gmp_lib.mpz_set_si(aBig, CInt(currentWorkItem.a))
+                        ' §108: ~11 gmp_lib thunks per term → direct GmpRaw_* P/Invokes
+                        GmpRaw_set_si(aBig.Pointer, CInt(currentWorkItem.a))
 
-                        gmp_lib.mpz_mul_ui(t1, aBig, 6UI)
-                        gmp_lib.mpz_sub_ui(t1, t1, 5UI)
-                        gmp_lib.mpz_mul_ui(t2, aBig, 2UI)
-                        gmp_lib.mpz_sub_ui(t2, t2, 1UI)
-                        gmp_lib.mpz_mul(res.P, t1, t2)
-                        gmp_lib.mpz_mul_ui(t1, aBig, 6UI)
-                        gmp_lib.mpz_sub_ui(t1, t1, 1UI)
-                        gmp_lib.mpz_mul(res.P, res.P, t1)
+                        GmpRaw_mul_ui(t1.Pointer, aBig.Pointer, 6UI)
+                        GmpRaw_sub_ui(t1.Pointer, t1.Pointer, 5UI)
+                        GmpRaw_mul_ui(t2.Pointer, aBig.Pointer, 2UI)
+                        GmpRaw_sub_ui(t2.Pointer, t2.Pointer, 1UI)
+                        GmpRaw_mul(res.P.Pointer, t1.Pointer, t2.Pointer)
+                        GmpRaw_mul_ui(t1.Pointer, aBig.Pointer, 6UI)
+                        GmpRaw_sub_ui(t1.Pointer, t1.Pointer, 1UI)
+                        GmpRaw_mul(res.P.Pointer, res.P.Pointer, t1.Pointer)
 
-                        gmp_lib.mpz_pow_ui(res.Q, aBig, 3UI)
-                        gmp_lib.mpz_mul(res.Q, res.Q, gmpC3Const)
+                        GmpRaw_pow_ui(res.Q.Pointer, aBig.Pointer, 3UI)
+                        GmpRaw_mul(res.Q.Pointer, res.Q.Pointer, gmpC3Const.Pointer)
 
-                        gmp_lib.mpz_mul_ui(t1, aBig, 545140134UI)
-                        gmp_lib.mpz_add_ui(t1, t1, 13591409UI)
-                        gmp_lib.mpz_mul(res.T, res.P, t1)
-                        If (currentWorkItem.a And 1L) = 1L Then gmp_lib.mpz_neg(res.T, res.T)
+                        GmpRaw_mul_ui(t1.Pointer, aBig.Pointer, 545140134UI)
+                        GmpRaw_add_ui(t1.Pointer, t1.Pointer, 13591409UI)
+                        GmpRaw_mul(res.T.Pointer, res.P.Pointer, t1.Pointer)
+                        If (currentWorkItem.a And 1L) = 1L Then GmpRaw_neg(res.T.Pointer, res.T.Pointer)
 
                         gmp_lib.mpz_clears(aBig, t1, t2, Nothing)
                     End If
@@ -1475,11 +1509,12 @@ Public Class Form1
                     Dim tempB As New mpz_t()
                     gmp_lib.mpz_inits(res.P, res.Q, res.T, tempA, tempB, Nothing)
 
-                    gmp_lib.mpz_mul(res.P, leftRes.P, rightRes.P)
-                    gmp_lib.mpz_mul(res.Q, leftRes.Q, rightRes.Q)
-                    gmp_lib.mpz_mul(tempA, leftRes.T, rightRes.Q)
-                    gmp_lib.mpz_mul(tempB, leftRes.P, rightRes.T)
-                    gmp_lib.mpz_add(res.T, tempA, tempB)
+                    ' §108: GmpRaw_* bypasses wrapper dispatch on the combine hot path
+                    GmpRaw_mul(res.P.Pointer, leftRes.P.Pointer, rightRes.P.Pointer)
+                    GmpRaw_mul(res.Q.Pointer, leftRes.Q.Pointer, rightRes.Q.Pointer)
+                    GmpRaw_mul(tempA.Pointer, leftRes.T.Pointer, rightRes.Q.Pointer)
+                    GmpRaw_mul(tempB.Pointer, leftRes.P.Pointer, rightRes.T.Pointer)
+                    GmpRaw_add(res.T.Pointer, tempA.Pointer, tempB.Pointer)
 
                     gmp_lib.mpz_clears(leftRes.P, leftRes.Q, leftRes.T, Nothing)
                     gmp_lib.mpz_clears(rightRes.P, rightRes.Q, rightRes.T, Nothing)
@@ -3671,19 +3706,20 @@ Phase2:
                     End Try
 
                     ' Same early-free + in-place-add pattern as the BinarySplitGMP combine loop.
-                    gmp_lib.mpz_mul(newP, left.P, right.P)
+                    ' §108: GmpRaw_* bypasses wrapper dispatch
+                    GmpRaw_mul(newP.Pointer, left.P.Pointer, right.P.Pointer)
                     gmp_lib.mpz_clears(right.P, Nothing)
 
-                    gmp_lib.mpz_mul(newQ, left.Q, right.Q)
+                    GmpRaw_mul(newQ.Pointer, left.Q.Pointer, right.Q.Pointer)
                     gmp_lib.mpz_clears(left.Q, Nothing)
 
-                    gmp_lib.mpz_mul(tA, left.T, right.Q)
+                    GmpRaw_mul(tA.Pointer, left.T.Pointer, right.Q.Pointer)
                     gmp_lib.mpz_clears(left.T, right.Q, Nothing)
 
-                    gmp_lib.mpz_mul(tB, left.P, right.T)
+                    GmpRaw_mul(tB.Pointer, left.P.Pointer, right.T.Pointer)
                     gmp_lib.mpz_clears(left.P, right.T, Nothing)
 
-                    gmp_lib.mpz_add(tA, tA, tB)    ' in-place: T result in tA's buffer
+                    GmpRaw_add(tA.Pointer, tA.Pointer, tB.Pointer)  ' in-place: T result in tA's buffer
                     gmp_lib.mpz_clears(tB, Nothing) ' tA IS newT
 
                     nextNodes.Add(New Result With {.P = newP, .Q = newQ, .T = tA})
