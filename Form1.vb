@@ -3708,6 +3708,7 @@ Phase2:
             SavePhase3Snapshot(p3SnapDir, digits, numTerms, finalP, finalQ, finalT)
 
 Phase3Start:
+            System.Threading.Volatile.Write(_safeMulDop, -1)   ' §107 Gap 7: reset DOP so Phase 3 uses all cores (may be 3 if Phase 2 serial path ran)
             gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpNumer, gmpPi, gmpOne, Nothing)
             gmpVariablesInitialized = True
 
@@ -4283,7 +4284,7 @@ NumeratorDone:
                     End If
                 End If
             End If
-            gmp_lib.mpz_tdiv_q(gmpPi, gmpNumer, finalT)
+            SafeMpzDiv(gmpPi, gmpNumer, finalT)   ' §107 Gap 6: operands ~5B+ limbs — mpz_tdiv_q hits mpn_mul_fft overflow
             gmp_lib.mpz_clears(gmpNumer, finalT, Nothing)
             LogPhase("Division complete")
 

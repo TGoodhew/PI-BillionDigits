@@ -2596,6 +2596,10 @@ DllImports added: `OpenThread`, `SetThreadAffinityMask`, `CloseHandle` (kernel32
 
 **Gap 4 — Level-aware outer DOP:** The outer `Parallel.For` over pairs was capped at `ProcessorCount` even at low levels where `pairCount < ProcessorCount`. Added `_outerDop = Min(ProcessorCount, pairCount)` so the scheduler isn't given more parallelism slots than there are work items.
 
+**Gap 5 — Final divide uses `mpz_tdiv_q` not `SafeMpzDiv` (NOT YET FIXED):** `gmp_lib.mpz_tdiv_q(gmpPi, gmpNumer, finalT)` at the end of `ComputePiGMP` uses native GMP. At 5B digits `gmpNumer` ≈ 5.2 billion limbs and `finalT` ≈ 2.6 billion limbs — both vastly exceed the 33M-limb threshold at which GMP's internal `mpn_mul_fft` overflows. This is the same crash class that broke `mpz_sqrt` and `mpz_mul`. Fix: replace with `SafeMpzDiv(gmpPi, gmpNumer, finalT)`.
+
+**Gap 6 — `_safeMulDop` not reset at `Phase3Start` (NOT YET FIXED):** When Phase 2 runs to completion and its last level takes the serial path (always true at 5B digits, where final levels have `pairCount < 4`), `_safeMulDop` is left at 3. There is no reset at `Phase3Start`. Phase 3's single-threaded callers — `SafeMpzPow10`, the Step 2 squaring, and `SafeMpzSqrt`'s internal `SafeMpzMul` calls — therefore run at DOP=3 instead of DOP=24, using only ~9 of 24 cores. Fix: add `Volatile.Write(_safeMulDop, -1)` at `Phase3Start` (−1 is read as `ProcessorCount` inside `SafeMpzMul`). Note: does not affect runs that load from `snap_Phase3` directly (Phase 2 never ran, so `_safeMulDop` stays at its initial −1).
+
 ### Newton step checkpointing (SafeMpzSqrt)
 
 Each of the 6 Newton refinement steps in `SafeMpzSqrt` now saves a checkpoint immediately after completing: `snap_Phase3/sqrt_newton.bin` (serialized `x`) + `sqrt_newton_meta.txt` (`bitsN`, `kBitsX`, `step`). On entry, if a matching checkpoint exists (`bitsN` matches and `kBitsX > SEED_BITS`), `x` is deserialized and the loop resumes at the saved step. After each save, `BackupSnapshotToStore("snap_Phase3")` is called immediately.
@@ -2612,3 +2616,5 @@ Checkpoints added:
 - **finalT** — saved alongside gmpNumer so the divide can resume without reloading from snap_Phase3/T.bin
 
 At `Phase3Start`, if `gmpNumer` is found in the checkpoint, the code jumps to `NumeratorDone:` (past Steps 1–5, the sqrt, all three R multiplies, and Combine A–D), loading `finalT` from checkpoint or falling back to `snap_Phase3/T.bin`.
+
+**Known cosmetic inaccuracy:** The log line `"finalT reloaded from spill file"` at `NumeratorDone:` is printed on both the normal path (where finalT really was loaded from spill) and the `GoTo NumeratorDone` checkpoint path (where finalT was loaded from `snap_Phase3/finalT.bin`). Not a correctness issue.
