@@ -2140,23 +2140,75 @@ Public Class Form1
     ' ════════════════════════════════════════════════════════════════════════
 
     ' Compute floor(op / 2^bits) → rop.  Handles bits > UInt32.Max.  rop may alias op.
+    ' Pre-allocate an mpz_t's limb buffer to at least neededLimbs without going
+    ' through GmpReallocFunc.  Required before any GMP operation that would trigger
+    ' a Small→Large realloc (CRT-alloc'd 1-limb init buffer → VirtualAlloc'd multi-GB
+    ' buffer), because GMP calls __gmp_realloc which reaches GmpReallocFunc BEFORE
+    ' writing anything to rop — if that path crashes the diagnostic log shows nothing
+    ' between "about to call" and the process exit.
+    '
+    ' Pattern: identical to the tmpHigh / mpQ1 / mpQ2 pre-alloc blocks in ComputePiGMP.
+    ' If neededLimbs is already satisfied, or neededBytes < GMP_LARGE_THRESHOLD, returns
+    ' immediately (GmpReallocFunc handles small→small transitions fine).
+    Private Shared Sub PreAllocMpzToLimbs(m As mpz_t, neededLimbs As Long)
+        If neededLimbs <= 0L Then Return
+        Dim currentAlloc As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(m.Pointer, 0)))
+        If currentAlloc >= neededLimbs Then Return   ' already large enough
+
+        Dim neededBytes As Long = neededLimbs * 8L
+        If neededBytes < GMP_LARGE_THRESHOLD Then Return  ' small; GmpReallocFunc handles it
+
+        Dim currentBuf As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(m.Pointer, 8))
+        Dim currentBytes As Long = currentAlloc * 8L
+
+        Dim newBuf As IntPtr = PoolGet(neededBytes)
+        If newBuf = IntPtr.Zero Then
+            AppendLog($"[PreAlloc] PoolGet({neededBytes:N0} B) FAILED — will rely on GmpReallocFunc{vbCrLf}")
+            Return
+        End If
+
+        If currentBytes < GMP_LARGE_THRESHOLD Then
+            ' Current buffer is CRT-alloc'd (small) — free via GMP's saved CRT free.
+            _savedGmpFree(New void_ptr(currentBuf), New size_t(CULng(currentBytes)))
+        ElseIf currentBytes > POOL_MAX_BLOCK Then
+            VirtualFree(currentBuf, UIntPtr.Zero, MEM_RELEASE)
+        Else
+            PoolReturn(currentBuf, currentBytes)
+        End If
+
+        Runtime.InteropServices.Marshal.WriteInt32(m.Pointer, 0, CInt(neededLimbs))
+        Runtime.InteropServices.Marshal.WriteInt64(m.Pointer, 8, newBuf.ToInt64())
+        AppendLog($"[PreAlloc] {neededLimbs:N0} limbs ({neededBytes \ 1048576L:N0} MB) OK{vbCrLf}")
+    End Sub
+
+    ' Compute floor(op / 2^bits) → rop.  Handles bits > UInt32.Max.  rop may alias op.
+    '
+    ' §101 fix: GMP's mpz_tdiv_q_2exp calls _mpz_realloc before writing any data.
+    ' When rop has a small (CRT-alloc'd) 1-limb buffer and op is multi-GB, that
+    ' realloc is a Small→Large transition that triggers GmpReallocFunc.  Empirically
+    ' GMP crashes before our callback fires (no S→L log line appears).  Fix: pre-alloc
+    ' rop to hold the first chunk's result using PreAllocMpzToLimbs (direct VirtualAlloc,
+    ' bypassing GmpReallocFunc entirely).  Subsequent chunks are always Large→Large.
     Private Shared Sub BigShiftRight(rop As mpz_t, op As mpz_t, bits As Long)
         If bits <= 0L Then
             If rop.Pointer <> op.Pointer Then gmp_lib.mpz_set(rop, op)
             Return
         End If
+
+        ' Pre-alloc rop for the first chunk result before calling GmpRaw_tdiv_q_2exp.
+        Dim opLimbs As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(op.Pointer, 4)))
+        Dim firstChunkLimbs As Long = System.Math.Min(bits, 2_100_000_000L) \ 64L
+        Dim firstResultLimbs As Long = opLimbs - firstChunkLimbs + 1L   ' +1 safety margin
+        If firstResultLimbs > 0L Then PreAllocMpzToLimbs(rop, firstResultLimbs)
+
         Dim src As IntPtr = op.Pointer
         Dim dst As IntPtr = rop.Pointer
         Dim bitsLeft As Long = bits
-        Dim chunkNum As Integer = 0
         Do
             Dim chunk As UInteger = CUInt(System.Math.Min(bitsLeft, 2_100_000_000L))
-            chunkNum += 1
-            AppendLog($"[BigShiftRight] §D chunk {chunkNum}: shift {chunk:N0} bits, bitsLeft={bitsLeft:N0}{vbCrLf}")
             GmpRaw_tdiv_q_2exp(dst, src, chunk)
             src = dst
             bitsLeft -= CLng(chunk)
-            AppendLog($"[BigShiftRight] §D chunk {chunkNum} done{vbCrLf}")
         Loop While bitsLeft > 0L
     End Sub
 
@@ -2342,10 +2394,8 @@ Public Class Form1
     '   xNew     = ((xTrunc + q) >> 1) << xHalf  [scaled back to sqrt(n) domain]
     ' Convergence: Newton quadratic convergence, ~6 large iterations for 5B digits.
     Private Shared Sub SafeMpzSqrt(result As mpz_t, n As mpz_t)
-        AppendLog($"[SafeMpzSqrt] §D1 entered: n.Pointer=0x{n.Pointer:X} result.Pointer=0x{result.Pointer:X}{vbCrLf}")
         Const SAFE As Integer = 33_554_431
         Dim szN As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(n.Pointer, 4))
-        AppendLog($"[SafeMpzSqrt] §D2 szN={szN:N0}{vbCrLf}")
         If CLng(szN) <= SAFE Then
             gmp_lib.mpz_sqrt(result, n)
             Return
@@ -2358,27 +2408,21 @@ Public Class Form1
         Const SEED_BITS As Long = 350_000_000L
         Dim seedShift As Long = System.Math.Max(0L, bitsN - 2L * SEED_BITS)
         If (seedShift And 1L) <> 0L Then seedShift += 1L  ' must be even
-        AppendLog($"[SafeMpzSqrt] §D3 bitsN={bitsN:N0} bitsS={bitsS:N0} seedShift={seedShift:N0}{vbCrLf}")
 
         Dim x As New mpz_t()
         gmp_lib.mpz_init(x)
-        AppendLog($"[SafeMpzSqrt] §D4 x initialised{vbCrLf}")
         If seedShift = 0L Then
             gmp_lib.mpz_sqrt(x, n)
         Else
             Dim nSeed As New mpz_t()
             gmp_lib.mpz_init(nSeed)
-            AppendLog($"[SafeMpzSqrt] §D5 nSeed initialised; about to BigShiftRight by {seedShift:N0} bits{vbCrLf}")
-            BigShiftRight(nSeed, n, seedShift)
-            AppendLog($"[SafeMpzSqrt] §D6 BigShiftRight done; about to mpz_sqrt{vbCrLf}")
-            gmp_lib.mpz_sqrt(x, nSeed)   ' safe: nSeed has 2·SEED_BITS bits
-            AppendLog($"[SafeMpzSqrt] §D7 mpz_sqrt done; about to BigShiftLeft by {seedShift >> 1:N0} bits{vbCrLf}")
+            BigShiftRight(nSeed, n, seedShift)   ' PreAllocMpzToLimbs inside BigShiftRight
+            gmp_lib.mpz_sqrt(x, nSeed)           ' safe: nSeed has 2·SEED_BITS bits
             gmp_lib.mpz_clear(nSeed)
             BigShiftLeft(x, x, seedShift >> 1)   ' x ≈ sqrt(n), correct to SEED_BITS bits
-            AppendLog($"[SafeMpzSqrt] §D8 BigShiftLeft done{vbCrLf}")
         End If
 
-        AppendLog($"[SafeMpzSqrt] seed ready ({CLng(gmp_lib.mpz_sizeinbase(x, 10)):N0} digits); beginning Newton refinement{vbCrLf}")
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] seed ready ({CLng(gmp_lib.mpz_sizeinbase(x, 10)):N0} digits); beginning Newton refinement{vbCrLf}")
 
         ' Newton refinement — doubles precision each step
         Dim kBitsX As Long = SEED_BITS
