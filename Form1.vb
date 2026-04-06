@@ -2370,22 +2370,29 @@ Public Class Form1
 
     ' Compute op * 2^bits → rop.  Handles bits > UInt32.Max.  rop may alias op.
     '
-    ' §102 fix: GMP's mpz_mul_2exp calls _mpz_realloc before writing data.
-    ' On Windows (32-bit mp_size_t), _mpz_realloc aborts if new_alloc > 268M limbs
-    ' even though INT_MAX = 2.1B.  The abort check fires BEFORE our GmpReallocFunc.
-    ' Fix: pre-alloc rop to the full result size before the first GmpRaw_mul_2exp
-    ' call, so MPZ_REALLOC sees alloc >= needed and skips _mpz_realloc entirely.
+    ' §102 / §105 fix: GMP's _mpz_realloc aborts with "overflow" when new_alloc
+    ' exceeds INT_MAX/GMP_NUMB_BITS = 33,554,431 limbs on Windows 64-bit (32-bit
+    ' mp_size_t).  This check fires BEFORE our GmpReallocFunc callback.
+    '
+    ' Every chunk of a left-shift grows the result, so chunk 2, 3, … would each
+    ' trigger _mpz_realloc with a progressively larger new_alloc — all of them
+    ' above the 33M-limb limit when shifting by billions of bits.
+    '
+    ' Fix: pre-alloc rop to the FULL final result size before any GmpRaw_mul_2exp
+    ' chunk runs.  Every chunk then finds _mp_alloc >= needed and MPZ_REALLOC
+    ' short-circuits without ever calling _mpz_realloc.
     Private Shared Sub BigShiftLeft(rop As mpz_t, op As mpz_t, bits As Long)
         If bits <= 0L Then
             If rop.Pointer <> op.Pointer Then gmp_lib.mpz_set(rop, op)
             Return
         End If
 
-        ' Pre-alloc rop for the first chunk result before calling GmpRaw_mul_2exp.
+        ' Pre-alloc rop to the FULL final result size — not just the first chunk.
+        ' Each intermediate chunk grows rop; without this any chunk whose result
+        ' exceeds 33M limbs hits GMP's _mpz_realloc overflow abort.
         Dim opLimbs As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(op.Pointer, 4)))
-        Dim firstChunkBits As Long = System.Math.Min(bits, 2_100_000_000L)
-        Dim firstResultLimbs As Long = opLimbs + (firstChunkBits + 63L) \ 64L + 1L   ' +1 safety margin
-        If firstResultLimbs > 0L Then PreAllocMpzToLimbs(rop, firstResultLimbs)
+        Dim finalResultLimbs As Long = opLimbs + (bits + 63L) \ 64L + 1L   ' +1 safety margin
+        If finalResultLimbs > 0L Then PreAllocMpzToLimbs(rop, finalResultLimbs)
 
         Dim src As IntPtr = op.Pointer
         Dim dst As IntPtr = rop.Pointer

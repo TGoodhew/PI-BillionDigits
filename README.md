@@ -2530,3 +2530,50 @@ Five helper routines were added:
 ### Why not use GMP's integer square root directly?
 
 GMP's `mpz_sqrt` internally calls `mpn_sqrtrem` which calls `mpn_mul_fft` for the Schönhage-Strassen squarings used in Newton refinement — and those calls read from the same static table that overflows. There is no GMP API to compute a large integer square root without triggering this path.
+
+## §101 — PreAllocMpzToLimbs: bypass GMP S→L realloc crash in BigShiftRight
+
+### Problem
+
+`BigShiftRight`'s first chunk called `GmpRaw_tdiv_q_2exp` on a freshly `mpz_init`'d destination with only a 1-limb CRT-allocated buffer (~8 bytes). GMP's `_mpz_realloc` was needed to grow this to ~3.9 GB (486M limbs), but `_mpz_realloc` has a hard overflow check: it aborts with `gmp_die("mpz_realloc: overflow")` whenever `new_alloc > INT_MAX / GMP_NUMB_BITS = 33,554,431 limbs`. This abort fires *before* our `GmpReallocFunc` callback is reached. Result: silent crash in native code.
+
+### Solution
+
+`PreAllocMpzToLimbs(m, neededLimbs)`: directly replaces the mpz_t's limb buffer via struct manipulation (the same pattern used for `tmpHigh`, `mpQ1`, `mpQ2` in `ComputePiGMP`). Obtains a pool/VirtualAlloc block of the required size, copies any existing limb data (for aliased calls), frees the old buffer, and writes the new pointer and alloc count directly into the mpz_t header. Called at the start of `BigShiftRight` before the first `GmpRaw_tdiv_q_2exp` chunk.
+
+## §102 — BigShiftLeft first-chunk pre-alloc (partial fix)
+
+Applied the same `PreAllocMpzToLimbs` to the first chunk of `BigShiftLeft` (aliased `BigShiftLeft(x, x, ...)` case). This fixed the S→L transition for the seed shift-back in `SafeMpzSqrt`. However, subsequent chunks still crashed — see §105.
+
+## §103 — snap_Phase3 checkpoint: skip Phase 1/2 on Phase 3 crash
+
+### Problem
+
+Phase 3 crashes (Steps 1–9 of `ComputePiGMP`) cost 10+ hours of Phase 1/2 re-work because snap_L* node files are deleted when Phase 2 completes (nodes are loaded into memory and disk files removed). By the time a crash is diagnosed and fixed, no valid checkpoint exists.
+
+### Solution
+
+- `SavePhase3Snapshot(snapDir, digits, numTerms, finalP, finalQ, finalT)`: serialises the three large integers to `NodeCache/snap_Phase3/` (P.bin, Q.bin, T.bin, meta.txt) immediately after Phase 2 finishes, before any Phase 3 operation begins.
+- `TryLoadPhase3Snapshot(snapDir, digits, outP, outQ, outT)`: on startup (when `--auto-checkpoint`), checks for `snap_Phase3`, validates `digits` match, deserialises P/Q/T via the existing `DeserializeOneMpz` path, and returns True to skip `BinarySplitGMP` entirely.
+- `GoTo Phase3Start` label added in `ComputePiGMP` at the Phase 3 entry point.
+- `Run-PiCompute.ps1`: `Invoke-CheckpointRestore` called before each run to copy `snap_Phase3`/`snap_L*` from SnapshotStore → NodeCache; `Invoke-CheckpointBackup` extended to include `snap_Phase3`.
+
+## §104 — Immediate SnapshotStore backup after every snapshot write
+
+### Problem
+
+The end-of-run script backup was too late: Phase 2 deletes snap_L* `.bin` files when loading nodes for the final combine. The backup saw only empty directories.
+
+### Solution
+
+`BackupSnapshotToStore(snapName)` and `DeleteSnapshotFromStore(level)`: called immediately inside `WriteLevelSnapshot` (after each successful write) and inside `SavePhase3Snapshot`. SnapshotStore is now updated in real-time — the backup reflects the current computation state regardless of when the run exits or crashes. The script `Invoke-CheckpointRestore` at run-start closes the loop: the next run always begins with the latest protected checkpoint.
+
+## §105 — BigShiftLeft full pre-alloc: fix all chunks, not just the first
+
+### Problem
+
+§102 pre-allocated `rop` to accommodate only the first 2.1B-bit chunk. Every subsequent chunk grows `rop` further; once the intermediate result exceeds 33,554,431 limbs, GMP's `_mpz_realloc` overflow abort fires (same mechanism as §101). For the seed shift-back in `SafeMpzSqrt` — `BigShiftLeft(x, x, 16,259,640,482 bits)` — there are ~8 chunks; chunks 2–8 all grew past the 33M-limb limit.
+
+### Solution
+
+Change `BigShiftLeft` to pre-allocate `rop` to the **full final result size** (`opLimbs + (bits + 63) / 64 + 1`) before any chunk executes. Every chunk then finds `_mp_alloc ≥ needed` and `MPZ_REALLOC` short-circuits without ever calling `_mpz_realloc`. Existing limb data is copied by `PreAllocMpzToLimbs` before the old buffer is freed, making the aliased case safe.
