@@ -2577,3 +2577,38 @@ The end-of-run script backup was too late: Phase 2 deletes snap_L* `.bin` files 
 ### Solution
 
 Change `BigShiftLeft` to pre-allocate `rop` to the **full final result size** (`opLimbs + (bits + 63) / 64 + 1`) before any chunk executes. Every chunk then finds `_mp_alloc ≥ needed` and `MPZ_REALLOC` short-circuits without ever calling `_mpz_realloc`. Existing limb data is copied by `PreAllocMpzToLimbs` before the old buffer is freed, making the aliased case safe.
+
+## §106 — Affinity watchdog (#33), Phase 3 parallelism gaps (#34), Newton + Phase 3 checkpointing
+
+### #33: P-core affinity watchdog
+
+New GMP and .NET runtime threads created after the initial `SetPCoreAffinity` call were landing on E-cores, causing them to run at low frequency. The fix adds an `AffinityWatchdog` background thread that polls every 500 ms, enumerates all threads in the current process via `OpenThread` / `SetThreadAffinityMask`, and re-applies the P-core affinity mask to any thread that has drifted. `_pCoreMask` (Shared Long) stores the mask set by `SetPCoreAffinity`. The watchdog is started on form load (after `SetPCoreAffinity`) and cancelled on form close. On non-hybrid machines (`_pCoreMask = 0`) the watchdog exits immediately without polling.
+
+DllImports added: `OpenThread`, `SetThreadAffinityMask`, `CloseHandle` (kernel32.dll).
+
+### #34: Phase 3 parallelism gaps
+
+**Gap 1 — R0/R1/R2 parallel multiplies with checkpoints:** `SafeMpzMul(mpR0, gmpNumer, finalQ)`, `SafeMpzMul(mpR1, gmpNumer, mpQ1)`, `SafeMpzMul(mpR2, gmpNumer, mpQ2)` now run concurrently via `Parallel.Invoke`. Before launching, each result is checked against a Phase 3 checkpoint (`snap_Phase3/{mpR0,mpR1,mpR2}.bin`); if all three are present the multiplies are skipped entirely. After completion, each result is saved immediately.
+
+**Gap 2 — `_safeMulDop` ceiling division:** `_safeMulDop` was computed as `Floor(ProcessorCount / pairCount)`, starving inner parallelism at levels where `pairCount` doesn't divide evenly. Changed to ceiling division: `_rawDop = ProcessorCount / pairCount`; if `_rawDop >= 1.5` use `Ceiling`, else 1.
+
+**Gap 3 — Lock-free Phase 1 chunk writes:** Phase 1's per-chunk `SyncLock` on `FileStream` was a serialisation bottleneck. Replaced with `RandomAccess.Write` (positional, no seek/lock) backed by a `SafeFileHandle` opened with `FileOptions.Asynchronous Or FileOptions.WriteThrough`. File offsets are allocated lock-free via `Interlocked.Add`.
+
+**Gap 4 — Level-aware outer DOP:** The outer `Parallel.For` over pairs was capped at `ProcessorCount` even at low levels where `pairCount < ProcessorCount`. Added `_outerDop = Min(ProcessorCount, pairCount)` so the scheduler isn't given more parallelism slots than there are work items.
+
+### Newton step checkpointing (SafeMpzSqrt)
+
+Each of the 6 Newton refinement steps in `SafeMpzSqrt` now saves a checkpoint immediately after completing: `snap_Phase3/sqrt_newton.bin` (serialized `x`) + `sqrt_newton_meta.txt` (`bitsN`, `kBitsX`, `step`). On entry, if a matching checkpoint exists (`bitsN` matches and `kBitsX > SEED_BITS`), `x` is deserialized and the loop resumes at the saved step. After each save, `BackupSnapshotToStore("snap_Phase3")` is called immediately.
+
+`BackupSnapshotToStore`, `SerializeOneMpz`, `DeserializeOneMpz` promoted to `Shared` so they can be called from the `Shared` `SafeMpzSqrt`. `_autoCheckpoint` promoted to `Shared` for the same reason.
+
+### Phase 3 intermediate checkpoints (gmpNumer, R0/R1/R2, finalT)
+
+`SavePhase3Value(name, val, dir)` / `TryLoadPhase3Value(name, val, dir)` helpers write/read a single `mpz_t` to `snap_Phase3/{name}.bin` and back up snap_Phase3 immediately.
+
+Checkpoints added:
+- **gmpNumer** — saved after Combine D (the most expensive intermediate; avoids re-running Steps 1–5 on divide crash)
+- **mpR0, mpR1, mpR2** — saved after parallel multiply; loaded at Phase3Start to skip all three multiplies
+- **finalT** — saved alongside gmpNumer so the divide can resume without reloading from snap_Phase3/T.bin
+
+At `Phase3Start`, if `gmpNumer` is found in the checkpoint, the code jumps to `NumeratorDone:` (past Steps 1–5, the sqrt, all three R multiplies, and Combine A–D), loading `finalT` from checkpoint or falling back to `snap_Phase3/T.bin`.

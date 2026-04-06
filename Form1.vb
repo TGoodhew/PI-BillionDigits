@@ -67,7 +67,7 @@ Public Class Form1
     '   auto-resume from the highest valid snapshot on the next run.  All combine
     '   work still runs in RAM; the snapshot is written as a batch after each level
     '   completes, before GC/FlushGmpPool while nodes are still live.
-    Private _autoCheckpoint As Boolean = False
+    Private Shared _autoCheckpoint As Boolean = False
     ' Custom verify checks supplied via --verify-at "DIGITS:POSITION" and
     ' --verify-contains "DIGITS".  Populated during CLI arg parsing; consumed
     ' by RunCustomVerifications() which is called from BtnTest_Click.
@@ -296,6 +296,26 @@ Public Class Form1
     End Function
 
     <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Shared Function OpenThread(
+        dwDesiredAccess As UInteger,
+        bInheritHandle As Boolean,
+        dwThreadId As UInteger) As IntPtr
+    End Function
+
+    <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Shared Function SetThreadAffinityMask(
+        hThread As IntPtr,
+        dwThreadAffinityMask As IntPtr) As IntPtr
+    End Function
+
+    <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Shared Function CloseHandle(hObject As IntPtr) As Boolean
+    End Function
+
+    Private Const THREAD_SET_INFORMATION As UInteger = &H20UI
+    Private Const THREAD_QUERY_INFORMATION As UInteger = &H40UI
+
+    <DllImport("kernel32.dll", SetLastError:=True)>
     Private Shared Function GetLogicalProcessorInformationEx(
         relationshipType As Integer,
         buffer As IntPtr,
@@ -371,6 +391,7 @@ Public Class Form1
                     ' Hybrid CPU — restrict process to P-cores
                     If SetProcessAffinityMask(GetCurrentProcess(), New IntPtr(pCoreMask)) Then
                         AppendLog($"[Affinity] Hybrid CPU detected. P-core mask=0x{pCoreMask:X}  E-core mask=0x{eCoreMask:X}. Process restricted to P-cores.{vbCrLf}")
+                        System.Threading.Volatile.Write(_pCoreMask, pCoreMask)   ' §106: save for watchdog
                     Else
                         AppendLog($"[Affinity] Hybrid CPU detected but SetProcessAffinityMask failed. P=0x{pCoreMask:X} E=0x{eCoreMask:X}{vbCrLf}")
                     End If
@@ -386,6 +407,52 @@ Public Class Form1
         End Try
     End Sub
 
+    ' §106: Affinity watchdog — re-applies the P-core mask to every thread every 500 ms.
+    ' SetProcessAffinityMask only constrains new threads; existing threads that drifted
+    ' to E-cores under competing load are never migrated back automatically.  The watchdog
+    ' iterates all process threads and calls SetThreadAffinityMask on each one, forcing
+    ' them back to P-cores within one watchdog interval.
+    Private Shared Sub StartAffinityWatchdog()
+        Dim mask As Long = System.Threading.Volatile.Read(_pCoreMask)
+        If mask = 0L Then Return   ' uniform CPU or detection failed — nothing to do
+
+        _affinityWatchdogToken = New System.Threading.CancellationTokenSource()
+        Dim token As System.Threading.CancellationToken = _affinityWatchdogToken.Token
+        Dim t As New System.Threading.Thread(
+            Sub()
+                Dim affinityPtr As New IntPtr(mask)
+                While Not token.IsCancellationRequested
+                    Try
+                        For Each pt As Diagnostics.ProcessThread In
+                                Diagnostics.Process.GetCurrentProcess().Threads
+                            Dim h As IntPtr = OpenThread(
+                                THREAD_SET_INFORMATION Or THREAD_QUERY_INFORMATION,
+                                False, CUInt(pt.Id))
+                            If h <> IntPtr.Zero Then
+                                SetThreadAffinityMask(h, affinityPtr)
+                                CloseHandle(h)
+                            End If
+                        Next
+                    Catch
+                        ' Process.Threads can throw if a thread exits mid-enumeration
+                    End Try
+                    System.Threading.Thread.Sleep(500)
+                End While
+            End Sub)
+        t.IsBackground = True
+        t.Name = "AffinityWatchdog"
+        t.Priority = System.Threading.ThreadPriority.BelowNormal
+        t.Start()
+        AppendLog($"[Affinity] Watchdog started (P-core mask=0x{mask:X}, interval=500ms){vbCrLf}")
+    End Sub
+
+    Private Shared Sub StopAffinityWatchdog()
+        Try
+            _affinityWatchdogToken?.Cancel()
+        Catch
+        End Try
+    End Sub
+
     Private Shared Sub DisablePowerThrottling()
         Dim state As New PROCESS_POWER_THROTTLING_STATE With {
             .Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
@@ -397,6 +464,10 @@ Public Class Form1
                               state,
                               CUInt(Runtime.InteropServices.Marshal.SizeOf(state)))
     End Sub
+
+    ' §106: P-core affinity mask saved by SetPCoreAffinity for use by the watchdog.
+    Private Shared _pCoreMask As Long = 0L
+    Private Shared _affinityWatchdogToken As System.Threading.CancellationTokenSource = Nothing
 
     ' GC-anchor ALL six delegates — collected delegates crash the process.
     ' Shared so the Shared callback methods can reach the saved defaults.
@@ -949,6 +1020,7 @@ Public Class Form1
         ' AMD Zen 4c).  E-cores run GMP arithmetic ~30-50% slower and cause
         ' cache-topology mismatches in parallel workloads.
         SetPCoreAffinity()
+        StartAffinityWatchdog()   ' §106: keep all threads on P-cores throughout the run
 
         ' Install VirtualAlloc/VirtualFree custom GMP allocator so large limb
         ' buffers are immediately decommitted on free, preventing commit-charge
@@ -1100,6 +1172,7 @@ Public Class Form1
             WriteToLog($"[FormClosing] Reason={e.CloseReason}")
         Catch
         End Try
+        StopAffinityWatchdog()   ' §106
 
         ' Headless runs exit unattended; autoverify path uses ApplicationExitCall.
         If _headless OrElse e.CloseReason = CloseReason.ApplicationExitCall Then Return
@@ -1605,7 +1678,7 @@ Public Class Form1
 
     ' §104: Immediately copy a NodeCache snapshot to SnapshotStore after it is
     ' written, so the backup is current before Phase 2 loads and deletes the files.
-    Private Sub BackupSnapshotToStore(snapName As String)
+    Private Shared Sub BackupSnapshotToStore(snapName As String)
         Try
             Dim storeDir As String = System.IO.Path.Combine(_outputDir, "SnapshotStore")
             Dim src As String = System.IO.Path.Combine(DISK_CACHE_DIR, snapName)
@@ -1621,9 +1694,9 @@ Public Class Form1
             For Each srcFile As String In System.IO.Directory.GetFiles(src)
                 System.IO.File.Copy(srcFile, System.IO.Path.Combine(dst, System.IO.Path.GetFileName(srcFile)))
             Next
-            WriteToLog($"[Snapshot] Backed up {snapName} to SnapshotStore")
+            AppendLog($"[Snapshot] Backed up {snapName} to SnapshotStore{vbCrLf}")
         Catch ex As Exception
-            WriteToLog($"[Snapshot] WARN: backup of {snapName} to SnapshotStore failed: {ex.Message}")
+            AppendLog($"[Snapshot] WARN: backup of {snapName} to SnapshotStore failed: {ex.Message}{vbCrLf}")
         End Try
     End Sub
 
@@ -1642,6 +1715,51 @@ Public Class Form1
 
     ' §103: Save finalP/finalQ/finalT to snap_Phase3/ before Phase 3 begins.
     ' Allows Phase 3 to be re-run from this checkpoint without repeating Phase 1/2.
+    ' §106: Save a single named mpz_t to snap_Phase3/ for mid-Phase-3 resumption.
+    ' name should be a safe filename stem (e.g. "gmpNumer", "mpR0").
+    ' Backs up snap_Phase3 to SnapshotStore immediately after writing.
+    Private Sub SavePhase3Value(name As String, val As mpz_t, p3SnapDir As String)
+        If Not _autoCheckpoint Then Return
+        Try
+            If Not System.IO.Directory.Exists(p3SnapDir) Then
+                System.IO.Directory.CreateDirectory(p3SnapDir)
+            End If
+            Dim path As String = System.IO.Path.Combine(p3SnapDir, name & ".bin")
+            Dim staging(4194303) As Byte
+            Using fs As New FileStream(path, FileMode.Create, FileAccess.Write)
+                Using bw As New BinaryWriter(fs)
+                    SerializeOneMpz(val, bw, staging)
+                End Using
+            End Using
+            BackupSnapshotToStore("snap_Phase3")
+            LogPhase($"[ComputePi] Checkpoint: {name} saved (~{CLng(gmp_lib.mpz_sizeinbase(val, 10)):N0} digits)")
+        Catch ex As Exception
+            LogPhase($"[ComputePi] Checkpoint: {name} save failed: {ex.Message}")
+        End Try
+    End Sub
+
+    ' §106: Load a single named mpz_t from snap_Phase3/ if it exists.
+    ' Returns True and populates val on success; returns False if the file is missing.
+    ' val must already be mpz_init'd by the caller.
+    Private Function TryLoadPhase3Value(name As String, val As mpz_t, p3SnapDir As String) As Boolean
+        If Not _autoCheckpoint Then Return False
+        Try
+            Dim path As String = System.IO.Path.Combine(p3SnapDir, name & ".bin")
+            If Not System.IO.File.Exists(path) Then Return False
+            Dim staging(4194303) As Byte
+            Using fs As New FileStream(path, FileMode.Open, FileAccess.Read)
+                Using br As New BinaryReader(fs)
+                    DeserializeOneMpz(val, br, staging)
+                End Using
+            End Using
+            LogPhase($"[ComputePi] Checkpoint: {name} loaded (~{CLng(gmp_lib.mpz_sizeinbase(val, 10)):N0} digits)")
+            Return True
+        Catch ex As Exception
+            LogPhase($"[ComputePi] Checkpoint: {name} load failed: {ex.Message} — recomputing")
+            Return False
+        End Try
+    End Function
+
     Private Sub SavePhase3Snapshot(snapDir As String, digits As Long, numTerms As Long,
                                     finalP As mpz_t, finalQ As mpz_t, finalT As mpz_t)
         Try
@@ -1774,7 +1892,7 @@ Public Class Form1
     ''' the number), followed by |_mp_size| * 8 bytes of raw limb data in the
     ''' platform-native byte order (little-endian on x64 Windows).
     ''' </remarks>
-    Private Sub SerializeOneMpz(val As mpz_t, bw As BinaryWriter, staging As Byte())
+    Private Shared Sub SerializeOneMpz(val As mpz_t, bw As BinaryWriter, staging As Byte())
         ' Read _mp_size from the native __mpz_struct (Int32 at byte offset 4).
         ' Positive = positive number, negative = negative number.
         Dim mpSize As Integer = Marshal.ReadInt32(val.Pointer, 4)
@@ -1877,7 +1995,7 @@ Public Class Form1
     ''' Disk format: Int32 _mp_size (signed), followed by |_mp_size| * 8 bytes of
     ''' raw limb data in the platform-native byte order (little-endian on x64).
     ''' </remarks>
-    Private Sub DeserializeOneMpz(val As mpz_t, br As BinaryReader, staging As Byte())
+    Private Shared Sub DeserializeOneMpz(val As mpz_t, br As BinaryReader, staging As Byte())
         Dim mpSize As Integer = br.ReadInt32()
         If mpSize = 0 Then Return
         Dim limbCount As Long = CLng(System.Math.Abs(mpSize))
@@ -2598,11 +2716,48 @@ Public Class Form1
             BigShiftLeft(x, x, seedShift >> 1)   ' x ≈ sqrt(n), correct to SEED_BITS bits
         End If
 
+        ' §106: Newton step checkpoint — resume from the last completed step if available.
+        ' Checkpoint lives in snap_Phase3/sqrt_newton.bin + sqrt_newton_meta.txt.
+        ' Written immediately after each step completes and backed up to SnapshotStore.
+        Dim sqrtSnapDir As String = System.IO.Path.Combine(DISK_CACHE_DIR, "snap_Phase3")
+        Dim sqrtCheckBin As String = System.IO.Path.Combine(sqrtSnapDir, "sqrt_newton.bin")
+        Dim sqrtCheckMeta As String = System.IO.Path.Combine(sqrtSnapDir, "sqrt_newton_meta.txt")
+        Dim kBitsX As Long = SEED_BITS
+
+        ' Try to load an existing Newton checkpoint.
+        If _autoCheckpoint AndAlso System.IO.File.Exists(sqrtCheckBin) AndAlso System.IO.File.Exists(sqrtCheckMeta) Then
+            Try
+                Dim metaLines As String() = System.IO.File.ReadAllLines(sqrtCheckMeta)
+                Dim meta As New Dictionary(Of String, String)()
+                For Each ml As String In metaLines
+                    Dim eq As Integer = ml.IndexOf("="c)
+                    If eq > 0 Then meta(ml.Substring(0, eq)) = ml.Substring(eq + 1)
+                Next
+                Dim snapBitsN As Long = 0L, snapKBitsX As Long = 0L
+                If meta.ContainsKey("bitsN") AndAlso Long.TryParse(meta("bitsN"), snapBitsN) AndAlso
+                   meta.ContainsKey("kBitsX") AndAlso Long.TryParse(meta("kBitsX"), snapKBitsX) AndAlso
+                   snapBitsN = bitsN AndAlso snapKBitsX > SEED_BITS Then
+                    Dim staging(4194303) As Byte
+                    ' x was mpz_init'd above — DeserializeOneMpz handles large limb counts.
+                    Using fs As New FileStream(sqrtCheckBin, FileMode.Open, FileAccess.Read)
+                        Using br As New BinaryReader(fs)
+                            DeserializeOneMpz(x, br, staging)
+                        End Using
+                    End Using
+                    kBitsX = snapKBitsX
+                    AppendLog($"[SafeMpzSqrt] Resumed from Newton checkpoint: kBitsX={kBitsX:N0} bits{vbCrLf}")
+                End If
+            Catch ex As Exception
+                AppendLog($"[SafeMpzSqrt] Newton checkpoint load failed ({ex.Message}) — starting from seed{vbCrLf}")
+            End Try
+        End If
+
         If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] seed ready ({CLng(gmp_lib.mpz_sizeinbase(x, 10)):N0} digits); beginning Newton refinement{vbCrLf}")
 
         ' Newton refinement — doubles precision each step
-        Dim kBitsX As Long = SEED_BITS
+        Dim _newtonStep As Integer = 0
         Do While kBitsX < bitsS + 2L
+            _newtonStep += 1
             Dim target As Long = System.Math.Min(kBitsX * 2L + 4L, bitsS + 2L)
             Dim nShift As Long = System.Math.Max(0L, bitsN - 2L * target)
             If (nShift And 1L) <> 0L Then nShift += 1L
@@ -2620,7 +2775,7 @@ Public Class Form1
             gmp_lib.mpz_init(q)
             Dim szNT As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(nTrunc.Pointer, 4))
             Dim szXT As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(xTrunc.Pointer, 4))
-            If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] Newton step: target={target:N0} bits, div {szNT:N0}/{szXT:N0} limbs{vbCrLf}")
+            If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] Newton step {_newtonStep}: target={target:N0} bits, div {szNT:N0}/{szXT:N0} limbs{vbCrLf}")
             If CLng(szNT) + CLng(szXT) <= SAFE Then
                 gmp_lib.mpz_tdiv_q(q, nTrunc, xTrunc)
             Else
@@ -2636,6 +2791,27 @@ Public Class Form1
             gmp_lib.mpz_swap(x, xTrunc)
             gmp_lib.mpz_clear(xTrunc)
             kBitsX = target
+
+            ' §106: Save Newton step checkpoint immediately after completion.
+            If _autoCheckpoint Then
+                Try
+                    If Not System.IO.Directory.Exists(sqrtSnapDir) Then
+                        System.IO.Directory.CreateDirectory(sqrtSnapDir)
+                    End If
+                    Dim staging(4194303) As Byte
+                    Using fs As New FileStream(sqrtCheckBin, FileMode.Create, FileAccess.Write)
+                        Using bw As New BinaryWriter(fs)
+                            SerializeOneMpz(x, bw, staging)
+                        End Using
+                    End Using
+                    System.IO.File.WriteAllText(sqrtCheckMeta,
+                        $"bitsN={bitsN}{vbLf}kBitsX={kBitsX}{vbLf}step={_newtonStep}{vbLf}")
+                    BackupSnapshotToStore("snap_Phase3")
+                    AppendLog($"[SafeMpzSqrt] Newton step {_newtonStep} checkpoint saved (kBitsX={kBitsX:N0}){vbCrLf}")
+                Catch ex As Exception
+                    AppendLog($"[SafeMpzSqrt] Newton checkpoint save failed: {ex.Message}{vbCrLf}")
+                End Try
+            End If
         Loop
 
         If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] Newton done; final adjustment{vbCrLf}")
@@ -2832,15 +3008,22 @@ Public Class Form1
         Dim completedChunks As Long = 0L
         ' §54: single-file format — all Level-0 chunks written to one L0.bin.
         ' Eliminates 137K individual file creates/deletes (the ~2 min NVMe
-        ' metadata overhead at the start of every run).  Each thread serializes
-        ' to a MemoryStream outside the lock; only the file-position record and
-        ' write happen under SyncLock, keeping lock hold-time minimal.
+        ' metadata overhead at the start of every run).
+        '
+        ' §106 Gap 3: lock-free writes via RandomAccess.Write + Interlocked offset.
+        ' Each thread serializes to a MemoryStream, then atomically reserves a
+        ' file region with Interlocked.Add, and writes directly to that offset
+        ' via RandomAccess.Write (no seek, no lock needed).  The file is pre-opened
+        ' with FileAccess.ReadWrite so RandomAccess can address any offset.
         Dim L0_BIN_PATH As String = DISK_CACHE_DIR & "L0.bin"
-        Dim l0Stream As FileStream = Nothing
-        Dim l0Lock As New Object()
+        Dim l0Handle As Microsoft.Win32.SafeHandles.SafeFileHandle = Nothing
+        Dim l0NextOffset As Long = 0L   ' atomic file-position counter
         If numChunks > DISK_THRESHOLD Then
-            l0Stream = New FileStream(L0_BIN_PATH, FileMode.Create, FileAccess.Write,
-                                      FileShare.None, 4 * 1024 * 1024)
+            l0Handle = System.IO.File.OpenHandle(L0_BIN_PATH,
+                                                 FileMode.Create,
+                                                 FileAccess.ReadWrite,
+                                                 FileShare.None,
+                                                 FileOptions.Asynchronous Or FileOptions.WriteThrough)
         End If
         ' Dedicated background thread (not thread-pool) polls completedChunks
         ' every 500 ms.  System.Threading.Timer callbacks run on thread-pool
@@ -2884,9 +3067,9 @@ Public Class Form1
                     node.MemQ = tempQ
                     node.MemT = tempT
                 Else
-                    ' Serialize to a MemoryStream first (no lock needed), then
-                    ' write to the shared L0.bin under lock — recording the byte
-                    ' offset so Phase 2 can seek directly to this chunk.
+                    ' §106 Gap 3: serialize to MemoryStream (no lock), atomically reserve
+                    ' a file region with Interlocked.Add, then write at the reserved offset
+                    ' via RandomAccess.Write — completely lock-free.
                     Dim stagingBuf(4194303) As Byte  ' 4 MB staging buffer (§56)
                     Using ms As New System.IO.MemoryStream()
                         Using bw As New System.IO.BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen:=True)
@@ -2895,12 +3078,12 @@ Public Class Form1
                             SerializeOneMpz(tempT, bw, stagingBuf)
                         End Using
                         gmp_lib.mpz_clears(tempP, tempQ, tempT, Nothing)
-                        Dim chunkData As Byte() = ms.GetBuffer()
-                        Dim chunkLen As Integer = CInt(ms.Length)
-                        SyncLock l0Lock
-                            node.FileOffset = l0Stream.Position
-                            l0Stream.Write(chunkData, 0, chunkLen)
-                        End SyncLock
+                        Dim chunkLen As Long = ms.Length
+                        ' Reserve [offset, offset+chunkLen) atomically — no lock needed.
+                        Dim fileOffset As Long = Interlocked.Add(l0NextOffset, chunkLen) - chunkLen
+                        node.FileOffset = fileOffset
+                        Dim chunkData As ReadOnlyMemory(Of Byte) = ms.GetBuffer().AsMemory(0, CInt(chunkLen))
+                        RandomAccess.Write(l0Handle, chunkData.Span, fileOffset)
                     End Using
                     node.FilePath = L0_BIN_PATH
                 End If
@@ -2915,10 +3098,9 @@ Public Class Form1
 
         phase1PollThread.Join()
 
-        If l0Stream IsNot Nothing Then
-            l0Stream.Flush()
-            l0Stream.Dispose()
-            l0Stream = Nothing
+        If l0Handle IsNot Nothing Then
+            l0Handle.Dispose()
+            l0Handle = Nothing
         End If
 
         diskNodes.AddRange(chunkResults)
@@ -2987,9 +3169,18 @@ Phase2:
                 '   pairCount = 8              → _safeMulDop = 3 (8 × 3 = 24 active threads)
                 ' No deadlock: outer tasks no longer block on Parallel.Invoke; inner
                 ' Parallel.For sub-tasks are short fast-path GmpRaw_mul calls with no nesting.
-                System.Threading.Volatile.Write(_safeMulDop, System.Math.Max(1, Environment.ProcessorCount \ CInt(System.Math.Max(1L, pairCount))))  ' §27
+                ' §106 Gap 2: use ceiling division so fractional capacity (e.g. 24/16=1.5)
+                ' rounds up to 2 instead of down to 1, giving each pair 2 inner sub-product
+                ' threads rather than 1 when there is spare CPU capacity.
+                Dim _rawDop As Double = CDbl(Environment.ProcessorCount) / CDbl(System.Math.Max(1L, pairCount))
+                Dim _innerDop As Integer = If(_rawDop >= 1.5, CInt(System.Math.Ceiling(_rawDop)), 1)
+                System.Threading.Volatile.Write(_safeMulDop, System.Math.Max(1, _innerDop))  ' §27
+                ' §106 Gap 4: level-aware outer DOP — cap at pairCount so we don't
+                ' spin up more outer tasks than there are pairs to process.
+                ' outerDop × innerDop ≈ ProcessorCount keeps total active tasks bounded.
+                Dim _outerDop As Integer = System.Math.Min(Environment.ProcessorCount, CInt(System.Math.Max(1L, pairCount)))
                 Dim _p2opts As New System.Threading.Tasks.ParallelOptions() With {
-                    .MaxDegreeOfParallelism = Environment.ProcessorCount
+                    .MaxDegreeOfParallelism = _outerDop
                 }
                 Parallel.For(0L, pairCount, _p2opts,
                     Sub(pairIdx As Long)
@@ -3520,6 +3711,28 @@ Phase3Start:
             gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpNumer, gmpPi, gmpOne, Nothing)
             gmpVariablesInitialized = True
 
+            ' §106 checkpoint: if gmpNumer was already computed and saved, skip Steps 1–5
+            ' (SafeMpzPow10, SafeMpzMul squaring, sqrt, and all three R*Q multiplies).
+            If TryLoadPhase3Value("gmpNumer", gmpNumer, p3SnapDir) Then
+                LogPhase("[ComputePi] gmpNumer loaded from checkpoint — skipping Steps 1–5")
+                ' finalT is still needed for the divide — reload from spill or checkpoint.
+                gmp_lib.mpz_clear(finalT)   ' finalT was mpz_inits'd above as 0
+                gmp_lib.mpz_init(finalT)
+                If Not TryLoadPhase3Value("finalT", finalT, p3SnapDir) Then
+                    ' finalT not checkpointed yet — must reload from snap_Phase3 P/Q/T files.
+                    ' (This path only occurs if gmpNumer was saved but finalT spill was lost.)
+                    LogPhase("[ComputePi] finalT not in checkpoint — reloading from snap_Phase3")
+                    Dim _ftStaging(4194303) As Byte
+                    Using fs As New FileStream(System.IO.Path.Combine(p3SnapDir, "T.bin"),
+                                               FileMode.Open, FileAccess.Read)
+                        Using br As New BinaryReader(fs)
+                            DeserializeOneMpz(finalT, br, _ftStaging)
+                        End Using
+                    End Using
+                End If
+                GoTo NumeratorDone
+            End If
+
             ' §99: Use SafeMpzPow10 (repeated squaring via SafeMpzMul) for all digit counts.
             ' mpz_ui_pow_ui uses GMP's internal repeated squaring which hits the 32-bit
             ' mpn_mul_fft overflow once intermediates exceed ~33M limbs (~2GB).  At 5B digits
@@ -3566,6 +3779,8 @@ Phase3Start:
                     SerializeOneMpz(finalT, bw, stagingT)
                 End Using
             End Using
+            ' §106 checkpoint: also save finalT to snap_Phase3 so the gmpNumer shortcut can reload it.
+            SavePhase3Value("finalT", finalT, p3SnapDir)
             gmp_lib.mpz_clear(finalT)   ' free ~548 MB; will be reloaded below
             LogPhase($"[ComputePi] Step 5 done: finalT spilled, finalQ={CLng(gmp_lib.mpz_sizeinbase(finalQ, 10)):N0} digits")
             ' gmpNumer *= finalQ in a single call peaks at ~2.3 GB — too large.
@@ -3764,18 +3979,32 @@ Phase3Start:
             WriteToLog($"[ComputePi] §61 r0 DIAG: rop.Ptr={mpR0.Pointer:X} rop_alloc={Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer,0):N0} rop_sz={Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer,4):N0} rop_d={Runtime.InteropServices.Marshal.ReadInt64(mpR0.Pointer,8):X}")
             WriteToLog($"[ComputePi] §61 r0 DIAG: opA.Ptr={gmpNumer.Pointer:X} opA_alloc={Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer,0):N0} opA_sz={Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer,4):N0} opA_d={Runtime.InteropServices.Marshal.ReadInt64(gmpNumer.Pointer,8):X}")
             WriteToLog($"[ComputePi] §61 r0 DIAG: opB.Ptr={finalQ.Pointer:X} opB_alloc={Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer,0):N0} opB_sz={Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer,4):N0} opB_d={Runtime.InteropServices.Marshal.ReadInt64(finalQ.Pointer,8):X}")
-            WriteToLog("[ComputePi] §61 calling r0 = N*Q0...")
-            SafeMpzMul(mpR0, gmpNumer, finalQ)
-            WriteToLog("[ComputePi] §61 r0 done")
-            WriteToLog("[ComputePi] §61 calling r1 = N*Q1...")
-            SafeMpzMul(mpR1, gmpNumer, mpQ1)
-            WriteToLog("[ComputePi] §61 r1 done")
-            WriteToLog("[ComputePi] §61 calling r2 = N*Q2...")
-            SafeMpzMul(mpR2, gmpNumer, mpQ2)
-            WriteToLog("[ComputePi] §61 r2 done")
-            WriteToLog("[ComputePi] §61 calling mpz_clears(finalQ, mpQ1, mpQ2)...")
-            gmp_lib.mpz_clears(finalQ, mpQ1, mpQ2, Nothing)
-            WriteToLog("[ComputePi] §61 clears done")
+            ' §106 Gap 1: R0/R1/R2 run in parallel — each uses a disjoint (result, Q_i) pair.
+            ' gmpNumer is read-only in SafeMpzMul (only opA/opB struct fields are read to set
+            ' up zero-copy piece windows; neither is ever written).  The pool allocator and
+            ' VirtualAlloc are both thread-safe.  Running all three concurrently saves ~2/3
+            ' of their combined wall-clock time on a 24-core machine.
+            '
+            ' §106 checkpoint: try to reload previously computed R0/R1/R2 before multiplying.
+            Dim _r0Done As Boolean = TryLoadPhase3Value("mpR0", mpR0, p3SnapDir)
+            Dim _r1Done As Boolean = TryLoadPhase3Value("mpR1", mpR1, p3SnapDir)
+            Dim _r2Done As Boolean = TryLoadPhase3Value("mpR2", mpR2, p3SnapDir)
+            If _r0Done AndAlso _r1Done AndAlso _r2Done Then
+                LogPhase("[ComputePi] §61 all R0/R1/R2 loaded from checkpoint — skipping multiply")
+                gmp_lib.mpz_clears(finalQ, mpQ1, mpQ2, Nothing)
+            Else
+                WriteToLog("[ComputePi] §61 calling r0=N*Q0, r1=N*Q1, r2=N*Q2 in parallel...")
+                System.Threading.Tasks.Parallel.Invoke(
+                    Sub() SafeMpzMul(mpR0, gmpNumer, finalQ),
+                    Sub() SafeMpzMul(mpR1, gmpNumer, mpQ1),
+                    Sub() SafeMpzMul(mpR2, gmpNumer, mpQ2))
+                WriteToLog("[ComputePi] §61 parallel r0/r1/r2 done")
+                gmp_lib.mpz_clears(finalQ, mpQ1, mpQ2, Nothing)
+                ' §106 checkpoint: save all three immediately so a later crash can reload.
+                SavePhase3Value("mpR0", mpR0, p3SnapDir)
+                SavePhase3Value("mpR1", mpR1, p3SnapDir)
+                SavePhase3Value("mpR2", mpR2, p3SnapDir)
+            End If
             ' Swap r2 into gmpNumer (same pattern as the old serial Pass 2 end).
             ' The old gmpNumer buffer (~208 MB, the 426880*sqrt value) is freed by the swap.
             WriteToLog("[ComputePi] §61 calling mpz_swap(gmpNumer, mpR2)...")
@@ -4004,6 +4233,11 @@ Phase3Start:
 
             LogPhase("Numerator complete")
 
+            ' §106 checkpoint: save gmpNumer before the final divide — it's the most
+            ' expensive intermediate and reloading it avoids re-running the R0/R1/R2
+            ' multiplies and Combine A-D steps if the divide crashes.
+            SavePhase3Value("gmpNumer", gmpNumer, p3SnapDir)
+
             ' Reload finalT now that the large multiply is done
             gmp_lib.mpz_init(finalT)    ' re-init the cleared mpz_t before import
             Using fs As New FileStream(finalT_spillPath, FileMode.Open, FileAccess.Read)
@@ -4015,6 +4249,8 @@ Phase3Start:
                 System.IO.File.Delete(finalT_spillPath)
             Catch
             End Try
+
+NumeratorDone:
             If _logLevel >= 2 Then
                 WriteToLog($"[ComputePi] finalT reloaded from spill file")
                 WriteToLog($"[ComputePi] mpz_tdiv_q: pi = numer / T  (numer~{CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 10)):N0} digits  T~{CLng(gmp_lib.mpz_sizeinbase(finalT, 10)):N0} digits)")
