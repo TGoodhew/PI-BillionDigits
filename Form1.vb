@@ -1119,7 +1119,7 @@ Public Class Form1
             "Results appear in the status bar — no dialog boxes.")
         TipMain.SetToolTip(BtnTest,
             "Run verification now against the full computed Pi buffer. " &
-            "Checks: 999999 at position 762, 777777777 at position 24,658,601, and the first digits of e (27182818284). " &
+            "Checks: 999999 at position 762, 777777777 at position 24,658,601, and nine-9s (999999999) at position 564,665,206. " &
             "Results appear in the status bar.")
         TipMain.SetToolTip(LblStatus,
             "Current computation status and phase timing.")
@@ -4581,11 +4581,15 @@ NumeratorDone:
             parts.Add("777777777 not found")
         End If
 
-        Dim pos3 As Integer = piText.IndexOf("27182818284")
-        If pos3 >= 0 Then
-            parts.Add($"e-digits@{pos3} OK")
+        ' §29: nine-9s replaces e-digits check (e-digits don't appear until 45B+ digits)
+        Dim pos3 As Integer = piText.IndexOf("999999999")
+        If pos3 = 564665205 Then
+            parts.Add("nine-9s@564,665,206 OK")
+        ElseIf pos3 >= 0 Then
+            parts.Add($"nine-9s at {pos3} (expected 564665205) FAIL")
+            allOk = False
         Else
-            parts.Add("e-digits not found")
+            parts.Add("nine-9s not found (need 564M+ digits)")
         End If
 
         Dim summary As String = If(allOk, "Verify OK: ", "Verify: ") & String.Join(" | ", parts)
