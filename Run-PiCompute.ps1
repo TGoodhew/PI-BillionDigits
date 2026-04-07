@@ -1,10 +1,10 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Clean, build, and run PI-BillionDigits in headless mode.
 
 .DESCRIPTION
-    Runs: dotnet clean → dotnet build → launch exe with
+    Runs: dotnet clean -> dotnet build -> launch exe with
     --digits 1000000000 --autostart --autoverify
     No dialogs will appear during the run.  All suppressed dialog text
     is written to the phase log with a [DIALOG] prefix for review.
@@ -14,13 +14,13 @@
 
     The build output directory is auto-detected by globbing for
     PI-BillionDigits.exe under bin\Debug (or bin\Release with -UseRelease)
-    after the build — no hardcoded
+    after the build  -  no hardcoded
     TFM folder name.  The output directory defaults to .\PiOutput next to
     the script, and can be overridden with -OutputDir.
 
     Output files (written to OutputDir):
-        pi_digits.txt      — computed Pi digits
-        pi_phase_log.txt   — phase timings + suppressed dialog text
+        pi_digits.txt       -  computed Pi digits
+        pi_phase_log.txt    -  phase timings + suppressed dialog text
 
 .PARAMETER OutputDir
     Directory for pi_digits.txt and pi_phase_log.txt.
@@ -43,9 +43,9 @@
     OutputDir\test_suite_report.txt.
 
     Verification pass/fail rules (known digit positions in Pi):
-      999999        expected at position 762  — checked when digits >= 768
-      777777777     expected at position 24,658,601 — checked when digits >= 24,658,610
-      e-digits      27182818284 — position unknown; reported as Found/Not found (informational)
+      999999        expected at position 762   -  checked when digits >= 768
+      777777777     expected at position 24,658,601  -  checked when digits >= 24,658,610
+      e-digits      27182818284  -  position unknown; reported as Found/Not found (informational)
 
     Combine with -Trace to run dotnet-trace on every power-of-10 run; per-run
     trace reports are appended to the combined report.
@@ -66,7 +66,7 @@
     Write a RAM snapshot to NodeCache\snap_L{N}\ at the end of each Phase 2 level.
     All combine work still runs in RAM; the snapshot is written as a batch after each
     level completes.  On the next run with -AutoCheckpoint the highest valid snapshot
-    is detected automatically and the run resumes from that level — no -ResumeFromLevel
+    is detected automatically and the run resumes from that level  -  no -ResumeFromLevel
     needed.  Only the most recent level's snapshot is kept (previous level deleted after
     next level confirms).
     Example: -AutoCheckpoint  (use on every run; interrupted runs resume automatically)
@@ -192,7 +192,7 @@ if ($msbuildExe -and (Test-Path $nativeVcxproj)) {
     & $msbuildExe $slnFile /p:Configuration=$config '/p:Platform=Any CPU' /v:minimal /t:GmpNativeAlloc
     if ($LASTEXITCODE -ne 0) { throw "MSBuild GmpNativeAlloc failed (exit $LASTEXITCODE)" }
 } else {
-    Write-Host "WARNING: VS MSBuild not found or native project missing — skipping GmpNativeAlloc build." -ForegroundColor Yellow
+    Write-Host "WARNING: VS MSBuild not found or native project missing  -  skipping GmpNativeAlloc build." -ForegroundColor Yellow
     Write-Host "         GmpNativeAlloc.dll must already be present in the output directory." -ForegroundColor Yellow
 }
 
@@ -314,7 +314,7 @@ if ($Test) {
             $allPassed = $false
         }
 
-        # e-digits: informational — position not guaranteed within 1B
+        # e-digits: informational  -  position not guaranteed within 1B
         if ($verifyLine -match 'e-digits@(\d+) OK') {
             $check3 = "Found@" + $Matches[1]
         } else {
@@ -364,10 +364,10 @@ if ($Test) {
 }
 
 # ── CheckpointBackup / Restore helpers ──────────────────────────────────────
-# Backup: copy all snap_L* and snap_Phase3 dirs from NodeCache → SnapshotStore.
-# Restore: copy any missing/incomplete snaps from SnapshotStore → NodeCache.
+# Backup: copy all snap_L* and snap_Phase3 dirs from NodeCache -> SnapshotStore.
+# Restore: copy any missing/incomplete snaps from SnapshotStore -> NodeCache.
 # Together these ensure the backup always reflects the latest run, and the next
-# run always starts with the best available checkpoint — even if the app deleted
+# run always starts with the best available checkpoint  -  even if the app deleted
 # NodeCache entries during normal operation.
 
 function Invoke-CheckpointBackup {
@@ -386,7 +386,7 @@ function Invoke-CheckpointBackup {
         if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
         Copy-Item -Path $snap.FullName -Destination $dest -Recurse
         $count = @(Get-ChildItem $dest -File).Count
-        Write-Host "BackupCheckpoint: $($snap.Name) → SnapshotStore ($count files)" -ForegroundColor Green
+        Write-Host "BackupCheckpoint: $($snap.Name) -> SnapshotStore ($count files)" -ForegroundColor Green
     }
 }
 
@@ -404,13 +404,13 @@ function Invoke-CheckpointRestore {
         $storeCount = @(Get-ChildItem $save.FullName -File).Count
         $cacheCount  = if (Test-Path $dest) { @(Get-ChildItem $dest -File).Count } else { 0 }
         if ($storeCount -gt 0 -and $cacheCount -ge $storeCount) {
-            Write-Host "RestoreCheckpoint: $($save.Name) — NodeCache current ($cacheCount files), skipping" -ForegroundColor DarkGray
+            Write-Host "RestoreCheckpoint: $($save.Name)  -  NodeCache current ($cacheCount files), skipping" -ForegroundColor DarkGray
             continue
         }
         if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
         Copy-Item -Path $save.FullName -Destination $dest -Recurse
         $restored = @(Get-ChildItem $dest -File).Count
-        Write-Host "RestoreCheckpoint: $($save.Name) ← SnapshotStore ($restored files restored)" -ForegroundColor Cyan
+        Write-Host "RestoreCheckpoint: $($save.Name) <- SnapshotStore ($restored files restored)" -ForegroundColor Cyan
     }
 }
 
@@ -466,7 +466,7 @@ if ($Trace) {
         Write-Host "Report written: $reportFile" -ForegroundColor Green
         Write-Host "Paste the contents of that file into Claude for analysis."
     } else {
-        Write-Warning "Trace file not found — report skipped."
+        Write-Warning "Trace file not found  -  report skipped."
     }
 } else {
     Write-Host "--- Launching ($Digits digits, autostart, autoverify, log-level $LogLevel) ---" -ForegroundColor Yellow

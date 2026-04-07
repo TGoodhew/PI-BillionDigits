@@ -894,11 +894,16 @@ Public Class Form1
         AppendLog($"[GmpPool] Managed GMP lazy-init triggered (saved CRT alloc delegates){vbCrLf}")
 
         ' Step 2: Load GMP function pointers into the native DLL and install hooks.
-        ' LogLevel 1 (init only) keeps overhead low; raise to 2+ for pool diagnostics.
+        ' Map VB log levels to native log levels:
+        '   VB 0-4 -> native 1 (init messages only): no per-alloc logging; all 24 threads
+        '             contend on g_logLock for every GMP op at native level 2+, killing
+        '             parallel throughput (observed: ~1 core instead of 24 at VB level 2).
+        '   VB 5+  -> native 2 (pool diagnostics): useful for allocator debugging only.
+        Dim nativeLogLevel As Integer = If(_logLevel >= 5, 2, 1)
         Dim logPath As String = System.IO.Path.Combine(
             System.IO.Path.GetDirectoryName(Application.ExecutablePath),
             "gmpnativealloc.log")
-        Dim loaded As Boolean = GmpNativeAlloc_LoadGmp(_logLevel, logPath)
+        Dim loaded As Boolean = GmpNativeAlloc_LoadGmp(nativeLogLevel, logPath)
         If Not loaded Then
             AppendLog($"[GmpPool] GmpNativeAlloc_LoadGmp FAILED — falling back to managed pool{vbCrLf}")
             ' Fallback: install managed pool delegates (legacy path)
@@ -2238,12 +2243,14 @@ Public Class Form1
         ' §42: Allocate the large accumulation buffer and wire it into a raw accumPtr struct.
         ' Using Marshal.AllocHGlobal(16) for the struct header bypasses mpz_t wrapper
         ' corruption: Math.Gmp.Native cannot modify a plain IntPtr.
-        Dim accumBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_resultBytes)),
-                                              MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+        ' §30 fix: use GmpNativeAlloc_PoolGet so NativeFreeFunc can correctly compute raw=ptr-16.
+        ' Raw VirtualAlloc here would crash: NativeFreeFunc subtracts GMP_BLOCK_PREFIX (16) expecting
+        ' the SLIST_ENTRY header, but a direct VirtualAlloc'd pointer has no such prefix.
+        Dim accumBuf As IntPtr = GmpNativeAlloc_PoolGet(_resultBytes)
         If accumBuf = IntPtr.Zero Then
             AppendLog(
                 $"[SafeMpzMul] accum pre-alloc FAILED for {_resultBytes \ 1048576L:N0} MB — throwing OOM{vbCrLf}")
-            Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for accum buffer ({_resultBytes \ 1048576L} MB)")
+            Throw New OutOfMemoryException($"SafeMpzMul: GmpNativeAlloc_PoolGet failed for accum buffer ({_resultBytes \ 1048576L} MB)")
         End If
         Dim accumPtr As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
         Runtime.InteropServices.Marshal.WriteInt32(accumPtr, 0, CInt(_resultLimbs)) ' _mp_alloc
@@ -2394,7 +2401,7 @@ Public Class Form1
                                                    New UIntPtr(CULng(_maxShiftedLimbs * 8L)),
                                                    MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
         If _sharedSjBuf = IntPtr.Zero Then
-            VirtualFree(accumBuf, UIntPtr.Zero, MEM_RELEASE)
+            GmpNativeAlloc_FreeRaw(accumBuf, _resultBytes)   ' §30 fix: match PoolGet allocation above
             Runtime.InteropServices.Marshal.FreeHGlobal(accumPtr)
             AppendLog($"[SafeMpzMul] shared shifted pre-alloc FAILED for {_maxShiftedLimbs * 8L \ 1048576L:N0} MB — throwing OOM{vbCrLf}")
             Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shared shifted ({_maxShiftedLimbs * 8L \ 1048576L} MB)")
