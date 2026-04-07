@@ -55,7 +55,7 @@ Public Class Form1
     ' Set by --autostart (suppress all dialogs) and --autoverify (run verify +
     ' Application.Exit after computation completes).
     Private _headless As Boolean = False
-    Private Shared _logLevel As Integer = 1
+    Private Shared _logLevel As Integer = 2   ' §107-diag: raised to 2 for Newton-loop trace
     Private _autoVerify As Boolean = False
     ' §93: Checkpoint/resume support.
     ' --checkpoint-from-level N: serialize nodes at level >= N regardless of threshold.
@@ -1406,7 +1406,7 @@ Public Class Form1
 
         ' Capture threshold and log level from UI (or keep CLI-supplied values in headless mode).
         _diskThreshold = CInt(NudRamThreshold.Value)
-        System.Threading.Volatile.Write(_logLevel, CInt(NudLogLevel.Value))  ' §27
+        If Not _headless Then System.Threading.Volatile.Write(_logLevel, CInt(NudLogLevel.Value))  ' §27
 
         ' Pre-warm the thread pool to ProcessorCount threads before the compute
         ' thread starts.  Without this, the thread pool ramps up one thread at a
@@ -2724,12 +2724,16 @@ Public Class Form1
         Dim p As New mpz_t()
         gmp_lib.mpz_init(p)
         Dim prec As Long = 62L
+        Dim _nrIter As Integer = 0
         Do While prec < rBits + 2L
+            _nrIter += 1
             prec = System.Math.Min(prec * 2L + 4L, rBits + 2L)
 
-            ' Truncate r to prec bits
-            Dim rNow As Long = CLng(gmp_lib.mpz_sizeinbase(r, 2))
-            If rNow > prec Then BigShiftRight(r, r, rNow - prec)
+            ' §107-fix: do NOT truncate r.  Keep r in full domain (magnitude ~2^rBits).
+            ' The shift formula kBits-bShift is calibrated for r at full domain.
+            ' Truncating r to prec bits (as the old code did) reduces r from ~2^rBits
+            ' to ~2^prec, causing p→0 (early iters) or p>>2r (overshoot), both wrong.
+            ' With r kept full-size, bTrunc's increasing width drives progressive precision.
 
             ' bTrunc = floor(b / 2^bShift), bShift = max(0, bBits - prec - 2)
             ' §107: Use floor (not ceiling) truncation.  The +1 ceiling added to bTrunc
@@ -2767,9 +2771,20 @@ Public Class Form1
             End If
 
             ' p >>= (kBits - bShift);  r = 2r - p
+            ' §107-fix: revert to kBits-bShift.  This formula is correct when r is in
+            ' "full domain" (magnitude ~2^rBits).  The bug was the truncation above
+            ' which reduced r to ~2^prec, invalidating the shift.  With r kept at
+            ' full domain the formula converges correctly.
             BigShiftRight(p, p, kBits - bShift)
             gmp_lib.mpz_add(r, r, r)    ' r = 2r  (in-place; GMP allows rop=op1=op2)
             gmp_lib.mpz_sub(r, r, p)
+
+            ' §107-diag: per-iteration limb count trace
+            If _logLevel >= 2 Then
+                Dim _szR_after As Integer = Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4)
+                Dim _szP As Integer = Runtime.InteropServices.Marshal.ReadInt32(p.Pointer, 4)
+                AppendLog($"[NR] iter={_nrIter} prec={prec:N0} bShift={bShift:N0} kBitsMinusBShift={kBits - bShift:N0} szP={_szP:N0} szR_after={_szR_after:N0}{vbCrLf}")
+            End If
 
             ' Guard: reset if r went non-positive.  With floor truncation (§107) this
             ' should not happen in normal operation.  Retained as a safety net for
