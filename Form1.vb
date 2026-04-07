@@ -2776,6 +2776,11 @@ Public Class Form1
             ' pathological seeds only.
             ' §35: mpz_sgn is a GMP macro — read _mp_size field directly.
             If System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4)) <= 0 Then
+                Dim _guardSzR As Integer = Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4)
+                Dim _guardSzBTrunc As Integer = Runtime.InteropServices.Marshal.ReadInt32(bTrunc.Pointer, 4)
+                Dim _guardMsg As String = $"[SafeMpzReciprocal] GUARD fired: prec={prec:N0} bShift={bShift:N0} szR={_guardSzR:N0} szBTrunc={_guardSzBTrunc:N0} kBits={kBits:N0}" & vbCrLf
+                Try : System.IO.File.AppendAllText("C:\PiOutput\guard_debug.txt", _guardMsg) : Catch : End Try
+                AppendLog(_guardMsg)
                 gmp_lib.mpz_set_ui(r, 1UI)
                 prec = 1L
             End If

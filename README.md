@@ -2618,3 +2618,27 @@ Checkpoints added:
 At `Phase3Start`, if `gmpNumer` is found in the checkpoint, the code jumps to `NumeratorDone:` (past Steps 1–5, the sqrt, all three R multiplies, and Combine A–D), loading `finalT` from checkpoint or falling back to `snap_Phase3/T.bin`.
 
 **Known cosmetic inaccuracy:** The log line `"finalT reloaded from spill file"` at `NumeratorDone:` is printed on both the normal path (where finalT really was loaded from spill) and the `GoTo NumeratorDone` checkpoint path (where finalT was loaded from `snap_Phase3/finalT.bin`). Not a correctness issue.
+
+## §107 — SafeMpzReciprocal: Newton iteration guard and floor truncation
+
+### Problem
+
+`SafeMpzReciprocal` uses Newton's method to compute `r ≈ 2^kBits / b`. The inner loop iterates `r ← 2r − bTrunc·r² / 2^(kBits−bShift)` where `bTrunc` is a truncated version of `b` and `bShift = max(0, bBits − prec − 2)`.
+
+The previous implementation used *ceiling* truncation (`bTrunc = floor(b / 2^bShift) + 1`) to keep `p` as an overestimate of `b·r² / 2^kBits`, thereby guaranteeing `r_new = 2r − p ≤ R` (where `R = 2^kBits / b`). A guard block reset `r = 1, prec = 1` whenever `r_new ≤ 0`.
+
+When called from `SafeMpzDiv` during `SafeMpzSqrt`'s Newton step 2 (for a 1B-digit run), the ceiling excess `r² / 2^(kBits−bShift)` for the penultimate iteration was found to cause `r_new` to go negative. The guard fired, reset `r = 1`, and the subsequent restart iterations (doubling from prec=1) converged to a grossly wrong value (~3 limbs instead of ~21.875M limbs). `SafeMpzDiv` then tried to compute `q ≈ a·r / 2^kBits` with this tiny `r`, producing `q ≈ 2^26` instead of the correct quotient `≈ 2^1.4B`. The adjustment loop inside `SafeMpzDiv` then ran for effectively infinite iterations (≈2^1.4B subtractions at 1 core) until killed.
+
+### Gap 5: Final divide (SafeMpzDiv)
+
+`gmp_lib.mpz_tdiv_q(gmpPi, gmpNumer, finalT)` replaced with `SafeMpzDiv(gmpPi, gmpNumer, finalT)` to avoid the `mpn_mul_fft` overflow at 5B+ limbs.
+
+### Gap 6: `_safeMulDop` reset at Phase3Start
+
+Added `System.Threading.Volatile.Write(_safeMulDop, -1)` at `Phase3Start` so Phase 3's single-threaded callers (`SafeMpzPow10`, Step 2 squaring, `SafeMpzSqrt`) use all available cores instead of the DOP=3 left over from Phase 2's serial path.
+
+### Gap 7: Floor truncation fix (in progress)
+
+Removed the `+1` ceiling from `bTrunc` computation in `SafeMpzReciprocal`. With floor truncation, `p ≤ b·r²/2^kBits` so `r_new = 2r−p ≥ r·(2−r/R) ≥ 0` for any `r ≤ R`. The guard is retained as a safety net but should not fire in normal operation.
+
+**Status:** The guard is still firing (log shows `[PreAlloc] 67,586 limbs` restart sequence immediately following the `21,875,002` limb entry). Diagnostic logging (writing to `C:\PiOutput\guard_debug.txt`) has been added to the guard block to capture exact `prec`, `bShift`, and operand sizes when it fires, enabling identification of which iteration is the root cause.
