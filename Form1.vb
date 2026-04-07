@@ -2731,11 +2731,20 @@ Public Class Form1
             Dim rNow As Long = CLng(gmp_lib.mpz_sizeinbase(r, 2))
             If rNow > prec Then BigShiftRight(r, r, rNow - prec)
 
-            ' bTrunc = ceil(b / 2^bShift), bShift = max(0, bBits - prec - 2)
+            ' bTrunc = floor(b / 2^bShift), bShift = max(0, bBits - prec - 2)
+            ' §107: Use floor (not ceiling) truncation.  The +1 ceiling added to bTrunc
+            ' introduces an extra error of r²/2^(kBits-bShift) ≈ 2^(bShift+1)*r/R into p.
+            ' In the final Newton iteration bShift is small (~56 bits for sqrt inputs), so
+            ' this extra term ≈ 2^57*r/R dwarfs the true Newton correction e²/R (which is
+            ' near zero at convergence), pushing p > 2r and making r = 2r-p go deeply
+            ' negative.  The guard then resets r=1 and the loop exits with r ≈ 2^29 (3
+            ' limbs) instead of the correct ~21.875M-limb reciprocal.
+            ' Floor is safe: any slight overestimate of r is corrected by SafeMpzDiv's
+            ' adjustment loop (which already handles q too-large by decrementing).
             Dim bShift As Long = System.Math.Max(0L, bBits - prec - 2L)
             If bShift > 0L Then
                 BigShiftRight(bTrunc, b, bShift)
-                gmp_lib.mpz_add_ui(bTrunc, bTrunc, 1UI)
+                ' No ceiling +1: floor truncation avoids catastrophic overshoot in final step.
             Else
                 GmpRaw_set(bTrunc.Pointer, b.Pointer)  ' §35
             End If
@@ -2762,8 +2771,9 @@ Public Class Form1
             gmp_lib.mpz_add(r, r, r)    ' r = 2r  (in-place; GMP allows rop=op1=op2)
             gmp_lib.mpz_sub(r, r, p)
 
-            ' Guard: reset if r went non-positive (shouldn't happen but defends against
-            ' accumulated rounding pushing the seed over 2^kBits/b in early iterations)
+            ' Guard: reset if r went non-positive.  With floor truncation (§107) this
+            ' should not happen in normal operation.  Retained as a safety net for
+            ' pathological seeds only.
             ' §35: mpz_sgn is a GMP macro — read _mp_size field directly.
             If System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4)) <= 0 Then
                 gmp_lib.mpz_set_ui(r, 1UI)
