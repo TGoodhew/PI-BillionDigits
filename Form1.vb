@@ -2475,6 +2475,12 @@ Public Class Form1
                 Dim shiftBits As ULong = CULng(ki) * bitsA + CULng(kj) * bitsB
                 Dim _sv_prod As IntPtr = prods(k).Pointer
                 Dim _logPre As Integer = If(_logLevel >= 2, System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_prod, 4)), 0)
+                If _logLevel >= 2 Then
+                    Dim _prodDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_prod, 8))
+                    Dim _prodTop As Long = If(_logPre >= 1, Runtime.InteropServices.Marshal.ReadInt64(_prodDPtr, (_logPre - 1) * 8), 0L)
+                    Dim _prodTop2 As Long = If(_logPre >= 2, Runtime.InteropServices.Marshal.ReadInt64(_prodDPtr, (_logPre - 2) * 8), 0L)
+                    AppendLog($"[SafeMpzMul§gen] k={k} ki={ki} kj={kj} shift={shiftBits:N0} szProd={_logPre:N0} top2=[{_prodTop:X16} {_prodTop2:X16}]{vbCrLf}")
+                End If
                 If shiftBits = 0UL Then
                     GmpRaw_add(accumPtr, accumPtr, _sv_prod)
                     If _logLevel >= 2 Then
@@ -2851,10 +2857,29 @@ Public Class Form1
         Dim ar As New mpz_t()
         gmp_lib.mpz_init(ar)
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] computing a*r (szA={szA:N0} szR={szR:N0})...{vbCrLf}")
+        If _logLevel >= 2 Then
+            Dim _aDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(a.Pointer, 8))
+            Dim _aTop As Long = If(szA >= 1, Runtime.InteropServices.Marshal.ReadInt64(_aDPtr, (szA - 1) * 8), 0L)
+            Dim _aTop2 As Long = If(szA >= 2, Runtime.InteropServices.Marshal.ReadInt64(_aDPtr, (szA - 2) * 8), 0L)
+            AppendLog($"[SafeMpzDiv] a top2=[{_aTop:X16} {_aTop2:X16}]{vbCrLf}")
+        End If
         SafeMpzMul(ar, a, r)
         gmp_lib.mpz_clear(r)
         Dim szAR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(ar.Pointer, 4))
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] a*r done: szAR={szAR:N0}; shifting right by kBits={kBits:N0}...{vbCrLf}")
+        If _logLevel >= 2 Then
+            Dim _arDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
+            Dim _arTop As Long = If(szAR >= 1, Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, (szAR - 1) * 8), 0L)
+            Dim _arTop2 As Long = If(szAR >= 2, Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, (szAR - 2) * 8), 0L)
+            ' Boundary limbs: at index kBits\64 and kBits\64+1. q_bot = (bnd0 >> kBits%64) | (bnd1 << (64 - kBits%64))
+            Dim _kLimb As Long = kBits \ 64L
+            Dim _kRem As Integer = CInt(kBits Mod 64L)
+            Dim _arBnd0 As Long = If(_kLimb >= 0L AndAlso _kLimb < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt(_kLimb * 8L)), 0L)
+            Dim _arBnd1 As Long = If(_kLimb + 1L < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt((_kLimb + 1L) * 8L)), 0L)
+            Dim _arBot As Long = If(szAR >= 1, Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, 0), 0L)
+            Dim _qBotExpected As Long = CLng(CULng(_arBnd0) >> _kRem) Or CLng(CULng(_arBnd1) << (64 - _kRem))
+            AppendLog($"[SafeMpzDiv] ar pre-shift: szAR={szAR:N0} top2=[{_arTop:X16} {_arTop2:X16}] bot=[{_arBot:X16}] bnd=[{_arBnd0:X16} {_arBnd1:X16}] q_bot_expected={_qBotExpected:X16}{vbCrLf}")
+        End If
+        AppendLog($"[SafeMpzDiv] a*r done: szAR={szAR:N0}; shifting right by kBits={kBits:N0}...{vbCrLf}")
         BigShiftRight(ar, ar, kBits)
         Dim szQ As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(ar.Pointer, 4))
         If _logLevel >= 2 Then
