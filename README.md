@@ -2709,7 +2709,21 @@ With the error precisely localised to `(A2×B2)[20,904,662]` — the interior of
 
 ### Status
 
-Run in progress — awaiting log analysis.
+`prod[20,904,662] = accum[64,654,664] = ar[64,654,664] = 0x8AF1A69460682417` — all non-zero and matching.  The k=8 raw product at that limb is correct.  Therefore the error is NOT at `ar[64,654,664]`; it must be in the middle zone `ar[43,750,002..64,654,663]`.
+
+## §112 — SafeMpzDiv: sparse ar limb sweep to localise middle-zone error
+
+### Problem
+
+`ar[64,654,664]` is confirmed correct, but `q` is still ~2^1,337,898,496 short.  The shortfall must live in `ar[43,750,002..64,654,663]`.  A sparse sweep at ~11 positions across this zone will reveal exactly where values transition from valid to wrong/zero.
+
+### Fix (diagnostic)
+
+Added a `§112` sparse sweep inside the existing `szAR=65,625,001` guard in `SafeMpzDiv`, sampling `ar` at positions: 43,750,002 / 45,000,000 / 47,000,000 / 50,000,000 / 52,000,000 / 55,000,000 / 57,000,000 / 60,000,000 / 62,000,000 / 64,000,000 / 64,654,663.  Output as `[SafeMpzDiv§112]`.
+
+### Status
+
+Diagnostic added — run in progress.
 
 ## Repo housekeeping — exclude DLLs and PDBs from source control
 

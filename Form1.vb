@@ -2895,12 +2895,21 @@ Public Class Form1
             Dim _arBot As Long = If(szAR >= 1, Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, 0), 0L)
             Dim _qBotExpected As Long = CLng(CULng(_arBnd0) >> _kRem) Or CLng(CULng(_arBnd1) << (64 - _kRem))
             AppendLog($"[SafeMpzDiv] ar pre-shift: szAR={szAR:N0} top2=[{_arTop:X16} {_arTop2:X16}] bot=[{_arBot:X16}] bnd=[{_arBnd0:X16} {_arBnd1:X16}] q_bot_expected={_qBotExpected:X16}{vbCrLf}")
-            ' §111: log the specific error-limb of ar.
+            ' §111/§112: log error-limb and sparse sweep of ar[43750002..64654663].
             If szAR = 65625001 Then
                 Const _ARD As Long = 64654664L
                 Dim _arErrL As Long = If(_ARD < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt(_ARD * 8L)), 0L)
                 Dim _arErrL1 As Long = If(_ARD + 1L < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt((_ARD + 1L) * 8L)), 0L)
                 AppendLog($"[SafeMpzDiv§111] ar[{_ARD:N0}]={_arErrL:X16} ar[{_ARD+1:N0}]={_arErrL1:X16}{vbCrLf}")
+                ' §112: sparse sweep across the middle zone to find where ar goes wrong.
+                Dim _sweepPositions() As Long = {43750002L, 45000000L, 47000000L, 50000000L, 52000000L, 55000000L, 57000000L, 60000000L, 62000000L, 64000000L, 64654663L}
+                Dim _sweepSb As New System.Text.StringBuilder()
+                _sweepSb.Append($"[SafeMpzDiv§112] ar sparse sweep (szAR={szAR:N0}):{vbCrLf}")
+                For Each _sp As Long In _sweepPositions
+                    Dim _sv As Long = If(_sp < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt(_sp * 8L)), 0L)
+                    _sweepSb.Append($"  ar[{_sp:N0}]={_sv:X16}{vbCrLf}")
+                Next
+                AppendLog(_sweepSb.ToString())
             End If
         End If
         AppendLog($"[SafeMpzDiv] a*r done: szAR={szAR:N0}; shifting right by kBits={kBits:N0}...{vbCrLf}")
