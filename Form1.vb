@@ -2474,8 +2474,13 @@ Public Class Form1
                 Dim kj As Integer = k Mod 3
                 Dim shiftBits As ULong = CULng(ki) * bitsA + CULng(kj) * bitsB
                 Dim _sv_prod As IntPtr = prods(k).Pointer
+                Dim _logPre As Integer = If(_logLevel >= 2, System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_prod, 4)), 0)
                 If shiftBits = 0UL Then
                     GmpRaw_add(accumPtr, accumPtr, _sv_prod)
+                    If _logLevel >= 2 Then
+                        Dim _accumSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
+                        AppendLog($"[SafeMpzMul§gen] k={k} shift=0 szProd={_logPre:N0} accumSz={_accumSz:N0}{vbCrLf}")
+                    End If
                 Else
                     Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 4, 0)
                     Dim _shiftSrc As IntPtr = _sv_prod
@@ -2487,6 +2492,11 @@ Public Class Form1
                         _shiftRem -= CULng(_chunk)
                     End While
                     GmpRaw_add(accumPtr, accumPtr, _sv_shifted_hdr)
+                    If _logLevel >= 2 Then
+                        Dim _shiftedSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted_hdr, 4))
+                        Dim _accumSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
+                        AppendLog($"[SafeMpzMul§gen] k={k} shift={shiftBits:N0} szProd={_logPre:N0} szShifted={_shiftedSz:N0} accumSz={_accumSz:N0}{vbCrLf}")
+                    End If
                 End If
                 GmpRaw_clear(prods(k).Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(prods(k).Pointer)
             Next k
@@ -2851,7 +2861,9 @@ Public Class Form1
             Dim _qDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
             Dim _qTop As Long = If(szQ >= 1, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, (szQ - 1) * 8), 0L)
             Dim _qTop2 As Long = If(szQ >= 2, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, (szQ - 2) * 8), 0L)
-            AppendLog($"[SafeMpzDiv] q_approx ready: szQ={szQ:N0} top2limbs=[{_qTop:X16} {_qTop2:X16}]{vbCrLf}")
+            Dim _qBot As Long = If(szQ >= 1, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, 0), 0L)
+            Dim _qBot2 As Long = If(szQ >= 2, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, 8), 0L)
+            AppendLog($"[SafeMpzDiv] q_approx ready: szQ={szQ:N0} top2limbs=[{_qTop:X16} {_qTop2:X16}] bot2limbs=[{_qBot:X16} {_qBot2:X16}]{vbCrLf}")
         End If
         GmpRaw_swap(q.Pointer, ar.Pointer)  ' §35
         gmp_lib.mpz_clear(ar)
