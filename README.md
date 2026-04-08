@@ -2723,6 +2723,20 @@ Added a `§112` sparse sweep inside the existing `szAR=65,625,001` guard in `Saf
 
 ### Status
 
+All 11 sweep positions non-zero: `ar[43,750,002..64,654,663]` is fully populated.  `ar` itself is correct.  The error is therefore in `BigShiftRight` or in the `q×b` multiplication that follows.
+
+## §113 — SafeMpzDiv: verify q middle limbs after BigShiftRight
+
+### Problem
+
+`ar` is confirmed correct throughout.  The next hypothesis is that `BigShiftRight(ar, ar, kBits)` or the `q×b` SafeMpzMul (which uses the §39 equal-size path for szA=szB=21,875,001) produces the wrong result.  Logging `q[10,937,500]` and `q[20,904,664]` immediately after BigShiftRight (before q×b) will confirm whether q itself is wrong or the error is introduced during q×b.
+
+### Fix (diagnostic)
+
+Added `[SafeMpzDiv§113]` inside the `szQ=21,875,001` guard: logs `q[10,937,500]` and `q[20,904,664]` from the shifted `ar` buffer before the `GmpRaw_swap`.
+
+### Status
+
 Diagnostic added — run in progress.
 
 ## Repo housekeeping — exclude DLLs and PDBs from source control

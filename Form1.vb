@@ -2922,6 +2922,17 @@ Public Class Form1
             Dim _qBot As Long = If(szQ >= 1, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, 0), 0L)
             Dim _qBot2 As Long = If(szQ >= 2, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, 8), 0L)
             AppendLog($"[SafeMpzDiv] q_approx ready: szQ={szQ:N0} top2limbs=[{_qTop:X16} {_qTop2:X16}] bot2limbs=[{_qBot:X16} {_qBot2:X16}]{vbCrLf}")
+            ' §113: log q middle limbs to verify BigShiftRight correctness.
+            If szQ = 21875001 Then
+                Dim _q113Positions() As Long = {10937500L, 20904664L}
+                Dim _q113Sb As New System.Text.StringBuilder()
+                _q113Sb.Append($"[SafeMpzDiv§113] q middle limbs (szQ={szQ:N0}):{vbCrLf}")
+                For Each _qp As Long In _q113Positions
+                    Dim _qv As Long = If(_qp < CLng(szQ), Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, CInt(_qp * 8L)), 0L)
+                    _q113Sb.Append($"  q[{_qp:N0}]={_qv:X16}{vbCrLf}")
+                Next
+                AppendLog(_q113Sb.ToString())
+            End If
         End If
         GmpRaw_swap(q.Pointer, ar.Pointer)  ' §35
         gmp_lib.mpz_clear(ar)
