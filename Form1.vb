@@ -2809,6 +2809,7 @@ Public Class Form1
     ' for large inputs (which would crash via mpn_mul_fft overflow at 5B digits).
     Private Shared Sub SafeMpzDiv(q As mpz_t, a As mpz_t, b As mpz_t)
         Const SAFE As Integer = 33_554_431
+        Const MAX_ADJ_ITERS As Integer = 10   ' Barrett should need ≤ 2; >10 means reciprocal is wrong
         Dim szA As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(a.Pointer, 4))
         Dim szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
         If CLng(szA) + CLng(szB) <= SAFE Then
@@ -2817,38 +2818,72 @@ Public Class Form1
         End If
 
         Dim aBits As Long = CLng(gmp_lib.mpz_sizeinbase(a, 2))
+        Dim bBits As Long = CLng(gmp_lib.mpz_sizeinbase(b, 2))
         ' r = floor(2^kBits / b), kBits = aBits+3 (Barrett: quotient_bits + divisor_bits + margin)
         Dim kBits As Long = aBits + 3L
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] entry: szA={szA:N0} szB={szB:N0} aBits={aBits:N0} bBits={bBits:N0} kBits={kBits:N0}{vbCrLf}")
+
         Dim r As New mpz_t()
         gmp_lib.mpz_init(r)
         SafeMpzReciprocal(r, b, kBits)
+        Dim szR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] reciprocal done: szR={szR:N0}{vbCrLf}")
 
         ' q_approx = floor(a · r / 2^kBits)
         Dim ar As New mpz_t()
         gmp_lib.mpz_init(ar)
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] computing a*r (szA={szA:N0} szR={szR:N0})...{vbCrLf}")
         SafeMpzMul(ar, a, r)
         gmp_lib.mpz_clear(r)
+        Dim szAR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(ar.Pointer, 4))
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] a*r done: szAR={szAR:N0}; shifting right by kBits={kBits:N0}...{vbCrLf}")
         BigShiftRight(ar, ar, kBits)
+        Dim szQ As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(ar.Pointer, 4))
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] q_approx ready: szQ={szQ:N0}{vbCrLf}")
         GmpRaw_swap(q.Pointer, ar.Pointer)  ' §35
         gmp_lib.mpz_clear(ar)
 
         ' Adjustment: remainder = a - q·b; fix until 0 ≤ remainder < b  (at most 2 corrections)
         Dim qb As New mpz_t()
         gmp_lib.mpz_init(qb)
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] computing q*b (szQ={szQ:N0} szB={szB:N0})...{vbCrLf}")
         SafeMpzMul(qb, q, b)
+        Dim szQB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(qb.Pointer, 4))
         Dim remainder As New mpz_t()
         gmp_lib.mpz_init(remainder)
         gmp_lib.mpz_sub(remainder, a, qb)
         gmp_lib.mpz_clear(qb)
+        Dim remSign As Integer = System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4))
+        Dim szRem As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4))
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] q*b done: szQB={szQB:N0}; remainder sign={remSign} szRem={szRem:N0}{vbCrLf}")
+
         ' §35: mpz_sgn is a GMP macro — read _mp_size field directly.
+        Dim _adjDown As Integer = 0
         Do While System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4)) < 0  ' q too large
+            _adjDown += 1
+            If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-down iter={_adjDown}{vbCrLf}")
+            If _adjDown > MAX_ADJ_ITERS Then
+                Dim _szRem2 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4))
+                Throw New InvalidOperationException($"SafeMpzDiv adj-down exceeded {MAX_ADJ_ITERS} iters — reciprocal likely wrong. szA={szA} szB={szB} aBits={aBits} kBits={kBits} szR={szR} szQ={szQ} szQB={szQB} szRem={_szRem2}")
+            End If
             gmp_lib.mpz_sub_ui(q, q, 1UI)
             gmp_lib.mpz_add(remainder, remainder, b)
         Loop
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-down complete: {_adjDown} iter(s){vbCrLf}")
+
+        Dim _adjUp As Integer = 0
         Do While GmpRaw_cmp(remainder.Pointer, b.Pointer) >= 0   ' §35: q too small
+            _adjUp += 1
+            If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-up iter={_adjUp}{vbCrLf}")
+            If _adjUp > MAX_ADJ_ITERS Then
+                Dim _szRem2 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4))
+                Throw New InvalidOperationException($"SafeMpzDiv adj-up exceeded {MAX_ADJ_ITERS} iters — reciprocal likely wrong. szA={szA} szB={szB} aBits={aBits} kBits={kBits} szR={szR} szQ={szQ} szQB={szQB} szRem={_szRem2}")
+            End If
             gmp_lib.mpz_add_ui(q, q, 1UI)
             gmp_lib.mpz_sub(remainder, remainder, b)
         Loop
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-up complete: {_adjUp} iter(s); SafeMpzDiv done{vbCrLf}")
+
         gmp_lib.mpz_clear(remainder)
     End Sub
 
@@ -3000,11 +3035,16 @@ Public Class Form1
         ' Final adjustment: ensure result = floor(sqrt(n)) exactly (off by at most 1)
         Dim xSq As New mpz_t()
         gmp_lib.mpz_init(xSq)
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] final adj: computing x² to check x²≤n{vbCrLf}")
         SafeMpzMul(xSq, x, x)
+        Dim _adjDownSqrt As Integer = 0
         Do While GmpRaw_cmp(xSq.Pointer, n.Pointer) > 0   ' §35: x² > n → x too large
+            _adjDownSqrt += 1
+            If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] adj-down iter={_adjDownSqrt} (x²>n){vbCrLf}")
             gmp_lib.mpz_sub_ui(x, x, 1UI)
             SafeMpzMul(xSq, x, x)
         Loop
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] adj-down done: {_adjDownSqrt} iter(s){vbCrLf}")
         gmp_lib.mpz_clear(xSq)
 
         Dim x1 As New mpz_t()
@@ -3012,12 +3052,17 @@ Public Class Form1
         gmp_lib.mpz_add_ui(x1, x, 1UI)
         Dim x1Sq As New mpz_t()
         gmp_lib.mpz_init(x1Sq)
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] final adj: computing (x+1)² to check (x+1)²>n{vbCrLf}")
         SafeMpzMul(x1Sq, x1, x1)
+        Dim _adjUpSqrt As Integer = 0
         Do While GmpRaw_cmp(x1Sq.Pointer, n.Pointer) <= 0   ' §35: (x+1)² ≤ n → x too small
+            _adjUpSqrt += 1
+            If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] adj-up iter={_adjUpSqrt} ((x+1)²≤n){vbCrLf}")
             GmpRaw_swap(x.Pointer, x1.Pointer)  ' §35
             gmp_lib.mpz_add_ui(x1, x, 1UI)
             SafeMpzMul(x1Sq, x1, x1)
         Loop
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] adj-up done: {_adjUpSqrt} iter(s); SafeMpzSqrt done{vbCrLf}")
         gmp_lib.mpz_clear(x1)
         gmp_lib.mpz_clear(x1Sq)
 
