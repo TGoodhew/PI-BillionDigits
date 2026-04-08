@@ -2737,6 +2737,20 @@ Added `[SafeMpzDiv§113]` inside the `szQ=21,875,001` guard: logs `q[10,937,500]
 
 ### Status
 
+`q[10,937,500]=62E99550C2B36B0F` and `q[20,904,664]=26909AD15E34D28C` — both non-zero.  q itself is correct after BigShiftRight.  The bug is in `SafeMpzMul(q, b)` via the §39 equal-size path.
+
+## §114 — SafeMpzMul §39: per-column diagnostics for q×b
+
+### Problem
+
+q is confirmed correct.  `SafeMpzMul(q, b)` uses the §39 column-group path (mA=mB=7,291,667).  The result qb is too small by ~2^1,337,898,496, causing rem=a−qb to have 42,779,665 limbs.  Need to identify which column contributes wrong/missing data.
+
+### Fix (diagnostic)
+
+Added `[SafeMpzMul§114]` inside the §39 loop, guarded by `mA=7,291,667`: logs per-column `szBk`, `bkTop`, `bkBot`, `szShifted`, `szAccum` for all 5 columns, plus `accum[42,779,664]` after col=4 (A2×B2, shift=1,866,666,752 bits).
+
+### Status
+
 Diagnostic added — run in progress.
 
 ## Repo housekeeping — exclude DLLs and PDBs from source control

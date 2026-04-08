@@ -2464,6 +2464,23 @@ Public Class Form1
                     End While
                     GmpRaw_add(accumPtr, accumPtr, _sv_shifted_hdr)
                 End If
+                ' §114: per-column diagnostic for q*b (mA=mB=7,291,667 symmetric call).
+                If _logLevel >= 2 AndAlso mA = 7291667UL Then
+                    Dim _114bkSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_bk, 4))
+                    Dim _114shSz As Integer = If(_colShift = 0UL, _114bkSz, System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted_hdr, 4)))
+                    Dim _114aSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
+                    Dim _114bkDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_bk, 8))
+                    Dim _114bkTop As Long = If(_114bkSz >= 1, Runtime.InteropServices.Marshal.ReadInt64(_114bkDPtr, (_114bkSz - 1) * 8), 0L)
+                    Dim _114bkBot As Long = If(_114bkSz >= 1, Runtime.InteropServices.Marshal.ReadInt64(_114bkDPtr, 0), 0L)
+                    AppendLog($"[SafeMpzMul§114] §39 col={_col} shift={_colShift:N0} szBk={_114bkSz:N0} bkTop={_114bkTop:X16} bkBot={_114bkBot:X16} szShifted={_114shSz:N0} szAccum={_114aSz:N0}{vbCrLf}")
+                    ' For col=4 (A2*B2): log accum at the position driving the rem error.
+                    If _col = 4 Then
+                        Const _114EL As Long = 42779664L
+                        Dim _114ADPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(accumPtr, 8))
+                        Dim _114AV As Long = If(_114EL < CLng(_114aSz), Runtime.InteropServices.Marshal.ReadInt64(_114ADPtr, CInt(_114EL * 8L)), 0L)
+                        AppendLog($"[SafeMpzMul§114] accum[{_114EL:N0}]={_114AV:X16}{vbCrLf}")
+                    End If
+                End If
                 GmpRaw_clear(_sv_bk)
                 prods(_bk).Pointer = IntPtr.Zero : Runtime.InteropServices.Marshal.FreeHGlobal(_sv_bk)
             Next _col
