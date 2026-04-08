@@ -2751,6 +2751,22 @@ Added `[SafeMpzMul§114]` inside the §39 loop, guarded by `mA=7,291,667`: logs 
 
 ### Status
 
+**Result**: First 2 §39 calls (mA=7,291,667) have all 5 columns populated — these are SafeMpzReciprocal's r×r Newton iterations.  Subsequent 20+ calls show col0–3 szBk=0, col4 szBk=14,583,333 — implying A0=A1=B0=B1=0.  Yet §113 confirmed q[0]≠0 and q[10,937,500]≠0.  **Contradiction** — requires §115 to resolve.
+
+## §115 — SafeMpzMul: distinguish r×r vs q×b calls via buffer-identity check
+
+### Problem
+
+§114 shows 20+ §39 calls where parts A0/A1/B0/B1 appear zero (trimmed szT=0) even though §113 confirmed q has non-zero limbs in those ranges.  Two possible explanations:
+1. Those calls are SafeMpzReciprocal's `r×r` iterations (opA_d == opB_d), where r legitimately has zero low limbs.
+2. Something corrupts q's buffer between §113 (before GmpRaw_swap) and SafeMpzMul(qb,q,b).
+
+### Fix (diagnostic)
+
+Added `[SafeMpzMul§115]` after A/B window setup, guarded by `mA=7,291,667`.  Logs `opA_d`, `opB_d`, `same` (pointer equality), and all six piece trim-sizes (`A0sz`…`B2sz`).  If `same=True` → r×r call.  If `same=False` with A0sz=0/A1sz=0 → genuine corruption in q.
+
+### Status
+
 Diagnostic added — run in progress.
 
 ## Repo housekeeping — exclude DLLs and PDBs from source control

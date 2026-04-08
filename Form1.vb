@@ -2349,6 +2349,15 @@ Public Class Form1
         Dim A_parts() As mpz_t = {A0, A1, A2}
         Dim B_parts() As mpz_t = {B0, B1, B2}
 
+        ' §115: log piece trim-sizes and buffer identity to distinguish r*r vs q*b calls.
+        ' If opA._mp_d == opB._mp_d → r*r (same buffer). Else → q*b or other.
+        If _logLevel >= 2 AndAlso mA = 7291667UL Then
+            Dim _115same As Boolean = (_pre_opA_d = _opB_d)
+            AppendLog($"[SafeMpzMul§115] mA=mB=7291667 call: opA_d={_pre_opA_d:X16} opB_d={_opB_d:X16} same={_115same}" &
+                      $" A0sz={_A0_szT:N0} A1sz={_A1_szT:N0} A2sz={_A2_szT:N0}" &
+                      $" B0sz={_B0_szT:N0} B1sz={_B1_szT:N0} B2sz={_B2_szT:N0}{vbCrLf}")
+        End If
+
         ' Allocate one result buffer per sub-product (k = i*3 + j, k ∈ 0..8).
         ' §25: raw init — Marshal.AllocHGlobal(16) struct header + GmpRaw_init limb buffer.
         Dim prods(8) As mpz_t
