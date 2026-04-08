@@ -2480,6 +2480,14 @@ Public Class Form1
                     Dim _prodTop As Long = If(_logPre >= 1, Runtime.InteropServices.Marshal.ReadInt64(_prodDPtr, (_logPre - 1) * 8), 0L)
                     Dim _prodTop2 As Long = If(_logPre >= 2, Runtime.InteropServices.Marshal.ReadInt64(_prodDPtr, (_logPre - 2) * 8), 0L)
                     AppendLog($"[SafeMpzMul§gen] k={k} ki={ki} kj={kj} shift={shiftBits:N0} szProd={_logPre:N0} top2=[{_prodTop:X16} {_prodTop2:X16}]{vbCrLf}")
+                    ' §111: For the final a*r call only, log product limb at the known error position.
+                    If k = 8 AndAlso szA = 43750001 AndAlso szB = 21875001 Then
+                        Const _EL As Long = 20904662L
+                        Dim _pDPtrErr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_prod, 8))
+                        Dim _pErrL As Long = If(_logPre > CInt(_EL), Runtime.InteropServices.Marshal.ReadInt64(_pDPtrErr, CInt(_EL * 8L)), 0L)
+                        Dim _pErrL1 As Long = If(_logPre > CInt(_EL + 1L), Runtime.InteropServices.Marshal.ReadInt64(_pDPtrErr, CInt((_EL + 1L) * 8L)), 0L)
+                        AppendLog($"[SafeMpzMul§111] k=8 prod[{_EL:N0}]={_pErrL:X16} prod[{_EL+1:N0}]={_pErrL1:X16}{vbCrLf}")
+                    End If
                 End If
                 If shiftBits = 0UL Then
                     GmpRaw_add(accumPtr, accumPtr, _sv_prod)
@@ -2502,6 +2510,15 @@ Public Class Form1
                         Dim _shiftedSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted_hdr, 4))
                         Dim _accumSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
                         AppendLog($"[SafeMpzMul§gen] k={k} shift={shiftBits:N0} szProd={_logPre:N0} szShifted={_shiftedSz:N0} accumSz={_accumSz:N0}{vbCrLf}")
+                        ' §111: For the final a*r call only, log accum at the known error position.
+                        If k = 8 AndAlso szA = 43750001 AndAlso szB = 21875001 Then
+                            Const _AL As Long = 64654664L
+                            Dim _accDiagSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
+                            Dim _accDiagDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(accumPtr, 8))
+                            Dim _aErrL As Long = If(_AL < CLng(_accDiagSz), Runtime.InteropServices.Marshal.ReadInt64(_accDiagDPtr, CInt(_AL * 8L)), 0L)
+                            Dim _aErrL1 As Long = If(_AL + 1L < CLng(_accDiagSz), Runtime.InteropServices.Marshal.ReadInt64(_accDiagDPtr, CInt((_AL + 1L) * 8L)), 0L)
+                            AppendLog($"[SafeMpzMul§111] k=8 accum[{_AL:N0}]={_aErrL:X16} accum[{_AL+1:N0}]={_aErrL1:X16}{vbCrLf}")
+                        End If
                     End If
                 End If
                 GmpRaw_clear(prods(k).Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(prods(k).Pointer)
@@ -2878,6 +2895,13 @@ Public Class Form1
             Dim _arBot As Long = If(szAR >= 1, Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, 0), 0L)
             Dim _qBotExpected As Long = CLng(CULng(_arBnd0) >> _kRem) Or CLng(CULng(_arBnd1) << (64 - _kRem))
             AppendLog($"[SafeMpzDiv] ar pre-shift: szAR={szAR:N0} top2=[{_arTop:X16} {_arTop2:X16}] bot=[{_arBot:X16}] bnd=[{_arBnd0:X16} {_arBnd1:X16}] q_bot_expected={_qBotExpected:X16}{vbCrLf}")
+            ' §111: log the specific error-limb of ar.
+            If szAR = 65625001 Then
+                Const _ARD As Long = 64654664L
+                Dim _arErrL As Long = If(_ARD < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt(_ARD * 8L)), 0L)
+                Dim _arErrL1 As Long = If(_ARD + 1L < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt((_ARD + 1L) * 8L)), 0L)
+                AppendLog($"[SafeMpzDiv§111] ar[{_ARD:N0}]={_arErrL:X16} ar[{_ARD+1:N0}]={_arErrL1:X16}{vbCrLf}")
+            End If
         End If
         AppendLog($"[SafeMpzDiv] a*r done: szAR={szAR:N0}; shifting right by kBits={kBits:N0}...{vbCrLf}")
         BigShiftRight(ar, ar, kBits)

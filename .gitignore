@@ -5,6 +5,8 @@ obj/
 # Native project build artifacts (intermediate/standalone builds)
 GmpNativeAlloc/GmpNativeAlloc/
 GmpNativeAlloc/*/obj/
+*.dll
+*.pdb
 
 # Claude Code session data
 .claude/

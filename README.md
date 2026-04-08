@@ -2642,3 +2642,75 @@ Added `System.Threading.Volatile.Write(_safeMulDop, -1)` at `Phase3Start` so Pha
 Removed the `+1` ceiling from `bTrunc` computation in `SafeMpzReciprocal`. With floor truncation, `p ≤ b·r²/2^kBits` so `r_new = 2r−p ≥ r·(2−r/R) ≥ 0` for any `r ≤ R`. The guard is retained as a safety net but should not fire in normal operation.
 
 **Status:** The guard is still firing (log shows `[PreAlloc] 67,586 limbs` restart sequence immediately following the `21,875,002` limb entry). Diagnostic logging (writing to `C:\PiOutput\guard_debug.txt`) has been added to the guard block to capture exact `prec`, `bShift`, and operand sizes when it fires, enabling identification of which iteration is the root cause.
+
+## §108 — SafeMpzDiv: dense diagnostic logging + adj-loop safety abort
+
+### Problem
+
+With floor truncation in `SafeMpzReciprocal`, the Newton iterations all converge successfully (25 iterations, `szR=21,875,001`). However `SafeMpzDiv`'s adjustment loop (which corrects the Barrett-reduced quotient by ±1 until `0 ≤ remainder < b`) was hanging indefinitely — observed as a 20+ hour silent stall.
+
+Post-mortem analysis showed `q_approx = floor(a·r / 2^kBits)` was catastrophically low: only the top 970,336 limbs were non-zero while the bottom 20,904,665 limbs were effectively zero. This made `remainder = a − q·b` have ~42,779,665 limbs (≈ b-sized), requiring ~2^1.34B adj-up iterations.
+
+### Fix
+
+Added `MAX_ADJ_ITERS = 10` safety abort to both the adj-down and adj-up loops inside `SafeMpzDiv`. When exceeded, a `InvalidOperationException` is thrown with full context (`szA`, `szB`, `aBits`, `kBits`, `szR`, `szQ`, `szQB`, `szRem`). This converts a multi-hour hang into a 3-minute crash with a clear diagnostic message.
+
+Also added dense `_logLevel >= 2` logging throughout `SafeMpzDiv`: entry parameters, `a*r` result size, shift size, q top-2 limbs, `q*b` result size, remainder sign/size/top-limb, and each adj-up/adj-down iteration.
+
+### Status
+
+The run now terminates in ~3 minutes with the exception. Root cause (zero lower limbs in `q_approx`) is confirmed but not yet fixed.
+
+## §109 — SafeMpzMul general-path per-sub-product diagnostics + q bottom-limb logging
+
+### Problem
+
+`q_approx` from `SafeMpzDiv` has only its top ~970K limbs non-zero and ~20.9M zero bottom limbs. The zero-lower-limbs hypothesis is: if `q`'s lower 20,904,665 limbs are zero, then `remainder = a − q·b` has `20,904,665 + 21,875,001 − 1 = 42,779,665` limbs — exactly matching the observed `szRem=42,779,665`.
+
+`q` is produced by `SafeMpzMul(ar, a, r)` followed by `BigShiftRight(ar, ar, kBits)`. Since `szA=43,750,001` and `szR=21,875,001`, we have `mA ≠ mB` so the **general accumulation path** is used (not the §39 column path). That path loops `k=0..8`, shifts each of the 9 sub-products `A_i × B_j` by `ki*bitsA + kj*bitsB`, and accumulates.
+
+### Fix (diagnostic)
+
+Added `[SafeMpzMul§gen]` log lines after each of the 9 `GmpRaw_add` calls in the general accumulation loop, reporting `k`, `shiftBits`, `szProd` (sub-product limb count), `szShifted` (shifted limb count, for non-zero shifts), and `accumSz` (accumulator limb count after the add). This will identify exactly which sub-product first produces an abnormal accumulator state.
+
+Also extended the `[SafeMpzDiv] q_approx ready:` log line to include `bot2limbs=[limb0 limb1]`, confirming whether the bottom two limbs of `q` are both zero.
+
+### Status
+
+Diagnostics added. Run in progress — awaiting log analysis.
+
+## §110 — SafeMpzMul/SafeMpzDiv: sub-product top-2 limb diagnostics + `a` top-2
+
+### Problem
+
+After §109 confirmed that sub-product sizes are all plausible (k=0/1/2 zero because `A0=0` in the final Newton step; k=3..8 matching expected sizes), the root cause of the underflowing `q_approx` was still unclear.  The error corresponds to `ar` being short by ≈2^4,137,898,523, placing the missing bit at `ar[64,654,664]`, which falls entirely within k=8's shifted product (shift = 2,800,000,128 bits = exactly 43,750,002 limbs, so the raw product limb at index 20,904,662 is implicated).
+
+### Fix (diagnostic)
+
+- Added `top2=[hi lo]` logging for each of the 9 sub-products after their `GmpRaw_mul` completes, inside the general §23/§90 accumulation loop.
+- Added `[SafeMpzDiv] a top2=[...]` immediately before `SafeMpzMul(ar, a, r)` to confirm `a` (`nTrunc`) is sane.
+
+### Status
+
+Log confirms `a top2=[000000000085BA61 25BC66C4D7A3C6AF]` and k=8's top2 matches `ar`'s top2.  `BigShiftRight` is confirmed correct (`q_bot_expected` matches actual `q_bot`).  Reciprocal top2 is confirmed correct.  Root cause localised to k=8's raw product at limb 20,904,662.
+
+## §111 — SafeMpzMul/SafeMpzDiv: targeted error-limb diagnostic
+
+### Problem
+
+With the error precisely localised to `(A2×B2)[20,904,662]` — the interior of k=8's GmpRaw_mul sub-product — we need empirical read-back of that exact limb before and after accumulation to determine whether the fault is in the raw product, the limb-shift, or carry propagation from lower sub-products.
+
+### Fix (diagnostic)
+
+- In the §23/§90 accumulation loop, for the `a×r` call only (guard `szA=43,750,001 ∧ szB=21,875,001`):
+  - Before accumulating k=8: log `prods(8)[20,904,662]` and `prods(8)[20,904,663]` as `[SafeMpzMul§111]`.
+  - After accumulating k=8: log `accum[64,654,664]` and `accum[64,654,665]` as `[SafeMpzMul§111]`.
+- In `SafeMpzDiv`'s `ar` diagnostic block, for `szAR=65,625,001`: log `ar[64,654,664]` and `ar[64,654,665]` as `[SafeMpzDiv§111]`.
+
+### Status
+
+Run in progress — awaiting log analysis.
+
+## Repo housekeeping — exclude DLLs and PDBs from source control
+
+Added `*.dll` and `*.pdb` patterns to `.gitignore` to prevent pre-built native binaries (`GmpNativeAlloc/Debug/GmpNativeAlloc.dll`, `GmpNativeAlloc/Debug/GmpNativeAlloc.pdb`) from appearing as modified files in the source control window.  Existing tracked copies removed from the git index.
