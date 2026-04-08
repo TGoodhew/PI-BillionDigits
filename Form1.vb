@@ -2800,6 +2800,14 @@ Public Class Form1
                 prec = 1L
             End If
         Loop
+        ' §108-diag: log top 4 limbs of r to verify value (not just size)
+        If _logLevel >= 2 Then
+            Dim _szRFinal As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
+            Dim _rDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
+            Dim _rLimb2 As Long = If(_szRFinal >= 1, Runtime.InteropServices.Marshal.ReadInt64(_rDPtr, (_szRFinal - 1) * 8), 0L)
+            Dim _rLimb1 As Long = If(_szRFinal >= 2, Runtime.InteropServices.Marshal.ReadInt64(_rDPtr, (_szRFinal - 2) * 8), 0L)
+            AppendLog($"[SafeMpzReciprocal] done: szR={_szRFinal:N0} top2limbs=[{_rLimb2:X16} {_rLimb1:X16}] kBits={kBits:N0} rBits={rBits:N0}{vbCrLf}")
+        End If
         ' §36: Clear loop-external temporaries once after loop completes.
         gmp_lib.mpz_clears(bTrunc, rSq, p, Nothing)
     End Sub
@@ -2839,7 +2847,12 @@ Public Class Form1
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] a*r done: szAR={szAR:N0}; shifting right by kBits={kBits:N0}...{vbCrLf}")
         BigShiftRight(ar, ar, kBits)
         Dim szQ As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(ar.Pointer, 4))
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] q_approx ready: szQ={szQ:N0}{vbCrLf}")
+        If _logLevel >= 2 Then
+            Dim _qDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
+            Dim _qTop As Long = If(szQ >= 1, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, (szQ - 1) * 8), 0L)
+            Dim _qTop2 As Long = If(szQ >= 2, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, (szQ - 2) * 8), 0L)
+            AppendLog($"[SafeMpzDiv] q_approx ready: szQ={szQ:N0} top2limbs=[{_qTop:X16} {_qTop2:X16}]{vbCrLf}")
+        End If
         GmpRaw_swap(q.Pointer, ar.Pointer)  ' §35
         gmp_lib.mpz_clear(ar)
 
@@ -2855,7 +2868,13 @@ Public Class Form1
         gmp_lib.mpz_clear(qb)
         Dim remSign As Integer = System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4))
         Dim szRem As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4))
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] q*b done: szQB={szQB:N0}; remainder sign={remSign} szRem={szRem:N0}{vbCrLf}")
+        If _logLevel >= 2 Then
+            Dim _remDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(remainder.Pointer, 8))
+            Dim _remTop As Long = If(szRem >= 1, Runtime.InteropServices.Marshal.ReadInt64(_remDPtr, (szRem - 1) * 8), 0L)
+            Dim _bDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(b.Pointer, 8))
+            Dim _bTop As Long = If(szB >= 1, Runtime.InteropServices.Marshal.ReadInt64(_bDPtr, (szB - 1) * 8), 0L)
+            AppendLog($"[SafeMpzDiv] q*b done: szQB={szQB:N0}; remainder sign={remSign} szRem={szRem:N0} remTop={_remTop:X16} bTop={_bTop:X16}{vbCrLf}")
+        End If
 
         ' §35: mpz_sgn is a GMP macro — read _mp_size field directly.
         Dim _adjDown As Integer = 0
