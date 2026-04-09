@@ -2818,6 +2818,15 @@ Public Class Form1
                 GmpRaw_set(bTrunc.Pointer, b.Pointer)  ' §35
             End If
 
+            ' §127: log r[20,904,664..665] BEFORE rSq — this is r_24 (input to final Newton step)
+            If _logLevel >= 2 AndAlso bShift = 0 Then
+                Dim _sz127 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
+                Const _idx127 As Integer = 20_904_664
+                Dim _r127DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
+                Dim _r127Val As Long = If(_sz127 > _idx127, Runtime.InteropServices.Marshal.ReadInt64(_r127DPtr, CLng(_idx127) * 8L), 0L)
+                Dim _r127Val1 As Long = If(_sz127 > _idx127 + 1, Runtime.InteropServices.Marshal.ReadInt64(_r127DPtr, CLng(_idx127 + 1) * 8L), 0L)
+                AppendLog($"[NR127] iter={_nrIter} r_before_rSq[{_idx127:N0}]={_r127Val:X16} r[{_idx127 + 1:N0}]={_r127Val1:X16} sz={_sz127:N0}{vbCrLf}")
+            End If
             ' rSq = r²
             Dim szR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
             If CLng(szR) * 2L <= SAFE Then
