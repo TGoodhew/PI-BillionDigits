@@ -2698,7 +2698,9 @@ Public Class Form1
         Dim bitsLeft As Long = bits
         Do
             Dim chunk As UInteger = CUInt(System.Math.Min(bitsLeft, 2_100_000_000L))
+            If _logLevel >= 2 Then AppendLog($"[BSR§129] dst={dst.ToInt64():X16} src={src.ToInt64():X16} chunk={chunk:N0} bitsLeft={bitsLeft:N0} rop_alloc={Runtime.InteropServices.Marshal.ReadInt32(dst, 0):N0} rop_sz={Runtime.InteropServices.Marshal.ReadInt32(dst, 4):N0} src_sz={Runtime.InteropServices.Marshal.ReadInt32(src, 4):N0}{vbCrLf}")
             GmpRaw_tdiv_q_2exp(dst, src, chunk)
+            If _logLevel >= 2 Then AppendLog($"[BSR§129] done chunk={chunk:N0} rop_sz={Runtime.InteropServices.Marshal.ReadInt32(dst, 4):N0}{vbCrLf}")
             src = dst
             bitsLeft -= CLng(chunk)
         Loop While bitsLeft > 0L
@@ -2836,6 +2838,14 @@ Public Class Form1
             End If
             ' rSq = r²
             Dim szR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
+            ' §129: verify r and rSq pointers are valid before rSq=r² call
+            If _logLevel >= 2 Then
+                Dim _r129Alloc As Integer = Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 0)
+                Dim _rSq129Alloc As Integer = Runtime.InteropServices.Marshal.ReadInt32(rSq.Pointer, 0)
+                Dim _rSq129Sz As Integer = Runtime.InteropServices.Marshal.ReadInt32(rSq.Pointer, 4)
+                Dim _bTrunc129Sz As Integer = Runtime.InteropServices.Marshal.ReadInt32(bTrunc.Pointer, 4)
+                AppendLog($"[NR§129] iter={_nrIter} szR={szR:N0} r_alloc={_r129Alloc:N0} rSq_alloc={_rSq129Alloc:N0} rSq_sz={_rSq129Sz:N0} bTrunc_sz={_bTrunc129Sz:N0}{vbCrLf}")
+            End If
             If CLng(szR) * 2L <= SAFE Then
                 GmpRaw_mul(rSq.Pointer, r.Pointer, r.Pointer)
             Else
