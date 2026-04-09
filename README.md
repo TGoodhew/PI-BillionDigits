@@ -2772,3 +2772,35 @@ Diagnostic added — run in progress.
 ## Repo housekeeping — exclude DLLs and PDBs from source control
 
 Added `*.dll` and `*.pdb` patterns to `.gitignore` to prevent pre-built native binaries (`GmpNativeAlloc/Debug/GmpNativeAlloc.dll`, `GmpNativeAlloc/Debug/GmpNativeAlloc.pdb`) from appearing as modified files in the source control window.  Existing tracked copies removed from the git index.
+
+## §NR-raw — SafeMpzReciprocal: replace managed wrapper calls with raw P/Invoke in Newton loop
+
+### Problem
+
+The Newton reciprocal loop (`SafeMpzReciprocal`) computed `r = 2r − p` via two successive managed wrapper calls:
+```vb
+gmp_lib.mpz_add(r, r, r)   ' r = 2r
+gmp_lib.mpz_sub(r, r, p)   ' r = 2r - p
+```
+The `Math.Gmp.Native` managed wrapper is documented (§42/§78) to corrupt `mpz_t.Pointer` fields during native GMP calls on large objects.  At iterations 21–25 (r ≈ 21,875,001 limbs), this corruption caused `r.Pointer` to be read/written at a wrong address between the `mpz_add` return and the subsequent `mpz_sub` call.
+
+Evidence:
+- §119 log after iter=1: `bot=[FFFFFFFFFFFFFFFF FFFFFFFFFFFFFFFF]` (r has non-zero bottom limbs from seed borrow-propagation).
+- §115 log at iter=2 entry (reading from same buffer address `0x0000027B1A590010`): `A0sz=0 A1sz=0` — all 7,291,667 bottom limbs read as zero.
+- These two readings of the same buffer address are contradictory; the only intervening operation touching `r` is `gmp_lib.mpz_sub(r, r, p)` (managed wrapper).
+- Bottom 2 limbs of r change by ~2^61–2^62 at each of iters 21–25 (diverging rather than converging), consistent with pointer corruption producing operand reads from a wrong address.
+
+The guard path also used `gmp_lib.mpz_set_ui(r, 1UI)` — another managed call on a large object.
+
+### Fix
+
+1. Added `GmpRaw_sub` P/Invoke declaration (`__gmpz_sub`, `libgmp-10.dll`) for general mpz_t subtraction.
+2. Replaced `gmp_lib.mpz_add(r, r, r)` with `GmpRaw_add(r.Pointer, r.Pointer, r.Pointer)` — tagged `§NR-raw`.
+3. Replaced `gmp_lib.mpz_sub(r, r, p)` with `GmpRaw_sub(r.Pointer, r.Pointer, p.Pointer)` — tagged `§NR-raw`.
+4. Replaced guard's `gmp_lib.mpz_set_ui(r, 1UI)` with `GmpRaw_set_ui(r.Pointer, 1UI)` — tagged `§NR-raw`.
+
+All three raw calls bypass the managed wrapper entirely, eliminating pointer corruption on large operands.
+
+### Status
+
+Fix applied — run in progress.

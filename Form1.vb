@@ -828,6 +828,12 @@ Public Class Form1
     Private Shared Sub GmpRaw_set(rop As IntPtr, op As IntPtr)
     End Sub
 
+    ' §NR-raw: general subtraction — two mpz_t operands; bypasses managed wrapper pointer corruption
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_sub",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Sub GmpRaw_sub(rop As IntPtr, op1 As IntPtr, op2 As IntPtr)
+    End Sub
+
     ' §30: Native pool DLL exports — replace managed VirtualAlloc pool delegates.
     <DllImport("GmpNativeAlloc.dll", EntryPoint:="GmpNativeAlloc_LoadGmp",
                CallingConvention:=CallingConvention.Winapi)>
@@ -2819,6 +2825,16 @@ Public Class Form1
             Else
                 SafeMpzMul(rSq, r, r)
             End If
+            ' §121: log rSq top+bot at final iteration to verify r×r correctness
+            If _logLevel >= 2 AndAlso bShift = 0 Then
+                Dim _sz121 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(rSq.Pointer, 4))
+                Dim _rSq121DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(rSq.Pointer, 8))
+                Dim _rSq121B0 As Long = If(_sz121 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_rSq121DPtr, 0), 0L)
+                Dim _rSq121B1 As Long = If(_sz121 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_rSq121DPtr, 8), 0L)
+                Dim _rSq121T1 As Long = If(_sz121 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_rSq121DPtr, (_sz121 - 1) * 8), 0L)
+                Dim _rSq121T0 As Long = If(_sz121 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_rSq121DPtr, (_sz121 - 2) * 8), 0L)
+                AppendLog($"[NR121] iter={_nrIter} rSq sz={_sz121:N0} bot=[{_rSq121B0:X16} {_rSq121B1:X16}] top=[{_rSq121T0:X16} {_rSq121T1:X16}]{vbCrLf}")
+            End If
 
             ' p = bTrunc · rSq
             Dim szBt As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(bTrunc.Pointer, 4))
@@ -2828,6 +2844,16 @@ Public Class Form1
             Else
                 SafeMpzMul(p, bTrunc, rSq)
             End If
+            ' §122: log p top+bot before BigShiftRight at final iteration to verify b×rSq correctness
+            If _logLevel >= 2 AndAlso bShift = 0 Then
+                Dim _sz122 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(p.Pointer, 4))
+                Dim _p122DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(p.Pointer, 8))
+                Dim _p122B0 As Long = If(_sz122 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_p122DPtr, 0), 0L)
+                Dim _p122B1 As Long = If(_sz122 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_p122DPtr, 8), 0L)
+                Dim _p122T1 As Long = If(_sz122 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_p122DPtr, (_sz122 - 1) * 8), 0L)
+                Dim _p122T0 As Long = If(_sz122 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_p122DPtr, (_sz122 - 2) * 8), 0L)
+                AppendLog($"[NR122] iter={_nrIter} p_before_shift sz={_sz122:N0} bot=[{_p122B0:X16} {_p122B1:X16}] top=[{_p122T0:X16} {_p122T1:X16}]{vbCrLf}")
+            End If
 
             ' p >>= (kBits - bShift);  r = 2r - p
             ' §107-fix: revert to kBits-bShift.  This formula is correct when r is in
@@ -2835,13 +2861,31 @@ Public Class Form1
             ' which reduced r to ~2^prec, invalidating the shift.  With r kept at
             ' full domain the formula converges correctly.
             BigShiftRight(p, p, kBits - bShift)
-            gmp_lib.mpz_add(r, r, r)    ' r = 2r  (in-place; GMP allows rop=op1=op2)
-            gmp_lib.mpz_sub(r, r, p)
+            ' §120: log p top+bot after BigShiftRight (only at bShift=0, i.e. final iter)
+            If _logLevel >= 2 AndAlso bShift = 0 Then
+                Dim _sz120 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(p.Pointer, 4))
+                Dim _p120DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(p.Pointer, 8))
+                Dim _p120B0 As Long = If(_sz120 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_p120DPtr, 0), 0L)
+                Dim _p120B1 As Long = If(_sz120 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_p120DPtr, 8), 0L)
+                Dim _p120T1 As Long = If(_sz120 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_p120DPtr, (_sz120 - 1) * 8), 0L)
+                Dim _p120T0 As Long = If(_sz120 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_p120DPtr, (_sz120 - 2) * 8), 0L)
+                AppendLog($"[NR120] iter={_nrIter} p_after_shift: sz={_sz120:N0} bot=[{_p120B0:X16} {_p120B1:X16}] top=[{_p120T0:X16} {_p120T1:X16}]{vbCrLf}")
+            End If
+            GmpRaw_add(r.Pointer, r.Pointer, r.Pointer)    ' §NR-raw: r = 2r — bypass managed wrapper pointer corruption
+            GmpRaw_sub(r.Pointer, r.Pointer, p.Pointer)    ' §NR-raw: r = 2r - p — bypass managed wrapper pointer corruption
 
             ' §107-diag: per-iteration limb count trace
             If _logLevel >= 2 Then
                 Dim _szR_after As Integer = Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4)
                 Dim _szP As Integer = Runtime.InteropServices.Marshal.ReadInt32(p.Pointer, 4)
+                ' §119: log r bottom+top 2 limbs at every NR iteration to track lower-bit convergence
+                Dim _sz119 As Integer = System.Math.Abs(_szR_after)
+                Dim _r119DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
+                Dim _r119B0 As Long = If(_sz119 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_r119DPtr, 0), 0L)
+                Dim _r119B1 As Long = If(_sz119 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_r119DPtr, 8), 0L)
+                Dim _r119T1 As Long = If(_sz119 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_r119DPtr, (_sz119 - 1) * 8), 0L)
+                Dim _r119T0 As Long = If(_sz119 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_r119DPtr, (_sz119 - 2) * 8), 0L)
+                AppendLog($"[NR§119] iter={_nrIter} szR={_sz119:N0} bot=[{_r119B0:X16} {_r119B1:X16}] top=[{_r119T0:X16} {_r119T1:X16}]{vbCrLf}")
                 AppendLog($"[NR] iter={_nrIter} prec={prec:N0} bShift={bShift:N0} kBitsMinusBShift={kBits - bShift:N0} szP={_szP:N0} szR_after={_szR_after:N0}{vbCrLf}")
             End If
 
@@ -2855,7 +2899,7 @@ Public Class Form1
                 Dim _guardMsg As String = $"[SafeMpzReciprocal] GUARD fired: prec={prec:N0} bShift={bShift:N0} szR={_guardSzR:N0} szBTrunc={_guardSzBTrunc:N0} kBits={kBits:N0}" & vbCrLf
                 Try : System.IO.File.AppendAllText("C:\PiOutput\guard_debug.txt", _guardMsg) : Catch : End Try
                 AppendLog(_guardMsg)
-                gmp_lib.mpz_set_ui(r, 1UI)
+                GmpRaw_set_ui(r.Pointer, 1UI)    ' §NR-raw: bypass managed wrapper
                 prec = 1L
             End If
         Loop
@@ -2895,6 +2939,30 @@ Public Class Form1
         SafeMpzReciprocal(r, b, kBits)
         Dim szR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] reciprocal done: szR={szR:N0}{vbCrLf}")
+
+        ' §116: verify r interior limbs — are lower limbs within each piece zero?
+        If _logLevel >= 2 Then
+            Dim _r116DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
+            Dim _r116Bot0 As Long = If(szR >= 1, Runtime.InteropServices.Marshal.ReadInt64(_r116DPtr, 0), 0L)
+            Dim _r116Bot1 As Long = If(szR >= 2, Runtime.InteropServices.Marshal.ReadInt64(_r116DPtr, 8), 0L)
+            Dim _r116Mid As Long = If(szR >= 10937501, Runtime.InteropServices.Marshal.ReadInt64(_r116DPtr, 10937500 * 8), 0L)
+            Dim _r116Near As Long = If(szR >= 20904665, Runtime.InteropServices.Marshal.ReadInt64(_r116DPtr, 20904664 * 8), 0L)
+            AppendLog($"[SafeMpzDiv§116] r limbs: bot=[{_r116Bot0:X16} {_r116Bot1:X16}] mid[10937500]={_r116Mid:X16} near[20904664]={_r116Near:X16}{vbCrLf}")
+            Dim _a116DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(a.Pointer, 8))
+            Dim _a116Bot As Long = If(szA >= 1, Runtime.InteropServices.Marshal.ReadInt64(_a116DPtr, 0), 0L)
+            Dim _a116Mid As Long = If(szA >= 10937501, Runtime.InteropServices.Marshal.ReadInt64(_a116DPtr, 10937500 * 8), 0L)
+            AppendLog($"[SafeMpzDiv§116b] a limbs: bot={_a116Bot:X16} mid[10937500]={_a116Mid:X16}{vbCrLf}")
+        End If
+
+        ' §117: verify r limbs in the unsampled near-top region (20,904,665..21,874,998)
+        If _logLevel >= 2 Then
+            Dim _r117DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
+            Dim _r117_a As Long = If(szR >= 20904666, Runtime.InteropServices.Marshal.ReadInt64(_r117DPtr, 20904665 * 8), 0L)
+            Dim _r117_b As Long = If(szR >= 21000001, Runtime.InteropServices.Marshal.ReadInt64(_r117DPtr, 21000000 * 8), 0L)
+            Dim _r117_c As Long = If(szR >= 21500001, Runtime.InteropServices.Marshal.ReadInt64(_r117DPtr, 21500000 * 8), 0L)
+            Dim _r117_d As Long = If(szR >= 21874999, Runtime.InteropServices.Marshal.ReadInt64(_r117DPtr, 21874998 * 8), 0L)
+            AppendLog($"[SafeMpzDiv§117] r near-top: [20904665]={_r117_a:X16} [21000000]={_r117_b:X16} [21500000]={_r117_c:X16} [21874998]={_r117_d:X16}{vbCrLf}")
+        End If
 
         ' q_approx = floor(a · r / 2^kBits)
         Dim ar As New mpz_t()
@@ -2962,6 +3030,20 @@ Public Class Form1
         End If
         GmpRaw_swap(q.Pointer, ar.Pointer)  ' §35
         gmp_lib.mpz_clear(ar)
+
+        ' §118: log b limbs at key positions to compare vs q, and verify a at critical position
+        If _logLevel >= 2 AndAlso szB = 21875001 Then
+            Dim _b118DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(b.Pointer, 8))
+            Dim _b118_0 As Long = If(szB >= 1, Runtime.InteropServices.Marshal.ReadInt64(_b118DPtr, 0), 0L)
+            Dim _b118_1 As Long = If(szB >= 2, Runtime.InteropServices.Marshal.ReadInt64(_b118DPtr, 8), 0L)
+            Dim _b118_mid As Long = If(szB >= 10937501, Runtime.InteropServices.Marshal.ReadInt64(_b118DPtr, CInt(10937500L * 8L)), 0L)
+            Dim _b118_b2start As Long = If(szB >= 14583335, Runtime.InteropServices.Marshal.ReadInt64(_b118DPtr, CInt(14583334L * 8L)), 0L)
+            Dim _b118_near As Long = If(szB >= 20904665, Runtime.InteropServices.Marshal.ReadInt64(_b118DPtr, CInt(20904664L * 8L)), 0L)
+            AppendLog($"[SafeMpzDiv§118] b limbs: bot=[{_b118_0:X16} {_b118_1:X16}] mid[10937500]={_b118_mid:X16} [14583334]={_b118_b2start:X16} [20904664]={_b118_near:X16}{vbCrLf}")
+            Dim _a118DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(a.Pointer, 8))
+            Dim _a118_4277 As Long = If(szA >= 42779665, Runtime.InteropServices.Marshal.ReadInt64(_a118DPtr, CInt(42779664L * 8L)), 0L)
+            AppendLog($"[SafeMpzDiv§118b] a[42779664]={_a118_4277:X16}{vbCrLf}")
+        End If
 
         ' Adjustment: remainder = a - q·b; fix until 0 ≤ remainder < b  (at most 2 corrections)
         Dim qb As New mpz_t()
