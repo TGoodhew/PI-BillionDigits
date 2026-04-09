@@ -2835,6 +2835,15 @@ Public Class Form1
                 Dim _rSq121T0 As Long = If(_sz121 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_rSq121DPtr, (_sz121 - 2) * 8), 0L)
                 AppendLog($"[NR121] iter={_nrIter} rSq sz={_sz121:N0} bot=[{_rSq121B0:X16} {_rSq121B1:X16}] top=[{_rSq121T0:X16} {_rSq121T1:X16}]{vbCrLf}")
             End If
+            ' §126: log rSq[20,904,662..663] at final iter — B2[6,321,328] of rSq feeds into p[64,654,664]
+            If _logLevel >= 2 AndAlso bShift = 0 Then
+                Dim _sz126 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(rSq.Pointer, 4))
+                Const _idx126 As Integer = 20_904_662
+                Dim _rSq126DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(rSq.Pointer, 8))
+                Dim _rSq126Val As Long = If(_sz126 > _idx126, Runtime.InteropServices.Marshal.ReadInt64(_rSq126DPtr, CLng(_idx126) * 8L), 0L)
+                Dim _rSq126Val1 As Long = If(_sz126 > _idx126 + 1, Runtime.InteropServices.Marshal.ReadInt64(_rSq126DPtr, CLng(_idx126 + 1) * 8L), 0L)
+                AppendLog($"[NR126] iter={_nrIter} rSq[{_idx126:N0}]={_rSq126Val:X16} rSq[{_idx126 + 1:N0}]={_rSq126Val1:X16} sz={_sz126:N0}{vbCrLf}")
+            End If
 
             ' p = bTrunc · rSq
             Dim szBt As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(bTrunc.Pointer, 4))
@@ -2854,6 +2863,15 @@ Public Class Form1
                 Dim _p122T0 As Long = If(_sz122 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_p122DPtr, (_sz122 - 2) * 8), 0L)
                 AppendLog($"[NR122] iter={_nrIter} p_before_shift sz={_sz122:N0} bot=[{_p122B0:X16} {_p122B1:X16}] top=[{_p122T0:X16} {_p122T1:X16}]{vbCrLf}")
             End If
+            ' §125: log p[64,654,664..665] before BigShiftRight — this limb pair maps to p_shifted[20,904,664] via kBits=2,800,000,027 shift
+            If _logLevel >= 2 AndAlso bShift = 0 Then
+                Dim _sz125 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(p.Pointer, 4))
+                Const _idx125 As Integer = 64_654_664
+                Dim _p125DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(p.Pointer, 8))
+                Dim _p125Val As Long = If(_sz125 > _idx125, Runtime.InteropServices.Marshal.ReadInt64(_p125DPtr, CLng(_idx125) * 8L), 0L)
+                Dim _p125Val1 As Long = If(_sz125 > _idx125 + 1, Runtime.InteropServices.Marshal.ReadInt64(_p125DPtr, CLng(_idx125 + 1) * 8L), 0L)
+                AppendLog($"[NR125] iter={_nrIter} p_before_shift[{_idx125:N0}]={_p125Val:X16} p[{_idx125 + 1:N0}]={_p125Val1:X16} sz={_sz125:N0}{vbCrLf}")
+            End If
 
             ' p >>= (kBits - bShift);  r = 2r - p
             ' §107-fix: revert to kBits-bShift.  This formula is correct when r is in
@@ -2871,10 +2889,26 @@ Public Class Form1
                 Dim _p120T0 As Long = If(_sz120 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_p120DPtr, (_sz120 - 2) * 8), 0L)
                 AppendLog($"[NR120] iter={_nrIter} p_after_shift: sz={_sz120:N0} bot=[{_p120B0:X16} {_p120B1:X16}] top=[{_p120T0:X16} {_p120T1:X16}]{vbCrLf}")
             End If
+            ' §123: log p[20,904,664..665] after BigShiftRight — cross-check with §125 via (p125[64654664]>>27)|(p125[64654665]<<37)
+            If _logLevel >= 2 AndAlso bShift = 0 Then
+                Dim _sz123 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(p.Pointer, 4))
+                Const _idx123 As Integer = 20_904_664
+                Dim _p123DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(p.Pointer, 8))
+                Dim _p123Val As Long = If(_sz123 > _idx123, Runtime.InteropServices.Marshal.ReadInt64(_p123DPtr, CLng(_idx123) * 8L), 0L)
+                Dim _p123Val1 As Long = If(_sz123 > _idx123 + 1, Runtime.InteropServices.Marshal.ReadInt64(_p123DPtr, CLng(_idx123 + 1) * 8L), 0L)
+                AppendLog($"[NR123] iter={_nrIter} p_after_shift[{_idx123:N0}]={_p123Val:X16} p[{_idx123 + 1:N0}]={_p123Val1:X16} sz={_sz123:N0}{vbCrLf}")
+            End If
             GmpRaw_add(r.Pointer, r.Pointer, r.Pointer)    ' §NR-raw: r = 2r — bypass managed wrapper pointer corruption
             GmpRaw_sub(r.Pointer, r.Pointer, p.Pointer)    ' §NR-raw: r = 2r - p — bypass managed wrapper pointer corruption
-
-            ' §107-diag: per-iteration limb count trace
+            ' §124: log r[20,904,664..665] immediately after r = 2r - p (final iter) — should match §116 value in SafeMpzDiv
+            If _logLevel >= 2 AndAlso bShift = 0 Then
+                Dim _sz124 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
+                Const _idx124 As Integer = 20_904_664
+                Dim _r124DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
+                Dim _r124Val As Long = If(_sz124 > _idx124, Runtime.InteropServices.Marshal.ReadInt64(_r124DPtr, CLng(_idx124) * 8L), 0L)
+                Dim _r124Val1 As Long = If(_sz124 > _idx124 + 1, Runtime.InteropServices.Marshal.ReadInt64(_r124DPtr, CLng(_idx124 + 1) * 8L), 0L)
+                AppendLog($"[NR124] iter={_nrIter} r_after_sub[{_idx124:N0}]={_r124Val:X16} r[{_idx124 + 1:N0}]={_r124Val1:X16} sz={_sz124:N0}{vbCrLf}")
+            End If
             If _logLevel >= 2 Then
                 Dim _szR_after As Integer = Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4)
                 Dim _szP As Integer = Runtime.InteropServices.Marshal.ReadInt32(p.Pointer, 4)

@@ -2804,3 +2804,38 @@ All three raw calls bypass the managed wrapper entirely, eliminating pointer cor
 ### Status
 
 Fix applied — run in progress.
+
+## §123-§126 — Targeted limb diagnostics in SafeMpzReciprocal Newton final iteration
+
+### Problem
+
+After the §NR-raw fix, the run still crashes with `szRem=42,779,665 >> szB=21,875,001`.
+Cross-checking confirmed:
+- `q[20,904,664] = 0x26909AD15E34D28C` (computed) vs `b[20,904,664] = 0x2690BFD417C6E66C` (expected)
+- The error at `q` traces back to `ar[64,654,664] = A2×B2[20,904,662] = 0x8AF1A69460682417` in `SafeMpzDiv`'s `a×r` multiplication
+- This means either `r[20,904,664]` itself is wrong (bad Newton reciprocal), or GMP's `__gmpz_mul` is wrong (unlikely)
+- Further narrowing: `r[20,904,664] = 0x0CFE92E693312BCA` (logged by §116); need to verify if this is correct
+
+The Newton final iteration computes `p = bTrunc × rSq` (via `SafeMpzMul`), then `p >>= kBits`, then `r = 2r - p`.
+If `p[64,654,664]` (before shift) or `p[20,904,664]` (after shift) carry an error, that propagates into r[20,904,664].
+
+### Diagnostics added
+
+All four fire only at `bShift = 0` (the final Newton iteration, iter=25):
+
+- **§126** (`[NR126]`): `rSq[20,904,662]` and `rSq[20,904,663]` when `rSq = r²` is complete.
+  `rSq[20,904,662]` feeds into `p[64,654,664]` via the B2 piece of `rSq` in `SafeMpzMul(p, bTrunc, rSq)`.
+
+- **§125** (`[NR125]`): `p[64,654,664]` and `p[64,654,665]` before `BigShiftRight(p, p, kBits)`.
+  The shift by `kBits = 2,800,000,027` bits maps these limbs to `p_shifted[20,904,664]` via:
+  `p_shifted[20,904,664] = (p[64,654,664] >> 27) | (p[64,654,665] << 37)`
+
+- **§123** (`[NR123]`): `p[20,904,664]` and `p[20,904,665]` after `BigShiftRight`.
+  Cross-check: §123 value must equal `(§125[64654664] >> 27) | (§125[64654665] << 37)` — if not, the Newton `BigShiftRight` has a bug.
+
+- **§124** (`[NR124]`): `r[20,904,664]` and `r[20,904,665]` immediately after `GmpRaw_sub(r, r, p)`.
+  Must match §116 value `0x0CFE92E693312BCA` (logged in SafeMpzDiv after Newton completes) — if not, r is modified between Newton exit and SafeMpzDiv entry.
+
+### Status
+
+Diagnostics added — run in progress.
