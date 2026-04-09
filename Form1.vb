@@ -2188,8 +2188,14 @@ Public Class Form1
     ''' limbs, which stays well below the 33,554,431-limb threshold.
     ''' </summary>
     Private Shared Sub SafeMpzMul(result As mpz_t, opA As mpz_t, opB As mpz_t)
-        ' Threshold: pl * 64 must fit in int32. pl_max = floor((2^31-1)/64) = 33,554,431.
-        Const SAFE_LIMB_THRESHOLD As Integer = 33_554_431
+        ' §143: Threshold lowered from 33,554,431 to 10,000,000 to prevent GMP FFT precision errors.
+        ' At ~7.3M × 7.3M limbs (total 14.6M), GMP's FFT transform size M≈2^24 causes rounding
+        ' errors because 64-bit limb data makes intermediate FFT coefficients exceed double precision
+        ' (53-bit mantissa), producing silently wrong products.  Lowering the threshold forces the
+        ' 3×3 recursive split, breaking the sub-products down to ≈2.4M × 2.4M limbs each (≈4.9M
+        ' total) which are well within safe FFT accuracy range.
+        ' Upper bound constraint: pl * 64 must fit in int32 → pl_max = floor((2^31-1)/64) = 33,554,431.
+        Const SAFE_LIMB_THRESHOLD As Integer = 10_000_000
 
         Dim szA_signed As Integer = Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4)
         Dim szB_signed As Integer = Runtime.InteropServices.Marshal.ReadInt32(opB.Pointer, 4)
@@ -2212,6 +2218,11 @@ Public Class Form1
                     $"result_d={Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8):X}{vbCrLf}")
             End If
             Return
+        End If
+
+        ' §143: Log when recursion is triggered for large multiplications (szA+szB > threshold).
+        If _logLevel >= 2 AndAlso CLng(szA) + CLng(szB) > 5_000_000L Then
+            AppendLog($"[SafeMpzMul§143] RECURSE szA={szA:N0} szB={szB:N0} total={CLng(szA)+CLng(szB):N0} (threshold={SAFE_LIMB_THRESHOLD:N0}) — using 3×3 split to avoid GMP FFT precision error{vbCrLf}")
         End If
 
         Dim resultSign As Integer = System.Math.Sign(szA_signed) * System.Math.Sign(szB_signed)
@@ -2404,9 +2415,11 @@ Public Class Form1
             End Sub)
         End If
 
-        ' §136: serially recompute A2×B2 and compare to prods(8)[13612996] for q×b.
-        ' With §138 active, prods(8) is already serial → match=True confirms serial is correct.
-        ' If this were run without §138, match=False would prove the parallel path was the bug.
+        ' §136: directly call GmpRaw_mul for A2×B2 and compare to prods(8)[13612996] for q×b.
+        ' After §143 threshold fix: prods(8) is computed via recursive SafeMpzMul (correct),
+        ' but §136's direct GmpRaw_mul call bypasses the threshold and hits the GMP FFT precision bug.
+        ' Expected post-fix: match=False (§136 direct=wrong, prods(8) recursive=correct).
+        ' This mismatch CONFIRMS the GMP FFT bug: same inputs, different code paths, different results.
         If _logLevel >= 2 AndAlso szA = 21875001 AndAlso szB = 21875001 AndAlso _pre_opA_d <> _opB_d Then
             Dim _fr136 As New mpz_t()
             _fr136.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
@@ -2893,14 +2906,17 @@ Public Class Form1
                 GmpRaw_set(bTrunc.Pointer, b.Pointer)  ' §35
             End If
 
-            ' §127: log r[20,904,664..665] BEFORE rSq — this is r_24 (input to final Newton step)
+            ' §127: log r[20,904,662..665] BEFORE rSq — this is r_24 (input to final Newton step)
+            ' §147: extend to 20,904,662..663 — unverified range, hypothesized error site
             If _logLevel >= 2 AndAlso bShift = 0 Then
                 Dim _sz127 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
                 Const _idx127 As Integer = 20_904_664
                 Dim _r127DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
+                Dim _r127Vm2 As Long = If(_sz127 > _idx127 - 2, Runtime.InteropServices.Marshal.ReadInt64(_r127DPtr, CLng(_idx127 - 2) * 8L), 0L)
+                Dim _r127Vm1 As Long = If(_sz127 > _idx127 - 1, Runtime.InteropServices.Marshal.ReadInt64(_r127DPtr, CLng(_idx127 - 1) * 8L), 0L)
                 Dim _r127Val As Long = If(_sz127 > _idx127, Runtime.InteropServices.Marshal.ReadInt64(_r127DPtr, CLng(_idx127) * 8L), 0L)
                 Dim _r127Val1 As Long = If(_sz127 > _idx127 + 1, Runtime.InteropServices.Marshal.ReadInt64(_r127DPtr, CLng(_idx127 + 1) * 8L), 0L)
-                AppendLog($"[NR127] iter={_nrIter} r_before_rSq[{_idx127:N0}]={_r127Val:X16} r[{_idx127 + 1:N0}]={_r127Val1:X16} sz={_sz127:N0}{vbCrLf}")
+                AppendLog($"[NR127] iter={_nrIter} r_before_rSq[{_idx127-2:N0}]={_r127Vm2:X16} [{_idx127-1:N0}]={_r127Vm1:X16} [{_idx127:N0}]={_r127Val:X16} [{_idx127+1:N0}]={_r127Val1:X16} sz={_sz127:N0}{vbCrLf}")
             End If
             ' rSq = r²
             Dim szR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
@@ -2955,14 +2971,18 @@ Public Class Form1
                 Dim _p122T0 As Long = If(_sz122 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_p122DPtr, (_sz122 - 2) * 8), 0L)
                 AppendLog($"[NR122] iter={_nrIter} p_before_shift sz={_sz122:N0} bot=[{_p122B0:X16} {_p122B1:X16}] top=[{_p122T0:X16} {_p122T1:X16}]{vbCrLf}")
             End If
-            ' §125: log p[64,654,664..665] before BigShiftRight — this limb pair maps to p_shifted[20,904,664] via kBits=2,800,000,027 shift
+            ' §125: log p[64,654,663..665] before BigShiftRight
+            ' p[64654663] maps to p_shifted[20904663]; p[64654664] maps to p_shifted[20904664]
+            ' §147: add 64654663 to verify p_shifted[20904663] = (p[64654663]>>27)|(p[64654664]<<37)
             If _logLevel >= 2 AndAlso bShift = 0 Then
                 Dim _sz125 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(p.Pointer, 4))
                 Const _idx125 As Integer = 64_654_664
                 Dim _p125DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(p.Pointer, 8))
+                Dim _p125Vm1 As Long = If(_sz125 > _idx125 - 1, Runtime.InteropServices.Marshal.ReadInt64(_p125DPtr, CLng(_idx125 - 1) * 8L), 0L)
                 Dim _p125Val As Long = If(_sz125 > _idx125, Runtime.InteropServices.Marshal.ReadInt64(_p125DPtr, CLng(_idx125) * 8L), 0L)
                 Dim _p125Val1 As Long = If(_sz125 > _idx125 + 1, Runtime.InteropServices.Marshal.ReadInt64(_p125DPtr, CLng(_idx125 + 1) * 8L), 0L)
-                AppendLog($"[NR125] iter={_nrIter} p_before_shift[{_idx125:N0}]={_p125Val:X16} p[{_idx125 + 1:N0}]={_p125Val1:X16} sz={_sz125:N0}{vbCrLf}")
+                Dim _p125Exp As Long = CLng(CULng(_p125Vm1) >> 27) Or (_p125Val << 37)  ' expected p_shifted[20904663] — unsigned shift to match GMP
+                AppendLog($"[NR125] iter={_nrIter} p_before_shift[{_idx125-1:N0}]={_p125Vm1:X16} [{_idx125:N0}]={_p125Val:X16} [{_idx125+1:N0}]={_p125Val1:X16} sz={_sz125:N0} expected_psh[{_idx125-43750001:N0}]={_p125Exp:X16}{vbCrLf}")
             End If
 
             ' p >>= (kBits - bShift);  r = 2r - p
@@ -2981,25 +3001,31 @@ Public Class Form1
                 Dim _p120T0 As Long = If(_sz120 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_p120DPtr, (_sz120 - 2) * 8), 0L)
                 AppendLog($"[NR120] iter={_nrIter} p_after_shift: sz={_sz120:N0} bot=[{_p120B0:X16} {_p120B1:X16}] top=[{_p120T0:X16} {_p120T1:X16}]{vbCrLf}")
             End If
-            ' §123: log p[20,904,664..665] after BigShiftRight — cross-check with §125 via (p125[64654664]>>27)|(p125[64654665]<<37)
+            ' §123: log p[20,904,662..665] after BigShiftRight — §147: add 20904662..663 for cross-check with §125
+            ' Verify: p_shifted[20904663] should == (p_before[64654663]>>27)|(p_before[64654664]<<37) from §125
             If _logLevel >= 2 AndAlso bShift = 0 Then
                 Dim _sz123 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(p.Pointer, 4))
                 Const _idx123 As Integer = 20_904_664
                 Dim _p123DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(p.Pointer, 8))
+                Dim _p123Vm2 As Long = If(_sz123 > _idx123 - 2, Runtime.InteropServices.Marshal.ReadInt64(_p123DPtr, CLng(_idx123 - 2) * 8L), 0L)
+                Dim _p123Vm1 As Long = If(_sz123 > _idx123 - 1, Runtime.InteropServices.Marshal.ReadInt64(_p123DPtr, CLng(_idx123 - 1) * 8L), 0L)
                 Dim _p123Val As Long = If(_sz123 > _idx123, Runtime.InteropServices.Marshal.ReadInt64(_p123DPtr, CLng(_idx123) * 8L), 0L)
                 Dim _p123Val1 As Long = If(_sz123 > _idx123 + 1, Runtime.InteropServices.Marshal.ReadInt64(_p123DPtr, CLng(_idx123 + 1) * 8L), 0L)
-                AppendLog($"[NR123] iter={_nrIter} p_after_shift[{_idx123:N0}]={_p123Val:X16} p[{_idx123 + 1:N0}]={_p123Val1:X16} sz={_sz123:N0}{vbCrLf}")
+                AppendLog($"[NR123] iter={_nrIter} p_after_shift[{_idx123-2:N0}]={_p123Vm2:X16} [{_idx123-1:N0}]={_p123Vm1:X16} [{_idx123:N0}]={_p123Val:X16} [{_idx123+1:N0}]={_p123Val1:X16} sz={_sz123:N0}{vbCrLf}")
             End If
             GmpRaw_add(r.Pointer, r.Pointer, r.Pointer)    ' §NR-raw: r = 2r — bypass managed wrapper pointer corruption
             GmpRaw_sub(r.Pointer, r.Pointer, p.Pointer)    ' §NR-raw: r = 2r - p — bypass managed wrapper pointer corruption
-            ' §124: log r[20,904,664..665] immediately after r = 2r - p (final iter) — should match §116 value in SafeMpzDiv
+            ' §124: log r[20,904,662..665] immediately after r = 2r - p (final iter)
+            ' §147: extend to 20904662..663 — check if r[20904663] has a gross error vs §127/§123
             If _logLevel >= 2 AndAlso bShift = 0 Then
                 Dim _sz124 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
                 Const _idx124 As Integer = 20_904_664
                 Dim _r124DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
+                Dim _r124Vm2 As Long = If(_sz124 > _idx124 - 2, Runtime.InteropServices.Marshal.ReadInt64(_r124DPtr, CLng(_idx124 - 2) * 8L), 0L)
+                Dim _r124Vm1 As Long = If(_sz124 > _idx124 - 1, Runtime.InteropServices.Marshal.ReadInt64(_r124DPtr, CLng(_idx124 - 1) * 8L), 0L)
                 Dim _r124Val As Long = If(_sz124 > _idx124, Runtime.InteropServices.Marshal.ReadInt64(_r124DPtr, CLng(_idx124) * 8L), 0L)
                 Dim _r124Val1 As Long = If(_sz124 > _idx124 + 1, Runtime.InteropServices.Marshal.ReadInt64(_r124DPtr, CLng(_idx124 + 1) * 8L), 0L)
-                AppendLog($"[NR124] iter={_nrIter} r_after_sub[{_idx124:N0}]={_r124Val:X16} r[{_idx124 + 1:N0}]={_r124Val1:X16} sz={_sz124:N0}{vbCrLf}")
+                AppendLog($"[NR124] iter={_nrIter} r_after_sub[{_idx124-2:N0}]={_r124Vm2:X16} [{_idx124-1:N0}]={_r124Vm1:X16} [{_idx124:N0}]={_r124Val:X16} [{_idx124+1:N0}]={_r124Val1:X16} sz={_sz124:N0}{vbCrLf}")
             End If
             If _logLevel >= 2 Then
                 Dim _szR_after As Integer = Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4)
@@ -3067,13 +3093,16 @@ Public Class Form1
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] reciprocal done: szR={szR:N0}{vbCrLf}")
 
         ' §116: verify r interior limbs — are lower limbs within each piece zero?
+        ' §147: extend to include r[20904662] and r[20904663] — hypothesized error site
         If _logLevel >= 2 Then
             Dim _r116DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
             Dim _r116Bot0 As Long = If(szR >= 1, Runtime.InteropServices.Marshal.ReadInt64(_r116DPtr, 0), 0L)
             Dim _r116Bot1 As Long = If(szR >= 2, Runtime.InteropServices.Marshal.ReadInt64(_r116DPtr, 8), 0L)
             Dim _r116Mid As Long = If(szR >= 10937501, Runtime.InteropServices.Marshal.ReadInt64(_r116DPtr, 10937500 * 8), 0L)
+            Dim _r116Near2 As Long = If(szR >= 20904663, Runtime.InteropServices.Marshal.ReadInt64(_r116DPtr, 20904662 * 8), 0L)
+            Dim _r116Near1 As Long = If(szR >= 20904664, Runtime.InteropServices.Marshal.ReadInt64(_r116DPtr, 20904663 * 8), 0L)
             Dim _r116Near As Long = If(szR >= 20904665, Runtime.InteropServices.Marshal.ReadInt64(_r116DPtr, 20904664 * 8), 0L)
-            AppendLog($"[SafeMpzDiv§116] r limbs: bot=[{_r116Bot0:X16} {_r116Bot1:X16}] mid[10937500]={_r116Mid:X16} near[20904664]={_r116Near:X16}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§116] r limbs: bot=[{_r116Bot0:X16} {_r116Bot1:X16}] mid[10937500]={_r116Mid:X16} [20904662]={_r116Near2:X16} [20904663]={_r116Near1:X16} [20904664]={_r116Near:X16}{vbCrLf}")
             Dim _a116DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(a.Pointer, 8))
             Dim _a116Bot As Long = If(szA >= 1, Runtime.InteropServices.Marshal.ReadInt64(_a116DPtr, 0), 0L)
             Dim _a116Mid As Long = If(szA >= 10937501, Runtime.InteropServices.Marshal.ReadInt64(_a116DPtr, 10937500 * 8), 0L)
@@ -3088,6 +3117,26 @@ Public Class Form1
             Dim _r117_c As Long = If(szR >= 21500001, Runtime.InteropServices.Marshal.ReadInt64(_r117DPtr, 21500000 * 8), 0L)
             Dim _r117_d As Long = If(szR >= 21874999, Runtime.InteropServices.Marshal.ReadInt64(_r117DPtr, 21874998 * 8), 0L)
             AppendLog($"[SafeMpzDiv§117] r near-top: [20904665]={_r117_a:X16} [21000000]={_r117_b:X16} [21500000]={_r117_c:X16} [21874998]={_r117_d:X16}{vbCrLf}")
+        End If
+
+        ' §144: verify b×r ≈ 2^kBits — correct r means b×r < 2^kBits exactly.
+        ' Checks limb kBits\64 (should have bits kBits%64..63 = 0) and limb kBits\64+1 (should be 0).
+        ' A nonzero result means SafeMpzReciprocal overestimated r, which would cause Barrett to fail.
+        If _logLevel >= 2 AndAlso szR = 21875001 Then
+            Dim _br144 As New mpz_t()
+            gmp_lib.mpz_init(_br144)
+            AppendLog($"[SafeMpzDiv§144] computing b*r to verify reciprocal (szB={szB:N0} szR={szR:N0})...{vbCrLf}")
+            SafeMpzMul(_br144, b, r)
+            Dim _szBR144 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_br144.Pointer, 4))
+            Dim _kLimb144 As Long = kBits \ 64L
+            Dim _kRem144 As Integer = CInt(kBits Mod 64L)
+            Dim _br144DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_br144.Pointer, 8))
+            Dim _br144_km1 As Long = If(_szBR144 > _kLimb144 - 1, Runtime.InteropServices.Marshal.ReadInt64(_br144DPtr, CInt(_kLimb144 - 1) * 8), 0L)
+            Dim _br144_k As Long = If(_szBR144 > _kLimb144, Runtime.InteropServices.Marshal.ReadInt64(_br144DPtr, CInt(_kLimb144) * 8), 0L)
+            Dim _br144_kp1 As Long = If(_szBR144 > _kLimb144 + 1, Runtime.InteropServices.Marshal.ReadInt64(_br144DPtr, CInt(_kLimb144 + 1) * 8), 0L)
+            Dim _rOk144 As Boolean = (_br144_kp1 = 0L) AndAlso (CULng(_br144_k) < CULng(1L << _kRem144))
+            AppendLog($"[SafeMpzDiv§144] b*r sz={_szBR144:N0} kLimb={_kLimb144:N0} kRem={_kRem144} b*r[kLimb-1]={_br144_km1:X16} b*r[kLimb]={_br144_k:X16} b*r[kLimb+1]={_br144_kp1:X16} maxOK={(1L << _kRem144) - 1L:X16} r_valid={_rOk144}{vbCrLf}")
+            gmp_lib.mpz_clear(_br144)
         End If
 
         ' q_approx = floor(a · r / 2^kBits)
@@ -3106,6 +3155,14 @@ Public Class Form1
         ' §135 save slots: ar[64654664/65] captured inside §111 block, used after BigShiftRight.
         Dim _ar135_v0 As Long = 0L
         Dim _ar135_v1 As Long = 0L
+        ' §141 save slots: ar[65139832/33] → expected q[21389832] (A2/B2 midpoint).
+        Dim _ar141_v0 As Long = 0L
+        Dim _ar141_v1 As Long = 0L
+        ' §142: A2-range q verification — save ar pairs for q[14583334+j] at j=0,1M..6M.
+        ' ar index = kLimb + q_index = 43750000 + (14583334 + j) = 58333334 + j.
+        ' Evenly-spaced j: 0, 1000000, 2000000, 3000000, 4000000, 5000000, 6000000.
+        Dim _ar142_pairs(6, 1) As Long  ' (7 points) × (v0, v1)
+        Dim _ar142_qIdx() As Long = {14583334L, 15583334L, 16583334L, 17583334L, 18583334L, 19583334L, 20583334L}
         If _logLevel >= 2 Then
             Dim _arDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
             Dim _arTop As Long = If(szAR >= 1, Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, (szAR - 1) * 8), 0L)
@@ -3127,7 +3184,8 @@ Public Class Form1
                 _ar135_v0 = _arErrL   ' §135: save for post-BigShiftRight verification
                 _ar135_v1 = _arErrL1
                 ' §112: sparse sweep across the middle zone to find where ar goes wrong.
-                Dim _sweepPositions() As Long = {43750002L, 45000000L, 47000000L, 50000000L, 52000000L, 55000000L, 57000000L, 58333334L, 58333335L, 60000000L, 62000000L, 64000000L, 64654663L}
+                ' Also includes 65139832/33 which correspond to q[21389832] (A2/B2 midpoint check).
+                Dim _sweepPositions() As Long = {43750002L, 45000000L, 47000000L, 50000000L, 52000000L, 55000000L, 57000000L, 58333334L, 58333335L, 60000000L, 62000000L, 64000000L, 64654663L, 65139832L, 65139833L}
                 Dim _sweepSb As New System.Text.StringBuilder()
                 _sweepSb.Append($"[SafeMpzDiv§112] ar sparse sweep (szAR={szAR:N0}):{vbCrLf}")
                 For Each _sp As Long In _sweepPositions
@@ -3135,6 +3193,15 @@ Public Class Form1
                     _sweepSb.Append($"  ar[{_sp:N0}]={_sv:X16}{vbCrLf}")
                 Next
                 AppendLog(_sweepSb.ToString())
+                ' Save ar[65139832/33] for §141 verification of q[21389832] after BigShiftRight.
+                _ar141_v0 = If(65139832L < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt(65139832L * 8L)), 0L)
+                _ar141_v1 = If(65139833L < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt(65139833L * 8L)), 0L)
+                ' §142: save ar pairs for A2-range q verification.
+                For _i142 As Integer = 0 To 6
+                    Dim _ar142_base As Long = 43750000L + _ar142_qIdx(_i142)  ' = 58333334 + j
+                    _ar142_pairs(_i142, 0) = If(_ar142_base < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt(_ar142_base * 8L)), 0L)
+                    _ar142_pairs(_i142, 1) = If(_ar142_base + 1L < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt((_ar142_base + 1L) * 8L)), 0L)
+                Next
                 ' §132: verify q[14583334] from ar — q[i] = (ar[kLimb+i] >> kRem) | (ar[kLimb+i+1] << (64-kRem))
                 ' kLimb=43750000, kRem=27 → q[14583334] = (ar[58333334] >> 27) | (ar[58333335] << 37)
                 Const _Q132_IDX As Long = 14583334L
@@ -3176,6 +3243,33 @@ Public Class Form1
                 Dim _qDPtr135 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
                 Dim _q135_actual As Long = If(_Q135_IDX < CLng(szQ), Runtime.InteropServices.Marshal.ReadInt64(_qDPtr135, CInt(_Q135_IDX * 8L)), 0L)
                 AppendLog($"[SafeMpzDiv§135] ar[64654664]={_ar135_v0:X16} ar[64654665]={_ar135_v1:X16} → q[{_Q135_IDX:N0}] expected={_q135_expected:X16} actual={_q135_actual:X16} match={_q135_expected = _q135_actual}{vbCrLf}")
+            End If
+            ' §142: A2-range q sweep — verify q at 7 evenly-spaced positions from saved ar pairs.
+            If szQ = 21875001 AndAlso _ar142_pairs(0, 0) <> 0L Then
+                Dim _qDPtr142 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
+                Dim _bDPtr142 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(b.Pointer, 8))
+                Dim _sb142 As New System.Text.StringBuilder()
+                _sb142.Append($"[SafeMpzDiv§142] A2-range q vs expected-from-ar vs b (kRem=27):{vbCrLf}")
+                For _i142 As Integer = 0 To 6
+                    Dim _qj As Long = _ar142_qIdx(_i142)
+                    Dim _exp142 As Long = CLng(CULng(_ar142_pairs(_i142, 0)) >> 27) Or CLng(CULng(_ar142_pairs(_i142, 1)) << 37)
+                    Dim _act142 As Long = If(_qj < CLng(szQ), Runtime.InteropServices.Marshal.ReadInt64(_qDPtr142, CInt(_qj * 8L)), 0L)
+                    Dim _b142 As Long = If(_qj < CLng(szB), Runtime.InteropServices.Marshal.ReadInt64(_bDPtr142, CInt(_qj * 8L)), 0L)
+                    _sb142.Append($"  q[{_qj:N0}] exp={_exp142:X16} act={_act142:X16} match={_exp142 = _act142} b={_b142:X16}{vbCrLf}")
+                Next
+                AppendLog(_sb142.ToString())
+            End If
+            ' §141: verify q[21389832] (A2/B2 midpoint) from ar[65139832/33] saved in §112 sweep.
+            ' q[21389832] = (ar[65139832] >> 27) | (ar[65139833] << 37)
+            ' Also log q[21389832] vs b[21389832] to check their relative magnitude.
+            If szQ = 21875001 AndAlso _ar141_v0 <> 0L Then
+                Const _Q141_IDX As Long = 21389832L
+                Dim _q141_expected As Long = CLng(CULng(_ar141_v0) >> 27) Or CLng(CULng(_ar141_v1) << 37)
+                Dim _qDPtr141 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
+                Dim _q141_actual As Long = If(_Q141_IDX < CLng(szQ), Runtime.InteropServices.Marshal.ReadInt64(_qDPtr141, CInt(_Q141_IDX * 8L)), 0L)
+                Dim _bDPtr141 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(b.Pointer, 8))
+                Dim _b141_val As Long = If(_Q141_IDX < CLng(szB), Runtime.InteropServices.Marshal.ReadInt64(_bDPtr141, CInt(_Q141_IDX * 8L)), 0L)
+                AppendLog($"[SafeMpzDiv§141] ar[65139832]={_ar141_v0:X16} ar[65139833]={_ar141_v1:X16} → q[{_Q141_IDX:N0}] expected={_q141_expected:X16} actual={_q141_actual:X16} match={_q141_expected = _q141_actual} b[{_Q141_IDX:N0}]={_b141_val:X16}{vbCrLf}")
             End If
         End If
         GmpRaw_swap(q.Pointer, ar.Pointer)  ' §35
@@ -3360,6 +3454,28 @@ Public Class Form1
             gmp_lib.mpz_init(q)
             Dim szNT As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(nTrunc.Pointer, 4))
             Dim szXT As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(xTrunc.Pointer, 4))
+
+            ' §140: verify xTrunc at B2-range positions by reading x's raw limbs and comparing.
+            ' xHalf=1921928090: xHalf_limb=30030126, xHalf_rem=26.
+            ' xTrunc[j] = (x[30030126+j] >> 26) | (x[30030126+j+1] << 38)
+            ' Check 7 evenly-spaced B2-range positions + 2 midpoint/top.
+            If _logLevel >= 2 AndAlso szXT = 21875001 AndAlso xHalf = 1921928090L Then
+                Dim _xHLimb140 As Long = 30030126L
+                Dim _xSz140 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(x.Pointer, 4))
+                Dim _xD140 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(x.Pointer, 8))
+                Dim _xtD140 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(xTrunc.Pointer, 8))
+                Dim _j140_check() As Long = {14583334L, 15583334L, 16583334L, 17583334L, 18583334L, 19583334L, 20583334L, 21389832L, 21875000L}
+                Dim _sb140 As New System.Text.StringBuilder()
+                _sb140.Append($"[SafeMpzSqrt§140] szX={_xSz140:N0} xHalf=1921928090 xHalf_limb=30030126{vbCrLf}")
+                For Each _j140 As Long In _j140_check
+                    Dim _x0 As Long = If(_xHLimb140 + _j140 < CLng(_xSz140), Runtime.InteropServices.Marshal.ReadInt64(_xD140, CInt((_xHLimb140 + _j140) * 8L)), 0L)
+                    Dim _x1 As Long = If(_xHLimb140 + _j140 + 1L < CLng(_xSz140), Runtime.InteropServices.Marshal.ReadInt64(_xD140, CInt((_xHLimb140 + _j140 + 1L) * 8L)), 0L)
+                    Dim _xt_exp As Long = CLng(CULng(_x0) >> 26) Or CLng(CULng(_x1) << 38)
+                    Dim _xt_act As Long = If(_j140 < CLng(szXT), Runtime.InteropServices.Marshal.ReadInt64(_xtD140, CInt(_j140 * 8L)), 0L)
+                    _sb140.Append($"  j={_j140:N0}: x[{_xHLimb140+_j140}]={_x0:X16} x[{_xHLimb140+_j140+1}]={_x1:X16} exp={_xt_exp:X16} act={_xt_act:X16} match={_xt_exp = _xt_act}{vbCrLf}")
+                Next
+                AppendLog(_sb140.ToString())
+            End If
             If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] Newton step {_newtonStep}: target={target:N0} bits, div {szNT:N0}/{szXT:N0} limbs{vbCrLf}")
             If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt§133-probe] szNT={szNT} szXT={szXT} logLevel={_logLevel} cond={szNT = 43750001 AndAlso szXT = 21875001}{vbCrLf}")
             ' §133: verify nTrunc[42779664] by reading n directly, bypassing BigShiftRight.
