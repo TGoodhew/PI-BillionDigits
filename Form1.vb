@@ -2443,7 +2443,14 @@ Public Class Form1
         ' Column 2: prod(2)+prod(4)+prod(6) shift 2*bitsA
         ' Column 3: prod(5)+prod(7)      shift 3*bitsA
         ' Column 4: prod(8)              shift 4*bitsA
-        If mA = mB Then
+          ' §128: The §39 column-group path assumes all split windows behave like
+          ' dense m-limb blocks. In the failing SafeMpzDiv q*b case, B0 is exactly
+          ' zero (B0sz=0), and the grouped accumulation produced a catastrophic
+          ' quotient under-estimate. Fall back to the general 9-product path when
+          ' any split piece is zero-sized; keep §39 only for fully dense windows.
+          If mA = mB AndAlso
+              _A0_szT > 0 AndAlso _A1_szT > 0 AndAlso _A2_szT > 0 AndAlso
+              _B0_szT > 0 AndAlso _B1_szT > 0 AndAlso _B2_szT > 0 Then
             If _logLevel >= 4 Then AppendLog($"[SafeMpzMul] §39 column-group fast path (mA=mB={mA:N0}){vbCrLf}")
             ' Per-column: base product index and list of additional product indices to add first
             Dim _col_base As Integer() = {0, 1, 2, 5, 8}

@@ -2839,3 +2839,28 @@ All four fire only at `bShift = 0` (the final Newton iteration, iter=25):
 ### Status
 
 Diagnostics added — run in progress.
+
+## §128 — SafeMpzMul: disable §39 column fast path when any split piece is zero
+
+### Problem
+
+The `SafeMpzDiv` failure (`adj-up exceeded 10`) remained reproducible after the §123–§126 diagnostics.  The trace showed:
+- `a*r` and `BigShiftRight` produced a plausible `q_approx`
+- the failure exploded during `SafeMpzMul(qb, q, b)`
+- in that call, `mA=mB=7,291,667` and one split piece was exactly zero (`B0sz=0`), while the §39 column-group fast path was active.
+
+The §39 path is an optimization that groups 9 sub-products into 5 shifted columns when `mA=mB`.  In this sparse-piece case, it produced a catastrophically low `q*b`, leaving `remainder = a - q*b` at ~42.8M limbs and forcing effectively unbounded adj-up corrections.
+
+### Fix
+
+Hardened the §39 branch condition in `SafeMpzMul`:
+
+- **Before:** use §39 whenever `mA = mB`
+- **After:** use §39 only when all six split windows are non-empty
+    (`A0sz/A1sz/A2sz/B0sz/B1sz/B2sz > 0`)
+
+If any split piece is zero-sized, `SafeMpzMul` now falls back to the general 9-product accumulation path (§23/§90), which is slower but robust for sparse windows.
+
+### Status
+
+Fix applied in code; verification run pending.
