@@ -2195,7 +2195,19 @@ Public Class Form1
         ' 3×3 recursive split, breaking the sub-products down to ≈2.4M × 2.4M limbs each (≈4.9M
         ' total) which are well within safe FFT accuracy range.
         ' Upper bound constraint: pl * 64 must fit in int32 → pl_max = floor((2^31-1)/64) = 33,554,431.
-        Const SAFE_LIMB_THRESHOLD As Integer = 10_000_000
+        '
+        ' §160: Threshold further lowered from 10,000,000 to 5,000,000.
+        ' The a×r multiplication (szA=43750001, szB=21875001) uses two levels of 3×3 §gen:
+        '   Outer §gen → inner SafeMpzMul(14583333, 7291667) [21.9M total, uses §gen again]
+        '   Inner §gen → inner-inner SafeMpzMul(4861111, 2430555) [7.29M total]
+        ' At 10M threshold, the inner-inner call (7.29M total) fell below the threshold and used
+        ' GmpRaw_mul directly. But 7.29M total requires GMP FFT transform size M≈2^23, which
+        ' still triggers the same double-precision rounding errors — silently producing wrong limbs
+        ' at position ar[64654664] and causing the Barrett rem to exceed b (szRem=42779665 crash).
+        ' q×b and b×r inner-inner products are only ≈4.86M total (M≈2^22) and are unaffected.
+        ' Lowering to 5M forces SafeMpzMul(4861111, 2430555) into §gen, breaking it into
+        ' sub-products of ≈2.43M total (M≈2^22), which are within safe FFT accuracy range.
+        Const SAFE_LIMB_THRESHOLD As Integer = 5_000_000
 
         Dim szA_signed As Integer = Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4)
         Dim szB_signed As Integer = Runtime.InteropServices.Marshal.ReadInt32(opB.Pointer, 4)
@@ -2614,6 +2626,15 @@ Public Class Form1
                         _shiftSrc = _sv_shifted_hdr
                         _shiftRem -= CULng(_chunk)
                     End While
+                    ' §150: q*b pre-add check — verify accum[42779664]=0 before adding k=8.
+                    ' Only k=8 (shift=29166668 limbs) can reach position 42779664; no k<8 does.
+                    ' A nonzero pre-k8 value would reveal an unexpected earlier sub-product bug.
+                    If _logLevel >= 2 AndAlso k = 8 AndAlso szA = 21875001 AndAlso szB = 21875001 Then
+                        Dim _pre150sz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
+                        Dim _pre150DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(accumPtr, 8))
+                        Dim _pre150v As Long = If(42779664L < CLng(_pre150sz), Runtime.InteropServices.Marshal.ReadInt64(_pre150DPtr, CInt(42779664L * 8L)), 0L)
+                        AppendLog($"[SafeMpzMul§150] pre-k8-add accum[42779664]={_pre150v:X16} (expect 0000000000000000){vbCrLf}")
+                    End If
                     GmpRaw_add(accumPtr, accumPtr, _sv_shifted_hdr)
                     If _logLevel >= 2 Then
                         Dim _shiftedSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted_hdr, 4))
@@ -3149,6 +3170,18 @@ Public Class Form1
             Dim _aTop2 As Long = If(szA >= 2, Runtime.InteropServices.Marshal.ReadInt64(_aDPtr, (szA - 2) * 8), 0L)
             AppendLog($"[SafeMpzDiv] a top2=[{_aTop:X16} {_aTop2:X16}]{vbCrLf}")
         End If
+        ' §154: log r at key positions for independent ar verification.
+        If _logLevel >= 2 AndAlso szR = 21875001 Then
+            Dim _r154DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
+            Dim _r154_pos() As Long = {20904664L, 20904665L, 21000000L, 21500000L, 21874999L, 21875000L}
+            Dim _sb154 As New System.Text.StringBuilder()
+            _sb154.Append($"[SafeMpzDiv§154] r at key positions (szR={szR:N0}):{vbCrLf}")
+            For Each _p154 As Long In _r154_pos
+                Dim _v154 As Long = If(_p154 < CLng(szR), Runtime.InteropServices.Marshal.ReadInt64(_r154DPtr, CInt(_p154 * 8L)), 0L)
+                _sb154.Append($"  r[{_p154:N0}]={_v154:X16}{vbCrLf}")
+            Next
+            AppendLog(_sb154.ToString())
+        End If
         SafeMpzMul(ar, a, r)
         gmp_lib.mpz_clear(r)
         Dim szAR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(ar.Pointer, 4))
@@ -3163,6 +3196,15 @@ Public Class Form1
         ' Evenly-spaced j: 0, 1000000, 2000000, 3000000, 4000000, 5000000, 6000000.
         Dim _ar142_pairs(6, 1) As Long  ' (7 points) × (v0, v1)
         Dim _ar142_qIdx() As Long = {14583334L, 15583334L, 16583334L, 17583334L, 18583334L, 19583334L, 20583334L}
+        ' §149: Top q-range — save ar pairs for q[k] at k in [20950000..21875000].
+        ' These q limbs (q[20904664..21875000]) are the inputs to A2×B2[13612996] in q×b,
+        ' and were NOT verified by §135/§141/§142.  A mismatch here pinpoints the bug.
+        ' ar index = 43750000 + k.  Last valid ar index = 65625000 (szAR=65625001).
+        Dim _ar149_pairs(10, 1) As Long  ' (11 points) × (v0, v1)
+        Dim _ar149_qIdx() As Long = {20950000L, 21000000L, 21100000L, 21200000L, 21300000L, 21500000L, 21600000L, 21700000L, 21800000L, 21874999L, 21875000L}
+        ' §151: Gap q-range [20583334..20950000] — unverified by §142/§149, all contribute to A2×B2[13612996].
+        Dim _ar151_pairs(3, 1) As Long  ' (4 points) × (v0, v1)
+        Dim _ar151_qIdx() As Long = {20600000L, 20700000L, 20800000L, 20900000L}
         If _logLevel >= 2 Then
             Dim _arDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
             Dim _arTop As Long = If(szAR >= 1, Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, (szAR - 1) * 8), 0L)
@@ -3196,6 +3238,18 @@ Public Class Form1
                 ' Save ar[65139832/33] for §141 verification of q[21389832] after BigShiftRight.
                 _ar141_v0 = If(65139832L < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt(65139832L * 8L)), 0L)
                 _ar141_v1 = If(65139833L < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt(65139833L * 8L)), 0L)
+                ' §149: save ar pairs for top q-range verification.
+                For _i149 As Integer = 0 To 10
+                    Dim _ar149_base As Long = 43750000L + _ar149_qIdx(_i149)
+                    _ar149_pairs(_i149, 0) = If(_ar149_base < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt(_ar149_base * 8L)), 0L)
+                    _ar149_pairs(_i149, 1) = If(_ar149_base + 1L < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt((_ar149_base + 1L) * 8L)), 0L)
+                Next
+                ' §151: save ar pairs for gap q-range [20583334..20950000] verification.
+                For _i151 As Integer = 0 To 3
+                    Dim _ar151_base As Long = 43750000L + _ar151_qIdx(_i151)
+                    _ar151_pairs(_i151, 0) = If(_ar151_base < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt(_ar151_base * 8L)), 0L)
+                    _ar151_pairs(_i151, 1) = If(_ar151_base + 1L < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt((_ar151_base + 1L) * 8L)), 0L)
+                Next
                 ' §142: save ar pairs for A2-range q verification.
                 For _i142 As Integer = 0 To 6
                     Dim _ar142_base As Long = 43750000L + _ar142_qIdx(_i142)  ' = 58333334 + j
@@ -3270,6 +3324,43 @@ Public Class Form1
                 Dim _bDPtr141 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(b.Pointer, 8))
                 Dim _b141_val As Long = If(_Q141_IDX < CLng(szB), Runtime.InteropServices.Marshal.ReadInt64(_bDPtr141, CInt(_Q141_IDX * 8L)), 0L)
                 AppendLog($"[SafeMpzDiv§141] ar[65139832]={_ar141_v0:X16} ar[65139833]={_ar141_v1:X16} → q[{_Q141_IDX:N0}] expected={_q141_expected:X16} actual={_q141_actual:X16} match={_q141_expected = _q141_actual} b[{_Q141_IDX:N0}]={_b141_val:X16}{vbCrLf}")
+            End If
+            ' §149: verify q at top range [20950000..21875000] against pre-BigShiftRight ar values.
+            ' These q limbs (q[20904664..21875000]) are the inputs to A2×B2[13612996] in q×b.
+            ' §135 covered q[20904664], §141 covered q[21389832]; this fills the unchecked gap.
+            ' A mismatch (exp≠act) means BigShiftRight is wrong at that q position.
+            ' A wrong saved ar pair (verified only by §112 sweep) would point to wrong a×r instead.
+            If szQ = 21875001 Then
+                Dim _qDPtr149 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
+                Dim _sb149 As New System.Text.StringBuilder()
+                _sb149.Append($"[SafeMpzDiv§149] top q-range verify — limbs contributing to A2×B2[13612996]:{vbCrLf}")
+                Dim _149anyBad As Boolean = False
+                For _i149 As Integer = 0 To 10
+                    Dim _qk149 As Long = _ar149_qIdx(_i149)
+                    Dim _e149 As Long = CLng(CULng(_ar149_pairs(_i149, 0)) >> 27) Or CLng(CULng(_ar149_pairs(_i149, 1)) << 37)
+                    Dim _a149 As Long = If(_qk149 < CLng(szQ), Runtime.InteropServices.Marshal.ReadInt64(_qDPtr149, CInt(_qk149 * 8L)), 0L)
+                    If _e149 <> _a149 Then _149anyBad = True
+                    _sb149.Append($"  q[{_qk149:N0}] exp={_e149:X16} act={_a149:X16} match={_e149 = _a149}{vbCrLf}")
+                Next
+                _sb149.Append($"  any_mismatch={_149anyBad}{vbCrLf}")
+                AppendLog(_sb149.ToString())
+            End If
+            ' §151: verify q at gap range [20583334..20950000] against pre-BigShiftRight ar values.
+            ' This is the last unverified range contributing to A2×B2[13612996] in q×b.
+            If szQ = 21875001 Then
+                Dim _qDPtr151 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
+                Dim _sb151 As New System.Text.StringBuilder()
+                _sb151.Append($"[SafeMpzDiv§151] gap q-range verify [20583334..20950000]:{vbCrLf}")
+                Dim _151anyBad As Boolean = False
+                For _i151 As Integer = 0 To 3
+                    Dim _qk151 As Long = _ar151_qIdx(_i151)
+                    Dim _e151 As Long = CLng(CULng(_ar151_pairs(_i151, 0)) >> 27) Or CLng(CULng(_ar151_pairs(_i151, 1)) << 37)
+                    Dim _a151 As Long = If(_qk151 < CLng(szQ), Runtime.InteropServices.Marshal.ReadInt64(_qDPtr151, CInt(_qk151 * 8L)), 0L)
+                    If _e151 <> _a151 Then _151anyBad = True
+                    _sb151.Append($"  q[{_qk151:N0}] exp={_e151:X16} act={_a151:X16} match={_e151 = _a151}{vbCrLf}")
+                Next
+                _sb151.Append($"  any_mismatch={_151anyBad}{vbCrLf}")
+                AppendLog(_sb151.ToString())
             End If
         End If
         GmpRaw_swap(q.Pointer, ar.Pointer)  ' §35
@@ -3464,7 +3555,9 @@ Public Class Form1
                 Dim _xSz140 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(x.Pointer, 4))
                 Dim _xD140 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(x.Pointer, 8))
                 Dim _xtD140 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(xTrunc.Pointer, 8))
-                Dim _j140_check() As Long = {14583334L, 15583334L, 16583334L, 17583334L, 18583334L, 19583334L, 20583334L, 21389832L, 21875000L}
+                ' §153: Extended check — add 8 positions in [14904664..21554666] (the B2 range contributing to A2×B2[13612996]).
+                ' These positions have never been verified. A mismatch here proves BigShiftRight corrupts b at that location.
+                Dim _j140_check() As Long = {14583334L, 14904664L, 15583334L, 15904664L, 16583334L, 17583334L, 17904664L, 18583334L, 19583334L, 19904664L, 20583334L, 20904664L, 21389832L, 21554666L, 21875000L}
                 Dim _sb140 As New System.Text.StringBuilder()
                 _sb140.Append($"[SafeMpzSqrt§140] szX={_xSz140:N0} xHalf=1921928090 xHalf_limb=30030126{vbCrLf}")
                 For Each _j140 As Long In _j140_check
