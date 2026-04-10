@@ -2411,9 +2411,12 @@ Public Class Form1
         ' Parallel.For with GmpNativeAlloc.dll gave catastrophically wrong prods(8) for q×b —
         ' suspected GMP internal allocator thread-safety issue under concurrent mpz_mul reallocs.
         ' r×r has opA_d=opB_d (same=True) and continues to use the parallel path safely.
-        Dim _forceSerialQxB As Boolean = (szA = 21875001 AndAlso szB = 21875001 AndAlso _pre_opA_d <> _opB_d)
+        ' §165: Extended to also cover a×r (szA=43750001, szB=21875001, opA_d≠opB_d).
+        ' Newton's non-squaring mults peak at ~21875000×10937500 (half the size of a×r) so
+        ' they were never affected; a×r is the first 43750001×21875001 non-squaring call.
+        Dim _forceSerialQxB As Boolean = ((szA = 21875001 OrElse szA = 43750001) AndAlso szB = 21875001 AndAlso _pre_opA_d <> _opB_d)
         If _smmDop <= 1 OrElse _forceSerialQxB Then
-            If _logLevel >= 2 AndAlso _forceSerialQxB Then AppendLog($"[SafeMpzMul§138] forcing serial sub-products for q×b (opA_d={_pre_opA_d:X16} opB_d={_opB_d:X16}){vbCrLf}")
+            If _logLevel >= 2 AndAlso _forceSerialQxB Then AppendLog($"[SafeMpzMul§138] forcing serial sub-products for {If(szA = 43750001, "a×r", "q×b")} (opA_d={_pre_opA_d:X16} opB_d={_opB_d:X16}){vbCrLf}")
             ' Serial path: no thread pool involvement, no park/unpark overhead.
             For k As Integer = 0 To 8
                 SafeMpzMul(prods(k), A_parts(k \ 3), B_parts(k Mod 3))
@@ -3109,7 +3112,15 @@ Public Class Form1
 
         Dim r As New mpz_t()
         gmp_lib.mpz_init(r)
+        ' §168: Force all-serial for SafeMpzReciprocal — bTrunc×rSq inside iter=25
+        ' (szA=21875001, szB≈34603008) bypasses §138 (szB≠21875001) and runs in parallel,
+        ' corrupting r. §166/§167 proved a×r and q×b are computed correctly FROM wrong r.
+        ' Making the entire Newton reciprocal serial ensures bTrunc×rSq produces correct p.
+        Dim _saved168Dop As Integer = System.Threading.Volatile.Read(_safeMulDop)
+        System.Threading.Volatile.Write(_safeMulDop, 1)
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§168] forcing all-serial for SafeMpzReciprocal (savedDop={_saved168Dop}){vbCrLf}")
         SafeMpzReciprocal(r, b, kBits)
+        System.Threading.Volatile.Write(_safeMulDop, _saved168Dop)
         Dim szR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] reciprocal done: szR={szR:N0}{vbCrLf}")
 
@@ -3157,6 +3168,34 @@ Public Class Form1
             Dim _br144_kp1 As Long = If(_szBR144 > _kLimb144 + 1, Runtime.InteropServices.Marshal.ReadInt64(_br144DPtr, CInt(_kLimb144 + 1) * 8), 0L)
             Dim _rOk144 As Boolean = (_br144_kp1 = 0L) AndAlso (CULng(_br144_k) < CULng(1L << _kRem144))
             AppendLog($"[SafeMpzDiv§144] b*r sz={_szBR144:N0} kLimb={_kLimb144:N0} kRem={_kRem144} b*r[kLimb-1]={_br144_km1:X16} b*r[kLimb]={_br144_k:X16} b*r[kLimb+1]={_br144_kp1:X16} maxOK={(1L << _kRem144) - 1L:X16} r_valid={_rOk144}{vbCrLf}")
+            ' §169: Check LOWER bound — b*(r+1) > 2^kBits. If false, r < floor(2^kBits/b), i.e., r is too small.
+            ' b*(r+1) = b*r + b. Check if adding b to b*r causes bit kBits to be set.
+            ' This is cheap (O(n) add) since b*r is already computed. No extra SafeMpzMul needed.
+            gmp_lib.mpz_add(_br144, _br144, b)
+            Dim _szBRp1 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_br144.Pointer, 4))
+            Dim _brp1DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_br144.Pointer, 8))
+            Dim _brp1_k As Long = If(_szBRp1 > _kLimb144, Runtime.InteropServices.Marshal.ReadInt64(_brp1DPtr, CInt(_kLimb144) * 8), 0L)
+            Dim _brp1_kp1 As Long = If(_szBRp1 > _kLimb144 + 1, Runtime.InteropServices.Marshal.ReadInt64(_brp1DPtr, CInt(_kLimb144 + 1) * 8), 0L)
+            ' b*(r+1) > 2^kBits iff bit kBits is set, i.e., b*(r+1)[kLimb] has bit kRem set OR [kLimb+1]≠0
+            Dim _rTight169 As Boolean = (CULng(_brp1_k) >= CULng(1L << _kRem144)) OrElse (_brp1_kp1 <> 0L)
+            AppendLog($"[SafeMpzDiv§169] b*(r+1) sz={_szBRp1:N0} [kLimb]={_brp1_k:X16} [kLimb+1]={_brp1_kp1:X16} r_tight(lower_bound_ok)={_rTight169}{vbCrLf}")
+            ' §170: Measure exact error magnitude of r. delta = 2^kBits - b*r.
+            ' At this point _br144 = b*(r+1) = b*r + b, so:
+            '   delta = 2^kBits - b*r = 2^kBits + b - b*(r+1) = 2^kBits + b - _br144
+            ' szDelta > szB means r is wrong by more than 1 full unit, i.e. massively off.
+            ' r_error ~ delta/b in limbs: szDelta - szB = approximate limb-count of r's error.
+            Dim _pow170 As New mpz_t()
+            gmp_lib.mpz_init(_pow170)
+            gmp_lib.mpz_set_ui(_pow170, 1UI)
+            gmp_lib.mpz_mul_2exp(_pow170, _pow170, New mp_bitcnt_t(CUInt(kBits)))
+            gmp_lib.mpz_add(_pow170, _pow170, b)        ' 2^kBits + b
+            gmp_lib.mpz_sub(_pow170, _pow170, _br144)   ' 2^kBits + b - b*(r+1) = delta
+            Dim _szDelta170 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_pow170.Pointer, 4))
+            Dim _delta170DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_pow170.Pointer, 8))
+            Dim _delta170Top As Long = If(_szDelta170 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_delta170DPtr, CInt((_szDelta170 - 1) * 8L)), 0L)
+            Dim _delta170Top2 As Long = If(_szDelta170 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_delta170DPtr, CInt((_szDelta170 - 2) * 8L)), 0L)
+            AppendLog($"[SafeMpzDiv§170] delta=2^kBits-b*r szDelta={_szDelta170:N0} szB={szB:N0} r_error_limbs~={_szDelta170 - szB:N0} top2=[{_delta170Top:X16} {_delta170Top2:X16}]{vbCrLf}")
+            gmp_lib.mpz_clear(_pow170)
             gmp_lib.mpz_clear(_br144)
         End If
 
@@ -3182,7 +3221,16 @@ Public Class Form1
             Next
             AppendLog(_sb154.ToString())
         End If
+        ' §166: Force ALL recursive levels of a×r fully serial — GMP allocator is not
+        ' thread-safe under concurrent mpz_mul reallocs with distinct opA_d/opB_d buffers.
+        ' §138/§165 only forced the outer Parallel.For; inner recursive SafeMpzMul calls
+        ' still used Parallel.For (szA=14583333 ≠ 21875001 bypassed §138 gate).
+        ' Setting _safeMulDop=1 propagates into every recursive level of SafeMpzMul.
+        Dim _saved166Dop As Integer = System.Threading.Volatile.Read(_safeMulDop)
+        System.Threading.Volatile.Write(_safeMulDop, 1)
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§166] forcing all-serial for a×r (savedDop={_saved166Dop}){vbCrLf}")
         SafeMpzMul(ar, a, r)
+        System.Threading.Volatile.Write(_safeMulDop, _saved166Dop)
         gmp_lib.mpz_clear(r)
         Dim szAR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(ar.Pointer, 4))
         ' §135 save slots: ar[64654664/65] captured inside §111 block, used after BigShiftRight.
@@ -3395,7 +3443,12 @@ Public Class Form1
         Dim qb As New mpz_t()
         gmp_lib.mpz_init(qb)
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] computing q*b (szQ={szQ:N0} szB={szB:N0})...{vbCrLf}")
+        ' §167: Same all-levels serial fix for q×b.
+        Dim _saved167Dop As Integer = System.Threading.Volatile.Read(_safeMulDop)
+        System.Threading.Volatile.Write(_safeMulDop, 1)
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§167] forcing all-serial for q×b (savedDop={_saved167Dop}){vbCrLf}")
         SafeMpzMul(qb, q, b)
+        System.Threading.Volatile.Write(_safeMulDop, _saved167Dop)
         Dim szQB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(qb.Pointer, 4))
         Dim remainder As New mpz_t()
         gmp_lib.mpz_init(remainder)
@@ -3430,8 +3483,17 @@ Public Class Form1
             _adjUp += 1
             If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-up iter={_adjUp}{vbCrLf}")
             If _adjUp > MAX_ADJ_ITERS Then
-                Dim _szRem2 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4))
-                Throw New InvalidOperationException($"SafeMpzDiv adj-up exceeded {MAX_ADJ_ITERS} iters — reciprocal likely wrong. szA={szA} szB={szB} aBits={aBits} kBits={kBits} szR={szR} szQ={szQ} szQB={szQB} szRem={_szRem2}")
+                ' §171: Barrett reciprocal produced a wildly wrong q (off by more than MAX_ADJ_ITERS).
+                ' Root cause: SafeMpzReciprocal's fixed-domain Newton accumulates per-step floor
+                ' truncation errors (≈ 2^bShift * r_true/b per step) that dwarf the true Newton
+                ' correction, causing the result to be wrong by ~20M limbs for kBits≈2.8B.
+                ' Fall back to GMP's mpz_tdiv_q which uses a correctly-bounded half-domain Newton.
+                Dim _szRem171 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4))
+                AppendLog($"[SafeMpzDiv§171] adj-up exceeded {MAX_ADJ_ITERS} iters (szRem={_szRem171:N0} > szB={szB:N0}); falling back to mpz_tdiv_q{vbCrLf}")
+                gmp_lib.mpz_clear(remainder)
+                gmp_lib.mpz_tdiv_q(q, a, b)
+                AppendLog($"[SafeMpzDiv§171] mpz_tdiv_q fallback complete; szQ={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(q.Pointer, 4)):N0}{vbCrLf}")
+                Return
             End If
             gmp_lib.mpz_add_ui(q, q, 1UI)
             gmp_lib.mpz_sub(remainder, remainder, b)
