@@ -2214,6 +2214,19 @@ Public Class Form1
         Dim szA As Integer = System.Math.Abs(szA_signed)
         Dim szB As Integer = System.Math.Abs(szB_signed)
 
+        ' §183: At SafeMpzMul entry, detect if opA._mp_d already points to zero data (pre-corruption).
+        ' If opA._mp_d is zero-filled here, the bug happened in the CALLER before this call.
+        If _logLevel >= 2 AndAlso opA.Pointer = opB.Pointer AndAlso szA > 0 Then
+            Dim _183_opAd As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
+            If _183_opAd <> 0L Then
+                Dim _183_r0 As Long = Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_183_opAd), 0)
+                Dim _183_r1 As Long = Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_183_opAd + 8L), 0)
+                If _183_r0 = 0L AndAlso _183_r1 = 0L Then
+                    AppendLog($"[SafeMpzMul§183] ENTRY zero-data squaring: szA={szA:N0} opA_d={_183_opAd:X16} r[0]={_183_r0:X16} r[1]={_183_r1:X16} opAptr={opA.Pointer.ToInt64():X16} resPtr={result.Pointer.ToInt64():X16}{vbCrLf}")
+                End If
+            End If
+        End If
+
         If szA + szB <= SAFE_LIMB_THRESHOLD Then
             If _logLevel >= 4 AndAlso CLng(szA) + CLng(szB) > 5_000_000L Then
                 AppendLog(
@@ -2228,6 +2241,20 @@ Public Class Form1
                 AppendLog(
                     $"[SafeMpzMul] FAST-POST result.Ptr={result.Pointer.ToInt64():X} result_sz={Runtime.InteropServices.Marshal.ReadInt32(result.Pointer, 4):N0} " &
                     $"result_d={Runtime.InteropServices.Marshal.ReadInt64(result.Pointer, 8):X}{vbCrLf}")
+            End If
+            ' §178: Diagnose zero-result squarings in the fast path (szA+szB ≤ threshold).
+            ' Fires when opA=opB (squaring) AND the result is unexpectedly zero.
+            ' Case A: szA=0 means depth-1 trim incorrectly found all-zeros in r[0..mA-1].
+            ' Case B: szA>0 but result=0 means GmpRaw_mul itself produced a wrong answer.
+            ' In both cases, log szA and the raw limb at opA._mp_d to identify root cause.
+            If _logLevel >= 2 AndAlso opA.Pointer = opB.Pointer Then
+                Dim _178rSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(result.Pointer, 4))
+                If _178rSz = 0 Then
+                    Dim _178aD As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
+                    Dim _178r0 As Long = If(_178aD <> 0L, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_178aD), 0), 0L)
+                    Dim _178r1 As Long = If(_178aD <> 0L AndAlso szA >= 2, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_178aD + 8L), 0), 0L)
+                    AppendLog($"[SafeMpzMul§178] zero-result squaring: szA={szA:N0} opA.Ptr={opA.Pointer.ToInt64():X16} opA._mp_d={_178aD:X16} raw[0]={_178r0:X16} raw[1]={_178r1:X16}{vbCrLf}")
+                End If
             End If
             Return
         End If
@@ -2351,6 +2378,19 @@ Public Class Form1
         While _A0_szT > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_pre_opA_d + CLng(_A0_szT - 1) * 8L)) = 0L
             _A0_szT -= 1
         End While
+        ' §179: Catch A0-trim-to-zero in squarings — diagnoses wrong _pre_opA_d vs genuine all-zero data.
+        If _logLevel >= 2 AndAlso _A0_szT = 0 AndAlso CInt(System.Math.Min(CLng(szA), CLng(mA))) > 0 AndAlso _pre_opA_d = _opB_d Then
+            Dim _179_raw0 As Long = Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_pre_opA_d), 0)
+            Dim _179_raw1 As Long = Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_pre_opA_d + 8L), 0)
+            Dim _179_opAptr As Long = opA.Pointer.ToInt64()
+            Dim _179_freed As Long = _oldResultPtr.ToInt64()
+            Dim _179_accBuf As Long = accumBuf.ToInt64()
+            Dim _179_same As Boolean = (_179_freed = _pre_opA_d)
+            Dim _179_accumSame As Boolean = (_179_accBuf = _pre_opA_d)
+            AppendLog($"[SafeMpzMul§179] A0-trim-ZERO squaring: szA={szA:N0} mA={mA:N0} opA_d={_pre_opA_d:X16} raw[0]={_179_raw0:X16} raw[1]={_179_raw1:X16}" &
+                      $" opAptr={_179_opAptr:X16} savedResPtr={savedResultPtr.ToInt64():X16} freedBuf={_179_freed:X16} freed==opA_d={_179_same}" &
+                      $" accumBuf={_179_accBuf:X16} accumBuf==opA_d={_179_accumSame}{vbCrLf}")
+        End If
         Runtime.InteropServices.Marshal.WriteInt32(A0.Pointer, 0, CInt(mA))
         Runtime.InteropServices.Marshal.WriteInt32(A0.Pointer, 4, _A0_szT)
         Runtime.InteropServices.Marshal.WriteInt64(A0.Pointer, 8, _pre_opA_d)
@@ -2387,6 +2427,19 @@ Public Class Form1
                       $" B0sz={_B0_szT:N0} B1sz={_B1_szT:N0} B2sz={_B2_szT:N0}{vbCrLf}")
         End If
 
+        ' §177: For depth-2 r×r squaring calls (mA=2430556, same buffer), log opA_d, szA,
+        ' piece trim sizes, and the actual limb values at key positions in the sub-piece.
+        ' This diagnoses why A_sub0_2 appears as size=0 even though r[0]≠0.
+        If _logLevel >= 2 AndAlso mA = 2430556UL AndAlso _pre_opA_d = _opB_d Then
+            Dim _177b0 As Long = If(_A0_szT >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_pre_opA_d), 0), 0L)
+            Dim _177b1 As Long = If(_A0_szT >= 2, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_pre_opA_d), 8), 0L)
+            Dim _177top As Long = If(_A0_szT >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_pre_opA_d + CLng(_A0_szT - 1) * 8L), 0), 0L)
+            Dim _177rawAt0 As Long = Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_pre_opA_d), 0)
+            AppendLog($"[SafeMpzMul§177] depth2-sq mA=2430556 szA={szA:N0} opA_d={_pre_opA_d:X16}" &
+                      $" A0sz={_A0_szT:N0} A1sz={_A1_szT:N0} A2sz={_A2_szT:N0}" &
+                      $" sub0[0]={_177b0:X16} sub0[1]={_177b1:X16} sub0[top]={_177top:X16} raw[0]@opA_d={_177rawAt0:X16}{vbCrLf}")
+        End If
+
         ' Allocate one result buffer per sub-product (k = i*3 + j, k ∈ 0..8).
         ' §25: raw init — Marshal.AllocHGlobal(16) struct header + GmpRaw_init limb buffer.
         Dim prods(8) As mpz_t
@@ -2419,6 +2472,13 @@ Public Class Form1
             If _logLevel >= 2 AndAlso _forceSerialQxB Then AppendLog($"[SafeMpzMul§138] forcing serial sub-products for {If(szA = 43750001, "a×r", "q×b")} (opA_d={_pre_opA_d:X16} opB_d={_opB_d:X16}){vbCrLf}")
             ' Serial path: no thread pool involvement, no park/unpark overhead.
             For k As Integer = 0 To 8
+                ' §182: Before each inner call involving A2 (k=6,7,8), log A2._mp_d and its raw[0].
+                ' Detects when A2._mp_d gets corrupted between piece setup and the k=8 call.
+                If _logLevel >= 2 AndAlso k >= 6 AndAlso _pre_opA_d = _opB_d Then
+                    Dim _182_A2d As Long = Runtime.InteropServices.Marshal.ReadInt64(A_parts(2).Pointer, 8)
+                    Dim _182_A2r0 As Long = If(_182_A2d <> 0L, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_182_A2d), 0), 0L)
+                    AppendLog($"[SafeMpzMul§182] pre-k={k} squaring szA={szA:N0} mA={mA:N0} A2_ptr={A_parts(2).Pointer.ToInt64():X16} A2_d={_182_A2d:X16} A2_d[0]={_182_A2r0:X16}{vbCrLf}")
+                End If
                 SafeMpzMul(prods(k), A_parts(k \ 3), B_parts(k Mod 3))
             Next k
         Else
@@ -2473,8 +2533,29 @@ Public Class Form1
                       $" szProd={_p8Sz134:N0} [0]={_p8Bot134:X16} [1]={_p8Bot1134:X16}" &
                       $" [top]={_p8Top134:X16} [{_IDX134:N0}]={_p8Mid134:X16}{vbCrLf}")
         End If
+        ' §176: For the r×r squaring call (same buffer, mA=mB=7291667), read prods(0..2)[0]
+        ' immediately after inner SafeMpzMul completes — before §44 recovery or any shift.
+        ' If prods(0)[0]=0 here, the bug is inside depth-2 computation of A_piece0^2.
+        ' If prods(0)[0]≠0 here but =0 at §114, something between here and §114 corrupts it.
+        If _logLevel >= 2 AndAlso mA = 7291667UL AndAlso _pre_opA_d = _opB_d Then
+            For _p176 As Integer = 0 To 2
+                Dim _ptr176 As IntPtr = prods(_p176).Pointer
+                If _ptr176 <> IntPtr.Zero Then
+                    Dim _sz176 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_ptr176, 4))
+                    Dim _d176 As Long = Runtime.InteropServices.Marshal.ReadInt64(_ptr176, 8)
+                    Dim _b0_176 As Long = If(_sz176 >= 1 AndAlso _d176 <> 0L, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_d176), 0), 0L)
+                    Dim _b1_176 As Long = If(_sz176 >= 2 AndAlso _d176 <> 0L, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_d176), 8), 0L)
+                    AppendLog($"[SafeMpzMul§176] post-inner k={_p176} prods[{_p176}].Ptr={_ptr176.ToInt64():X16} sz={_sz176:N0} [0]={_b0_176:X16} [1]={_b1_176:X16}{vbCrLf}")
+                End If
+            Next _p176
+        End If
+
         ' §44: recover accumPtr from result's stash after Parallel.For.
-        savedResultPtr = result.Pointer
+        ' §181-fix: Do NOT re-read result.Pointer here — Math.Gmp.Native may have corrupted it
+        ' during inner SafeMpzMul calls (§175/§78 corruption). savedResultPtr was captured at
+        ' line 2274 as a plain IntPtr, immune to managed-wrapper corruption, and remains correct.
+        ' The old `savedResultPtr = result.Pointer` overwrite was the root cause of opA._mp_d
+        ' being corrupted across recursive depths (§179 diagnosis).
         accumPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(savedResultPtr, 8))
 
         ' Serial accumulation: shift each prod_k into its positional slot and add to accum.
@@ -2674,11 +2755,14 @@ Public Class Form1
         Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 4, 0)
         Runtime.InteropServices.Marshal.WriteInt64(_sv_shifted_hdr, 8, 0L)
         GmpRaw_init(_sv_shifted_hdr)   ' allocates fresh 1-limb buffer; freed by GmpRaw_clear below
-        ' §44: re-read accumPtr from result's stash after the serial accumulation loop.
-        ' The accumulation loop contains no inner SafeMpzMul calls so locals are uncorrupted,
-        ' but we re-read from the stash anyway for consistency with the §44 pattern.
-        savedResultPtr = result.Pointer
-        accumPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(savedResultPtr, 8))
+        ' §175: Do NOT re-read result.Pointer here.  Math.Gmp.Native corrupts mpz_t.Pointer
+        ' for locally-scoped objects during recursive SafeMpzMul calls (§78), so result.Pointer
+        ' may point to a wrong struct after sub-product computation.  The original savedResultPtr
+        ' (line 2260) and local accumPtr (line 2284) are plain IntPtr locals — immune to
+        ' managed-wrapper corruption — and are still correct here (accumulation loop has no
+        ' inner SafeMpzMul calls).  Re-reading was unnecessary and caused result.Pointer to be
+        ' restored to a corrupted address, making rSq.Pointer point at the wrong struct and
+        ' rSq bot/lower-limbs to appear as zero (§121 symptom), giving wrong Newton r.
 
         ' Copy accumPtr struct to savedResultPtr, then free the 16-byte accumPtr header.
         ' accumBuf ownership transfers to result (via savedResultPtr._mp_d); do NOT free it here.
@@ -3183,7 +3267,11 @@ Public Class Form1
             Dim _br144 As New mpz_t()
             gmp_lib.mpz_init(_br144)
             AppendLog($"[SafeMpzDiv§144] computing b*r to verify reciprocal (szB={szB:N0} szR={szR:N0})...{vbCrLf}")
+            ' §144-serial: force serial to avoid parallel SafeMpzMul race condition corrupting diagnostic
+            Dim _saved144Dop As Integer = System.Threading.Volatile.Read(_safeMulDop)
+            System.Threading.Volatile.Write(_safeMulDop, 1)
             SafeMpzMul(_br144, b, r)
+            System.Threading.Volatile.Write(_safeMulDop, _saved144Dop)
             Dim _szBR144 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_br144.Pointer, 4))
             Dim _kLimb144 As Long = kBits \ 64L
             Dim _kRem144 As Integer = CInt(kBits Mod 64L)

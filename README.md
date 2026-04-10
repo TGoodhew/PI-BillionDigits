@@ -2863,4 +2863,80 @@ If any split piece is zero-sized, `SafeMpzMul` now falls back to the general 9-p
 
 ### Status
 
-Fix applied in code; verification run pending.
+Fix verified: the 700M→1.4B Barrett step (kBits=2,800,000,027, szB=21,875,001) completed
+successfully with zero adj-up iterations.  The 1.4B→2.8B step (kBits=5,600,000,067,
+szB=43,750,001) also exercised the fix (B0sz=0 again) and passed without incident.
+
+---
+
+## §175/§181 — SafeMpzMul: remove result.Pointer re-reads after inner calls
+
+### Problem
+
+Inside the 3×3 recursive `SafeMpzMul`, `savedResultPtr` was being overwritten with
+`result.Pointer` in two places:
+
+1. **After the 9 inner sub-product calls** (before serial accumulation):
+   `savedResultPtr = result.Pointer`
+2. **After the serial accumulation loop** (before the final struct copy):
+   `savedResultPtr = result.Pointer`
+
+Both re-reads were intended for safety, but `result.Pointer` is a managed-wrapper field
+that Math.Gmp.Native may corrupt during recursive `SafeMpzMul` calls (§78 corruption —
+the inner call's `mpz_init`/`mpz_clear` side-effects overwrite the outer frame's managed
+field).  After a recursive sub-product call, `result.Pointer` pointed to a different struct
+than `savedResultPtr` (the original pre-alloc'd native struct).  The re-read therefore
+replaced the correct `savedResultPtr` with a corrupted address.
+
+The effect: the outer accumulation and final struct-copy operated on the wrong native
+struct, leaving `rSq`'s lower limbs zeroed — causing Newton iterations to appear
+converged prematurely and producing a wrong reciprocal.
+
+### Fix
+
+Removed both `savedResultPtr = result.Pointer` re-reads.  `savedResultPtr` is now
+captured exactly once (immediately after pre-alloc, before any inner call) and never
+overwritten.  `accumPtr` is derived from `savedResultPtr` rather than from
+`result.Pointer`.
+
+The serial accumulation loop contains no inner `SafeMpzMul` calls, so `accumPtr` is
+also stable across that loop — the second re-read was doubly unnecessary.
+
+### Status
+
+Fix applied and verified across Newton iterations 1–26 for szB=43,750,001.
+
+---
+
+## §176–§183 — SafeMpzMul diagnostic probes
+
+A set of `_logLevel >= 2` instrumentation probes added during the Barrett crash
+investigation to identify the source of zero-data corruption in Newton squarings:
+
+| Probe | Location | Purpose |
+|-------|----------|---------|
+| §176  | After 9 inner calls, mA=7,291,667 squarings | Log prods(0..2) bottom limbs immediately after inner SafeMpzMul |
+| §177  | After piece trim, mA=2,430,556 squarings | Log A0/A1/A2 sizes and raw limbs for depth-2 r×r calls |
+| §178  | After fast-path return, squarings only | Log if fast-path produced zero result (szA+szB ≤ threshold) |
+| §179  | After A0 trim loop | Log when A0-trim reduces to zero in squarings — with freed-buffer aliasing check |
+| §182  | Before k=6,7,8 inner calls (serial path) | Log A2._mp_d and A2_d[0] to detect mid-loop corruption |
+| §183  | SafeMpzMul entry, squarings only | Log if opA._mp_d already points to zero data on entry |
+
+These probes fire only when `_logLevel >= 2` and are conditioned to avoid hot-path
+overhead.  §179/§183 fire legitimately for `SafeMpzPow10` squarings (powers of 10 have
+trailing zero limbs); they do not fire for Newton squarings of r.
+
+---
+
+## §144-serial — SafeMpzDiv b×r diagnostic: force serial
+
+### Problem
+
+The `§144` diagnostic block (which computes `b×r` to verify the Newton reciprocal) was
+calling `SafeMpzMul` without serialising it, causing the diagnostic itself to race and
+potentially corrupt state being measured.
+
+### Fix
+
+Wrap the `§144` `SafeMpzMul(_br144, b, r)` call with `_safeMulDop = 1` save/restore,
+matching the §168 pattern used for the main reciprocal computation.
