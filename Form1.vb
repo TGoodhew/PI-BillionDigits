@@ -3553,8 +3553,21 @@ Public Class Form1
         End If
 
         ' Adjustment: remainder = a - q·b; fix until 0 ≤ remainder < b  (at most 2 corrections)
+        ' §184: Use raw struct header for qb — bypasses Math.Gmp.Native managed wrapper entirely.
+        ' gmp_lib.mpz_init(qb) + gmp_lib.mpz_sub(remainder, a, qb) goes through the managed
+        ' wrapper, which exhibits the §78 side-effect: after gmp_lib.mpz_init(remainder),
+        ' Math.Gmp.Native corrupts qb.Pointer (it scans registered mpz_t objects and updates
+        ' their Pointer fields).  When gmp_lib.mpz_sub then reads qb.Pointer, it gets a garbage
+        ' address and passes it to GMP's __gmpz_sub, which hits a STATUS_ASSERTION_FAILURE
+        ' (exception 0x40000015, offset 0x14ef6 in libgmp-10.dll) every time.
+        ' Fix: allocate qb as a plain raw IntPtr struct (Marshal.AllocHGlobal(16)), use
+        ' GmpRaw_init to fill it, pass SafeMpzMul the managed wrapper for result capture,
+        ' then do all subsequent operations (sub, clear) via raw P/Invoke using the captured
+        ' raw pointer — immune to §78 corruption.
+        Dim _qbRaw As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+        GmpRaw_init(_qbRaw)   ' sets _mp_alloc=1, _mp_size=0, allocates 1-limb buffer via GmpAllocFunc
         Dim qb As New mpz_t()
-        gmp_lib.mpz_init(qb)
+        qb.Pointer = _qbRaw
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] computing q*b (szQ={szQ:N0} szB={szB:N0})...{vbCrLf}")
         ' §167: Same all-levels serial fix for q×b.
         Dim _saved167Dop As Integer = System.Threading.Volatile.Read(_safeMulDop)
@@ -3562,58 +3575,68 @@ Public Class Form1
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§167] forcing all-serial for q×b (savedDop={_saved167Dop}){vbCrLf}")
         SafeMpzMul(qb, q, b)
         System.Threading.Volatile.Write(_safeMulDop, _saved167Dop)
-        Dim szQB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(qb.Pointer, 4))
+        ' Capture qb's raw pointer immediately — before any native call that could corrupt qb.Pointer.
+        Dim _qbPtr As IntPtr = qb.Pointer   ' = savedResultPtr set by SafeMpzMul
+        Dim szQB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4))
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§184] qb raw: alloc={Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 0):N0} size={Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4):N0} _mp_d={Runtime.InteropServices.Marshal.ReadInt64(_qbPtr, 8):X16}{vbCrLf}")
+        ' §184: Allocate remainder as raw struct too, for consistency and to avoid §78 corruption
+        ' of _qbPtr if gmp_lib.mpz_init(remainder) were used here.
+        Dim _remRaw As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+        GmpRaw_init(_remRaw)
         Dim remainder As New mpz_t()
-        gmp_lib.mpz_init(remainder)
-        gmp_lib.mpz_sub(remainder, a, qb)
-        gmp_lib.mpz_clear(qb)
-        Dim remSign As Integer = System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4))
-        Dim szRem As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4))
+        remainder.Pointer = _remRaw
+        ' §184: Use raw P/Invoke for sub — bypasses managed wrapper entirely.
+        GmpRaw_sub(_remRaw, a.Pointer, _qbPtr)
+        GmpRaw_clear(_qbPtr) : Runtime.InteropServices.Marshal.FreeHGlobal(_qbRaw)
+        qb.Pointer = IntPtr.Zero   ' prevent GC finalizer from double-freeing
+        Dim remSign As Integer = System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
+        Dim szRem As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
         If _logLevel >= 2 Then
-            Dim _remDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(remainder.Pointer, 8))
+            Dim _remDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_remRaw, 8))
             Dim _remTop As Long = If(szRem >= 1, Runtime.InteropServices.Marshal.ReadInt64(_remDPtr, (szRem - 1) * 8), 0L)
             Dim _bDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(b.Pointer, 8))
             Dim _bTop As Long = If(szB >= 1, Runtime.InteropServices.Marshal.ReadInt64(_bDPtr, (szB - 1) * 8), 0L)
             AppendLog($"[SafeMpzDiv] q*b done: szQB={szQB:N0}; remainder sign={remSign} szRem={szRem:N0} remTop={_remTop:X16} bTop={_bTop:X16}{vbCrLf}")
         End If
 
+        ' §184: All adj-down/adj-up operations use _remRaw directly (raw IntPtr) — immune to §78.
         ' §35: mpz_sgn is a GMP macro — read _mp_size field directly.
         Dim _adjDown As Integer = 0
-        Do While System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4)) < 0  ' q too large
+        Do While System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4)) < 0  ' q too large
             _adjDown += 1
             If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-down iter={_adjDown}{vbCrLf}")
             If _adjDown > MAX_ADJ_ITERS Then
-                Dim _szRem2 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4))
+                Dim _szRem2 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
+                GmpRaw_clear(_remRaw) : Runtime.InteropServices.Marshal.FreeHGlobal(_remRaw)
+                remainder.Pointer = IntPtr.Zero
                 Throw New InvalidOperationException($"SafeMpzDiv adj-down exceeded {MAX_ADJ_ITERS} iters — reciprocal likely wrong. szA={szA} szB={szB} aBits={aBits} kBits={kBits} szR={szR} szQ={szQ} szQB={szQB} szRem={_szRem2}")
             End If
-            gmp_lib.mpz_sub_ui(q, q, 1UI)
-            gmp_lib.mpz_add(remainder, remainder, b)
+            GmpRaw_sub_ui(q.Pointer, q.Pointer, 1UI)
+            GmpRaw_add(_remRaw, _remRaw, b.Pointer)
         Loop
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-down complete: {_adjDown} iter(s){vbCrLf}")
 
         Dim _adjUp As Integer = 0
-        Do While GmpRaw_cmp(remainder.Pointer, b.Pointer) >= 0   ' §35: q too small
+        Do While GmpRaw_cmp(_remRaw, b.Pointer) >= 0   ' §35: q too small
             _adjUp += 1
             If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-up iter={_adjUp}{vbCrLf}")
             If _adjUp > MAX_ADJ_ITERS Then
                 ' §171: Barrett reciprocal produced a wildly wrong q (off by more than MAX_ADJ_ITERS).
-                ' Root cause: SafeMpzReciprocal's fixed-domain Newton accumulates per-step floor
-                ' truncation errors (≈ 2^bShift * r_true/b per step) that dwarf the true Newton
-                ' correction, causing the result to be wrong by ~20M limbs for kBits≈2.8B.
-                ' Fall back to GMP's mpz_tdiv_q which uses a correctly-bounded half-domain Newton.
-                Dim _szRem171 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(remainder.Pointer, 4))
+                Dim _szRem171 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
                 AppendLog($"[SafeMpzDiv§171] adj-up exceeded {MAX_ADJ_ITERS} iters (szRem={_szRem171:N0} > szB={szB:N0}); falling back to mpz_tdiv_q{vbCrLf}")
-                gmp_lib.mpz_clear(remainder)
+                GmpRaw_clear(_remRaw) : Runtime.InteropServices.Marshal.FreeHGlobal(_remRaw)
+                remainder.Pointer = IntPtr.Zero
                 gmp_lib.mpz_tdiv_q(q, a, b)
                 AppendLog($"[SafeMpzDiv§171] mpz_tdiv_q fallback complete; szQ={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(q.Pointer, 4)):N0}{vbCrLf}")
                 Return
             End If
-            gmp_lib.mpz_add_ui(q, q, 1UI)
-            gmp_lib.mpz_sub(remainder, remainder, b)
+            GmpRaw_add_ui(q.Pointer, q.Pointer, 1UI)
+            GmpRaw_sub(_remRaw, _remRaw, b.Pointer)
         Loop
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-up complete: {_adjUp} iter(s); SafeMpzDiv done{vbCrLf}")
 
-        gmp_lib.mpz_clear(remainder)
+        GmpRaw_clear(_remRaw) : Runtime.InteropServices.Marshal.FreeHGlobal(_remRaw)
+        remainder.Pointer = IntPtr.Zero
     End Sub
 
     ' Compute result = floor(sqrt(n)).  Safe for any size n.

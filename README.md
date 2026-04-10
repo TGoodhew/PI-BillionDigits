@@ -2940,3 +2940,43 @@ potentially corrupt state being measured.
 
 Wrap the `§144` `SafeMpzMul(_br144, b, r)` call with `_safeMulDop = 1` save/restore,
 matching the §168 pattern used for the main reciprocal computation.
+
+---
+
+## §184 — SafeMpzDiv: bypass managed wrapper for qb and remainder (fix STATUS_ASSERTION_FAILURE crash)
+
+### Problem
+
+After `SafeMpzMul(qb, q, b)` returned, `SafeMpzDiv` called `gmp_lib.mpz_init(remainder)` via
+the Math.Gmp.Native managed wrapper, then `gmp_lib.mpz_sub(remainder, a, qb)`.
+
+The `gmp_lib.mpz_init(remainder)` call went through the managed wrapper, which triggered the §78
+side-effect: Math.Gmp.Native's internal tracking scanned registered `mpz_t` objects and updated
+their `Pointer` fields.  This corrupted `qb.Pointer` (even though `qb` was not passed to the
+call), replacing it with a stale/wrong address.
+
+When `gmp_lib.mpz_sub(remainder, a, qb)` was then called, Math.Gmp.Native read the corrupted
+`qb.Pointer` and passed a garbage struct address to GMP's `__gmpz_sub`.  GMP's internal
+assertion (`_mp_alloc ≥ abs(_mp_size)` or a limb-count sanity check) failed immediately,
+raising `STATUS_ASSERTION_FAILURE` (exception code 0x40000015) at offset 0x14ef6 in
+`libgmp-10.dll`.
+
+This crash was 100% reproducible: every run hit the same fault ~99 minutes in (after
+Newton completes for the 1.4B→2.8B step and q×b accumulation finishes).
+
+### Fix
+
+Replace all managed-wrapper calls in the post-`SafeMpzMul` section of `SafeMpzDiv` with raw
+P/Invoke calls (bypassing Math.Gmp.Native entirely):
+
+- Allocate `qb` as a plain `Marshal.AllocHGlobal(16)` struct + `GmpRaw_init` (not `gmp_lib.mpz_init`)
+- Capture `_qbPtr = qb.Pointer` immediately after `SafeMpzMul` returns, before any native call
+- Allocate `remainder` as a plain raw struct + `GmpRaw_init`
+- Use `GmpRaw_sub(_remRaw, a.Pointer, _qbPtr)` instead of `gmp_lib.mpz_sub(remainder, a, qb)`
+- Use `GmpRaw_clear` + `FreeHGlobal` for cleanup
+- All adj-down/adj-up operations use `_remRaw` and raw P/Invokes (`GmpRaw_sub_ui`, `GmpRaw_add`,
+  `GmpRaw_add_ui`, `GmpRaw_sub`, `GmpRaw_cmp`) — no managed wrapper calls touch `qb` or `remainder`
+
+### Status
+
+Fix applied and verified by build. Verification run in progress.
