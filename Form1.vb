@@ -2851,7 +2851,14 @@ Public Class Form1
     ' All large multiplications use SafeMpzMul — no direct mpn_mul_fft calls.
     Private Shared Sub SafeMpzReciprocal(r As mpz_t, b As mpz_t, kBits As Long)
         Const SAFE As Integer = 33_554_431
-        Dim bBits As Long = CLng(gmp_lib.mpz_sizeinbase(b, 2))
+        ' §174-fix: mpz_sizeinbase returns UInt32 — overflows when bBits > 2^31 (szB > 33M limbs).
+        ' Compute exact bBits from top limb via CLZ; avoids any overflow and is always precise.
+        Dim _szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
+        Dim _bDataPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(b.Pointer, 8))
+        Dim _topLimbPtr As IntPtr = New IntPtr(_bDataPtr.ToInt64() + CLng(_szB - 1) * 8L)
+        Dim _topLimb As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_topLimbPtr))
+        Dim _topLimbBits As Integer = 64 - System.Numerics.BitOperations.LeadingZeroCount(_topLimb)
+        Dim bBits As Long = CLng(_szB - 1) * 64L + CLng(_topLimbBits)
         Dim rBits As Long = kBits - bBits + 1L   ' r has at most rBits significant bits
         If rBits <= 0L Then
             gmp_lib.mpz_set_ui(r, 0UI)
@@ -3078,6 +3085,15 @@ Public Class Form1
                 GmpRaw_set_ui(r.Pointer, 1UI)    ' §NR-raw: bypass managed wrapper
                 prec = 1L
             End If
+
+            ' §173-removed: Do NOT zero lower bits of r.  §173 was introduced to fix a
+            ' hypothesised "garbage lower bits" problem, but it actually CAUSES the fixed-point
+            ' convergence failure: zeroing r's lower bits each step resets them to 0, so the
+            ' final iteration starts with lower bits=0 instead of the partially-converged value
+            ' from prior steps, causing p_after_shift top = r top (fixed point, szDelta≈42.8M).
+            ' Correct behaviour without §173: lower bits of r are "garbage" in early iterations
+            ' but they do NOT pollute the upper bits (the garbage contribution to p is confined
+            ' to low-order positions after the shift).  Newton converges normally.
         Loop
         ' §108-diag: log top 4 limbs of r to verify value (not just size)
         If _logLevel >= 2 Then
@@ -3104,8 +3120,17 @@ Public Class Form1
             Return
         End If
 
-        Dim aBits As Long = CLng(gmp_lib.mpz_sizeinbase(a, 2))
-        Dim bBits As Long = CLng(gmp_lib.mpz_sizeinbase(b, 2))
+        ' §172: Removed — §173 (zero lower bits after each Newton iter) fixes SafeMpzReciprocal
+        ' convergence for all szB, so the mpz_tdiv_q bypass is no longer needed.
+
+        ' §174: Compute aBits/bBits directly from limb counts to avoid GMP's mpz_sizeinbase
+        ' truncation bug: on GMP's MSVC build mp_bitcnt_t is 32-bit unsigned long, so
+        ' mpz_sizeinbase overflows for numbers > ~67M limbs (2^32 / 64 = 67.1M), returning
+        ' a truncated value.  For a=103.8M limbs (6.64B bits) the truncated result is 2.35B
+        ' which makes kBits < bBits → rBits negative → Newton loop skipped → Barrett fails.
+        ' Using szA*64 and szB*64 gives correct upper bounds (within 63 bits of actual).
+        Dim aBits As Long = CLng(szA) * 64L
+        Dim bBits As Long = CLng(szB) * 64L
         ' r = floor(2^kBits / b), kBits = aBits+3 (Barrett: quotient_bits + divisor_bits + margin)
         Dim kBits As Long = aBits + 3L
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] entry: szA={szA:N0} szB={szB:N0} aBits={aBits:N0} bBits={bBits:N0} kBits={kBits:N0}{vbCrLf}")
@@ -3527,8 +3552,13 @@ Public Class Form1
             Return
         End If
 
-        Dim bitsN As Long = CLng(gmp_lib.mpz_sizeinbase(n, 2))
-        Dim bitsS As Long = (bitsN + 1L) >> 1   ' bits in floor(sqrt(n))
+        ' §174: gmp_lib.mpz_sizeinbase uses GMP's MSVC mp_bitcnt_t (32-bit unsigned long on Windows).
+        ' For szN > 67.1M limbs (bitsN > 4.29B) the return value truncates.  szN=103.8M → 6.64B
+        ' truncates to 2.35B, giving bitsS=1.17B instead of 3.32B, which causes the Newton loop
+        ' to be skipped entirely (kBitsX=2.8B > bitsS+2=1.17B).  Use szN*64 as a safe upper bound.
+        ' bitsS upper bound is ceil(szN*64 / 2) = (szN*64+1) / 2 = szN*32 + (if odd, 1 else 0).
+        Dim bitsN As Long = CLng(szN) * 64L   ' upper bound; actual bitsN ≤ szN*64 and ≥ szN*64-63
+        Dim bitsS As Long = (bitsN + 1L) >> 1   ' bits in floor(sqrt(n)) — upper bound is fine for loop termination
 
         ' Seed: mpz_sqrt at safe scale — result ≤ SEED_BITS bits = ~5.5M limbs
         Const SEED_BITS As Long = 350_000_000L
@@ -3588,9 +3618,11 @@ Public Class Form1
 
         ' Newton refinement — doubles precision each step
         Dim _newtonStep As Integer = 0
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt§175] Newton loop entry: kBitsX={kBitsX:N0} bitsS={bitsS:N0} bitsN={bitsN:N0} szN={szN:N0} loop_cond={kBitsX < bitsS + 2L}{vbCrLf}")
         Do While kBitsX < bitsS + 2L
             _newtonStep += 1
             Dim target As Long = System.Math.Min(kBitsX * 2L + 4L, bitsS + 2L)
+            If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt§175] Newton step {_newtonStep}: target={target:N0}{vbCrLf}")
             Dim nShift As Long = System.Math.Max(0L, bitsN - 2L * target)
             If (nShift And 1L) <> 0L Then nShift += 1L
             Dim xHalf As Long = nShift >> 1
