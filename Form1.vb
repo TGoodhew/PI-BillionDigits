@@ -3197,6 +3197,12 @@ Public Class Form1
     Private Shared Sub SafeMpzDiv(q As mpz_t, a As mpz_t, b As mpz_t)
         Const SAFE As Integer = 33_554_431
         Const MAX_ADJ_ITERS As Integer = 10   ' Barrett should need ≤ 2; >10 means reciprocal is wrong
+        ' §184c: Capture a.Pointer and b.Pointer as plain IntPtrs immediately on entry.
+        ' Every SafeMpzMul call in this function (a×r and q×b) triggers the §78 side-effect,
+        ' corrupting ALL registered mpz_t Pointer fields — including a.Pointer and b.Pointer.
+        ' These pre-captured values remain valid for the lifetime of SafeMpzDiv.
+        Dim _aPtr As IntPtr = a.Pointer
+        Dim _bPtr As IntPtr = b.Pointer
         Dim szA As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(a.Pointer, 4))
         Dim szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
         If CLng(szA) + CLng(szB) <= SAFE Then
@@ -3564,13 +3570,7 @@ Public Class Form1
         ' GmpRaw_init to fill it, pass SafeMpzMul the managed wrapper for result capture,
         ' then do all subsequent operations (sub, clear) via raw P/Invoke using the captured
         ' raw pointer — immune to §78 corruption.
-        ' §184b: Capture a.Pointer and b.Pointer as plain IntPtrs BEFORE SafeMpzMul(qb,q,b).
-        ' SafeMpzMul's managed wrapper exhibits the §78 side-effect: it corrupts the Pointer
-        ' fields of ALL registered mpz_t objects (not just those passed to the call), including
-        ' a and b.  After SafeMpzMul returns, a.Pointer and b.Pointer are invalid.
-        ' Capturing them here ensures GmpRaw_sub and adj-loop calls use correct native addresses.
-        Dim _aPtr As IntPtr = a.Pointer
-        Dim _bPtr As IntPtr = b.Pointer
+        ' _aPtr and _bPtr were captured at SafeMpzDiv entry (§184c) — already correct here.
         Dim _qbRaw As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
         GmpRaw_init(_qbRaw)   ' sets _mp_alloc=1, _mp_size=0, allocates 1-limb buffer via GmpAllocFunc
         Dim qb As New mpz_t()
@@ -3586,12 +3586,18 @@ Public Class Form1
         Dim _qbPtr As IntPtr = qb.Pointer   ' = savedResultPtr set by SafeMpzMul
         Dim szQB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4))
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§184] qb raw: alloc={Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 0):N0} size={Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4):N0} _mp_d={Runtime.InteropServices.Marshal.ReadInt64(_qbPtr, 8):X16}{vbCrLf}")
-        ' §184: Allocate remainder as raw struct — GmpRaw_init bypasses managed wrapper entirely.
+        ' §184: Allocate remainder as raw struct with pre-allocated limb buffer large enough
+        ' to hold the result of a - qb (max szA limbs) — avoids GmpReallocFunc being called
+        ' inside __gmpz_sub, which could trigger the §78 side-effect or pool interaction.
+        Dim _remLimbs As Long = CLng(szA) + 2L
+        Dim _remBuf As IntPtr = GmpNativeAlloc_PoolGet(_remLimbs * 8L)
         Dim _remRaw As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
-        GmpRaw_init(_remRaw)
+        Runtime.InteropServices.Marshal.WriteInt32(_remRaw, 0, CInt(_remLimbs))  ' _mp_alloc
+        Runtime.InteropServices.Marshal.WriteInt32(_remRaw, 4, 0)                ' _mp_size = 0
+        Runtime.InteropServices.Marshal.WriteInt64(_remRaw, 8, _remBuf.ToInt64()) ' _mp_d
         Dim remainder As New mpz_t()
         remainder.Pointer = _remRaw
-        ' §184: Use captured _aPtr (pre-SafeMpzMul) — a.Pointer is corrupted by §78 after the call.
+        ' §184: Use captured _aPtr and _qbPtr — both corrupted by §78 after SafeMpzMul.
         GmpRaw_sub(_remRaw, _aPtr, _qbPtr)
         GmpRaw_clear(_qbPtr) : Runtime.InteropServices.Marshal.FreeHGlobal(_qbRaw)
         qb.Pointer = IntPtr.Zero   ' prevent GC finalizer from double-freeing
