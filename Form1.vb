@@ -3564,6 +3564,13 @@ Public Class Form1
         ' GmpRaw_init to fill it, pass SafeMpzMul the managed wrapper for result capture,
         ' then do all subsequent operations (sub, clear) via raw P/Invoke using the captured
         ' raw pointer — immune to §78 corruption.
+        ' §184b: Capture a.Pointer and b.Pointer as plain IntPtrs BEFORE SafeMpzMul(qb,q,b).
+        ' SafeMpzMul's managed wrapper exhibits the §78 side-effect: it corrupts the Pointer
+        ' fields of ALL registered mpz_t objects (not just those passed to the call), including
+        ' a and b.  After SafeMpzMul returns, a.Pointer and b.Pointer are invalid.
+        ' Capturing them here ensures GmpRaw_sub and adj-loop calls use correct native addresses.
+        Dim _aPtr As IntPtr = a.Pointer
+        Dim _bPtr As IntPtr = b.Pointer
         Dim _qbRaw As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
         GmpRaw_init(_qbRaw)   ' sets _mp_alloc=1, _mp_size=0, allocates 1-limb buffer via GmpAllocFunc
         Dim qb As New mpz_t()
@@ -3579,14 +3586,13 @@ Public Class Form1
         Dim _qbPtr As IntPtr = qb.Pointer   ' = savedResultPtr set by SafeMpzMul
         Dim szQB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4))
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§184] qb raw: alloc={Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 0):N0} size={Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4):N0} _mp_d={Runtime.InteropServices.Marshal.ReadInt64(_qbPtr, 8):X16}{vbCrLf}")
-        ' §184: Allocate remainder as raw struct too, for consistency and to avoid §78 corruption
-        ' of _qbPtr if gmp_lib.mpz_init(remainder) were used here.
+        ' §184: Allocate remainder as raw struct — GmpRaw_init bypasses managed wrapper entirely.
         Dim _remRaw As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
         GmpRaw_init(_remRaw)
         Dim remainder As New mpz_t()
         remainder.Pointer = _remRaw
-        ' §184: Use raw P/Invoke for sub — bypasses managed wrapper entirely.
-        GmpRaw_sub(_remRaw, a.Pointer, _qbPtr)
+        ' §184: Use captured _aPtr (pre-SafeMpzMul) — a.Pointer is corrupted by §78 after the call.
+        GmpRaw_sub(_remRaw, _aPtr, _qbPtr)
         GmpRaw_clear(_qbPtr) : Runtime.InteropServices.Marshal.FreeHGlobal(_qbRaw)
         qb.Pointer = IntPtr.Zero   ' prevent GC finalizer from double-freeing
         Dim remSign As Integer = System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
@@ -3594,7 +3600,7 @@ Public Class Form1
         If _logLevel >= 2 Then
             Dim _remDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_remRaw, 8))
             Dim _remTop As Long = If(szRem >= 1, Runtime.InteropServices.Marshal.ReadInt64(_remDPtr, (szRem - 1) * 8), 0L)
-            Dim _bDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(b.Pointer, 8))
+            Dim _bDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_bPtr, 8))
             Dim _bTop As Long = If(szB >= 1, Runtime.InteropServices.Marshal.ReadInt64(_bDPtr, (szB - 1) * 8), 0L)
             AppendLog($"[SafeMpzDiv] q*b done: szQB={szQB:N0}; remainder sign={remSign} szRem={szRem:N0} remTop={_remTop:X16} bTop={_bTop:X16}{vbCrLf}")
         End If
@@ -3612,12 +3618,12 @@ Public Class Form1
                 Throw New InvalidOperationException($"SafeMpzDiv adj-down exceeded {MAX_ADJ_ITERS} iters — reciprocal likely wrong. szA={szA} szB={szB} aBits={aBits} kBits={kBits} szR={szR} szQ={szQ} szQB={szQB} szRem={_szRem2}")
             End If
             GmpRaw_sub_ui(q.Pointer, q.Pointer, 1UI)
-            GmpRaw_add(_remRaw, _remRaw, b.Pointer)
+            GmpRaw_add(_remRaw, _remRaw, _bPtr)
         Loop
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-down complete: {_adjDown} iter(s){vbCrLf}")
 
         Dim _adjUp As Integer = 0
-        Do While GmpRaw_cmp(_remRaw, b.Pointer) >= 0   ' §35: q too small
+        Do While GmpRaw_cmp(_remRaw, _bPtr) >= 0   ' §35: q too small
             _adjUp += 1
             If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-up iter={_adjUp}{vbCrLf}")
             If _adjUp > MAX_ADJ_ITERS Then
@@ -3631,7 +3637,7 @@ Public Class Form1
                 Return
             End If
             GmpRaw_add_ui(q.Pointer, q.Pointer, 1UI)
-            GmpRaw_sub(_remRaw, _remRaw, b.Pointer)
+            GmpRaw_sub(_remRaw, _remRaw, _bPtr)
         Loop
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-up complete: {_adjUp} iter(s); SafeMpzDiv done{vbCrLf}")
 
