@@ -3739,6 +3739,15 @@ Public Class Form1
 
         If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] seed ready ({CLng(gmp_lib.mpz_sizeinbase(x, 10)):N0} digits); beginning Newton refinement{vbCrLf}")
 
+        ' §SqNewton: Capture raw x and n native struct pointers before the Newton loop.
+        ' SafeMpzDiv (called inside the loop) makes managed GMP calls (mpz_init/clear for r, ar,
+        ' bTrunc, rSq, p inside SafeMpzReciprocal) that trigger the §78 side-effect, corrupting
+        ' ALL registered mpz_t.Pointer fields — including x.Pointer and n.Pointer in this scope.
+        ' By capturing raw pointers here (before any managed calls in the loop), and restoring
+        ' them at the end of each iteration, BigShiftRight/GmpRaw_set use valid native structs.
+        Dim _xNativePtr As IntPtr = x.Pointer
+        Dim _nNativePtr As IntPtr = n.Pointer
+
         ' Newton refinement — doubles precision each step
         Dim _newtonStep As Integer = 0
         If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt§175] Newton loop entry: kBitsX={kBitsX:N0} bitsS={bitsS:N0} bitsN={bitsN:N0} szN={szN:N0} loop_cond={kBitsX < bitsS + 2L}{vbCrLf}")
@@ -3750,18 +3759,42 @@ Public Class Form1
             If (nShift And 1L) <> 0L Then nShift += 1L
             Dim xHalf As Long = nShift >> 1
 
+            ' §SqNewton: Use raw AllocHGlobal structs for nTrunc/xTrunc/q instead of
+            ' gmp_lib.mpz_init — bypasses the §78 managed-wrapper corruption.
+            ' gmp_lib.mpz_init registers objects with Math.Gmp.Native, which then corrupts
+            ' ALL registered Pointer fields on subsequent managed GMP calls inside SafeMpzDiv
+            ' (mpz_init(r), SafeMpzReciprocal's mpz_init(bTrunc/rSq/p), mpz_clear(ar), etc.).
+            ' Raw structs are invisible to the managed framework — their .Pointer fields
+            ' cannot be corrupted — so SafeMpzDiv receives valid native struct addresses.
+            Dim _nTruncRaw As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+            GmpRaw_init(_nTruncRaw)
             Dim nTrunc As New mpz_t()
-            gmp_lib.mpz_init(nTrunc)
-            If nShift > 0L Then BigShiftRight(nTrunc, n, nShift) Else GmpRaw_set(nTrunc.Pointer, n.Pointer)  ' §35
+            nTrunc.Pointer = _nTruncRaw
+            If nShift > 0L Then
+                BigShiftRight(nTrunc, n, nShift)
+            Else
+                PreAllocMpzToLimbs(nTrunc, CLng(szN))  ' pre-alloc to szN limbs; avoids small→large inside __gmpz_set
+                GmpRaw_set(_nTruncRaw, _nNativePtr)    ' copy n using captured raw pointer — immune to §78
+            End If
 
+            Dim _xTruncRaw As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+            GmpRaw_init(_xTruncRaw)
             Dim xTrunc As New mpz_t()
-            gmp_lib.mpz_init(xTrunc)
-            If xHalf > 0L Then BigShiftRight(xTrunc, x, xHalf) Else GmpRaw_set(xTrunc.Pointer, x.Pointer)  ' §35
+            xTrunc.Pointer = _xTruncRaw
+            If xHalf > 0L Then
+                BigShiftRight(xTrunc, x, xHalf)
+            Else
+                Dim _szX As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_xNativePtr, 4))
+                PreAllocMpzToLimbs(xTrunc, CLng(_szX))  ' pre-alloc
+                GmpRaw_set(_xTruncRaw, _xNativePtr)     ' copy x using captured raw pointer
+            End If
 
+            Dim _qRaw As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+            GmpRaw_init(_qRaw)
             Dim q As New mpz_t()
-            gmp_lib.mpz_init(q)
-            Dim szNT As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(nTrunc.Pointer, 4))
-            Dim szXT As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(xTrunc.Pointer, 4))
+            q.Pointer = _qRaw
+            Dim szNT As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_nTruncRaw, 4))
+            Dim szXT As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_xTruncRaw, 4))
 
             ' §140: verify xTrunc at B2-range positions by reading x's raw limbs and comparing.
             ' xHalf=1921928090: xHalf_limb=30030126, xHalf_rem=26.
@@ -3769,8 +3802,8 @@ Public Class Form1
             ' Check 7 evenly-spaced B2-range positions + 2 midpoint/top.
             If _logLevel >= 2 AndAlso szXT = 21875001 AndAlso xHalf = 1921928090L Then
                 Dim _xHLimb140 As Long = 30030126L
-                Dim _xSz140 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(x.Pointer, 4))
-                Dim _xD140 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(x.Pointer, 8))
+                Dim _xSz140 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_xNativePtr, 4))
+                Dim _xD140 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_xNativePtr, 8))
                 Dim _xtD140 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(xTrunc.Pointer, 8))
                 ' §153: Extended check — add 8 positions in [14904664..21554666] (the B2 range contributing to A2×B2[13612996]).
                 ' These positions have never been verified. A mismatch here proves BigShiftRight corrupts b at that location.
@@ -3797,8 +3830,8 @@ Public Class Form1
                 Const _TGT133 As Long = 42779664L
                 Dim _limb133 As Long = nShift \ 64L
                 Dim _bit133 As Integer = CInt(nShift Mod 64L)
-                Dim _nSz133 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(n.Pointer, 4))
-                Dim _nD133 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(n.Pointer, 8))
+                Dim _nSz133 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_nNativePtr, 4))
+                Dim _nD133 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_nNativePtr, 8))
                 Dim _idxLo133 As Long = _limb133 + _TGT133
                 Dim _idxHi133 As Long = _limb133 + _TGT133 + 1L
                 Dim _vLo133 As Long = If(_idxLo133 < CLng(_nSz133), Runtime.InteropServices.Marshal.ReadInt64(_nD133, CInt(_idxLo133 * 8L)), 0L)
@@ -3817,15 +3850,27 @@ Public Class Form1
             Else
                 SafeMpzDiv(q, nTrunc, xTrunc)
             End If
-            gmp_lib.mpz_clear(nTrunc)
+            ' §SqNewton: Use raw GmpRaw ops for cleanup — no managed mpz_clear/mpz_add.
+            ' After SafeMpzDiv, all managed mpz_t.Pointer fields in this scope are potentially
+            ' corrupted by §78. We use only the captured raw IntPtrs (_nTruncRaw, _xTruncRaw,
+            ' _qRaw, _xNativePtr) for all post-SafeMpzDiv operations.
+            GmpRaw_clear(_nTruncRaw)                                              ' free nTrunc limb buffer
+            nTrunc.Pointer = IntPtr.Zero                                          ' prevent finalizer mpz_clear
+            Runtime.InteropServices.Marshal.FreeHGlobal(_nTruncRaw)
 
-            gmp_lib.mpz_add(xTrunc, xTrunc, q)
-            gmp_lib.mpz_clear(q)
-            GmpRaw_tdiv_q_2exp(xTrunc.Pointer, xTrunc.Pointer, 1UI)   ' >> 1
+            GmpRaw_add(_xTruncRaw, _xTruncRaw, _qRaw)                           ' xTrunc += q
+            GmpRaw_clear(_qRaw)                                                   ' free q limb buffer
+            q.Pointer = IntPtr.Zero
+            Runtime.InteropServices.Marshal.FreeHGlobal(_qRaw)
+            GmpRaw_tdiv_q_2exp(_xTruncRaw, _xTruncRaw, 1UI)                     ' xTrunc >>= 1
 
             If xHalf > 0L Then BigShiftLeft(xTrunc, xTrunc, xHalf)
-            GmpRaw_swap(x.Pointer, xTrunc.Pointer)  ' §35
-            gmp_lib.mpz_clear(xTrunc)
+            GmpRaw_swap(_xNativePtr, _xTruncRaw)  ' swap: x's native struct gets new Newton value
+            x.Pointer = _xNativePtr               ' restore managed x.Pointer (corrupted by SafeMpzDiv §78)
+            n.Pointer = _nNativePtr               ' restore managed n.Pointer for next iteration
+            GmpRaw_clear(_xTruncRaw)                                              ' free old x limb buffer
+            xTrunc.Pointer = IntPtr.Zero
+            Runtime.InteropServices.Marshal.FreeHGlobal(_xTruncRaw)
             kBitsX = target
 
             ' §106: Save Newton step checkpoint immediately after completion.

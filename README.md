@@ -2979,4 +2979,52 @@ P/Invoke calls (bypassing Math.Gmp.Native entirely):
 
 ### Status
 
-Fix applied and verified by build. Verification run in progress.
+Fix applied and verified: computation completed the 1.4B→2.8B Newton step and
+saved checkpoint kBitsX=2,800,000,028 successfully.
+
+---
+
+## §SqNewton — SafeMpzSqrt Newton loop: bypass managed wrapper for nTrunc/xTrunc/q (fix STATUS_ASSERTION_FAILURE crash)
+
+### Problem
+
+After the 1.4B→2.8B checkpoint was saved, the compute resumed for the 2.8B→5.6B
+(final) Newton step in `SafeMpzSqrt`.  For this step `nShift=0` and `xHalf=0`, so
+the code path falls through to the `GmpRaw_set(nTrunc.Pointer, n.Pointer)` branch.
+
+The crash occurred because the three `gmp_lib.mpz_init` calls at the top of the
+Newton loop (`nTrunc`, `xTrunc`, `q`) went through the Math.Gmp.Native managed wrapper,
+triggering the §78 side-effect: every registered `mpz_t.Pointer` field was updated.
+After `gmp_lib.mpz_init(nTrunc)` the values of `n.Pointer` and `x.Pointer` in the
+enclosing scope became stale (pointing to wrong native structs).  When
+`GmpRaw_set(nTrunc.Pointer, n.Pointer)` was then called, it passed the corrupted
+`n.Pointer` address to GMP's `__gmpz_set`, which called `_mpz_realloc` on a garbage
+struct and fired GMP's internal assertion at offset 0x14ef6 in `libgmp-10.dll`
+(`STATUS_ASSERTION_FAILURE`, code 0x40000015).
+
+This crash always happened at the start of the final Newton step — never on earlier
+iterations because those used `BigShiftRight` (pure raw calls) instead of `GmpRaw_set`.
+
+### Fix (§SqNewton)
+
+Apply the same raw-struct bypass used by §184:
+
+- Before the Newton loop, capture `_xNativePtr = x.Pointer` and `_nNativePtr = n.Pointer`.
+- Inside each iteration, allocate `nTrunc`, `xTrunc`, `q` with `Marshal.AllocHGlobal(16) + GmpRaw_init`
+  instead of `gmp_lib.mpz_init` — these are never registered with the managed wrapper.
+- When `nShift=0` (copy n whole): use `PreAllocMpzToLimbs(nTrunc, szN)` then
+  `GmpRaw_set(_nTruncRaw, _nNativePtr)` using the pre-captured raw pointer.
+- When `xHalf=0` (copy x whole): similarly use `_xNativePtr` for the copy source.
+- After `SafeMpzDiv` returns (which triggers §78 again internally), restore:
+  `x.Pointer = _xNativePtr` and `n.Pointer = _nNativePtr`.
+- Replace `gmp_lib.mpz_add(xTrunc, xTrunc, q)` with `GmpRaw_add(_xTruncRaw, _xTruncRaw, _qRaw)`.
+- Replace `gmp_lib.mpz_tdiv_q_2exp` with `GmpRaw_tdiv_q_2exp`.
+- Replace `gmp_lib.mpz_clear` + `FreeHGlobal` for all three raw structs.
+- Use `GmpRaw_swap(_xNativePtr, _xTruncRaw)` (not `x.Pointer`) to update x after each step,
+  then immediately restore `x.Pointer = _xNativePtr`.
+
+### Status
+
+Fix applied; computation passed the previous crash point and entered `SafeMpzDiv`
+for the 2.8B→5.6B step (szA=103,810,254, szB=51,905,127 limbs) for the first time.
+`SafeMpzReciprocal` Newton iterations are running.
