@@ -4808,6 +4808,14 @@ Phase3Start:
             gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpNumer, gmpPi, gmpOne, Nothing)
             gmpVariablesInitialized = True
 
+            ' §NumeratorDiv: Capture native struct pointers immediately after mpz_inits, before
+            ' any managed GMP call triggers §78 and overwrites these Pointer fields with stale/wrong
+            ' addresses.  Native struct addresses never change (only _mp_d inside changes on realloc),
+            ' so these captures remain valid through all TryLoadPhase3Value / mpz_clear / mpz_init calls.
+            Dim _gmpPiRaw As IntPtr = gmpPi.Pointer
+            Dim _gmpNumerRaw As IntPtr = gmpNumer.Pointer
+            Dim _finalTRaw As IntPtr = IntPtr.Zero  ' set below after mpz_init(finalT) in checkpoint path
+
             ' §106 checkpoint: if gmpNumer was already computed and saved, skip Steps 1–5
             ' (SafeMpzPow10, SafeMpzMul squaring, sqrt, and all three R*Q multiplies).
             If TryLoadPhase3Value("gmpNumer", gmpNumer, p3SnapDir) Then
@@ -4815,6 +4823,7 @@ Phase3Start:
                 ' finalT is still needed for the divide — reload from spill or checkpoint.
                 gmp_lib.mpz_clear(finalT)   ' finalT was mpz_inits'd above as 0
                 gmp_lib.mpz_init(finalT)
+                _finalTRaw = finalT.Pointer  ' §NumeratorDiv: capture after fresh init, before TryLoadPhase3Value fires §78
                 If Not TryLoadPhase3Value("finalT", finalT, p3SnapDir) Then
                     ' finalT not checkpointed yet — must reload from snap_Phase3 P/Q/T files.
                     ' (This path only occurs if gmpNumer was saved but finalT spill was lost.)
@@ -5348,6 +5357,14 @@ Phase3Start:
             End Try
 
 NumeratorDone:
+            ' §NumeratorDiv: Restore Pointer fields corrupted by §78 during checkpoint loading.
+            ' Managed calls (TryLoadPhase3Value, mpz_clear, mpz_init) triggered §78 side-effect
+            ' which overwrote gmpPi.Pointer/gmpNumer.Pointer/finalT.Pointer with stale addresses.
+            ' Without restoration, the gmpPi pre-alloc below reads from a bad Pointer and passes
+            ' a garbage native-heap address to _savedGmpFree → STATUS_HEAP_CORRUPTION (0xc0000374).
+            If _gmpPiRaw <> IntPtr.Zero Then gmpPi.Pointer = _gmpPiRaw
+            If _gmpNumerRaw <> IntPtr.Zero Then gmpNumer.Pointer = _gmpNumerRaw
+            If _finalTRaw <> IntPtr.Zero Then finalT.Pointer = _finalTRaw
             If _logLevel >= 2 Then
                 WriteToLog($"[ComputePi] finalT reloaded from spill file")
                 WriteToLog($"[ComputePi] mpz_tdiv_q: pi = numer / T  (numer~{CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 10)):N0} digits  T~{CLng(gmp_lib.mpz_sizeinbase(finalT, 10)):N0} digits)")

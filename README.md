@@ -3025,6 +3025,59 @@ Apply the same raw-struct bypass used by §184:
 
 ### Status
 
-Fix applied; computation passed the previous crash point and entered `SafeMpzDiv`
-for the 2.8B→5.6B step (szA=103,810,254, szB=51,905,127 limbs) for the first time.
-`SafeMpzReciprocal` Newton iterations are running.
+Fix applied; computation completed the 2.8B→5.6B Newton step. Checkpoint
+kBitsX=3,321,928,130 saved.
+
+---
+
+## §NumeratorDiv — ComputePi final division: restore Pointer fields after §78 corruption (fix STATUS_HEAP_CORRUPTION)
+
+### Problem
+
+After SafeMpzSqrt completed and the numerator was saved to the `gmpNumer` checkpoint,
+the next restart loaded `gmpNumer` from `snap_Phase3/gmpNumer.bin` via
+`TryLoadPhase3Value("gmpNumer", gmpNumer, ...)` and similarly for `finalT`.
+
+These checkpoint-loading calls go through the Math.Gmp.Native managed wrapper
+(`gmp_lib.mpz_realloc2`, `gmp_lib.mpz_clear`, `gmp_lib.mpz_init`), each triggering
+the §78 side-effect: all registered `mpz_t.Pointer` fields are overwritten with
+stale/wrong native struct addresses.  By the time the code reached `NumeratorDone`,
+`gmpPi.Pointer`, `gmpNumer.Pointer`, and `finalT.Pointer` were all corrupted.
+
+At the gmpPi pre-allocation block (just before `SafeMpzDiv(gmpPi, gmpNumer, finalT)`),
+the code read `gmpPi.Pointer` to find the old 1-limb buffer address, then called
+`_savedGmpFree(old_buf, 8)` to release it before writing the new large VirtualAlloc
+pointer.  With a corrupted `gmpPi.Pointer`, `old_buf` was a garbage native-heap address.
+Passing a garbage pointer to `_savedGmpFree` (the CRT `free`) immediately corrupted the
+Windows heap, raising `STATUS_HEAP_CORRUPTION` (exception code 0xc0000374) at
+`ntdll.dll+0x1176e5`.
+
+### Fix (§NumeratorDiv)
+
+Capture the three native struct addresses immediately after `gmp_lib.mpz_inits` (before
+any managed call can trigger §78), and after `gmp_lib.mpz_init(finalT)` (the last init
+before `TryLoadPhase3Value` fires §78 for `finalT`).  Restore all three at
+`NumeratorDone` before the pre-alloc and `SafeMpzDiv` call:
+
+```vb
+' Captured before §78 corrupts them:
+Dim _gmpPiRaw As IntPtr = gmpPi.Pointer
+Dim _gmpNumerRaw As IntPtr = gmpNumer.Pointer
+Dim _finalTRaw As IntPtr = IntPtr.Zero      ' set after mpz_init(finalT)
+
+' ... after gmp_lib.mpz_init(finalT):
+_finalTRaw = finalT.Pointer
+
+' At NumeratorDone, before pre-alloc:
+If _gmpPiRaw <> IntPtr.Zero Then gmpPi.Pointer = _gmpPiRaw
+If _gmpNumerRaw <> IntPtr.Zero Then gmpNumer.Pointer = _gmpNumerRaw
+If _finalTRaw <> IntPtr.Zero Then finalT.Pointer = _finalTRaw
+```
+
+Native struct addresses never change (only `_mp_d` inside the struct changes on
+realloc), so the captured IntPtrs remain valid even after the checkpoint-loading
+reallocs modify the limb data.
+
+### Status
+
+Fix applied and built (Debug). Restarting computation from gmpNumer checkpoint.
