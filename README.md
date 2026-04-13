@@ -3052,32 +3052,49 @@ Passing a garbage pointer to `_savedGmpFree` (the CRT `free`) immediately corrup
 Windows heap, raising `STATUS_HEAP_CORRUPTION` (exception code 0xc0000374) at
 `ntdll.dll+0x1176e5`.
 
-### Fix (§NumeratorDiv)
+### Fix (§NumeratorDiv-v4)
 
-Capture the three native struct addresses immediately after `gmp_lib.mpz_inits` (before
-any managed call can trigger §78), and after `gmp_lib.mpz_init(finalT)` (the last init
-before `TryLoadPhase3Value` fires §78 for `finalT`).  Restore all three at
-`NumeratorDone` before the pre-alloc and `SafeMpzDiv` call:
+Two earlier attempts (d796769, 7487b61) to restore the three Pointer fields also failed:
+the captures were taken after `gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpNumer, gmpPi, gmpOne)`,
+but `mpz_inits` fires §78 during each internal `mpz_init` call.  The §78 fired during
+`mpz_init(gmpOne)` (last in the list) overwrote `gmpPi.Pointer` before we could capture it,
+so `_gmpPiRaw` itself contained a stale/wrong address — restoring to it put a garbage pointer
+into `gmpPi`, and the pre-alloc `_savedGmpFree` call still crashed.  By the same mechanism,
+`_gmpNumerRaw` was also wrong (overwritten by §78 during `mpz_init(gmpPi)` and `mpz_init(gmpOne)`).
+
+Additionally, the gmpPi pre-alloc block was removed entirely: it was never safe because even
+with a correct `_gmpPiRaw`, GmpReallocFunc handles the 1-limb CRT → large VirtualAlloc growth
+correctly when `SafeMpzDiv` first writes to `gmpPi` — one realloc inside the division is
+harmless.
+
+**Root fix:** remove `gmpNumer` and `gmpPi` from `mpz_inits`; init them separately, in order,
+capturing each `Pointer` immediately after its own `mpz_init` and before the next call fires §78:
 
 ```vb
-' Captured before §78 corrupts them:
-Dim _gmpPiRaw As IntPtr = gmpPi.Pointer
-Dim _gmpNumerRaw As IntPtr = gmpNumer.Pointer
-Dim _finalTRaw As IntPtr = IntPtr.Zero      ' set after mpz_init(finalT)
+gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpOne, Nothing)   ' gmpNumer/gmpPi excluded
+gmp_lib.mpz_init(gmpNumer)
+Dim _gmpNumerRaw As IntPtr = gmpNumer.Pointer  ' correct: captured before mpz_init(gmpPi) fires §78
+gmp_lib.mpz_init(gmpPi)
+Dim _gmpPiRaw As IntPtr = gmpPi.Pointer        ' correct: no managed GMP call between here and mpz_init(gmpPi)
+gmpNumer.Pointer = _gmpNumerRaw                ' restore: mpz_init(gmpPi) just fired §78 and corrupted gmpNumer.Pointer
+```
 
-' ... after gmp_lib.mpz_init(finalT):
-_finalTRaw = finalT.Pointer
+After this, `gmpNumer.Pointer` is correct so `TryLoadPhase3Value("gmpNumer", gmpNumer, ...)`
+(which calls `DeserializeOneMpz` → `Marshal.WriteInt32(val.Pointer, ...)`) writes to the right
+native struct.  `_finalTRaw` is captured after `gmp_lib.mpz_init(finalT)` as before.
 
-' At NumeratorDone, before pre-alloc:
+At `NumeratorDone`, all three are restored before `SafeMpzDiv`:
+
+```vb
 If _gmpPiRaw <> IntPtr.Zero Then gmpPi.Pointer = _gmpPiRaw
 If _gmpNumerRaw <> IntPtr.Zero Then gmpNumer.Pointer = _gmpNumerRaw
 If _finalTRaw <> IntPtr.Zero Then finalT.Pointer = _finalTRaw
+SafeMpzDiv(gmpPi, gmpNumer, finalT)
 ```
 
-Native struct addresses never change (only `_mp_d` inside the struct changes on
-realloc), so the captured IntPtrs remain valid even after the checkpoint-loading
-reallocs modify the limb data.
+`SafeMpzDiv` captures `a.Pointer`/`b.Pointer` at entry (§184c), uses `q.Pointer` for
+`GmpRaw_swap` and the adjustment loop — all require correct addresses.
 
 ### Status
 
-Fix applied and built (Debug). Restarting computation from gmpNumer checkpoint.
+v4 fix applied and built (Debug). Restarting computation from gmpNumer/finalT checkpoint.

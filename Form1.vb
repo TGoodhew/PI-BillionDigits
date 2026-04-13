@@ -4805,16 +4805,29 @@ Phase2:
 
 Phase3Start:
             System.Threading.Volatile.Write(_safeMulDop, -1)   ' §107 Gap 7: reset DOP so Phase 3 uses all cores (may be 3 if Phase 2 serial path ran)
-            gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpNumer, gmpPi, gmpOne, Nothing)
+            gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpOne, Nothing)
             gmpVariablesInitialized = True
 
-            ' §NumeratorDiv: Capture native struct pointers immediately after mpz_inits, before
-            ' any managed GMP call triggers §78 and overwrites these Pointer fields with stale/wrong
-            ' addresses.  Native struct addresses never change (only _mp_d inside changes on realloc),
-            ' so these captures remain valid through all TryLoadPhase3Value / mpz_clear / mpz_init calls.
-            Dim _gmpPiRaw As IntPtr = gmpPi.Pointer
-            Dim _gmpNumerRaw As IntPtr = gmpNumer.Pointer
-            Dim _finalTRaw As IntPtr = IntPtr.Zero  ' set below after mpz_init(finalT) in checkpoint path
+            ' §NumeratorDiv-v4: Init gmpNumer and gmpPi as the LAST two mpz_init calls, in order,
+            ' and capture each Pointer IMMEDIATELY after its own mpz_init — before the next call
+            ' fires §78 and overwrites it.
+            '
+            ' §78 side-effect: every managed GMP call overwrites ALL registered mpz_t.Pointer
+            ' fields with stale addresses.  mpz_inits(A,B,C) fires §78 during mpz_init(B), which
+            ' corrupts A.Pointer; then fires §78 during mpz_init(C), which corrupts A and B.Pointer.
+            ' Capturing after mpz_inits returns gives wrong values for all but the last arg.
+            '
+            ' Fix: init gmpNumer first (capture before gmpPi's mpz_init corrupts it), then init
+            ' gmpPi (capture before any subsequent managed call corrupts it).  Restore gmpNumer.Pointer
+            ' immediately so TryLoadPhase3Value's DeserializeOneMpz writes to the correct struct.
+            ' Native struct addresses never change (only _mp_d changes on realloc), so these
+            ' captures remain valid as restore values through all subsequent managed GMP calls.
+            gmp_lib.mpz_init(gmpNumer)
+            Dim _gmpNumerRaw As IntPtr = gmpNumer.Pointer  ' correct: captured before mpz_init(gmpPi) fires §78
+            gmp_lib.mpz_init(gmpPi)
+            Dim _gmpPiRaw As IntPtr = gmpPi.Pointer        ' correct: no managed GMP call between here and mpz_init(gmpPi)
+            gmpNumer.Pointer = _gmpNumerRaw                 ' restore: mpz_init(gmpPi) just fired §78 and corrupted gmpNumer.Pointer
+            Dim _finalTRaw As IntPtr = IntPtr.Zero          ' set below after mpz_init(finalT) in checkpoint path
 
             ' §106 checkpoint: if gmpNumer was already computed and saved, skip Steps 1–5
             ' (SafeMpzPow10, SafeMpzMul squaring, sqrt, and all three R*Q multiplies).
@@ -5362,45 +5375,30 @@ NumeratorDone:
                 WriteToLog($"[ComputePi] mpz_tdiv_q: pi = numer / T  (numer~{CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 10)):N0} digits  T~{CLng(gmp_lib.mpz_sizeinbase(finalT, 10)):N0} digits)")
             End If
             ' §NumeratorDiv: Restore Pointer fields AFTER the WriteToLog managed calls above.
-            ' gmp_lib.mpz_sizeinbase (called inside WriteToLog) triggers the §78 side-effect,
-            ' overwriting ALL registered mpz_t.Pointer fields with stale/wrong native addresses.
-            ' In particular, gmpPi.Pointer gets corrupted to point at another mpz_t's native struct.
-            ' Without this restore, the gmpPi pre-alloc below would read the wrong struct's _mp_d
-            ' and pass a live VirtualAlloc limb-data pointer to _savedGmpFree (a CRT free) →
-            ' immediate STATUS_HEAP_CORRUPTION (0xc0000374) at ntdll.dll+0x1176e5.
-            ' Native struct addresses never change (only _mp_d inside changes on realloc), so the
-            ' values captured at mpz_inits time remain valid here.
+            ' gmp_lib.mpz_sizeinbase fires §78 (side-effect of any managed GMP call), overwriting
+            ' ALL registered mpz_t.Pointer fields with stale/wrong native addresses.
+            ' _gmpPiRaw/_gmpNumerRaw/_finalTRaw were captured with the §NumeratorDiv-v4 fix
+            ' (correct values from the respective mpz_init calls, before the next managed call
+            ' could corrupt them).  Native struct addresses never change (only _mp_d inside changes
+            ' on realloc), so these captures remain valid as restore values here.
+            ' SafeMpzDiv reads q.Pointer (gmpPi.Pointer) and a.Pointer (gmpNumer.Pointer) at entry
+            ' to capture raw addresses — correct addresses are essential for the division result.
             If _gmpPiRaw <> IntPtr.Zero Then gmpPi.Pointer = _gmpPiRaw
             If _gmpNumerRaw <> IntPtr.Zero Then gmpNumer.Pointer = _gmpNumerRaw
             If _finalTRaw <> IntPtr.Zero Then finalT.Pointer = _finalTRaw
-            ' Pre-allocate gmpPi result buffer so MPZ_REALLOC short-circuits.
-            ' gmpPi was initialised via mpz_inits (1-limb CRT buffer); the quotient
-            ' is ~744 MB, so without pre-allocation GmpReallocFunc would be called.
-            ' Guard: only VirtualAlloc when the result will be large (>= GMP_LARGE_THRESHOLD).
-            ' For small/test inputs the quotient may be near-zero (numer << T), giving
-            ' _quotBytes = 3*8 = 24 bytes.  A tiny VirtualAlloc buffer would be freed by
-            ' GmpFreeFunc via _savedGmpFree (size < threshold) on a VirtualAlloc pointer → crash.
-            If gmpPi.Pointer <> IntPtr.Zero AndAlso gmpNumer.Pointer <> IntPtr.Zero AndAlso finalT.Pointer <> IntPtr.Zero Then
-                Dim _numerSzDiv As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
-                Dim _denomSzDiv As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(finalT.Pointer, 4)))
-                Dim _quotLimbs As Long = System.Math.Max(_numerSzDiv - _denomSzDiv + 1L, 1L) + 2L
-                Dim _quotBytes As Long = _quotLimbs * 8L
-                If _quotBytes >= GMP_LARGE_THRESHOLD Then
-                    Dim _bigBufPi As IntPtr = PoolGet(_quotBytes)  ' §79
-                    If _bigBufPi <> IntPtr.Zero Then
-                        Dim _oldAllocPi As Integer = Runtime.InteropServices.Marshal.ReadInt32(gmpPi.Pointer, 0)
-                        Dim _oldBufPi As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(gmpPi.Pointer, 8))
-                        ' The original buffer came from the CRT allocator (_savedGmpAlloc).
-                        ' Free it via the saved free function, not VirtualFree.
-                        _savedGmpFree(New void_ptr(_oldBufPi), New size_t(CULng(_oldAllocPi) * 8UL))
-                        Runtime.InteropServices.Marshal.WriteInt32(gmpPi.Pointer, 0, CInt(_quotLimbs))
-                        Runtime.InteropServices.Marshal.WriteInt64(gmpPi.Pointer, 8, _bigBufPi.ToInt64())
-                        WriteToLog($"[ComputePi] Division: pre-alloc gmpPi {_quotLimbs:N0} limbs ({_quotBytes \ 1048576L:N0} MB) ptr={_bigBufPi:X}")
-                    Else
-                        WriteToLog($"[ComputePi] Division: pre-alloc VirtualAlloc FAILED for {_quotBytes \ 1048576L:N0} MB — will rely on GmpReallocFunc")
-                    End If
-                End If
-            End If
+            ' §NumeratorDiv-v3: Pre-alloc block REMOVED.
+            ' gmp_lib.mpz_inits fires §78 during each mpz_init call internally, which overwrites
+            ' ALL registered mpz_t.Pointer fields including gmpPi.Pointer.  By the time
+            ' mpz_inits returns, gmpPi.Pointer is corrupted to another mpz_t's native struct address.
+            ' Any capture of _gmpPiRaw after mpz_inits is therefore wrong.  Writing the new large
+            ' buffer pointer to the wrong struct would silently corrupt memory; reading the wrong
+            ' struct's _mp_d and passing it to _savedGmpFree would crash with STATUS_HEAP_CORRUPTION.
+            ' Fix: skip pre-alloc entirely and let GmpReallocFunc handle it.
+            ' When SafeMpzDiv fires MPZ_REALLOC(gmpPi, ~93M limbs):
+            '   old_ptr = 1-limb CRT buffer (8 bytes), old_size < GMP_LARGE_THRESHOLD
+            '     → freed correctly via _savedGmpFree (CRT free of CRT pointer — no crash)
+            '   new_size ≈ 744 MB ≥ GMP_LARGE_THRESHOLD → VirtualAlloc for new buffer — correct
+            ' Net effect: one single realloc inside SafeMpzDiv, correctly handled, no pre-alloc needed.
             SafeMpzDiv(gmpPi, gmpNumer, finalT)   ' §107 Gap 6: operands ~5B+ limbs — mpz_tdiv_q hits mpn_mul_fft overflow
             gmp_lib.mpz_clears(gmpNumer, finalT, Nothing)
             LogPhase("Division complete")
