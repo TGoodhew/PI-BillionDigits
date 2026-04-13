@@ -5357,18 +5357,22 @@ Phase3Start:
             End Try
 
 NumeratorDone:
-            ' §NumeratorDiv: Restore Pointer fields corrupted by §78 during checkpoint loading.
-            ' Managed calls (TryLoadPhase3Value, mpz_clear, mpz_init) triggered §78 side-effect
-            ' which overwrote gmpPi.Pointer/gmpNumer.Pointer/finalT.Pointer with stale addresses.
-            ' Without restoration, the gmpPi pre-alloc below reads from a bad Pointer and passes
-            ' a garbage native-heap address to _savedGmpFree → STATUS_HEAP_CORRUPTION (0xc0000374).
-            If _gmpPiRaw <> IntPtr.Zero Then gmpPi.Pointer = _gmpPiRaw
-            If _gmpNumerRaw <> IntPtr.Zero Then gmpNumer.Pointer = _gmpNumerRaw
-            If _finalTRaw <> IntPtr.Zero Then finalT.Pointer = _finalTRaw
             If _logLevel >= 2 Then
                 WriteToLog($"[ComputePi] finalT reloaded from spill file")
                 WriteToLog($"[ComputePi] mpz_tdiv_q: pi = numer / T  (numer~{CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 10)):N0} digits  T~{CLng(gmp_lib.mpz_sizeinbase(finalT, 10)):N0} digits)")
             End If
+            ' §NumeratorDiv: Restore Pointer fields AFTER the WriteToLog managed calls above.
+            ' gmp_lib.mpz_sizeinbase (called inside WriteToLog) triggers the §78 side-effect,
+            ' overwriting ALL registered mpz_t.Pointer fields with stale/wrong native addresses.
+            ' In particular, gmpPi.Pointer gets corrupted to point at another mpz_t's native struct.
+            ' Without this restore, the gmpPi pre-alloc below would read the wrong struct's _mp_d
+            ' and pass a live VirtualAlloc limb-data pointer to _savedGmpFree (a CRT free) →
+            ' immediate STATUS_HEAP_CORRUPTION (0xc0000374) at ntdll.dll+0x1176e5.
+            ' Native struct addresses never change (only _mp_d inside changes on realloc), so the
+            ' values captured at mpz_inits time remain valid here.
+            If _gmpPiRaw <> IntPtr.Zero Then gmpPi.Pointer = _gmpPiRaw
+            If _gmpNumerRaw <> IntPtr.Zero Then gmpNumer.Pointer = _gmpNumerRaw
+            If _finalTRaw <> IntPtr.Zero Then finalT.Pointer = _finalTRaw
             ' Pre-allocate gmpPi result buffer so MPZ_REALLOC short-circuits.
             ' gmpPi was initialised via mpz_inits (1-limb CRT buffer); the quotient
             ' is ~744 MB, so without pre-allocation GmpReallocFunc would be called.
