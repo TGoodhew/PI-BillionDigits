@@ -5697,11 +5697,15 @@ NumeratorDone:
         End If
 
         ' §29: nine-9s replaces e-digits check (e-digits don't appear until 45B+ digits)
+        ' piText has the '.' stripped, so piText[0]='3' and piText[n] = n-th decimal digit (1-indexed).
+        ' Nine consecutive 9s first appear at 1-indexed decimal position 564,665,206 → piText[564665206].
+        ' (Previous hardcoded value 564665205 was off by 1 — it was the file offset minus 2 rather
+        ' than the correct piText index.)
         Dim pos3 As Integer = piText.IndexOf("999999999")
-        If pos3 = 564665205 Then
+        If pos3 = 564665206 Then
             parts.Add("nine-9s@564,665,206 OK")
         ElseIf pos3 >= 0 Then
-            parts.Add($"nine-9s at {pos3} (expected 564665205) FAIL")
+            parts.Add($"nine-9s at {pos3} (expected 564665206) FAIL")
             allOk = False
         Else
             parts.Add("nine-9s not found (need 564M+ digits)")

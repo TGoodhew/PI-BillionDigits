@@ -70,7 +70,7 @@ The computation uses the **Chudnovsky algorithm** with **binary splitting**, whi
 | **Display** checkbox | When checked, the computed digits are streamed into the output panel after computation completes. Unchecking this is useful when only the file output matters, since displaying a billion digits takes significant time. |
 | **Write to File** checkbox | When checked, the full digit string is saved to `C:\PiOutput\pi_digits.txt` after computation. |
 | **Chunk Size** text box | Number of characters pushed into the display per timer tick during streaming. Higher values stream faster but may make the UI less responsive. Default: 500. Range: 1–1,000,000. |
-| **Test** button | Searches the computed digits for three known substrings and reports whether they appear at the correct positions: `999999` (expected at position 762, the Feynman point), `777777777` (expected at position 24,658,601), and `27182818284` (first digits of e). Searches the full native buffer when available, otherwise searches the display text box. |
+| **Test** button | Searches the computed digits for three known substrings and reports whether they appear at the correct positions: `999999` (expected at position 762, the Feynman point), `777777777` (expected at position 24,658,601), and `999999999` (nine 9s, expected at position 564,665,206). Searches the full native buffer when available, otherwise searches the display text box. |
 | **Status** bar | Shows the current phase (e.g., "Streaming 1,000,000,000 digits...") or any error message. |
 | **Running Time** label | Elapsed wall-clock time since Start was clicked, updated every second. |
 | **Digits Displayed** label | Running count of digits streamed to the output panel so far. |
