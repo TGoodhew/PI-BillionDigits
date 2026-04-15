@@ -2557,6 +2557,7 @@ Public Class Form1
         ' The old `savedResultPtr = result.Pointer` overwrite was the root cause of opA._mp_d
         ' being corrupted across recursive depths (§179 diagnosis).
         accumPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(savedResultPtr, 8))
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzMul§accum] szA={szA:N0} accumPtr recovered; allocating shifted buffer ({CLng(mA) + CLng(mB) + CLng((2UL * bitsA + 2UL * bitsB) \ 64UL) + 4L:N0} limbs){vbCrLf}")
 
         ' Serial accumulation: shift each prod_k into its positional slot and add to accum.
         ' No inner SafeMpzMul calls — no §42/§44 managed-stack corruption in this loop.
@@ -2577,6 +2578,7 @@ Public Class Form1
             AppendLog($"[SafeMpzMul] shared shifted pre-alloc FAILED for {_maxShiftedLimbs * 8L \ 1048576L:N0} MB — throwing OOM{vbCrLf}")
             Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shared shifted ({_maxShiftedLimbs * 8L \ 1048576L} MB)")
         End If
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzMul§accum] shifted buffer OK ({_maxShiftedLimbs * 8L \ 1048576L:N0} MB); starting accumulation (§39={mA = mB AndAlso CLng(mA) + CLng(mB) <= 100_000_000L}){vbCrLf}")
         ' §25: raw init for shifted — struct header via Marshal.AllocHGlobal, limb buffer via GmpRaw_init.
         Dim shifted As New mpz_t()
         shifted.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
@@ -2604,7 +2606,16 @@ Public Class Form1
           ' zero (B0sz=0), and the grouped accumulation produced a catastrophic
           ' quotient under-estimate. Fall back to the general 9-product path when
           ' any split piece is zero-sized; keep §39 only for fully dense windows.
+          ' §Phase3ColAdd: The §39 column adds (e.g. prods(2)+=prods(4)) trigger a GMP
+          ' internal realloc of the destination sub-product buffer: our NativeReallocFunc
+          ' does VirtualAlloc(new) + memcpy + VirtualFree(old). When each sub-product
+          ' exceeds ~800 MB (mA+mB > 100 M limbs) this VirtualAlloc can fail at peak
+          ' memory pressure — GMP receives NULL from its realloc callback and calls
+          ' abort(), killing the process silently. The §gen path (below) accumulates
+          ' each sub-product one at a time into the pre-sized accumulator and shifted
+          ' buffer, so no GMP realloc is triggered. Skip §39 for large sub-products.
           If mA = mB AndAlso
+              CLng(mA) + CLng(mB) <= 100_000_000L AndAlso
               _A0_szT > 0 AndAlso _A1_szT > 0 AndAlso _A2_szT > 0 AndAlso
               _B0_szT > 0 AndAlso _B1_szT > 0 AndAlso _B2_szT > 0 Then
             If _logLevel >= 4 Then AppendLog($"[SafeMpzMul] §39 column-group fast path (mA=mB={mA:N0}){vbCrLf}")
