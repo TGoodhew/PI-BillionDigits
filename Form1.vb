@@ -4861,7 +4861,19 @@ Phase3Start:
             SafeMpzPow10(gmpOne, digits)
             LogPhase($"[ComputePi] Step 1 done: gmpOne={CLng(gmp_lib.mpz_sizeinbase(gmpOne, 10)):N0} digits")
             LogPhase($"[ComputePi] Step 2: SafeMpzMul gmpSqrtInput = gmpOne^2")
+            ' §Phase3OOM: Force serial sub-products for the Step 2 squaring.
+            ' At 5B digits gmpOne ≈ 130M limbs (1 GB).  With _safeMulDop=24 the 9 sub-products
+            ' run concurrently; each is ~43M×43M limbs → ~700 MB, so 9 in parallel = ~6 GB
+            ' of simultaneous allocation on top of ~22 GB already in use → silent OOM crash
+            ' (Windows terminates the process when VirtualAlloc fails with no managed exception).
+            ' Forcing serial sub-products reduces peak concurrent memory to 1 sub-product at a
+            ' time (~700 MB extra), allowing the squaring to complete safely.
+            ' Restore _safeMulDop after Step 2 so subsequent SafeMpzSqrt/SafeMpzMul calls
+            ' continue to use all cores where memory pressure is lower.
+            Dim _savedDopStep2 As Integer = System.Threading.Volatile.Read(_safeMulDop)
+            System.Threading.Volatile.Write(_safeMulDop, 1)
             SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)
+            System.Threading.Volatile.Write(_safeMulDop, _savedDopStep2)
             LogPhase($"[ComputePi] Step 2 done: gmpSqrtInput={CLng(gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10)):N0} digits")
             ' gmpOne is no longer needed — free its ~208 MB buffer now so it is
             ' not held alive through the sqrt, numerator multiply, and division.

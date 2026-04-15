@@ -3097,4 +3097,29 @@ SafeMpzDiv(gmpPi, gmpNumer, finalT)
 
 ### Status
 
-v4 fix applied and built (Debug). Restarting computation from gmpNumer/finalT checkpoint.
+v4 fix applied and built (Debug). 1B-digit run completed successfully (verified all three digit checks OK).
+
+## §Phase3OOM — Step 2 squaring OOM crash at 5B digits
+
+### Problem
+
+At 5B digits, `SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)` (Step 2: squaring 10^5B) uses
+`gmpOne` ≈ 130M limbs (1 GB). With `_safeMulDop=24` (all cores), the 9 sub-products
+run concurrently; each sub-product is ~43M×43M limbs → ~700 MB, so 9 simultaneous
+allocations = ~6 GB on top of ~22 GB already in use. Windows silently terminates the
+process when `VirtualAlloc` fails — no managed exception, no log entry, clean exit code.
+
+### Fix (§Phase3OOM)
+
+Force `_safeMulDop=1` for the Step 2 squaring only, then restore the saved DOP:
+
+```vb
+Dim _savedDopStep2 As Integer = Volatile.Read(_safeMulDop)
+Volatile.Write(_safeMulDop, 1)
+SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)
+Volatile.Write(_safeMulDop, _savedDopStep2)
+```
+
+Serial sub-products reduce peak concurrent memory to ~700 MB extra (one sub-product
+at a time) instead of ~6 GB. Step 2 takes longer but completes without OOM.
+snap_Phase3 (P/Q/T) is saved before Step 1, so restart resumes from there.
