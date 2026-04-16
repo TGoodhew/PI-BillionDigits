@@ -2630,8 +2630,32 @@ Public Class Form1
             }
             For _col As Integer = 0 To 4
                 Dim _bk As Integer = _col_base(_col)
-                ' Add extra sub-products into the base slot
+                ' Add extra sub-products into the base slot.
+                ' §Phase3ColAdd fix: pre-grow prods(_bk) before each add so GMP never needs
+                ' to call its internal realloc callback. When prods(_bk) is exactly szA+szB+2
+                ' limbs and the result needs one more limb (carry), GMP calls NativeReallocFunc
+                ' which does VirtualAlloc+memcpy+VirtualFree for a potentially large buffer.
+                ' At peak memory pressure that VirtualAlloc can fail → GMP calls abort() →
+                ' silent process termination. Pre-growing here prevents the realloc entirely.
                 For Each _ak As Integer In _col_extra(_col)
+                    Dim _bk_sz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prods(_bk).Pointer, 4))
+                    Dim _ak_sz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prods(_ak).Pointer, 4))
+                    Dim _needed As Integer = System.Math.Max(_bk_sz, _ak_sz) + 2  ' +2 for carry safety
+                    Dim _bk_alloc As Integer = Runtime.InteropServices.Marshal.ReadInt32(prods(_bk).Pointer, 0)
+                    If _bk_alloc < _needed Then
+                        Dim _oldBuf As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(prods(_bk).Pointer, 8))
+                        Dim _oldBytes As Long = CLng(_bk_alloc) * 8L
+                        Dim _newBytes As Long = CLng(_needed) * 8L
+                        Dim _newBuf As IntPtr = GmpNativeAlloc_PoolGet(_newBytes)
+                        If _newBuf = IntPtr.Zero Then
+                            AppendLog($"[SafeMpzMul§39] pre-grow FAILED for {_newBytes \ 1048576L:N0} MB — throwing OOM{vbCrLf}")
+                            Throw New OutOfMemoryException($"SafeMpzMul §39 pre-grow: GmpNativeAlloc_PoolGet failed ({_newBytes \ 1048576L} MB)")
+                        End If
+                        CopyMemory(_newBuf, _oldBuf, New UIntPtr(CULng(_bk_sz) * 8UL))
+                        GmpNativeAlloc_FreeRaw(_oldBuf, _oldBytes)
+                        Runtime.InteropServices.Marshal.WriteInt32(prods(_bk).Pointer, 0, _needed)
+                        Runtime.InteropServices.Marshal.WriteInt64(prods(_bk).Pointer, 8, _newBuf.ToInt64())
+                    End If
                     GmpRaw_add(prods(_bk).Pointer, prods(_bk).Pointer, prods(_ak).Pointer)
                     GmpRaw_clear(prods(_ak).Pointer)
                     Dim _tmp_ak = prods(_ak).Pointer : prods(_ak).Pointer = IntPtr.Zero : Runtime.InteropServices.Marshal.FreeHGlobal(_tmp_ak)
