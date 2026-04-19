@@ -4952,7 +4952,14 @@ Phase3Start:
             ' 10^2,500,000,000 ≈ 130M limbs — well above that threshold.  SafeMpzPow10 routes
             ' every squaring through SafeMpzMul which splits around the 33M-limb boundary.
             LogPhase($"[ComputePi] Step 1: SafeMpzPow10(10^{digits:N0})")
+            ' §Step1OOM: At 5B digits gmpOne ≈ 259M limbs.  P/Q/T are still resident (~15 GB),
+            ' leaving little headroom for 9 parallel shifted buffers (~2 GB each at the last
+            ' squaring).  Force serial sub-products for the entire Step 1, same rationale as
+            ' §Phase3OOM for Step 2.  Restore _safeMulDop afterwards.
+            Dim _savedDopStep1 As Integer = System.Threading.Volatile.Read(_safeMulDop)
+            System.Threading.Volatile.Write(_safeMulDop, 1)
             SafeMpzPow10(gmpOne, digits)
+            System.Threading.Volatile.Write(_safeMulDop, _savedDopStep1)
             LogPhase($"[ComputePi] Step 1 done: gmpOne={CLng(gmp_lib.mpz_sizeinbase(gmpOne, 10)):N0} digits")
             LogPhase($"[ComputePi] Step 2: SafeMpzMul gmpSqrtInput = gmpOne^2")
             ' §Phase3OOM: Force serial sub-products for the Step 2 squaring.
