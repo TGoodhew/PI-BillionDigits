@@ -2615,7 +2615,7 @@ Public Class Form1
           ' each sub-product one at a time into the pre-sized accumulator and shifted
           ' buffer, so no GMP realloc is triggered. Skip §39 for large sub-products.
           If mA = mB AndAlso
-              CLng(mA) + CLng(mB) <= 100_000_000L AndAlso
+              CLng(mA) + CLng(mB) <= 50_000_000L AndAlso
               _A0_szT > 0 AndAlso _A1_szT > 0 AndAlso _A2_szT > 0 AndAlso
               _B0_szT > 0 AndAlso _B1_szT > 0 AndAlso _B2_szT > 0 Then
             If _logLevel >= 4 Then AppendLog($"[SafeMpzMul] §39 column-group fast path (mA=mB={mA:N0}){vbCrLf}")
@@ -3014,6 +3014,42 @@ Public Class Form1
         GmpRaw_swap(r.Pointer, rSeed.Pointer)  ' §35
         gmp_lib.mpz_clear(rSeed)
 
+        ' §NR-ckpt: Resume from a mid-NR checkpoint if one exists for this exact kBits/bBits.
+        ' Saves r (the reciprocal estimate) and prec so a crash during a later NR iteration
+        ' does not require restarting from the seed.  bTrunc is re-derived each iteration
+        ' from b, so only r + prec need to be saved.
+        Dim _nrSnapDir As String = System.IO.Path.Combine(DISK_CACHE_DIR, "snap_Phase3")
+        Dim _nrBin As String = System.IO.Path.Combine(_nrSnapDir, "nr_r.bin")
+        Dim _nrMeta As String = System.IO.Path.Combine(_nrSnapDir, "nr_meta.txt")
+        Dim prec As Long = 62L
+        If _autoCheckpoint AndAlso System.IO.File.Exists(_nrBin) AndAlso System.IO.File.Exists(_nrMeta) Then
+            Try
+                Dim _metaLines As String() = System.IO.File.ReadAllLines(_nrMeta)
+                Dim _meta As New Dictionary(Of String, String)()
+                For Each _ml As String In _metaLines
+                    Dim _eq As Integer = _ml.IndexOf("="c)
+                    If _eq > 0 Then _meta(_ml.Substring(0, _eq)) = _ml.Substring(_eq + 1)
+                Next
+                Dim _snapKBits As Long = 0L, _snapBBits As Long = 0L, _snapPrec As Long = 0L
+                If _meta.ContainsKey("kBits") AndAlso Long.TryParse(_meta("kBits"), _snapKBits) AndAlso
+                   _meta.ContainsKey("bBits") AndAlso Long.TryParse(_meta("bBits"), _snapBBits) AndAlso
+                   _meta.ContainsKey("prec")  AndAlso Long.TryParse(_meta("prec"),  _snapPrec)  AndAlso
+                   _snapKBits = kBits AndAlso _snapBBits = bBits AndAlso _snapPrec > 62L Then
+                    Dim _nrStaging(4194303) As Byte
+                    Using _fs As New FileStream(_nrBin, FileMode.Open, FileAccess.Read)
+                        Using _br As New BinaryReader(_fs)
+                            DeserializeOneMpz(r, _br, _nrStaging)
+                        End Using
+                    End Using
+                    prec = _snapPrec
+                    AppendLog($"[SafeMpzReciprocal] §NR-ckpt resumed: prec={prec:N0} bBits={bBits:N0} kBits={kBits:N0}{vbCrLf}")
+                End If
+            Catch _ex As Exception
+                AppendLog($"[SafeMpzReciprocal] §NR-ckpt load failed ({_ex.Message}) — starting from seed{vbCrLf}")
+                prec = 62L
+            End Try
+        End If
+
         ' ── Newton: r ← 2r - ceil(b/2^bShift) · r² / 2^(kBits-bShift) ────
         ' Progressive precision: prec doubles each step from ~62 → rBits+2.
         ' Ceiling truncation of b maintains r as a strict underestimate throughout.
@@ -3026,7 +3062,7 @@ Public Class Form1
         gmp_lib.mpz_init(rSq)
         Dim p As New mpz_t()
         gmp_lib.mpz_init(p)
-        Dim prec As Long = 62L
+        ' prec is declared and initialised in the §NR-ckpt block above (default 62L, or restored value).
         Dim _nrIter As Integer = 0
         Do While prec < rBits + 2L
             _nrIter += 1
@@ -3189,6 +3225,29 @@ Public Class Form1
                 Dim _r119T0 As Long = If(_sz119 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_r119DPtr, (_sz119 - 2) * 8), 0L)
                 AppendLog($"[NR§119] iter={_nrIter} szR={_sz119:N0} bot=[{_r119B0:X16} {_r119B1:X16}] top=[{_r119T0:X16} {_r119T1:X16}]{vbCrLf}")
                 AppendLog($"[NR] iter={_nrIter} prec={prec:N0} bShift={bShift:N0} kBitsMinusBShift={kBits - bShift:N0} szP={_szP:N0} szR_after={_szR_after:N0}{vbCrLf}")
+            End If
+
+            ' §NR-ckpt: Save r and prec after each Newton iteration so a crash during
+            ' the NEXT iteration's SafeMpzMul can resume from here rather than the seed.
+            ' r.Pointer is valid here — no managed GMP call since the GmpRaw_sub above.
+            If _autoCheckpoint Then
+                Try
+                    If Not System.IO.Directory.Exists(_nrSnapDir) Then
+                        System.IO.Directory.CreateDirectory(_nrSnapDir)
+                    End If
+                    Dim _nrSaveStaging(4194303) As Byte
+                    Using _fs As New FileStream(_nrBin, FileMode.Create, FileAccess.Write)
+                        Using _bw As New BinaryWriter(_fs)
+                            SerializeOneMpz(r, _bw, _nrSaveStaging)
+                        End Using
+                    End Using
+                    System.IO.File.WriteAllText(_nrMeta,
+                        $"kBits={kBits}{vbLf}bBits={bBits}{vbLf}prec={prec}{vbLf}iter={_nrIter}{vbLf}")
+                    BackupSnapshotToStore("snap_Phase3")
+                    AppendLog($"[SafeMpzReciprocal] §NR-ckpt saved: iter={_nrIter} prec={prec:N0}{vbCrLf}")
+                Catch _ex As Exception
+                    AppendLog($"[SafeMpzReciprocal] §NR-ckpt save failed: {_ex.Message}{vbCrLf}")
+                End Try
             End If
 
             ' Guard: reset if r went non-positive.  With floor truncation (§107) this
@@ -4926,6 +4985,11 @@ Phase3Start:
 
             If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_mul_ui: gmpNumer = gmpSqrt * 426880")
             gmp_lib.mpz_mul_ui(gmpNumer, gmpSqrt, 426880UI)
+            ' §SqrtDone-ckpt: Save gmpNumer immediately after the sqrt so a crash during
+            ' Steps 5+ can restart from here (skipping all 10+ hours of Steps 1–4).
+            ' Restore gmpNumer.Pointer first — §78 corrupted it during mpz_mul_ui above.
+            gmpNumer.Pointer = _gmpNumerRaw
+            SavePhase3Value("gmpNumer", gmpNumer, p3SnapDir)
             ' gmpSqrt value is now encoded in gmpNumer — free its ~198 MB before
             ' the large multiply.  finalP is also not used in the final formula
             ' (pi = 426880·sqrt(10005)·Q / T), so free its ~340 MB too.
