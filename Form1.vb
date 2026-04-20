@@ -3634,6 +3634,7 @@ Public Class Form1
             End If
         End If
         GmpRaw_swap(q.Pointer, ar.Pointer)  ' §35
+        Dim _qPtr As IntPtr = q.Pointer     ' §§78-qptr: capture before mpz_clear(ar) fires §78 and corrupts q.Pointer
         gmp_lib.mpz_clear(ar)
 
         ' §118: log b limbs at key positions to compare vs q, and verify a at critical position
@@ -3726,7 +3727,7 @@ Public Class Form1
                 remainder.Pointer = IntPtr.Zero
                 Throw New InvalidOperationException($"SafeMpzDiv adj-down exceeded {MAX_ADJ_ITERS} iters — reciprocal likely wrong. szA={szA} szB={szB} aBits={aBits} kBits={kBits} szR={szR} szQ={szQ} szQB={szQB} szRem={_szRem2}")
             End If
-            GmpRaw_sub_ui(q.Pointer, q.Pointer, 1UI)
+            GmpRaw_sub_ui(_qPtr, _qPtr, 1UI)
             GmpRaw_add(_remRaw, _remRaw, _bPtr)
         Loop
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-down complete: {_adjDown} iter(s){vbCrLf}")
@@ -3737,19 +3738,23 @@ Public Class Form1
             If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-up iter={_adjUp}{vbCrLf}")
             If _adjUp > MAX_ADJ_ITERS Then
                 ' §171: Barrett reciprocal produced a wildly wrong q (off by more than MAX_ADJ_ITERS).
+                ' Use GmpRaw_tdiv_q with captured raw pointers — avoids managed-call §78 corruption
+                ' and the GMP 33.5M-limb abort that fires inside gmp_lib.mpz_tdiv_q for large inputs.
                 Dim _szRem171 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
-                AppendLog($"[SafeMpzDiv§171] adj-up exceeded {MAX_ADJ_ITERS} iters (szRem={_szRem171:N0} > szB={szB:N0}); falling back to mpz_tdiv_q{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§171] adj-up exceeded {MAX_ADJ_ITERS} iters (szRem={_szRem171:N0} > szB={szB:N0}); falling back to GmpRaw_tdiv_q{vbCrLf}")
                 GmpRaw_clear(_remRaw) : Runtime.InteropServices.Marshal.FreeHGlobal(_remRaw)
                 remainder.Pointer = IntPtr.Zero
-                gmp_lib.mpz_tdiv_q(q, a, b)
-                AppendLog($"[SafeMpzDiv§171] mpz_tdiv_q fallback complete; szQ={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(q.Pointer, 4)):N0}{vbCrLf}")
+                GmpRaw_tdiv_q(_qPtr, _aPtr, _bPtr)
+                q.Pointer = _qPtr  ' restore so caller sees the correct result struct
+                AppendLog($"[SafeMpzDiv§171] GmpRaw_tdiv_q fallback complete; szQ={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qPtr, 4)):N0}{vbCrLf}")
                 Return
             End If
-            GmpRaw_add_ui(q.Pointer, q.Pointer, 1UI)
+            GmpRaw_add_ui(_qPtr, _qPtr, 1UI)
             GmpRaw_sub(_remRaw, _remRaw, _bPtr)
         Loop
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-up complete: {_adjUp} iter(s); SafeMpzDiv done{vbCrLf}")
 
+        q.Pointer = _qPtr  ' §§78-qptr: restore after adj loops used _qPtr directly
         GmpRaw_clear(_remRaw) : Runtime.InteropServices.Marshal.FreeHGlobal(_remRaw)
         remainder.Pointer = IntPtr.Zero
     End Sub
