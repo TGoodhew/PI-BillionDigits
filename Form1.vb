@@ -4908,7 +4908,9 @@ Phase2:
 
 Phase3Start:
             System.Threading.Volatile.Write(_safeMulDop, -1)   ' §107 Gap 7: reset DOP so Phase 3 uses all cores (may be 3 if Phase 2 serial path ran)
-            gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpOne, Nothing)
+            gmp_lib.mpz_init(gmpSqrtInput)
+            Dim _gmpSqrtInputRaw As IntPtr = gmpSqrtInput.Pointer  ' §78: capture before mpz_inits(gmpSqrt,gmpOne) fires §78 and corrupts it
+            gmp_lib.mpz_inits(gmpSqrt, gmpOne, Nothing)
             gmpVariablesInitialized = True
 
             ' §NumeratorDiv-v4: Init gmpNumer and gmpPi as the LAST two mpz_init calls, in order,
@@ -4930,6 +4932,7 @@ Phase3Start:
             gmp_lib.mpz_init(gmpPi)
             Dim _gmpPiRaw As IntPtr = gmpPi.Pointer        ' correct: no managed GMP call between here and mpz_init(gmpPi)
             gmpNumer.Pointer = _gmpNumerRaw                 ' restore: mpz_init(gmpPi) just fired §78 and corrupted gmpNumer.Pointer
+            gmpSqrtInput.Pointer = _gmpSqrtInputRaw         ' restore: mpz_inits(gmpSqrt,gmpOne)+mpz_init(gmpNumer/gmpPi) all fired §78
             Dim _finalTRaw As IntPtr = IntPtr.Zero          ' set below after mpz_init(finalT) in checkpoint path
 
             ' §106 checkpoint: if gmpNumer was already computed and saved, skip Steps 1–5
@@ -4953,6 +4956,13 @@ Phase3Start:
                     End Using
                 End If
                 GoTo NumeratorDone
+            End If
+
+            ' §SqrtInput-ckpt: if gmpSqrtInput was saved after Step 3, skip Steps 1–3
+            gmpSqrtInput.Pointer = _gmpSqrtInputRaw  ' §78: restore before TryLoadPhase3Value uses val.Pointer
+            If TryLoadPhase3Value("gmpSqrtInput", gmpSqrtInput, p3SnapDir) Then
+                LogPhase("[ComputePi] gmpSqrtInput loaded from checkpoint — skipping Steps 1–3")
+                GoTo BeforeStep4
             End If
 
             ' §99: Use SafeMpzPow10 (repeated squaring via SafeMpzMul) for all digit counts.
@@ -4992,6 +5002,9 @@ Phase3Start:
             gmp_lib.mpz_init(gmpOne)
             LogPhase($"[ComputePi] Step 3: mpz_mul_ui gmpSqrtInput *= 10005")
             gmp_lib.mpz_mul_ui(gmpSqrtInput, gmpSqrtInput, 10005UI)
+            gmpSqrtInput.Pointer = _gmpSqrtInputRaw  ' §78: restore before SavePhase3Value uses val.Pointer
+            SavePhase3Value("gmpSqrtInput", gmpSqrtInput, p3SnapDir)
+BeforeStep4:
             LogPhase($"[ComputePi] Step 4: SafeMpzSqrt of {CLng(gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10)):N0}-digit number")
             SafeMpzSqrt(gmpSqrt, gmpSqrtInput)
             gmp_lib.mpz_clear(gmpSqrtInput)
