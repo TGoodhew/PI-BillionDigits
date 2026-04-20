@@ -3089,6 +3089,11 @@ Public Class Form1
                 BigShiftRight(bTrunc, b, bShift)
                 ' No ceiling +1: floor truncation avoids catastrophic overshoot in final step.
             Else
+                ' §PreAlloc-bTrunc: bTrunc._mp_alloc from prior BigShiftRight may be < _szB.
+                ' GMP's __gmpz_realloc aborts when new_alloc > 33,554,431 limbs (INT_MAX/64,
+                ' 32-bit mp_size_t overflow check fires BEFORE our GmpReallocFunc callback).
+                ' Pre-allocate via our pool to bypass it, same pattern as BigShiftRight/BigShiftLeft.
+                PreAllocMpzToLimbs(bTrunc, CLng(_szB))
                 GmpRaw_set(bTrunc.Pointer, b.Pointer)  ' §35
             End If
 
