@@ -3204,6 +3204,10 @@ Public Class Form1
                 Dim _p123Val1 As Long = If(_sz123 > _idx123 + 1, Runtime.InteropServices.Marshal.ReadInt64(_p123DPtr, CLng(_idx123 + 1) * 8L), 0L)
                 AppendLog($"[NR123] iter={_nrIter} p_after_shift[{_idx123-2:N0}]={_p123Vm2:X16} [{_idx123-1:N0}]={_p123Vm1:X16} [{_idx123:N0}]={_p123Val:X16} [{_idx123+1:N0}]={_p123Val1:X16} sz={_sz123:N0}{vbCrLf}")
             End If
+            ' §PreAlloc-r-add: After checkpoint restore r._mp_alloc equals _mp_size exactly.
+            ' GmpRaw_add(r,r,r) → 2r may need one extra limb → __gmpz_realloc > 33.5M limit → GMP abort.
+            ' Pre-allocate 2 extra limbs via our pool to bypass it.
+            PreAllocMpzToLimbs(r, CLng(szR) + 2L)
             GmpRaw_add(r.Pointer, r.Pointer, r.Pointer)    ' §NR-raw: r = 2r — bypass managed wrapper pointer corruption
             GmpRaw_sub(r.Pointer, r.Pointer, p.Pointer)    ' §NR-raw: r = 2r - p — bypass managed wrapper pointer corruption
             ' §124: log r[20,904,662..665] immediately after r = 2r - p (final iter)
