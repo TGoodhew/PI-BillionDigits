@@ -3761,7 +3761,17 @@ Public Class Form1
                 ' always correct.
                 _171Done = True
                 Dim _szRem171 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
-                AppendLog($"[SafeMpzDiv§171-entry] szA={szA:N0} szB={szB:N0} szRem={_szRem171:N0} ratio={(CDbl(_szRem171)/szB):F3}; iterative top-limb correction{vbCrLf}")
+                ' §171-entry: log bTop's bit width to quickly spot unnormalized divisors —
+                ' these can't converge via single-limb top correction at 5B+ scale.
+                Dim _bData171e As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_bPtr, 8))
+                Dim _bTop171e As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_bData171e, CInt(CLng(szB - 1) * 8L)))
+                Dim _bTopBits171 As Integer = 0
+                Dim _bTopScan As ULong = _bTop171e
+                Do While _bTopScan <> 0UL
+                    _bTopBits171 += 1
+                    _bTopScan >>= 1
+                Loop
+                AppendLog($"[SafeMpzDiv§171-entry] szA={szA:N0} szB={szB:N0} szRem={_szRem171:N0} ratio={(CDbl(_szRem171)/szB):F3} bTop=0x{_bTop171e:X16} bTopBits={_bTopBits171} (if <48, single-limb correction will NOT converge — upstream Barrett bug suspected){vbCrLf}")
 
                 Dim _171Pass As Integer = 0
                 Do While _szRem171 > szB
@@ -3817,7 +3827,7 @@ Public Class Form1
                     _szRem171 = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
                     AppendLog($"[SafeMpzDiv§171 pass={_171Pass}] done: szRemAfter={_szRem171:N0} Δ={_szRemBefore171 - _szRem171:N0}{vbCrLf}")
                     If _szRem171 >= _szRemBefore171 Then
-                        Throw New InvalidOperationException($"SafeMpzDiv §171 pass {_171Pass} did not reduce rem size: before={_szRemBefore171}, after={_szRem171}, szB={szB}, szProd={_szProd171}, ptrMatch={_ptrMatch171} — pointer corruption suspected")
+                        Throw New InvalidOperationException($"SafeMpzDiv §171 pass {_171Pass} did not reduce rem SIZE: before={_szRemBefore171}, after={_szRem171}, szB={szB}, szProd={_szProd171}, ptrMatch={_ptrMatch171}, bTopBits={_bTopBits171}. ROOT CAUSE: Barrett estimate was off by ~2^{(CLng(_szRemBefore171 - szB) * 64L):N0} (far more than the usual ±1-2). Single-limb top-limb correction cannot converge when bTopBits<{48} and rem/b value-ratio is ~2^({(CLng(_szRemBefore171 - szB) * 64L):N0}). Investigate upstream: SafeMpzMul(ar,a,r), BigShiftRight(ar,kBits), SafeMpzReciprocal precision at 5B scale.")
                     End If
                 Loop
                 AppendLog($"[SafeMpzDiv§171-done] {_171Pass} pass(es); szRem={_szRem171:N0} ≤ szB={szB:N0}{vbCrLf}")

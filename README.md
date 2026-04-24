@@ -3179,3 +3179,71 @@ a struct with `_mp_size=0`, so GMP subtracted zero. rem was left unchanged.
 
 If a future crash recurs, the per-pass `match=False` flag or a non-decreasing szRem would
 instantly pinpoint the failure mode.
+
+## §171-barrett — 5B SafeMpzSqrt Newton step 1: Barrett precision bug (NOT a §171 bug)
+
+### Observed (2026-04-23)
+
+After deploying `§171-iter` and restarting the 5B run, the fix threw a clean exception
+1h 11m in, at the same code location:
+
+```
+[SafeMpzDiv§171-entry] szA=175,000,001 szB=87,500,001 szRem=172,722,805 ratio=1.974
+[SafeMpzDiv§171 pass=1] bTop=0x0000000021D94463 szDelta=85,222,805
+[SafeMpzDiv§171 pass=1] szProd=172,722,805 prodHdr=0x…  prod.Ptr=0x… match=True
+[SafeMpzDiv§171 pass=1] done: szRemAfter=172,722,805 Δ=0
+  EXCEPTION: SafeMpzDiv §171 pass 1 did not reduce rem size
+```
+
+- `match=True` → pointer corruption was **not** the cause (my original §171-iter hypothesis).
+- `szProd=172,722,805` → SafeMpzMul did produce the correctly-sized delta×b.
+- `Δ=0` → GmpRaw_sub(rem, rem, prod) ran but left szRem exactly unchanged.
+
+### Root cause
+
+The real bug is **upstream of §171**, in SafeMpzDiv's Barrett estimate itself:
+
+- Barrett setup: `szA=175,000,001 szB=87,500,001 aBits=11,200,000,064 bBits=5,600,000,064 kBits=11,200,000,067 szR=87,500,001 rBits=5,600,000,038`.
+- `q_approx` from `(a*r) >> kBits` has top limbs `[0x21D94463, D8DAD84AB39138B5]`.
+- After `SafeMpzMul(q*b)` and subtract, `rem` has 172,722,805 limbs = ~2^(11.05B) — far larger than `b` (~2^(5.6B)).
+- So `q_true − q_approx ≈ rem/b ≈ 2^(5.45B)` (a **~85M-limb** integer).
+
+Normal Barrett should produce error ≤ 1-2. This is **off by 2^(5.45 billion)** — a bug, not rounding.
+
+### Why §171 cannot converge at 5B
+
+`b`'s top limb is `0x21D94463` (only **30 bits** non-zero). The single-limb correction
+`delta = floor(rem_top / (bTop+1))` is accurate only to ~2^bTopBits per pass. So each
+pass reduces rem by factor ≤ 2^30 in value. To close the 2^(5.45B) gap needs ~180 million
+passes — obviously infeasible.
+
+Even with b-normalization (shifting `bTop` to have its top bit set) the reduction is ~2^63
+per pass ≈ 86 million passes — still infeasible. **Single-limb top correction is
+fundamentally unable to fix a Barrett error this large.**
+
+### Where the real bug is
+
+One of these at 5B scale produces a wrong result:
+1. `SafeMpzMul(ar, a, r)` — 175M × 87.5M limb multiply.
+2. `BigShiftRight(ar, ar, kBits)` — shift by 11.2B bits = 175M limbs.
+3. `SafeMpzReciprocal(r, b, kBits)` — Newton reciprocal with insufficient precision for
+   the unnormalized b (top limb 30 bits → loss of significance propagates).
+
+At 1B digits these worked (§171 fired 4 times and all single-pass corrections succeeded).
+At 5B something is numerically wrong at one of these three stages.
+
+### Not yet fixed — next steps
+
+- Add Barrett sanity check: before adj-up, verify `szRem ≤ szB + MAX_ADJ_ITERS` or
+  throw immediately with all Barrett params logged, so we fail fast rather than run 11
+  pointless adj-up iters then enter §171.
+- Instrument `SafeMpzMul(ar,a,r)` top/bot limbs and compare against an independent
+  reference (small example with known answer) to localise which step is wrong.
+- Consider forcing b-normalization (`b << k` so bTop's top bit is set) before the
+  Barrett setup — this is a known stabiliser for divisors with sparse top limbs.
+
+### Status
+
+`§171-iter` code is correct — it catches the bug cleanly with rich diagnostics instead
+of the prior silent AV. But the 5B run still crashes at Newton step 1 because the root
+cause is upstream. Further investigation needed.
