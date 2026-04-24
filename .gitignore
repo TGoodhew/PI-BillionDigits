@@ -38,3 +38,5 @@ Desktop.ini
 *.psess
 *_report.txt
 pi_trace_*
+launch_stdout.txt
+launch_stderr.txt
