@@ -3123,3 +3123,59 @@ Volatile.Write(_safeMulDop, _savedDopStep2)
 Serial sub-products reduce peak concurrent memory to ~700 MB extra (one sub-product
 at a time) instead of ~6 GB. Step 2 takes longer but completes without OOM.
 snap_Phase3 (P/Q/T) is saved before Step 1, so restart resumes from there.
+
+## §171-iter — SafeMpzDiv: iterate top-limb correction + capture raw prodHdr (5B SafeMpzSqrt crash fix)
+
+### Problem
+
+At 5B digits, inside `SafeMpzSqrt` Newton step 1 (`175M / 87.5M` limbs), `SafeMpzDiv`'s
+adj-up loop exceeded `MAX_ADJ_ITERS=10` (Barrett quotient was ~2× too small: szRem ≈ 172.7M,
+szB ≈ 87.5M — ratio 1.97). The existing §171 top-limb correction fired, computed
+`szDelta=85,222,805` via `mpn_divrem_1`, then did:
+
+```vb
+SafeMpzMul(_prod171, _deltaWrap171, _bWrap171)
+GmpRaw_sub(_remRaw, _remRaw, _prod171.Pointer)
+```
+
+The log showed `szRemNew = 172,722,805` — **identical** to the pre-correction szRem.
+Subtraction produced no change. The outer adj-up loop then ran 11 more naive iterations,
+hit `§171b`'s `GmpRaw_tdiv_q(_qPtr, _aPtr, _bPtr)` fallback, which AV'd (0xC0000005)
+because `mpz_tdiv_q` allocates internal scratch that can't satisfy 172M-limb / 87.5M-limb
+at this scale.
+
+### Root cause
+
+Per the existing §175 note, `SafeMpzMul` recursion corrupts `result.Pointer` for
+locally-scoped `mpz_t` wrappers. `SafeMpzMul` restores via `savedResultPtr` at its exit,
+but when the caller uses the wrapper's `.Pointer` property *after* the call, it may still
+read a stale value routed through managed wrapping. The actual correct struct is always
+at the raw `IntPtr` captured before the call (`_prodHdr171`).
+
+When `GmpRaw_sub(_remRaw, _remRaw, _prod171.Pointer)` ran, `_prod171.Pointer` pointed at
+a struct with `_mp_size=0`, so GMP subtracted zero. rem was left unchanged.
+
+### Fix
+
+1. **Use captured raw pointer** `_prodHdr171` directly in `GmpRaw_sub` / `GmpRaw_clear` —
+   matches the §78/§NR-r-add/§184 pattern.
+2. **Iterate** the §171 correction until `szRem ≤ szB`. One pass is not enough when the
+   rem/b ratio approaches 2 (which it does at 5B scale). Bail with a clear
+   `InvalidOperationException` if a pass fails to reduce rem (pointer corruption or
+   arithmetic bug — loud, not silent-AV).
+3. **Remove `§171b` crash fallback**. Replace `GmpRaw_tdiv_q` with an
+   `InvalidOperationException` carrying `szRem`, `szB`, `szA` — if iterative §171
+   somehow leaves rem > b after MAX_ADJ_ITERS of normal adj-up, we want a clean
+   stack trace, not an AV.
+
+### New diagnostics (added per "every investigation adds logging")
+
+- `[SafeMpzDiv§171-entry]` — szA, szB, szRem, ratio on first §171 trigger.
+- `[SafeMpzDiv§171 pass=N]` — bTop, szDelta, szRemBefore (start of each pass).
+- `[SafeMpzDiv§171 pass=N]` — szProd, prodHdr address, `_prod171.Pointer`, **match flag**
+  (post-SafeMpzMul — would have caught the `.Pointer`-mismatch bug in seconds).
+- `[SafeMpzDiv§171 pass=N] done` — szRemAfter, delta.
+- `[SafeMpzDiv§171-done]` — total passes + final szRem.
+
+If a future crash recurs, the per-pass `match=False` flag or a non-decreasing szRem would
+instantly pinpoint the failure mode.

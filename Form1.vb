@@ -3747,74 +3747,90 @@ Public Class Form1
             If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-up iter={_adjUp}{vbCrLf}")
             If _adjUp > MAX_ADJ_ITERS AndAlso Not _171Done Then
                 ' §171: Barrett estimate is wildly off — rem >> b after adj loop.
-                ' Use mpn_divrem_1 (no TMP_ALLOC) on the top-limb slice of rem to compute
-                ' delta = floor(rem_top / ceil(bTop)) — guaranteed underestimate — then subtract
-                ' delta×b from rem and add delta to q in one shot, avoiding O(szRem) iterations.
+                ' Iterative top-limb correction: each pass computes delta = floor(rem_top /
+                ' (bTop+1)) via mpn_divrem_1 (no TMP_ALLOC, safe for any szB), then subtracts
+                ' delta×b from rem and adds delta to q.  Loops until szRem ≤ szB, then normal
+                ' adj-up finishes the last few iters.
+                '
+                ' §171-fix (5B crash, commit after 066f613): use captured _prodHdr171 (not
+                ' _prod171.Pointer) for the subtract.  SafeMpzMul recursion can corrupt
+                ' result.Pointer per §175 — at 5B the stale .Pointer pointed to a struct with
+                ' _mp_size=0 so GmpRaw_sub effectively subtracted zero → szRem unchanged →
+                ' §171b fallback → GmpRaw_tdiv_q AV on 172M-limb input.  The raw IntPtr
+                ' _prodHdr171 is set by SafeMpzMul's savedResultPtr path (line 2815) and is
+                ' always correct.
                 _171Done = True
                 Dim _szRem171 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
-                AppendLog($"[SafeMpzDiv§171] adj-up exceeded {MAX_ADJ_ITERS} iters (szRem={_szRem171:N0} > szB={szB:N0}); applying top-limb correction{vbCrLf}")
-                If _szRem171 > szB Then
+                AppendLog($"[SafeMpzDiv§171-entry] szA={szA:N0} szB={szB:N0} szRem={_szRem171:N0} ratio={(CDbl(_szRem171)/szB):F3}; iterative top-limb correction{vbCrLf}")
+
+                Dim _171Pass As Integer = 0
+                Do While _szRem171 > szB
+                    _171Pass += 1
+                    If _171Pass > 64 Then
+                        Throw New InvalidOperationException($"SafeMpzDiv §171 failed to converge in 64 passes (szRem={_szRem171}, szB={szB}, szA={szA})")
+                    End If
+                    Dim _szRemBefore171 As Integer = _szRem171
                     Dim _remData171 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_remRaw, 8))
                     Dim _bData171 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_bPtr, 8))
                     Dim _bTop171 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_bData171, CInt(CLng(szB - 1) * 8L)))
                     Dim _topSliceLen171 As Integer = _szRem171 - szB + 1
                     Dim _deltaBytes171 As Long = CLng(_topSliceLen171) * 8L
                     Dim _deltaBuf171 As IntPtr = GmpNativeAlloc_PoolGet(_deltaBytes171)
-                    If _deltaBuf171 <> IntPtr.Zero Then
-                        Dim _remTopPtr171 As IntPtr = New IntPtr(_remData171.ToInt64() + CLng(szB - 1) * 8L)
-                        GmpRaw_mpn_divrem_1(_deltaBuf171, 0, _remTopPtr171, _topSliceLen171, _bTop171 + 1UL)
-                        Dim _deltaSz171 As Integer = _topSliceLen171
-                        Do While _deltaSz171 > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(_deltaBuf171, CInt(CLng(_deltaSz171 - 1) * 8L)) = 0L
-                            _deltaSz171 -= 1
-                        Loop
-                        AppendLog($"[SafeMpzDiv§171] delta computed: szDelta={_deltaSz171:N0}{vbCrLf}")
-                        If _deltaSz171 > 0 Then
-                            Dim _deltaHdr171 As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
-                            Runtime.InteropServices.Marshal.WriteInt32(_deltaHdr171, 0, _topSliceLen171)
-                            Runtime.InteropServices.Marshal.WriteInt32(_deltaHdr171, 4, _deltaSz171)
-                            Runtime.InteropServices.Marshal.WriteInt64(_deltaHdr171, 8, _deltaBuf171.ToInt64())
-                            GmpRaw_add(_qPtr, _qPtr, _deltaHdr171)
-                            Dim _prodHdr171 As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
-                            GmpRaw_init(_prodHdr171)
-                            Dim _prod171 As New mpz_t()
-                            _prod171.Pointer = _prodHdr171
-                            Dim _bWrap171 As New mpz_t()
-                            _bWrap171.Pointer = _bPtr
-                            Dim _deltaWrap171 As New mpz_t()
-                            _deltaWrap171.Pointer = _deltaHdr171
-                            SafeMpzMul(_prod171, _deltaWrap171, _bWrap171)
-                            GmpRaw_sub(_remRaw, _remRaw, _prod171.Pointer)
-                            GmpRaw_clear(_prod171.Pointer)
-                            Runtime.InteropServices.Marshal.FreeHGlobal(_prodHdr171)
-                            _prod171.Pointer = IntPtr.Zero
-                            Runtime.InteropServices.Marshal.FreeHGlobal(_deltaHdr171)
-                        End If
-                        GmpNativeAlloc_FreeRaw(_deltaBuf171, _deltaBytes171)
-                        Dim _szRemNew171 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
-                        AppendLog($"[SafeMpzDiv§171] correction done: szRemNew={_szRemNew171:N0}{vbCrLf}")
-                    Else
-                        AppendLog($"[SafeMpzDiv§171] alloc failed — falling back to GmpRaw_tdiv_q{vbCrLf}")
-                        GmpRaw_clear(_remRaw) : Runtime.InteropServices.Marshal.FreeHGlobal(_remRaw)
-                        remainder.Pointer = IntPtr.Zero
-                        GmpRaw_tdiv_q(_qPtr, _aPtr, _bPtr)
-                        q.Pointer = _qPtr
-                        AppendLog($"[SafeMpzDiv§171] GmpRaw_tdiv_q fallback; szQ={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qPtr, 4)):N0}{vbCrLf}")
-                        Return
+                    If _deltaBuf171 = IntPtr.Zero Then
+                        Throw New InvalidOperationException($"SafeMpzDiv §171 pool alloc failed on pass {_171Pass}: requested {_deltaBytes171:N0} bytes")
                     End If
-                End If
+                    Dim _remTopPtr171 As IntPtr = New IntPtr(_remData171.ToInt64() + CLng(szB - 1) * 8L)
+                    GmpRaw_mpn_divrem_1(_deltaBuf171, 0, _remTopPtr171, _topSliceLen171, _bTop171 + 1UL)
+                    Dim _deltaSz171 As Integer = _topSliceLen171
+                    Do While _deltaSz171 > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(_deltaBuf171, CInt(CLng(_deltaSz171 - 1) * 8L)) = 0L
+                        _deltaSz171 -= 1
+                    Loop
+                    AppendLog($"[SafeMpzDiv§171 pass={_171Pass}] bTop=0x{_bTop171:X16} szDelta={_deltaSz171:N0} szRemBefore={_szRemBefore171:N0}{vbCrLf}")
+                    If _deltaSz171 = 0 Then
+                        GmpNativeAlloc_FreeRaw(_deltaBuf171, _deltaBytes171)
+                        Throw New InvalidOperationException($"SafeMpzDiv §171 delta=0 on pass {_171Pass}: top-limb ratio too small. szRem={_szRem171}, szB={szB}, bTop=0x{_bTop171:X16}")
+                    End If
+                    Dim _deltaHdr171 As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                    Runtime.InteropServices.Marshal.WriteInt32(_deltaHdr171, 0, _topSliceLen171)
+                    Runtime.InteropServices.Marshal.WriteInt32(_deltaHdr171, 4, _deltaSz171)
+                    Runtime.InteropServices.Marshal.WriteInt64(_deltaHdr171, 8, _deltaBuf171.ToInt64())
+                    GmpRaw_add(_qPtr, _qPtr, _deltaHdr171)
+                    Dim _prodHdr171 As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                    GmpRaw_init(_prodHdr171)
+                    Dim _prod171 As New mpz_t()
+                    _prod171.Pointer = _prodHdr171
+                    Dim _bWrap171 As New mpz_t()
+                    _bWrap171.Pointer = _bPtr
+                    Dim _deltaWrap171 As New mpz_t()
+                    _deltaWrap171.Pointer = _deltaHdr171
+                    SafeMpzMul(_prod171, _deltaWrap171, _bWrap171)
+                    ' §171-fix: read prod size from _prodHdr171 (captured raw) — _prod171.Pointer may be stale per §175.
+                    Dim _szProd171 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_prodHdr171, 4))
+                    Dim _ptrMatch171 As Boolean = (_prodHdr171 = _prod171.Pointer)
+                    AppendLog($"[SafeMpzDiv§171 pass={_171Pass}] szProd={_szProd171:N0} prodHdr=0x{_prodHdr171.ToInt64():X} prod.Ptr=0x{_prod171.Pointer.ToInt64():X} match={_ptrMatch171}{vbCrLf}")
+                    GmpRaw_sub(_remRaw, _remRaw, _prodHdr171)
+                    GmpRaw_clear(_prodHdr171)
+                    Runtime.InteropServices.Marshal.FreeHGlobal(_prodHdr171)
+                    _prod171.Pointer = IntPtr.Zero
+                    Runtime.InteropServices.Marshal.FreeHGlobal(_deltaHdr171)
+                    GmpNativeAlloc_FreeRaw(_deltaBuf171, _deltaBytes171)
+                    _szRem171 = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
+                    AppendLog($"[SafeMpzDiv§171 pass={_171Pass}] done: szRemAfter={_szRem171:N0} Δ={_szRemBefore171 - _szRem171:N0}{vbCrLf}")
+                    If _szRem171 >= _szRemBefore171 Then
+                        Throw New InvalidOperationException($"SafeMpzDiv §171 pass {_171Pass} did not reduce rem size: before={_szRemBefore171}, after={_szRem171}, szB={szB}, szProd={_szProd171}, ptrMatch={_ptrMatch171} — pointer corruption suspected")
+                    End If
+                Loop
+                AppendLog($"[SafeMpzDiv§171-done] {_171Pass} pass(es); szRem={_szRem171:N0} ≤ szB={szB:N0}{vbCrLf}")
                 _adjUp = 0
                 Continue Do
             End If
             If _adjUp > MAX_ADJ_ITERS Then
-                ' §171b: still not converged after top-limb correction — last resort fallback
+                ' §171b: after iterative correction, adj-up must converge in ≤ MAX_ADJ_ITERS.
+                ' If not, something is fundamentally wrong — throw with full diagnostics.
+                ' (Do NOT fall back to GmpRaw_tdiv_q — it AVs for 170M+ limb inputs in the
+                ' SafeMpzSqrt/Newton call stack; see investigation 2026-04-23.)
                 Dim _szRem171b As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
-                AppendLog($"[SafeMpzDiv§171b] still exceeded after correction (szRem={_szRem171b:N0}) — GmpRaw_tdiv_q{vbCrLf}")
-                GmpRaw_clear(_remRaw) : Runtime.InteropServices.Marshal.FreeHGlobal(_remRaw)
-                remainder.Pointer = IntPtr.Zero
-                GmpRaw_tdiv_q(_qPtr, _aPtr, _bPtr)
-                q.Pointer = _qPtr
-                AppendLog($"[SafeMpzDiv§171b] szQ={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qPtr, 4)):N0}{vbCrLf}")
-                Return
+                Throw New InvalidOperationException($"SafeMpzDiv §171b: adj-up still exceeded {MAX_ADJ_ITERS} iters after §171 correction. szRem={_szRem171b}, szB={szB}, szA={szA}")
             End If
             GmpRaw_add_ui(_qPtr, _qPtr, 1UI)
             GmpRaw_sub(_remRaw, _remRaw, _bPtr)
