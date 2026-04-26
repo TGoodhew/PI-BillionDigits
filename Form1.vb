@@ -3451,6 +3451,34 @@ Public Class Form1
             Next
             AppendLog(_sb154.ToString())
         End If
+        ' §5B-investigate: capture a, r boundary limbs BEFORE SafeMpzMul (r is cleared after).
+        ' These are used post-mul to verify ar[0] = a[0]*r[0] mod 2^64 (exact) and that
+        ' ar's top limbs are consistent with a[szA-1]*r[szR-1] (approximate, plus carries).
+        ' If pre-mul a/r values look plausible but post-mul ar values are wildly off, the
+        ' bug is in SafeMpzMul itself.  If pre-mul values are wrong, the bug is upstream
+        ' (SafeMpzReciprocal for r; whoever produced a for a).
+        Dim _5b_verify As Boolean = (szA = 175000001 AndAlso szR = 87500001)
+        Dim _5b_aBot As ULong = 0UL, _5b_aTop As ULong = 0UL, _5b_aTop2 As ULong = 0UL
+        Dim _5b_aMid As ULong = 0UL, _5b_aBot2 As ULong = 0UL
+        Dim _5b_rBot As ULong = 0UL, _5b_rTop As ULong = 0UL, _5b_rTop2 As ULong = 0UL
+        Dim _5b_rMid As ULong = 0UL, _5b_rBot2 As ULong = 0UL
+        If _logLevel >= 2 AndAlso _5b_verify Then
+            Dim _aD5 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(a.Pointer, 8))
+            Dim _rD5 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
+            _5b_aBot = CULng(Runtime.InteropServices.Marshal.ReadInt64(_aD5, 0))
+            _5b_aBot2 = CULng(Runtime.InteropServices.Marshal.ReadInt64(_aD5, 8))
+            _5b_aMid = CULng(Runtime.InteropServices.Marshal.ReadInt64(_aD5, CInt(CLng(szA \ 2) * 8L)))
+            _5b_aTop2 = CULng(Runtime.InteropServices.Marshal.ReadInt64(_aD5, CInt(CLng(szA - 2) * 8L)))
+            _5b_aTop = CULng(Runtime.InteropServices.Marshal.ReadInt64(_aD5, CInt(CLng(szA - 1) * 8L)))
+            _5b_rBot = CULng(Runtime.InteropServices.Marshal.ReadInt64(_rD5, 0))
+            _5b_rBot2 = CULng(Runtime.InteropServices.Marshal.ReadInt64(_rD5, 8))
+            _5b_rMid = CULng(Runtime.InteropServices.Marshal.ReadInt64(_rD5, CInt(CLng(szR \ 2) * 8L)))
+            _5b_rTop2 = CULng(Runtime.InteropServices.Marshal.ReadInt64(_rD5, CInt(CLng(szR - 2) * 8L)))
+            _5b_rTop = CULng(Runtime.InteropServices.Marshal.ReadInt64(_rD5, CInt(CLng(szR - 1) * 8L)))
+            AppendLog($"[SafeMpzDiv§5B-a] a[0]={_5b_aBot:X16} a[1]={_5b_aBot2:X16} a[mid={szA \ 2:N0}]={_5b_aMid:X16} a[szA-2]={_5b_aTop2:X16} a[szA-1]={_5b_aTop:X16}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-r] r[0]={_5b_rBot:X16} r[1]={_5b_rBot2:X16} r[mid={szR \ 2:N0}]={_5b_rMid:X16} r[szR-2]={_5b_rTop2:X16} r[szR-1]={_5b_rTop:X16}{vbCrLf}")
+        End If
+
         ' §166: Force ALL recursive levels of a×r fully serial — GMP allocator is not
         ' thread-safe under concurrent mpz_mul reallocs with distinct opA_d/opB_d buffers.
         ' §138/§165 only forced the outer Parallel.For; inner recursive SafeMpzMul calls
@@ -3463,6 +3491,25 @@ Public Class Form1
         System.Threading.Volatile.Write(_safeMulDop, _saved166Dop)
         gmp_lib.mpz_clear(r)
         Dim szAR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(ar.Pointer, 4))
+
+        ' §5B-investigate (post-mul): verify ar boundary limbs against pre-mul a, r values.
+        ' Bottom: ar[0] = (a[0]*r[0]) mod 2^64 — EXACT relation, mismatch ⇒ SafeMpzMul bug.
+        ' Top: ar[szAR-1] should be ≈ high(a[szA-1]*r[szR-1]) plus accumulated carry from cross
+        ' products; off-by-many-orders-of-magnitude indicates SafeMpzMul produced wrong top.
+        If _logLevel >= 2 AndAlso _5b_verify Then
+            Dim _arD5 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
+            Dim _arBot5 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, 0))
+            Dim _arBot5_2 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, 8))
+            Dim _arMid5 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt(CLng(szAR \ 2) * 8L)))
+            Dim _arTop5_2 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt(CLng(szAR - 2) * 8L)))
+            Dim _arTop5 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt(CLng(szAR - 1) * 8L)))
+            Dim _expArBot As ULong = _5b_aBot * _5b_rBot
+            Dim _expArTopLow As ULong = 0UL
+            Dim _expArTopHigh As ULong = System.Math.BigMul(_5b_aTop, _5b_rTop, _expArTopLow)
+            AppendLog($"[SafeMpzDiv§5B-ar] ar[0]={_arBot5:X16} ar[1]={_arBot5_2:X16} ar[mid={szAR \ 2:N0}]={_arMid5:X16} ar[szAR-2]={_arTop5_2:X16} ar[szAR-1]={_arTop5:X16}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-arBot] actual ar[0]={_arBot5:X16}  expected (a[0]*r[0])_lo={_expArBot:X16}  match={(_arBot5 = _expArBot)}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-arTop] actual ar[szAR-1..szAR-2]=[{_arTop5:X16} {_arTop5_2:X16}]  a[top]*r[top]=[hi={_expArTopHigh:X16} lo={_expArTopLow:X16}]  (top should be ≈ hi+carry; lo+carry should be near {_arTop5_2:X16}){vbCrLf}")
+        End If
         ' §135 save slots: ar[64654664/65] captured inside §111 block, used after BigShiftRight.
         Dim _ar135_v0 As Long = 0L
         Dim _ar135_v1 As Long = 0L
@@ -3555,6 +3602,17 @@ Public Class Form1
             Dim _qBot As Long = If(szQ >= 1, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, 0), 0L)
             Dim _qBot2 As Long = If(szQ >= 2, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, 8), 0L)
             AppendLog($"[SafeMpzDiv] q_approx ready: szQ={szQ:N0} top2limbs=[{_qTop:X16} {_qTop2:X16}] bot2limbs=[{_qBot:X16} {_qBot2:X16}]{vbCrLf}")
+            ' §5B-investigate (post-shift): log q at multiple positions and verify BigShiftRight
+            ' at the boundary.  q[i] = (ar[kLimb+i] >> kRem) | (ar[kLimb+i+1] << (64-kRem)).
+            ' Mismatch between this expected value (computed from saved ar limbs) and actual q[i]
+            ' would indicate BigShiftRight produced wrong output; agreement narrows the bug to
+            ' SafeMpzMul.  At kBits=11,200,000,067: kLimb=175,000,001, kRem=3.  Top valid q
+            ' index is szQ-1 = 87,500,000, which corresponds to ar[262,500,001] = ar[szAR-1].
+            If szQ = 87500001 Then
+                Dim _qMid5 As Long = If(CLng(szQ \ 2) < CLng(szQ), Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, CInt(CLng(szQ \ 2) * 8L)), 0L)
+                Dim _qBotPos5 As Long = If(1L < CLng(szQ), Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, 8), 0L)
+                AppendLog($"[SafeMpzDiv§5B-q] q[0]={_qBot:X16} q[1]={_qBotPos5:X16} q[mid={szQ \ 2:N0}]={_qMid5:X16} q[szQ-2]={_qTop2:X16} q[szQ-1]={_qTop:X16}{vbCrLf}")
+            End If
             ' §113: log q middle limbs to verify BigShiftRight correctness.
             If szQ = 21875001 Then
                 Dim _q113Positions() As Long = {10937500L, 20904664L}

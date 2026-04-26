@@ -3247,3 +3247,40 @@ At 5B something is numerically wrong at one of these three stages.
 `§171-iter` code is correct — it catches the bug cleanly with rich diagnostics instead
 of the prior silent AV. But the 5B run still crashes at Newton step 1 because the root
 cause is upstream. Further investigation needed.
+
+## §5B-investigate — Boundary-limb logging to localise the upstream Barrett bug
+
+### Approach
+
+Three candidates for the upstream bug at 5B scale: `SafeMpzMul(ar,a,r)`,
+`BigShiftRight(ar,kBits)`, or `SafeMpzReciprocal`. To localise:
+
+- **Pre-mul logging** (gated on `szA=175,000,001 ∧ szR=87,500,001`): log a[0], a[1],
+  a[mid], a[szA-2], a[szA-1] and r[0], r[1], r[mid], r[szR-2], r[szR-1].  Captured into
+  outer-scope ULongs so they are reusable post-mul.
+- **Post-mul self-verification** at the boundaries:
+  - **Bottom**: `ar[0]` must equal `(a[0] * r[0]) mod 2^64` exactly.  Mismatch ⇒
+    `SafeMpzMul` produced a wrong bottom limb (definitive).
+  - **Top**: `ar[szAR-1..szAR-2]` should be plausibly close to
+    `Math.BigMul(a[szA-1], r[szR-1])` (high) plus accumulated cross-product carry.
+    Wildly off ⇒ top-limb error in `SafeMpzMul`.
+- **Post-shift logging**: log q[0], q[1], q[mid], q[szQ-2], q[szQ-1].  Combined with
+  saved ar limbs (already logged for kLimb / kLimb+1), the existing `q_bot_expected`
+  formula tells us if `BigShiftRight` honoured the bit-shift correctly.
+
+### Why this is decisive
+
+If the §5B-arBot match flag is `False`, the bug is **definitely** in `SafeMpzMul` —
+no other component can change the bottom limb of a*r. If `True`, SafeMpzMul's bottom
+is correct; we then look at top-limb plausibility and the post-shift logs to attribute
+the error to either SafeMpzMul's top or BigShiftRight.
+
+If both the bottom matches and the top is plausible (carry within a few limbs of
+`hi(a_top*r_top)`), the bug is in `BigShiftRight` or `SafeMpzReciprocal` — and the
+post-shift q values let us pin it down.
+
+### Status
+
+Diagnostics added; relaunching the 5B run to capture them.  No checkpoint added because
+the existing Newton checkpoint (kBitsX=2.8B) already lets us get back to this point in
+~1h11m, and the diagnostics will fire on the very first §171 trigger.
