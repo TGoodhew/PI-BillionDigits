@@ -3284,3 +3284,49 @@ post-shift q values let us pin it down.
 Diagnostics added; relaunching the 5B run to capture them.  No checkpoint added because
 the existing Newton checkpoint (kBitsX=2.8B) already lets us get back to this point in
 ~1h11m, and the diagnostics will fire on the very first §171 trigger.
+
+### Result (2026-04-26 12:36)
+
+Run reached §171 in 1h 14m and threw with all diagnostics. Critical findings:
+
+```
+[SafeMpzDiv§5B-a]   a[0]=A514E7911325F190 ... a[szA-1]=0479BC06C17340EB
+[SafeMpzDiv§5B-r]   r[0]=88638C785832DAFF ... r[szR-1]=0000003C81298323
+[SafeMpzDiv§5B-ar]  ar[0]=FA82F7C310A03E70 ... ar[szAR-1]=000000010ECA231E
+[SafeMpzDiv§5B-arBot] actual ar[0]=FA82F7C310A03E70 expected=FA82F7C310A03E70  match=True
+[SafeMpzDiv§5B-arTop] ar[szAR-1]=000000010ECA231E  hi(a_top*r_top)=000000010ECA231E
+[SafeMpzDiv§5B-q]   q[0]=2DBB1E91012D8D3E ... q[szQ-1]=0000000021D94463
+[SafeMpzDiv§171-entry] szRem=172,722,805 ratio=1.974 bTop=0x21D94463 bTopBits=30
+```
+
+**SafeMpzMul is correct**: the bottom-limb identity `ar[0] = (a[0]*r[0]) mod 2^64`
+holds **exactly**, and the top limb matches `high(a[szA-1]*r[szR-1])` with cross-term
+carry of 0.
+
+**BigShiftRight is correct**: `q[szQ-1] = ar[szAR-1] >> 3 = 0x10ECA231E >> 3 = 0x21D94463`
+matches actual; `q[0]` matches the existing `q_bot_expected` formula.
+
+**Therefore the bug is in `r` itself** — `SafeMpzReciprocal` (or its checkpoint).  Given
+correct `a*r` and correct shift, q_approx error of 2^(5.45B) directly maps to an r
+error of ~2^(5.45B) in r's bottom ~85M limbs.  r's top ~2.5M limbs appear correct
+(rBits, top-limb value, magnitude all match expectations); the corruption (or Newton
+convergence shortfall) lives in the lower limbs that aren't surfaced by boundary checks.
+
+### Most likely root cause
+
+The 5B Newton-reciprocal checkpoint `nr_r.bin` was saved by an earlier run that already
+contained this bug; on every restart we load the same corrupt r.  Each subsequent run
+loads the bad checkpoint, computes the same wrong `a*r`, and crashes at the same place.
+
+### Next step (deferred — discuss with user)
+
+Options:
+1. Invalidate the checkpoint (`mv nr_r.bin nr_r.bin.suspect`) and force a fresh Newton
+   recomputation from seed.  Expensive (many hours) but definitive: if fresh r differs
+   from saved r, the checkpoint is the bug; if identical, the bug is in Newton
+   itself at this scale.
+2. In-process verification: after `SafeMpzReciprocal` returns, compute `r*b` and
+   confirm it lies in `[2^kBits - b, 2^kBits)`.  Direct but adds another 175M-limb
+   multiply per Newton step.
+3. Mid-limb spot check: log r at many positions (every ~1M limbs) and compare against
+   the expected magnitude/distribution of a true reciprocal.  Cheap but only suggestive.
