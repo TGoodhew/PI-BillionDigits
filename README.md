@@ -3285,6 +3285,24 @@ Diagnostics added; relaunching the 5B run to capture them.  No checkpoint added 
 the existing Newton checkpoint (kBitsX=2.8B) already lets us get back to this point in
 ~1h11m, and the diagnostics will fire on the very first §171 trigger.
 
+### Fresh-Newton verification (2026-04-26 12:43–21:57)
+
+Ran with `nr_r.bin` moved aside, forcing `SafeMpzReciprocal` to recompute `r` from seed.
+Newton converged through 27 iterations in ~8h.  Final `r` is **bit-for-bit identical**
+to the saved checkpoint at all five logged boundary positions (r[0], r[1], r[mid],
+r[szR-2], r[szR-1]) AND every other §5B-* value (a, ar, q, rem, ratio) is identical
+across the two runs.
+
+**Conclusion: bug is fully deterministic. Not checkpoint corruption, not Newton, not
+parallelism, not memory.**  The same wrong q_approx is produced reliably.
+
+The bug must be in the chain:
+1. `BigShiftRight(n, nShift) → nTrunc` (`a`) — only boundary verified, middle could be wrong.
+2. `SafeMpzMul(ar, a, r)` middle limbs — only ar[0] (exact) and ar[szAR-1] (boundary)
+   verified.  Middle limbs unverified.
+3. `BigShiftRight(ar, kBits) → q_approx` middle limbs — only q[0] is verified via the
+   existing `q_bot_expected` formula.  Middle of q unverified.
+
 ### Result (2026-04-26 12:36)
 
 Run reached §171 in 1h 14m and threw with all diagnostics. Critical findings:
