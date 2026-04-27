@@ -2755,6 +2755,22 @@ Public Class Form1
                         Dim _exp5SpBot As ULong = _ai5_bot * _bj5_bot
                         AppendLog($"[SafeMpzMul§5B-sub k={k} ki={ki} kj={kj}] szProd={_logPre:N0} bot=[{_sp5Bot:X16} {_sp5Bot2:X16}] mid[{_logPre\2:N0}]={_sp5Mid:X16} top=[{_sp5Top2:X16} {_sp5Top:X16}]{vbCrLf}")
                         AppendLog($"[SafeMpzMul§5B-sub k={k} verify] A_{ki}[0]={_ai5_bot:X16} B_{kj}[0]={_bj5_bot:X16} (A_{ki}*B_{kj})_lo={_exp5SpBot:X16} actual prod[0]={_sp5Bot:X16} match={(_exp5SpBot = _sp5Bot)}{vbCrLf}")
+                        ' §5B-sub-1: verify prods(k)[1].  prods[0] receives only one term
+                        ' (A_i[0]*B_j[0].lo) so its carry to limb 1 is 0.  prods[1] receives:
+                        '   hi(A_i[0]*B_j[0]) + lo(A_i[0]*B_j[1]) + lo(A_i[1]*B_j[0])
+                        ' all reduced mod 2^64.  Mismatch ⇒ that prods(k) is wrong starting
+                        ' from limb 1, narrowing the bug to a specific recursive sub-product.
+                        If _logPre >= 2 Then
+                            Dim _ai51_1 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_opA_d5, CInt((CLng(ki) * CLng(mA) + 1L) * 8L)))
+                            Dim _bj51_1 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_opB_d5, CInt((CLng(kj) * CLng(mB) + 1L) * 8L)))
+                            Dim _hi00_lo As ULong = 0UL
+                            Dim _hi00 As ULong = System.Math.BigMul(_ai5_bot, _bj5_bot, _hi00_lo)
+                            Dim _lo01 As ULong = _ai5_bot * _bj51_1
+                            Dim _lo10 As ULong = _ai51_1 * _bj5_bot
+                            Dim _expProd1 As ULong = _hi00 + _lo01 + _lo10
+                            Dim _actProd1 As ULong = _sp5Bot2
+                            AppendLog($"[SafeMpzMul§5B-sub k={k} verify1] A_{ki}[1]={_ai51_1:X16} B_{kj}[1]={_bj51_1:X16} hi00={_hi00:X16} lo01={_lo01:X16} lo10={_lo10:X16}  expected prod[1]={_expProd1:X16}  actual prod[1]={_actProd1:X16}  match={(_actProd1 = _expProd1)}{vbCrLf}")
+                        End If
                     End If
                 End If
                 If shiftBits = 0UL Then
