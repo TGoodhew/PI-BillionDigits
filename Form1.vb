@@ -2771,6 +2771,25 @@ Public Class Form1
                             Dim _actProd1 As ULong = _sp5Bot2
                             AppendLog($"[SafeMpzMul§5B-sub k={k} verify1] A_{ki}[1]={_ai51_1:X16} B_{kj}[1]={_bj51_1:X16} hi00={_hi00:X16} lo01={_lo01:X16} lo10={_lo10:X16}  expected prod[1]={_expProd1:X16}  actual prod[1]={_actProd1:X16}  match={(_actProd1 = _expProd1)}{vbCrLf}")
                         End If
+                        ' §5B-sub-T: verify prods(k) TOP limb ≈ hi(A_i[topA] * B_j[topB]).
+                        ' The top limb of A_i × B_j is dominated by hi(A_i[topA]*B_j[topB])
+                        ' plus a tiny carry from below (typically 0..2 for random data).
+                        ' If mpz_mul stripped a leading zero the actual size will be one less
+                        ' than expected and actTop ≈ lo(A_i[topA]*B_j[topB]).  A "wildly off"
+                        ' sub-product (the working hypothesis) will diverge by a huge amount,
+                        ' pinpointing which k's recursive SafeMpzMul produced a wrong top.
+                        Dim _szAi As ULong = If(ki = 2, CULng(szA) - 2UL * mA, mA)
+                        Dim _szBj As ULong = If(kj = 2, CULng(szB) - 2UL * mB, mB)
+                        Dim _topAOff As Long = (CLng(ki) * CLng(mA) + CLng(_szAi) - 1L) * 8L
+                        Dim _topBOff As Long = (CLng(kj) * CLng(mB) + CLng(_szBj) - 1L) * 8L
+                        Dim _ai5_top As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_opA_d5, CInt(_topAOff)))
+                        Dim _bj5_top2 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_opB_d5, CInt(_topBOff)))
+                        Dim _expTopLo As ULong = 0UL
+                        Dim _expTopHi As ULong = System.Math.BigMul(_ai5_top, _bj5_top2, _expTopLo)
+                        Dim _expSzProd As ULong = _szAi + _szBj
+                        Dim _expTopForCmp As ULong = If(_expSzProd = CULng(_logPre), _expTopHi, _expTopLo)
+                        Dim _topDiff As ULong = _sp5Top - _expTopForCmp
+                        AppendLog($"[SafeMpzMul§5B-sub k={k} verifyT] A_{ki}[{_szAi - 1UL:N0}]={_ai5_top:X16} B_{kj}[{_szBj - 1UL:N0}]={_bj5_top2:X16} expHi={_expTopHi:X16} expLo={_expTopLo:X16} expSzProd={_expSzProd:N0} actSzProd={_logPre:N0} actTop={_sp5Top:X16} actTop-1={_sp5Top2:X16} cmpExp={_expTopForCmp:X16} diff(act-exp)={_topDiff:X16}{vbCrLf}")
                     End If
                 End If
                 If shiftBits = 0UL Then

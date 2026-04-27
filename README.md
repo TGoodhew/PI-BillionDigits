@@ -3366,3 +3366,35 @@ Options:
    multiply per Newton step.
 3. Mid-limb spot check: log r at many positions (every ~1M limbs) and compare against
    the expected magnitude/distribution of a true reciprocal.  Cheap but only suggestive.
+
+### §5B-sub verifyT — per-sub-product TOP-limb spot check (2026-04-27)
+
+Fresh-Newton verification (above) ruled out `r` itself: the bug is fully deterministic
+and identical across runs.  Subsequent §5B-q-mid / §5B-q-quart / §5B-arBot / §5B-arTop
+work isolated the error to **`SafeMpzMul(ar, a, r)` middle limbs of one or more of the
+9 Toom-Cook sub-products**.
+
+`§5B-sub verify` (k=0..8 prods[0]) and `§5B-sub verify1` (k=0..8 prods[1]) both match
+all 9 sub-products: bottom limbs are correct.  The bug therefore lives in
+`prods(k)[≥2]` for at least one k.
+
+**verifyT** (this section) extends the gate to the TOP limb of each sub-product.
+For k=0..8, gated on `szA=175,000,001 ∧ szB=87,500,001` (the outer 175M × 87.5M
+SafeMpzMul call):
+
+- Compute `topA_idx = ki*mA + szAi - 1` and `topB_idx = kj*mB + szBj - 1`, where
+  `szAi`, `szBj` are the actual sizes of pieces `A_i` and `B_j` (the last A piece
+  is one limb shorter at 5B due to ceiling-division).
+- Compute `(expHi, expLo) = BigMul(A_i[topA_idx], B_j[topB_idx])`.
+- Compare against actual `prods(k)[szProd-1]` and `prods(k)[szProd-2]`.
+- Choose the comparison side based on whether `mpz_mul` stripped a leading zero:
+  - If `actSzProd == szAi + szBj`: the top limb should be `≈ expHi` (within 0..2 carry).
+  - If `actSzProd == szAi + szBj - 1`: leading zero was stripped, so `actTop ≈ expLo`.
+- Log `diff(act-exp)`: `0`, `1`, or `2` is normal carry; anything large pinpoints
+  the wrong sub-product's recursive `SafeMpzMul`.
+
+Most likely k=7 (A_2×B_1) and/or k=8 (A_2×B_2) — they are the only contributors to
+ar[218,750,001], the known-wrong limb.  This run will distinguish "wildly off top" (sub-
+product is broken end-to-end) from "correct top, broken middle" (sub-product top limb
+is fine but middle limbs are wrong, suggesting a deeper recursion or leaf `mpz_mul`
+issue at sizes near `SAFE_LIMB_THRESHOLD=5M`).
