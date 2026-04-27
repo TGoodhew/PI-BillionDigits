@@ -2736,6 +2736,26 @@ Public Class Form1
                         Dim _p130v1 As Long = If(_PL130 + 1L < CLng(_logPre), Runtime.InteropServices.Marshal.ReadInt64(_p130dPtr, CInt((_PL130 + 1L) * 8L)), 0L)
                         AppendLog($"[SafeMpzMul§130] k=8 A2*B2 prod[{_PL130:N0}]={_p130v:X16} prod[{_PL130+1:N0}]={_p130v1:X16} szProd={_logPre:N0}{vbCrLf}")
                     End If
+                    ' §5B-sub: at the outer 175M × 87.5M call only, log each of the 9 sub-products'
+                    ' bot/mid/top limbs AND verify prods(k)[0] = A_i[0] * B_j[0] mod 2^64 (exact).
+                    ' Mismatch ⇒ that sub-product (the recursive SafeMpzMul call for A_i × B_j)
+                    ' produced a wrong bottom limb — narrows the 5B bug to a specific k.
+                    If szA = 175000001 AndAlso szB = 87500001 AndAlso _logPre > 0 Then
+                        Dim _sp5DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_prod, 8))
+                        Dim _sp5Bot As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_sp5DPtr, 0))
+                        Dim _sp5Bot2 As ULong = If(_logPre >= 2, CULng(Runtime.InteropServices.Marshal.ReadInt64(_sp5DPtr, 8)), 0UL)
+                        Dim _sp5Mid As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_sp5DPtr, CInt(CLng(_logPre \ 2) * 8L)))
+                        Dim _sp5Top2 As ULong = If(_logPre >= 2, CULng(Runtime.InteropServices.Marshal.ReadInt64(_sp5DPtr, CInt(CLng(_logPre - 2) * 8L))), 0UL)
+                        Dim _sp5Top As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_sp5DPtr, CInt(CLng(_logPre - 1) * 8L)))
+                        ' Read A_i[0] and B_j[0] via opA/opB data + ki*mA, kj*mB offsets.
+                        Dim _opA_d5 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8))
+                        Dim _opB_d5 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(opB.Pointer, 8))
+                        Dim _ai5_bot As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_opA_d5, CInt(CLng(ki) * CLng(mA) * 8L)))
+                        Dim _bj5_bot As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_opB_d5, CInt(CLng(kj) * CLng(mB) * 8L)))
+                        Dim _exp5SpBot As ULong = _ai5_bot * _bj5_bot
+                        AppendLog($"[SafeMpzMul§5B-sub k={k} ki={ki} kj={kj}] szProd={_logPre:N0} bot=[{_sp5Bot:X16} {_sp5Bot2:X16}] mid[{_logPre\2:N0}]={_sp5Mid:X16} top=[{_sp5Top2:X16} {_sp5Top:X16}]{vbCrLf}")
+                        AppendLog($"[SafeMpzMul§5B-sub k={k} verify] A_{ki}[0]={_ai5_bot:X16} B_{kj}[0]={_bj5_bot:X16} (A_{ki}*B_{kj})_lo={_exp5SpBot:X16} actual prod[0]={_sp5Bot:X16} match={(_exp5SpBot = _sp5Bot)}{vbCrLf}")
+                    End If
                 End If
                 If shiftBits = 0UL Then
                     GmpRaw_add(accumPtr, accumPtr, _sv_prod)
