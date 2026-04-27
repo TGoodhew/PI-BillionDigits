@@ -3303,6 +3303,24 @@ The bug must be in the chain:
 3. `BigShiftRight(ar, kBits) → q_approx` middle limbs — only q[0] is verified via the
    existing `q_bot_expected` formula.  Middle of q unverified.
 
+### q[mid] / q[quart] verification result (2026-04-27)
+
+Added §5B-q-mid and §5B-q-quart spot-checks: capture ar[kLimb+i] and ar[kLimb+i+1]
+before BigShiftRight (for i = quartIdx=21,875,000 and midIdx=43,750,000); then post-shift
+verify q[i] = (ar[kLimb+i] >> 3) | (ar[kLimb+i+1] << 61) matches actual q[i].
+
+Result: **both match=True** at quart and mid. BigShiftRight produces q faithfully from
+ar across all four checked positions (q[0], q[quart], q[mid], q[szQ-1]).
+
+**The bug is now isolated to `SafeMpzMul(ar, a, r)` middle limbs.** ar's middle limbs are
+wrong (e.g., ar[218,750,001]=F749B40E433B9742 differs from the true a*r at that index),
+even though ar[0] = a[0]*r[0] mod 2^64 is exact and ar[szAR-1] = high(a[top]*r[top]) is
+plausible at the boundary. One or more of the 9 sub-products in SafeMpzMul's 3-way
+Toom-Cook split is producing a wrong value at 175M × 87.5M-limb scale.
+
+Next step: instrument SafeMpzMul to log each of the 9 sub-products' size/top/bottom/mid
+limbs at the szA=175M ∧ szR=87.5M gate so we can spot which sub-product is wrong.
+
 ### Result (2026-04-26 12:36)
 
 Run reached §171 in 1h 14m and threw with all diagnostics. Critical findings:
