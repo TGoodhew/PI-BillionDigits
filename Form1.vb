@@ -3462,6 +3462,12 @@ Public Class Form1
         Dim _5b_aMid As ULong = 0UL, _5b_aBot2 As ULong = 0UL
         Dim _5b_rBot As ULong = 0UL, _5b_rTop As ULong = 0UL, _5b_rTop2 As ULong = 0UL
         Dim _5b_rMid As ULong = 0UL, _5b_rBot2 As ULong = 0UL
+        ' §5B-q-mid: capture ar at the kLimb+midIdx and kLimb+quartIdx positions BEFORE
+        ' BigShiftRight, so post-shift we can verify q[mid] and q[quart] derive correctly
+        ' from those ar limbs via q[i] = (ar[kLimb+i] >> kRem) | (ar[kLimb+i+1] << (64-kRem)).
+        ' Mismatch ⇒ BigShiftRight middle bug.  Agreement ⇒ narrows bug to SafeMpzMul middle.
+        Dim _5b_arMid0 As ULong = 0UL, _5b_arMid1 As ULong = 0UL
+        Dim _5b_arQuart0 As ULong = 0UL, _5b_arQuart1 As ULong = 0UL
         If _logLevel >= 2 AndAlso _5b_verify Then
             Dim _aD5 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(a.Pointer, 8))
             Dim _rD5 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
@@ -3509,6 +3515,18 @@ Public Class Form1
             AppendLog($"[SafeMpzDiv§5B-ar] ar[0]={_arBot5:X16} ar[1]={_arBot5_2:X16} ar[mid={szAR \ 2:N0}]={_arMid5:X16} ar[szAR-2]={_arTop5_2:X16} ar[szAR-1]={_arTop5:X16}{vbCrLf}")
             AppendLog($"[SafeMpzDiv§5B-arBot] actual ar[0]={_arBot5:X16}  expected (a[0]*r[0])_lo={_expArBot:X16}  match={(_arBot5 = _expArBot)}{vbCrLf}")
             AppendLog($"[SafeMpzDiv§5B-arTop] actual ar[szAR-1..szAR-2]=[{_arTop5:X16} {_arTop5_2:X16}]  a[top]*r[top]=[hi={_expArTopHigh:X16} lo={_expArTopLow:X16}]  (top should be ≈ hi+carry; lo+carry should be near {_arTop5_2:X16}){vbCrLf}")
+            ' §5B-q-mid: capture ar at the q-mid and q-quart shift positions for post-shift verification.
+            ' kBits=11,200,000,067 ⇒ kLimb=175,000,001, kRem=3.  q has szQ=87,500,001 limbs.
+            ' q[mid=43,750,000] derives from ar[218,750,001] and ar[218,750,002].
+            ' q[quart=21,875,000] derives from ar[196,875,001] and ar[196,875,002].
+            Dim _5bKLimb As Long = kBits \ 64L
+            Dim _5bMidArIdx As Long = _5bKLimb + 43750000L
+            Dim _5bQuartArIdx As Long = _5bKLimb + 21875000L
+            _5b_arMid0 = CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt(_5bMidArIdx * 8L)))
+            _5b_arMid1 = CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt((_5bMidArIdx + 1L) * 8L)))
+            _5b_arQuart0 = CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt(_5bQuartArIdx * 8L)))
+            _5b_arQuart1 = CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt((_5bQuartArIdx + 1L) * 8L)))
+            AppendLog($"[SafeMpzDiv§5B-arQ-src] ar[{_5bQuartArIdx:N0}]={_5b_arQuart0:X16} ar[{_5bQuartArIdx+1:N0}]={_5b_arQuart1:X16} ar[{_5bMidArIdx:N0}]={_5b_arMid0:X16} ar[{_5bMidArIdx+1:N0}]={_5b_arMid1:X16}{vbCrLf}")
         End If
         ' §135 save slots: ar[64654664/65] captured inside §111 block, used after BigShiftRight.
         Dim _ar135_v0 As Long = 0L
@@ -3611,7 +3629,20 @@ Public Class Form1
             If szQ = 87500001 Then
                 Dim _qMid5 As Long = If(CLng(szQ \ 2) < CLng(szQ), Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, CInt(CLng(szQ \ 2) * 8L)), 0L)
                 Dim _qBotPos5 As Long = If(1L < CLng(szQ), Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, 8), 0L)
-                AppendLog($"[SafeMpzDiv§5B-q] q[0]={_qBot:X16} q[1]={_qBotPos5:X16} q[mid={szQ \ 2:N0}]={_qMid5:X16} q[szQ-2]={_qTop2:X16} q[szQ-1]={_qTop:X16}{vbCrLf}")
+                Dim _qQuart5 As Long = Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, CInt(21875000L * 8L))
+                AppendLog($"[SafeMpzDiv§5B-q] q[0]={_qBot:X16} q[1]={_qBotPos5:X16} q[quart=21,875,000]={_qQuart5:X16} q[mid={szQ \ 2:N0}]={_qMid5:X16} q[szQ-2]={_qTop2:X16} q[szQ-1]={_qTop:X16}{vbCrLf}")
+                ' §5B-q-mid: verify q[mid] and q[quart] derive correctly from saved ar limbs.
+                ' kRem=3, so q[i] = (ar[kLimb+i] >> 3) | (ar[kLimb+i+1] << 61).
+                ' If actual ≠ expected ⇒ BigShiftRight has a 5B middle-limb bug.
+                ' If actual = expected ⇒ BigShiftRight is faithful at these positions, narrowing
+                ' the bug to SafeMpzMul middle limbs.
+                Dim _kLimbQ5 As Long = kBits \ 64L
+                Dim _expQMid As ULong = (_5b_arMid0 >> 3) Or (_5b_arMid1 << 61)
+                Dim _expQQuart As ULong = (_5b_arQuart0 >> 3) Or (_5b_arQuart1 << 61)
+                Dim _actQMidU As ULong = CULng(_qMid5)
+                Dim _actQQuartU As ULong = CULng(_qQuart5)
+                AppendLog($"[SafeMpzDiv§5B-q-quart] actual q[21,875,000]={_actQQuartU:X16}  expected (ar[{21875000L+_kLimbQ5:N0}]>>3)|(ar[+1]<<61)={_expQQuart:X16}  match={(_actQQuartU = _expQQuart)}{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-q-mid]   actual q[43,750,000]={_actQMidU:X16}  expected (ar[{43750000L+_kLimbQ5:N0}]>>3)|(ar[+1]<<61)={_expQMid:X16}  match={(_actQMidU = _expQMid)}{vbCrLf}")
             End If
             ' §113: log q middle limbs to verify BigShiftRight correctness.
             If szQ = 21875001 Then
