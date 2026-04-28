@@ -40,3 +40,7 @@ Desktop.ini
 pi_trace_*
 launch_stdout.txt
 launch_stderr.txt
+
+# Run-PiCompute.ps1 redirected stdout/stderr per-run logs
+run_5B_*.log
+run_5B_*.log.err
