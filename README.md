@@ -3642,3 +3642,63 @@ Three level-2 calls fire the gate (prods(6), prods(7), prods(8)).  The opB[0]
 fingerprint distinguishes them in the log.  The k' that first introduces a
 wrong value pinpoints which level-3 sub-product (19.4M × 9.7M) is the culprit
 — or whether the bug is in the level-2 shift+add itself.
+
+### Option D result (2026-04-28 15:52 — run 10, 1h 14m to §171)
+
+prods(7) = SafeMpzMul(A_2, B_1) at 58.3M × 29.2M, accum[72,916,666] across k':
+
+```
+After k' | accum[72,916,666]
+---------|----------------------
+0..6     | 0000000000000000     (k'=0..6 shifts don't reach this index)
+7        | 6A28287E3E835734     ← level-3 sub-product 7 contribution
+8        | 3E924C7A243168E4     ← matches outer prods(7)[72,916,666] exactly
+```
+
+prods(8) = SafeMpzMul(A_2, B_2) at 58.3M × 29.2M, accum[43,749,999] across k':
+
+```
+After k' | accum[43,749,999]
+---------|----------------------
+0..1     | 0000000000000000
+2        | 04CCBF81C2006924
+3        | E2EEDAF0F48BA909
+4        | F029EC6DEF37FE89
+5        | A62ABA42210CF6B0
+6        | B8B767941F0A2E5D     ← matches outer C-3 delta (off by 1 = cross-limb carry)
+```
+
+**Both level-2 SafeMpzMul calls reproduce the wrong values verbatim.**  The
+bug is at level 3 or deeper, but we still cannot tell which of `prods(7)` or
+`prods(8)` (or both) is wrong without an independent oracle.
+
+Continued recursive narrowing (level-3, level-4, ...) doesn't produce an
+oracle either; it just localizes the bug to a smaller sub-product.
+
+### Next step (recommended): Option E — chunked-grid independent reference
+
+Compute `prods(7) = A_2 × B_1` (and/or `prods(8) = A_2 × B_2`) via a 2-way
+chunked-grid split that uses ONLY direct `GmpRaw_mul` at sub-threshold sizes:
+
+- Split A_2 (58.3M limbs) into ~39 chunks of ≤ 1.5M limbs each
+- Split B_1 (29.2M limbs) into ~20 chunks of ≤ 1.5M limbs each
+- For each (i,j) pair: compute `chunk_A[i] × chunk_B[j]` via direct
+  `GmpRaw_mul` (≤ 3M total — well under `SAFE_LIMB_THRESHOLD = 5M`,
+  where direct mpz_mul is reliable per §160's earlier analysis)
+- Accumulate all 780 sub-products into a fresh result mpz_t via
+  `mul_2exp` + `add`, exactly mirroring the §gen pattern but with a
+  flatter 2-way structure that avoids our 3×3 split entirely
+
+Read `result[72,916,666]` and compare to our SafeMpzMul `prods(7)[72,916,666]
+= 3E924C7A243168E4`:
+- **Match** ⇒ `prods(7)` is correct; the bug is in `prods(8)` (or in the
+  carry chain of `GmpRaw_add` at the outer level).  Drill into prods(8)
+  next.
+- **Differ** ⇒ `prods(7)` is wrong.  The chunked reference value IS the
+  truth.  We then know exactly how much our SafeMpzMul is off, and we can
+  drill into the level-2 prods(7) computation to find which level-3 k'
+  introduces the divergence.
+
+Cost: 780 sub-products at ~50ms each + accumulation ≈ 1-2 minutes one-shot.
+Memory peak: a few GB.  Gated on the outer 175M × 87.5M call so it fires
+once per run.
