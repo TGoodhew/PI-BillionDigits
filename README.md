@@ -3613,3 +3613,32 @@ own 9 sub-products (each ~19.4M × 9.7M), and the relevant accum index is 72,916
 This recursive narrowing pinpoints the inner k where the wrong value enters at
 level 2, and so on until we reach a leaf that we can verify directly against
 direct mpz_mul (which is safe at sub-5M total limb sizes).
+
+### Option D in flight (2026-04-28)
+
+**§5B-d-L2** — at every level-2 SafeMpzMul call (gated `szA=58,333,333 ∧
+szB=29,166,667`, the size of A_2 × any B_j at the outer 175M × 87.5M call),
+log `accum[72,916,666]` (= prods(7) suspect index) and `accum[43,749,999]`
+(= prods(8) suspect index) after each k=0..8 sub-product accumulation, plus
+opB[0] for fingerprinting (B_0=`88638C785832DAFF`, B_1=`4B08FAE8DCA50441`,
+B_2=`0706751D8688C2D3`).
+
+At level-2: mA' = 19,444,445, mB' = 9,722,223.  Shifts are limb-aligned at
+ki'·mA' + kj'·mB' limbs.
+
+For target index 72,916,666 (prods(7) suspect):
+- k'=0..6 shifts don't reach this index ⇒ accum should be 0.
+- k'=7 (shift=48,611,113 limbs) reaches it; post-k'=7 value is the level-3
+  sub-product limb that lands at offset 72,916,666 - 48,611,113 = 24,305,553.
+- k'=8 (shift=58,333,336 limbs) also reaches it; post-k'=8 value combines
+  contributions from both.
+
+For target index 43,749,999 (prods(8) suspect):
+- k'=0,1 shifts don't reach this index.
+- k'=2..6 shifts reach it; values accumulate.
+- k'=7,8 shifts are too high; their offsets within prods(k') are negative.
+
+Three level-2 calls fire the gate (prods(6), prods(7), prods(8)).  The opB[0]
+fingerprint distinguishes them in the log.  The k' that first introduces a
+wrong value pinpoints which level-3 sub-product (19.4M × 9.7M) is the culprit
+— or whether the bug is in the level-2 shift+add itself.

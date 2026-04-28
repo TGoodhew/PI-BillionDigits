@@ -2871,6 +2871,30 @@ Public Class Form1
                     Dim _accC3v2 As ULong = If(_IDX_C3 + 1L < CLng(_accC3sz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_accC3DPtr, CInt((_IDX_C3 + 1L) * 8L))), 0UL)
                     AppendLog($"[SafeMpzMul§5B-c3 k={k}] post-add accum[{_IDX_C3 - 1L:N0}]={_accC3v0:X16} accum[{_IDX_C3:N0}]={_accC3v1:X16} accum[{_IDX_C3 + 1L:N0}]={_accC3v2:X16} accumSz={_accC3sz:N0}{vbCrLf}")
                 End If
+                ' §5B-d-L2: Level-2 recursive C-3 — at the inner SafeMpzMul calls that produce
+                ' prods(6/7/8) of the outer 175M × 87.5M call (gated by szA=58,333,333 ∧
+                ' szB=29,166,667 — the size of A_2 × any B_j), log accum at the two suspect
+                ' indices after each k=0..8 sub-product accumulation.
+                '   prods(7) suspect: accum[72,916,666] (the limb that became the wrong outer
+                '     prods(7)[72,916,666] = 3E924C7A243168E4 in run 9).
+                '   prods(8) suspect: accum[43,749,999] (the limb that contributes to outer
+                '     ar[218,750,001] from prods(8) at level 1).
+                ' Fingerprint via opB[0] (cached pre-loop):
+                '   B_0[0]=88638C785832DAFF (prods(6)), B_1[0]=4B08FAE8DCA50441 (prods(7)),
+                '   B_2[0]=0706751D8688C2D3 (prods(8)).
+                ' The k' that first introduces a wrong value at the matching index pinpoints
+                ' which level-3 sub-product (or which level-2 shift+add step) is the culprit.
+                If _logLevel >= 2 AndAlso szA = 58333333 AndAlso szB = 29166667 Then
+                    Const _IDX_D_P7 As Long = 72916666L
+                    Const _IDX_D_P8 As Long = 43749999L
+                    Dim _accDsz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
+                    Dim _accDDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(accumPtr, 8))
+                    Dim _accD7 As ULong = If(_IDX_D_P7 < CLng(_accDsz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_accDDPtr, CInt(_IDX_D_P7 * 8L))), 0UL)
+                    Dim _accD8 As ULong = If(_IDX_D_P8 < CLng(_accDsz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_accDDPtr, CInt(_IDX_D_P8 * 8L))), 0UL)
+                    Dim _opBd_d2 As Long = Runtime.InteropServices.Marshal.ReadInt64(opB.Pointer, 8)
+                    Dim _opB0_d2 As ULong = If(_opBd_d2 <> 0L, CULng(Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_opBd_d2), 0)), 0UL)
+                    AppendLog($"[SafeMpzMul§5B-d-L2 k={k} opB[0]={_opB0_d2:X16}] post-add accum[{_IDX_D_P7:N0}]={_accD7:X16} accum[{_IDX_D_P8:N0}]={_accD8:X16} accumSz={_accDsz:N0}{vbCrLf}")
+                End If
                 GmpRaw_clear(prods(k).Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(prods(k).Pointer)
             Next k
         End If
