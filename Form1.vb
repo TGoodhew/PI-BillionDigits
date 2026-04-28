@@ -2504,31 +2504,14 @@ Public Class Form1
             End Sub)
         End If
 
-        ' §5B-c2: at the outer 175M × 87.5M call, compute prods(8) = A_2 × B_2 a SECOND time
-        ' via direct GmpRaw_mul (skipping our 3×3 split entirely) and compare middle limbs.
-        ' At 58.3M × 29.2M (87.5M total), GMP's internal FFT may have its own precision issues,
-        ' so a MISMATCH alone is inconclusive (both could be wrong).  But a MATCH at the suspect
-        ' index 43,749,999 (which contributes to ar[218,750,001]) would strongly suggest our
-        ' prods(8) is the true value — meaning the 5B mid-limb bug originates either in prods(7)
-        ' or in the §gen shift+add accumulation, not in prods(8) itself.
-        If _logLevel >= 2 AndAlso szA = 175000001 AndAlso szB = 87500001 Then
-            Dim _frC2 As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
-            GmpRaw_init(_frC2)
-            GmpRaw_mul(_frC2, A_parts(2).Pointer, B_parts(2).Pointer)
-            Dim _frC2sz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_frC2, 4))
-            Dim _frC2D As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_frC2, 8))
-            Dim _p8szC2 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prods(8).Pointer, 4))
-            Dim _p8DC2 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(prods(8).Pointer, 8))
-            ' Sanity-check at boundaries (expected to match — bot is exact identity, top is dominated by hi(A[top]*B[top]))
-            ' plus the suspect middle index 43,749,999 = limb of prods(8) that contributes to ar[218,750,001].
-            For Each _IDX_C2 As Long In New Long() {0L, 43749999L, CLng(_p8szC2 - 1)}
-                Dim _frC2v As ULong = If(_IDX_C2 < CLng(_frC2sz) AndAlso _IDX_C2 >= 0L, CULng(Runtime.InteropServices.Marshal.ReadInt64(_frC2D, CInt(_IDX_C2 * 8L))), 0UL)
-                Dim _p8vC2 As ULong = If(_IDX_C2 < CLng(_p8szC2) AndAlso _IDX_C2 >= 0L, CULng(Runtime.InteropServices.Marshal.ReadInt64(_p8DC2, CInt(_IDX_C2 * 8L))), 0UL)
-                AppendLog($"[SafeMpzMul§5B-c2 idx={_IDX_C2:N0}] direct={_frC2v:X16} (szDirect={_frC2sz:N0}) recursive={_p8vC2:X16} (szRec={_p8szC2:N0}) match={(_frC2v = _p8vC2)}{vbCrLf}")
-            Next
-            GmpRaw_clear(_frC2)
-            Runtime.InteropServices.Marshal.FreeHGlobal(_frC2)
-        End If
+        ' §5B-c2 (DISABLED 2026-04-28): originally compared prods(8) against a direct
+        ' GmpRaw_mul on A_2 × B_2 (58.3M × 29.2M).  At 87.5M total limbs, GMP's mpz_mul
+        ' AVs (0xC0000005 inside libgmp-10.dll) — the FFT workspace either OOMs or fails
+        ' an internal bound check.  This is the very failure §143 exists to avoid via the
+        ' recursive 3×3 split.  Existing §136 block uses the same pattern at 21.9M × 21.9M
+        ' (43.75M total) where GMP merely produces wrong limbs instead of crashing.
+        ' Replacement option (deferred): chunked-grid reference using ~1M × ~1M sub-products
+        ' under the SAFE_LIMB_THRESHOLD, then accumulate independently of SafeMpzMul.
 
         ' §136: directly call GmpRaw_mul for A2×B2 and compare to prods(8)[13612996] for q×b.
         ' After §143 threshold fix: prods(8) is computed via recursive SafeMpzMul (correct),
