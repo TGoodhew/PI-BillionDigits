@@ -3447,3 +3447,10 @@ Outcome:
 
 Single-constant change at line ~2271 of `Form1.vb`.  ~1h to next data point with the
 warm-checkpoint resume.
+
+### Option B in flight (2026-04-27)
+
+`SAFE_LIMB_THRESHOLD` lowered from `5_000_000` to `1_000_000` in `Form1.vb`.  Build
++ launch + warm-checkpoint resume; expecting either a clean 5B run (proves the bug
+was in the leaf GMP call at sizes ≥ 1M) or the same §171 throw (proves the bug is
+in our own split logic).  Result will be appended below.

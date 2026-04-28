@@ -2215,7 +2215,15 @@ Public Class Form1
         ' q×b and b×r inner-inner products are only ≈4.86M total (M≈2^22) and are unaffected.
         ' Lowering to 5M forces SafeMpzMul(4861111, 2430555) into §gen, breaking it into
         ' sub-products of ≈2.43M total (M≈2^22), which are within safe FFT accuracy range.
-        Const SAFE_LIMB_THRESHOLD As Integer = 5_000_000
+        '
+        ' §5B-Option-B (2026-04-27 — TEMPORARY DIAGNOSTIC): lowered 5M → 1M to force one
+        ' more recursion level past the current 2.2M × 1.1M leaves. Binary outcome:
+        '   Bug disappears  ⇒ leaf mpz_mul/mpn_mul_fft is wrong at sizes ≥ 1M (FFT
+        '                     precision issue at the previous threshold).
+        '   Bug persists    ⇒ middle-limb error is in our SafeMpzMul 3×3 split logic
+        '                     (accumulator add, mul_2exp shift, or recursion housekeeping).
+        ' Revert to 5M once the source of the 5B SafeMpzMul middle-limb bug is identified.
+        Const SAFE_LIMB_THRESHOLD As Integer = 1_000_000
 
         Dim szA_signed As Integer = Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4)
         Dim szB_signed As Integer = Runtime.InteropServices.Marshal.ReadInt32(opB.Pointer, 4)
