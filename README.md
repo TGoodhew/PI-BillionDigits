@@ -3398,3 +3398,52 @@ ar[218,750,001], the known-wrong limb.  This run will distinguish "wildly off to
 product is broken end-to-end) from "correct top, broken middle" (sub-product top limb
 is fine but middle limbs are wrong, suggesting a deeper recursion or leaf `mpz_mul`
 issue at sizes near `SAFE_LIMB_THRESHOLD=5M`).
+
+### verifyT result (2026-04-27 16:54 — run 6)
+
+Run reached §171 in 1h 11m and threw deterministically with the same Barrett error
+(~2^5,454,259,456). All 9 sub-products' **top limbs** matched the predicted
+`hi(A_i[topA] * B_j[topB])` with `diff(act-exp) ∈ {0, 1}` — no carry-of-2 anywhere,
+no "wildly off" k:
+
+```
+k  ki  kj  diff(act-exp)   actSzProd     expSzProd
+-  --  --  -------------   -----------   -----------
+0   0   0  0x1             87,500,001    87,500,001
+1   0   1  0x0             87,500,001    87,500,001
+2   0   2  0x0             87,500,001    87,500,001
+3   1   0  0x0             87,500,001    87,500,001
+4   1   1  0x1             87,500,001    87,500,001
+5   1   2  0x0             87,500,001    87,500,001
+6   2   0  0x0             87,500,000    87,500,000
+7   2   1  0x0             87,500,000    87,500,000
+8   2   2  0x0             87,500,000    87,500,000
+```
+
+Combined with the previously-verified prod[0] (verify) and prod[1] (verify1) match
+flags, this rules out the working hypothesis that one sub-product is "wildly off
+end-to-end".  **The bug is definitively in middle limbs of one or more sub-products**,
+not at any boundary.
+
+The known-wrong `ar[218,750,001]` receives contributions from exactly two sub-products
+(others' shift ranges don't reach that index):
+- `prods(7)[72,916,666]` (shift = 145,833,335 limbs)
+- `prods(8)[43,749,999]` (shift = 175,000,002 limbs; geometric mid of prods(8))
+
+The §5B-sub log already shows `prods(8)[mid=43,750,000]=11D57DC8288B6585` — that limb
+is essentially the suspect.
+
+### Next step (recommended): Option B — lower SAFE_LIMB_THRESHOLD 5M → 1M
+
+Option B becomes the natural next binary-search step: forces each of the 9 inner
+sub-products (each at 58.3M × 29.2M) to recurse one more split level past the
+2.2M × 1.1M leaves that currently call GMP `mpz_mul` directly.
+
+Outcome:
+- Bug **disappears** ⇒ leaf `mpz_mul` / `mpn_mul_fft` is producing wrong middle limbs
+  at sizes ≥ 1M (GMP FFT precision issue near the current threshold).
+- Bug **persists** ⇒ middle-limb error is in our `SafeMpzMul` 3×3 split logic itself
+  (accumulator add, `mul_2exp` shift, or recursion housekeeping).
+
+Single-constant change at line ~2271 of `Form1.vb`.  ~1h to next data point with the
+warm-checkpoint resume.
