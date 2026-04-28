@@ -3454,3 +3454,70 @@ warm-checkpoint resume.
 + launch + warm-checkpoint resume; expecting either a clean 5B run (proves the bug
 was in the leaf GMP call at sizes ≥ 1M) or the same §171 throw (proves the bug is
 in our own split logic).  Result will be appended below.
+
+### Option B result (2026-04-28 00:37 — run 7)
+
+Run reached §171 in 6h 26m (5.4× slower than the 5M run, due to deeper recursion
+overhead from the additional 9× sub-product fan-out at level 6) and threw the
+**identical** exception with the **identical** Barrett error magnitude
+(`~2^5,454,259,456`).  All 9 sub-products produced **bit-identical** mid[43,750,000]
+and top limbs as the 5M run:
+
+```
+k | mid (5M)              | mid (1M)              | top (5M)              | top (1M)
+- | --------------------- | --------------------- | --------------------- | ---------------------
+0 | 6CB381B03B25461A      | 6CB381B03B25461A      | 27B50FCBA40707E7      | 27B50FCBA40707E7
+1 | 3106EFF61B28AB18      | 3106EFF61B28AB18      | 38D70AFB5A9A3D99      | 38D70AFB5A9A3D99
+2 | 948620F9445F2749      | 948620F9445F2749      | 0000002FD735CD6D      | 0000002FD735CD6D
+3 | 51987FEC0865F037      | 51987FEC0865F037      | 1A93F197A821B53F      | 1A93F197A821B53F
+4 | AA62DB4D6DB9259B      | AA62DB4D6DB9259B      | 260BAECE29FCA757      | 260BAECE29FCA757
+5 | 68E86859D15E75D9      | 68E86859D15E75D9      | 00000020059F1CE1      | 00000020059F1CE1
+6 | E260C3D54136832D      | E260C3D54136832D      | 00E0C0ADDCA37B15      | 00E0C0ADDCA37B15
+7 | 0E4F4489AEE94ABF      | 0E4F4489AEE94ABF      | 0141BA6194A14F54      | 0141BA6194A14F54
+8 | 11D57DC8288B6585      | 11D57DC8288B6585      | 000000010ECA231E      | 000000010ECA231E
+```
+
+At 5M threshold the leaf `mpz_mul` calls operate on ~3.24M total limbs (FFT pl≈2^22).
+At 1M threshold the leaves operate on ~360K total limbs (FFT pl≈2^19) — far below
+any plausible FFT precision boundary.  Identical results across these two regimes
+**rules out** the leaf `mpz_mul` / `mpn_mul_fft` as the bug source.
+
+### Conclusion of Option B
+
+**The bug is in code COMMON to both threshold settings.** Top suspects:
+
+1. The **§gen accumulation step** itself — `GmpRaw_mul_2exp(_sv_shifted_hdr, _shiftSrc, _chunk)`
+   inside the chunked-shift loop.  For shifts > UInt32.MaxValue bits (~4.29 billion),
+   the loop iterates 2× (k=4-6) or 3× (k=7-8) at the outer 175M × 87.5M call, with
+   the second/third iterations reading from `_shiftSrc = _sv_shifted_hdr`
+   (in-place shift).  GMP supports aliasing but worth verifying.
+2. **Piece extraction (A_parts, B_parts mpz_t setup)** — A_2 size = 58,333,333 (one
+   limb shorter than mA = 58,333,334) due to ceiling division.  Edge-case slicing
+   for the last piece could mis-set _mp_size or _mp_d.
+3. **mpz_t struct juggling** (§40/§42/§44, accumPtr stash inside savedResultPtr's
+   _mp_d slot) — unusual layout; if any inner SafeMpzMul accidentally writes a
+   wrong buffer, middle-limb corruption could repeat deterministically.
+4. **GmpRaw_add into accum** — battle-tested GMP add; lowest probability.
+
+### Next step (recommended): Option C — pinpoint the wrong sub-product OR the wrong accumulation step
+
+Three complementary diagnostics, any can run individually:
+
+- **C-1 (independent prods(8) reference)**: gated on the outer 175M × 87.5M call,
+  compute prods(8) = A_2 × B_2 a SECOND time via a fresh SafeMpzMul into a separate
+  mpz_t, and compare mid[43,750,000].  Match ⇒ deterministic-but-wrong (true bug).
+  Differ ⇒ memory corruption (very different problem).
+- **C-2 (direct mpz_mul reference)**: at the outer call, also compute prods(8) via
+  a direct `GmpRaw_mul(prod_alt, A_2, B_2)` (skipping our 3×3 split).  Match ⇒ bug is
+  outside our split (in accumulation, mul_2exp, or piece extraction).  Differ ⇒ bug
+  is in our level-2 SafeMpzMul split.
+- **C-3 (per-k accumulation snapshot)**: log `accum[218,750,001]` after each k's
+  `GmpRaw_add`.  The k whose add introduces the divergence pinpoints either a bad
+  prods(k) middle limb OR a bad shift step.  Cheapest of the three (no extra
+  multiplication needed).
+
+C-2 is the most decisive single test: it directly compares our split against GMP's
+own multiplication.  Combine with C-3 for layered confirmation.
+
+**Note**: SAFE_LIMB_THRESHOLD should be reverted to 5,000,000 before further runs —
+the 5.4× slowdown is too costly for the rest of the investigation.
