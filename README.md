@@ -3563,3 +3563,53 @@ is the source (very unlikely but worth ruling out).
 Both diagnostics are cheap (~30 s for C-2's direct mpz_mul; C-3 is essentially
 free).  Combining their outputs should narrow the bug to one of: prods(7) middle,
 prods(8) middle, mul_2exp shift step, or accumulator-add step.
+
+### Option C result (2026-04-28 10:02 — runs 8 + 9)
+
+**C-2 disabled** after run 8 crashed natively (0xC0000005 in `libgmp-10.dll`)
+on the direct `GmpRaw_mul(A_2, B_2)` at 58.3M × 29.2M = 87.5M total limbs.
+GMP's mpz_mul is unsafe at this scale — exactly the regime `§143`'s recursive
+split was created to avoid.  Existing `§136` block uses the same pattern at
+43.75M total where GMP merely produces wrong limbs; the hard-fail boundary
+is somewhere between 43.75M and 87.5M total.
+
+**C-3 result (run 9, 1h 11m to §171, identical Barrett error)**:
+
+```
+After k | accum[218,750,001]                    Notes
+--------|---------------------------------------|----------------------------------------
+0..6    | 0000000000000000                      Their shift ranges don't reach this index
+7       | 3E924C7A243168E4                      = prods(7)[72,916,666] exactly (limb-aligned shift)
+8       | F749B40E433B9742                      = known-wrong ar[218,750,001]
+```
+
+Critical interpretation:
+- After k=0..6 the limb is exactly zero, confirming no spurious upstream contribution.
+- After k=7, accum[218,750,001] = `3E924C7A243168E4`. Because k=7's shift
+  (145,833,335 limbs × 64 bits) is exactly limb-aligned and the prior accum was zero
+  at this limb, this value equals `prods(7)[72,916,666]` with no carry contamination.
+- After k=8, the accum value matches the known-wrong final ar limb — confirming the
+  full §gen output reproduces the same wrong ar.
+
+The k=8 delta `F749B40E433B9742 - 3E924C7A243168E4 = B8B767941F0A2E5E` represents
+`prods(8)[43,749,999] + cross-limb carry from limb 218,750,000`.
+
+**Bug is now isolated to ONE limb of ONE of two specific level-2 SafeMpzMul calls:**
+- `prods(7)[72,916,666]` (the suspect value `3E924C7A243168E4`) where prods(7) =
+  SafeMpzMul(A_2, B_1) at 58.3M × 29.2M, OR
+- `prods(8)[43,749,999]` of prods(8) = SafeMpzMul(A_2, B_2) at 58.3M × 29.2M.
+
+A buggy `GmpRaw_add` carry chain at 175M-limb scale is extremely unlikely (battle-
+tested GMP code), but not formally ruled out.
+
+### Next step (recommended): Option D — recursive C-3 at the level-2 call
+
+Apply the same per-k accumulation snapshot to the level-2 SafeMpzMul calls (gated
+on szA=58,333,333 ∧ szB=29,166,667 with input-bot-limb fingerprints to identify
+prods(7) vs prods(8) specifically).  At that level, the level-2 §gen loop has its
+own 9 sub-products (each ~19.4M × 9.7M), and the relevant accum index is 72,916,666
+(for prods(7)) or 43,749,999 (for prods(8)).
+
+This recursive narrowing pinpoints the inner k where the wrong value enters at
+level 2, and so on until we reach a leaf that we can verify directly against
+direct mpz_mul (which is safe at sub-5M total limb sizes).
