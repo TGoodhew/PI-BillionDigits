@@ -3702,3 +3702,21 @@ Read `result[72,916,666]` and compare to our SafeMpzMul `prods(7)[72,916,666]
 Cost: 780 sub-products at ~50ms each + accumulation ≈ 1-2 minutes one-shot.
 Memory peak: a few GB.  Gated on the outer 175M × 87.5M call so it fires
 once per run.
+
+### Option E in flight (2026-04-28)
+
+`§5B-e` implemented in `Form1.vb`: at the outer 175M × 87.5M call, computes
+both `prods(7)` and `prods(8)` via 39 × 20 = 780 sub-products of size
+≤ 1.5M × ≤ 1.5M (≤ 3M total — well under the 5M FFT-precision boundary),
+then accumulates each into a fresh `_refAcc` mpz_t via `mul_2exp` + `add`.
+
+Compares the suspect index of each:
+- `reference prods(7)[72,916,666]` vs our SafeMpzMul `prods(7)[72,916,666]`
+  (`= 3E924C7A243168E4` per run 9/10)
+- `reference prods(8)[43,749,999]` vs our SafeMpzMul `prods(8)[43,749,999]`
+  (`= B8B767941F0A2E5D` per run 10)
+
+Logs include the `idx-1` and `idx+1` neighbours so we can see whether any
+disagreement is just a one-limb carry quirk or a substantive divergence.
+
+Result expected after the next ~1h 14m run.

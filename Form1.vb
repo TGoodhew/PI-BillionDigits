@@ -2510,8 +2510,104 @@ Public Class Form1
         ' an internal bound check.  This is the very failure §143 exists to avoid via the
         ' recursive 3×3 split.  Existing §136 block uses the same pattern at 21.9M × 21.9M
         ' (43.75M total) where GMP merely produces wrong limbs instead of crashing.
-        ' Replacement option (deferred): chunked-grid reference using ~1M × ~1M sub-products
-        ' under the SAFE_LIMB_THRESHOLD, then accumulate independently of SafeMpzMul.
+        ' Replaced by §5B-e below: chunked-grid reference using sub-threshold direct
+        ' GmpRaw_mul calls then independent accumulation.
+
+        ' §5B-e: Chunked-grid independent reference for prods(7) = A_2 × B_1 and
+        ' prods(8) = A_2 × B_2 at the outer 175M × 87.5M call.  Compute each via
+        ' a 39×20 grid (≤ 1.5M × 1.5M = ≤ 3M total per sub-product, well under
+        ' SAFE_LIMB_THRESHOLD = 5M where direct GmpRaw_mul is reliable per §160's
+        ' analysis), then accumulate via mul_2exp + add into a fresh reference mpz_t.
+        ' Compare the suspect index to our SafeMpzMul prods(k):
+        '   Match  ⇒ our prods(k) is correct (bug elsewhere — likely the other
+        '             prods(k) or in the level-1 GmpRaw_add carry chain).
+        '   Differ ⇒ our prods(k) is wrong; the chunked reference IS the truth, and
+        '             we have an exact delta + a known-good limb to investigate
+        '             our SafeMpzMul split with.
+        If _logLevel >= 2 AndAlso szA = 175000001 AndAlso szB = 87500001 Then
+            Const _CHUNK_E As Integer = 1500000
+            AppendLog($"[SafeMpzMul§5B-e] starting chunked-grid reference (chunk={_CHUNK_E:N0}){vbCrLf}")
+            For Each _refIdx As Integer In New Integer() {7, 8}
+                Dim _refTargetIdx As Long = If(_refIdx = 7, 72916666L, 43749999L)
+                Dim _ref_A_d As Long = Runtime.InteropServices.Marshal.ReadInt64(A_parts(2).Pointer, 8)
+                Dim _ref_A_sz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(A_parts(2).Pointer, 4))
+                Dim _ref_B_partIdx As Integer = If(_refIdx = 7, 1, 2)
+                Dim _ref_B_d As Long = Runtime.InteropServices.Marshal.ReadInt64(B_parts(_ref_B_partIdx).Pointer, 8)
+                Dim _ref_B_sz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(B_parts(_ref_B_partIdx).Pointer, 4))
+                AppendLog($"[SafeMpzMul§5B-e prods({_refIdx})] A_2 sz={_ref_A_sz:N0} B_{_ref_B_partIdx} sz={_ref_B_sz:N0} target idx={_refTargetIdx:N0}{vbCrLf}")
+                Dim _refAcc As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                GmpRaw_init(_refAcc)
+                ' Reusable zero-copy chunk headers (do NOT GmpRaw_clear — they alias opA/opB data)
+                Dim _ckA As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                Dim _ckB As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                ' Fresh result buffers
+                Dim _ckPartial As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                GmpRaw_init(_ckPartial)
+                Dim _ckShifted As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                GmpRaw_init(_ckShifted)
+                Dim _numCkA As Integer = (_ref_A_sz + _CHUNK_E - 1) \ _CHUNK_E
+                Dim _numCkB As Integer = (_ref_B_sz + _CHUNK_E - 1) \ _CHUNK_E
+                Dim _ckCount As Integer = 0
+                For i As Integer = 0 To _numCkA - 1
+                    Dim _ckA_off As Long = CLng(i) * CLng(_CHUNK_E)
+                    Dim _ckA_sz As Integer = CInt(System.Math.Min(CLng(_CHUNK_E), CLng(_ref_A_sz) - _ckA_off))
+                    If _ckA_sz <= 0 Then Continue For
+                    While _ckA_sz > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_ref_A_d + (_ckA_off + CLng(_ckA_sz - 1)) * 8L)) = 0L
+                        _ckA_sz -= 1
+                    End While
+                    If _ckA_sz <= 0 Then Continue For
+                    Runtime.InteropServices.Marshal.WriteInt32(_ckA, 0, _CHUNK_E)
+                    Runtime.InteropServices.Marshal.WriteInt32(_ckA, 4, _ckA_sz)
+                    Runtime.InteropServices.Marshal.WriteInt64(_ckA, 8, _ref_A_d + _ckA_off * 8L)
+                    For j As Integer = 0 To _numCkB - 1
+                        Dim _ckB_off As Long = CLng(j) * CLng(_CHUNK_E)
+                        Dim _ckB_sz As Integer = CInt(System.Math.Min(CLng(_CHUNK_E), CLng(_ref_B_sz) - _ckB_off))
+                        If _ckB_sz <= 0 Then Continue For
+                        While _ckB_sz > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_ref_B_d + (_ckB_off + CLng(_ckB_sz - 1)) * 8L)) = 0L
+                            _ckB_sz -= 1
+                        End While
+                        If _ckB_sz <= 0 Then Continue For
+                        Runtime.InteropServices.Marshal.WriteInt32(_ckB, 0, _CHUNK_E)
+                        Runtime.InteropServices.Marshal.WriteInt32(_ckB, 4, _ckB_sz)
+                        Runtime.InteropServices.Marshal.WriteInt64(_ckB, 8, _ref_B_d + _ckB_off * 8L)
+                        GmpRaw_mul(_ckPartial, _ckA, _ckB)
+                        Dim _ckShiftBits As ULong = CULng(_ckA_off + _ckB_off) * 64UL
+                        If _ckShiftBits = 0UL Then
+                            GmpRaw_add(_refAcc, _refAcc, _ckPartial)
+                        Else
+                            Runtime.InteropServices.Marshal.WriteInt32(_ckShifted, 4, 0)
+                            Dim _shiftSrc As IntPtr = _ckPartial
+                            Dim _shiftRem As ULong = _ckShiftBits
+                            While _shiftRem > 0UL
+                                Dim _chunkBits As UInteger = CUInt(System.Math.Min(_shiftRem, CULng(UInt32.MaxValue)))
+                                GmpRaw_mul_2exp(_ckShifted, _shiftSrc, _chunkBits)
+                                _shiftSrc = _ckShifted
+                                _shiftRem -= CULng(_chunkBits)
+                            End While
+                            GmpRaw_add(_refAcc, _refAcc, _ckShifted)
+                        End If
+                        _ckCount += 1
+                    Next j
+                Next i
+                Dim _refAccSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_refAcc, 4))
+                Dim _refAccD As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_refAcc, 8))
+                Dim _refV As ULong = If(_refTargetIdx < CLng(_refAccSz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_refAccD, CInt(_refTargetIdx * 8L))), 0UL)
+                Dim _refV_lo As ULong = If(_refTargetIdx - 1L < CLng(_refAccSz) AndAlso _refTargetIdx - 1L >= 0L, CULng(Runtime.InteropServices.Marshal.ReadInt64(_refAccD, CInt((_refTargetIdx - 1L) * 8L))), 0UL)
+                Dim _refV_hi As ULong = If(_refTargetIdx + 1L < CLng(_refAccSz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_refAccD, CInt((_refTargetIdx + 1L) * 8L))), 0UL)
+                Dim _ourSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prods(_refIdx).Pointer, 4))
+                Dim _ourD As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(prods(_refIdx).Pointer, 8))
+                Dim _ourV As ULong = If(_refTargetIdx < CLng(_ourSz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_ourD, CInt(_refTargetIdx * 8L))), 0UL)
+                Dim _ourV_lo As ULong = If(_refTargetIdx - 1L < CLng(_ourSz) AndAlso _refTargetIdx - 1L >= 0L, CULng(Runtime.InteropServices.Marshal.ReadInt64(_ourD, CInt((_refTargetIdx - 1L) * 8L))), 0UL)
+                Dim _ourV_hi As ULong = If(_refTargetIdx + 1L < CLng(_ourSz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_ourD, CInt((_refTargetIdx + 1L) * 8L))), 0UL)
+                AppendLog($"[SafeMpzMul§5B-e prods({_refIdx}) idx={_refTargetIdx:N0}] subProducts={_ckCount:N0} refSz={_refAccSz:N0} ourSz={_ourSz:N0} reference[idx-1,idx,idx+1]=[{_refV_lo:X16} {_refV:X16} {_refV_hi:X16}] ourSafeMpzMul[idx-1,idx,idx+1]=[{_ourV_lo:X16} {_ourV:X16} {_ourV_hi:X16}] match@idx={(_refV = _ourV)}{vbCrLf}")
+                GmpRaw_clear(_ckShifted) : Runtime.InteropServices.Marshal.FreeHGlobal(_ckShifted)
+                GmpRaw_clear(_ckPartial) : Runtime.InteropServices.Marshal.FreeHGlobal(_ckPartial)
+                Runtime.InteropServices.Marshal.FreeHGlobal(_ckA)
+                Runtime.InteropServices.Marshal.FreeHGlobal(_ckB)
+                GmpRaw_clear(_refAcc) : Runtime.InteropServices.Marshal.FreeHGlobal(_refAcc)
+            Next
+            AppendLog($"[SafeMpzMul§5B-e] chunked-grid reference complete{vbCrLf}")
+        End If
 
         ' §136: directly call GmpRaw_mul for A2×B2 and compare to prods(8)[13612996] for q×b.
         ' After §143 threshold fix: prods(8) is computed via recursive SafeMpzMul (correct),
