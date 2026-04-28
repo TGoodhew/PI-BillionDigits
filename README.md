@@ -3521,3 +3521,45 @@ own multiplication.  Combine with C-3 for layered confirmation.
 
 **Note**: SAFE_LIMB_THRESHOLD should be reverted to 5,000,000 before further runs —
 the 5.4× slowdown is too costly for the rest of the investigation.
+
+### Option C-2 + C-3 in flight (2026-04-28)
+
+Two complementary diagnostics added to `Form1.vb`, both gated on the outer 175M ×
+87.5M `SafeMpzMul(ar, a, r)` call.
+
+**§5B-c2** — Direct `GmpRaw_mul` reference for prods(8).  After the 9 outer
+sub-products are computed via recursive `SafeMpzMul`, also compute `A_2 × B_2`
+once via `GmpRaw_mul` (GMP's internal mpz_mul, 87.5M total limbs).  Compare the
+suspect middle limb at index 43,749,999 (which contributes to ar[218,750,001])
+plus boundaries at index 0 and szP-1.
+
+Interpretation:
+- **Match at idx=43,749,999** ⇒ both paths agree on this middle limb; either both
+  are right (so prods(8) is NOT the bug source — look at prods(7) or the
+  shift+add) or both happen to share the same wrong value (extraordinary
+  coincidence between two independent FFT engines — extremely unlikely).
+- **Mismatch at idx=43,749,999** ⇒ paths diverge.  We can't tell which is right
+  from C-2 alone, but combined with C-3 we can pin which contributor's middle
+  limb feeds the wrong ar value.
+
+**§5B-c3** — Per-k accumulation snapshot.  After each k=0..8's `GmpRaw_add` into
+`accum`, log `accum[218,750,001]` (the known-wrong ar limb) and its two
+neighbours.
+
+Expected progression:
+- k=0..6: shift ranges don't reach index 218,750,001 ⇒ accum[218,750,001] = 0
+- k=7: shift = 145,833,335 limbs, prods(7)[72,916,666] enters the limb ⇒
+  accum[218,750,001] = prods(7)[72,916,666]
+- k=8: shift = 175,000,002 limbs, prods(8)[43,749,999] is added ⇒
+  accum[218,750,001] = (prods(7)[72,916,666] + prods(8)[43,749,999]) mod 2^64
+  + cross-carry from limb 218,750,000
+
+If accum[218,750,001] differs from the known-wrong final value `F749B40E433B9742`
+already after k=7 ⇒ prods(7) is the source.  If it's correct after k=7 but wrong
+after k=8 ⇒ prods(8) is the source.  If neither sub-product alone seems wrong but
+their combined sum doesn't match expectations ⇒ `GmpRaw_add` or carry handling
+is the source (very unlikely but worth ruling out).
+
+Both diagnostics are cheap (~30 s for C-2's direct mpz_mul; C-3 is essentially
+free).  Combining their outputs should narrow the bug to one of: prods(7) middle,
+prods(8) middle, mul_2exp shift step, or accumulator-add step.

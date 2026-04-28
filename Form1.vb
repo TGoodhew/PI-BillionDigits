@@ -2504,6 +2504,32 @@ Public Class Form1
             End Sub)
         End If
 
+        ' §5B-c2: at the outer 175M × 87.5M call, compute prods(8) = A_2 × B_2 a SECOND time
+        ' via direct GmpRaw_mul (skipping our 3×3 split entirely) and compare middle limbs.
+        ' At 58.3M × 29.2M (87.5M total), GMP's internal FFT may have its own precision issues,
+        ' so a MISMATCH alone is inconclusive (both could be wrong).  But a MATCH at the suspect
+        ' index 43,749,999 (which contributes to ar[218,750,001]) would strongly suggest our
+        ' prods(8) is the true value — meaning the 5B mid-limb bug originates either in prods(7)
+        ' or in the §gen shift+add accumulation, not in prods(8) itself.
+        If _logLevel >= 2 AndAlso szA = 175000001 AndAlso szB = 87500001 Then
+            Dim _frC2 As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+            GmpRaw_init(_frC2)
+            GmpRaw_mul(_frC2, A_parts(2).Pointer, B_parts(2).Pointer)
+            Dim _frC2sz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_frC2, 4))
+            Dim _frC2D As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_frC2, 8))
+            Dim _p8szC2 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prods(8).Pointer, 4))
+            Dim _p8DC2 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(prods(8).Pointer, 8))
+            ' Sanity-check at boundaries (expected to match — bot is exact identity, top is dominated by hi(A[top]*B[top]))
+            ' plus the suspect middle index 43,749,999 = limb of prods(8) that contributes to ar[218,750,001].
+            For Each _IDX_C2 As Long In New Long() {0L, 43749999L, CLng(_p8szC2 - 1)}
+                Dim _frC2v As ULong = If(_IDX_C2 < CLng(_frC2sz) AndAlso _IDX_C2 >= 0L, CULng(Runtime.InteropServices.Marshal.ReadInt64(_frC2D, CInt(_IDX_C2 * 8L))), 0UL)
+                Dim _p8vC2 As ULong = If(_IDX_C2 < CLng(_p8szC2) AndAlso _IDX_C2 >= 0L, CULng(Runtime.InteropServices.Marshal.ReadInt64(_p8DC2, CInt(_IDX_C2 * 8L))), 0UL)
+                AppendLog($"[SafeMpzMul§5B-c2 idx={_IDX_C2:N0}] direct={_frC2v:X16} (szDirect={_frC2sz:N0}) recursive={_p8vC2:X16} (szRec={_p8szC2:N0}) match={(_frC2v = _p8vC2)}{vbCrLf}")
+            Next
+            GmpRaw_clear(_frC2)
+            Runtime.InteropServices.Marshal.FreeHGlobal(_frC2)
+        End If
+
         ' §136: directly call GmpRaw_mul for A2×B2 and compare to prods(8)[13612996] for q×b.
         ' After §143 threshold fix: prods(8) is computed via recursive SafeMpzMul (correct),
         ' but §136's direct GmpRaw_mul call bypasses the threshold and hits the GMP FFT precision bug.
@@ -2847,6 +2873,20 @@ Public Class Form1
                             AppendLog($"[SafeMpzMul§130] k=8 accum[{_AL130:N0}]={_acc130v:X16} accum[{_AL130+1:N0}]={_acc130v1:X16} accumSz={_acc130sz:N0}{vbCrLf}")
                         End If
                     End If
+                End If
+                ' §5B-c3: at the outer 175M × 87.5M call, log accum[218,750,001] (and neighbours)
+                ' after each k's accumulation.  Only k=7 (shift=145.83M limbs) and k=8 (shift=175.0M
+                ' limbs) reach that index; for k<7 the value should remain zero.  The k that first
+                ' introduces the wrong value pinpoints whether the bug is in prods(7)'s middle,
+                ' prods(8)'s middle, or the shift+add at one of those k's.
+                If _logLevel >= 2 AndAlso szA = 175000001 AndAlso szB = 87500001 Then
+                    Const _IDX_C3 As Long = 218750001L
+                    Dim _accC3sz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
+                    Dim _accC3DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(accumPtr, 8))
+                    Dim _accC3v0 As ULong = If(_IDX_C3 - 1L < CLng(_accC3sz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_accC3DPtr, CInt((_IDX_C3 - 1L) * 8L))), 0UL)
+                    Dim _accC3v1 As ULong = If(_IDX_C3 < CLng(_accC3sz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_accC3DPtr, CInt(_IDX_C3 * 8L))), 0UL)
+                    Dim _accC3v2 As ULong = If(_IDX_C3 + 1L < CLng(_accC3sz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_accC3DPtr, CInt((_IDX_C3 + 1L) * 8L))), 0UL)
+                    AppendLog($"[SafeMpzMul§5B-c3 k={k}] post-add accum[{_IDX_C3 - 1L:N0}]={_accC3v0:X16} accum[{_IDX_C3:N0}]={_accC3v1:X16} accum[{_IDX_C3 + 1L:N0}]={_accC3v2:X16} accumSz={_accC3sz:N0}{vbCrLf}")
                 End If
                 GmpRaw_clear(prods(k).Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(prods(k).Pointer)
             Next k
