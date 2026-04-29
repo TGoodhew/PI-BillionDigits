@@ -4408,6 +4408,135 @@ Public Class Form1
                 AppendLog($"[SafeMpzDiv§5B-f6 ALARM] a was corrupted between SafeMpzDiv entry and qb completion!{vbCrLf}")
             End If
         End If
+
+        ' §5B-f5: Chunked-grid independent reference for q × b at the 5B SafeMpzDiv call.
+        ' All other components verified: a intact (F-6), r correct (F-2), ar=a×r correct
+        ' (F-1), q derived correctly via BigShiftRight (F-3), §39 not the bug (Option G).
+        ' Yet rem = a - qb has size 172.7M limbs (> 2× szB).  The only remaining unverified
+        ' component is qb = SafeMpzMul(q, b) middle limbs.
+        '
+        ' Compute reference qb via chunked-grid (59 × 59 = 3,481 sub-products at ≤ 3M total
+        ' each — reliable mpz_mul per §160).  Scan our SafeMpzMul qb against the reference
+        ' at 1,000 evenly-spaced positions across [0..szQB-1].
+        '
+        ' Outcome:
+        '   Mismatches > 0 ⇒ SafeMpzMul has a bug specific to q × b at this scale; bug
+        '                    is in §gen for symmetric q × b (87.5M × 87.5M).
+        '   Mismatches = 0 ⇒ qb is correct; bug is in the §171 algorithm itself or in
+        '                    rem subtraction.
+        If _logLevel >= 2 AndAlso szQ = 87500001 AndAlso szB = 87500001 Then
+            Const _F5_CHUNK As Integer = 1500000
+            Const _F5_MAX_LIMBS As Integer = 180_000_000
+            Dim _F5_MAX_BYTES As Long = CLng(_F5_MAX_LIMBS) * 8L
+            Dim _F5_qD As Long = Runtime.InteropServices.Marshal.ReadInt64(_qPtr, 8)
+            Dim _F5_qSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qPtr, 4))
+            Dim _F5_bD As Long = Runtime.InteropServices.Marshal.ReadInt64(_bPtr, 8)
+            Dim _F5_bSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_bPtr, 4))
+            AppendLog($"[SafeMpzDiv§5B-f5] starting q×b chunked-grid reference (chunk={_F5_CHUNK:N0}, prealloc={_F5_MAX_LIMBS:N0} limbs/buf, {_F5_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-f5] q sz={_F5_qSz:N0} b sz={_F5_bSz:N0}{vbCrLf}")
+            Dim _F5_eAccBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F5_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            Dim _F5_eShiftBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F5_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If _F5_eAccBuf = IntPtr.Zero OrElse _F5_eShiftBuf = IntPtr.Zero Then
+                AppendLog($"[SafeMpzDiv§5B-f5] VirtualAlloc FAILED — skipping{vbCrLf}")
+                If _F5_eAccBuf <> IntPtr.Zero Then VirtualFree(_F5_eAccBuf, UIntPtr.Zero, MEM_RELEASE)
+                If _F5_eShiftBuf <> IntPtr.Zero Then VirtualFree(_F5_eShiftBuf, UIntPtr.Zero, MEM_RELEASE)
+            Else
+                Dim _F5_refAcc As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                GmpRaw_init(_F5_refAcc)
+                Dim _F5_ra_initAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_F5_refAcc, 0))
+                Dim _F5_ra_initPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_F5_refAcc, 8))
+                GmpNativeAlloc_FreeRaw(_F5_ra_initPtr, _F5_ra_initAlloc * 8L)
+                Runtime.InteropServices.Marshal.WriteInt32(_F5_refAcc, 0, _F5_MAX_LIMBS)
+                Runtime.InteropServices.Marshal.WriteInt32(_F5_refAcc, 4, 0)
+                Runtime.InteropServices.Marshal.WriteInt64(_F5_refAcc, 8, _F5_eAccBuf.ToInt64())
+                Dim _F5_ckShifted As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                GmpRaw_init(_F5_ckShifted)
+                Dim _F5_cs_initAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_F5_ckShifted, 0))
+                Dim _F5_cs_initPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_F5_ckShifted, 8))
+                GmpNativeAlloc_FreeRaw(_F5_cs_initPtr, _F5_cs_initAlloc * 8L)
+                Runtime.InteropServices.Marshal.WriteInt32(_F5_ckShifted, 0, _F5_MAX_LIMBS)
+                Runtime.InteropServices.Marshal.WriteInt32(_F5_ckShifted, 4, 0)
+                Runtime.InteropServices.Marshal.WriteInt64(_F5_ckShifted, 8, _F5_eShiftBuf.ToInt64())
+                Dim _F5_ckPartial As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                GmpRaw_init(_F5_ckPartial)
+                Dim _F5_ckA As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                Dim _F5_ckB As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                Dim _F5_numCkQ As Integer = (_F5_qSz + _F5_CHUNK - 1) \ _F5_CHUNK
+                Dim _F5_numCkB As Integer = (_F5_bSz + _F5_CHUNK - 1) \ _F5_CHUNK
+                Dim _F5_ckCount As Integer = 0
+                For i As Integer = 0 To _F5_numCkQ - 1
+                    Dim _F5_qOff As Long = CLng(i) * CLng(_F5_CHUNK)
+                    Dim _F5_qSzCk As Integer = CInt(System.Math.Min(CLng(_F5_CHUNK), CLng(_F5_qSz) - _F5_qOff))
+                    If _F5_qSzCk <= 0 Then Continue For
+                    While _F5_qSzCk > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_F5_qD + (_F5_qOff + CLng(_F5_qSzCk - 1)) * 8L)) = 0L
+                        _F5_qSzCk -= 1
+                    End While
+                    If _F5_qSzCk <= 0 Then Continue For
+                    Runtime.InteropServices.Marshal.WriteInt32(_F5_ckA, 0, _F5_CHUNK)
+                    Runtime.InteropServices.Marshal.WriteInt32(_F5_ckA, 4, _F5_qSzCk)
+                    Runtime.InteropServices.Marshal.WriteInt64(_F5_ckA, 8, _F5_qD + _F5_qOff * 8L)
+                    For j As Integer = 0 To _F5_numCkB - 1
+                        Dim _F5_bOff As Long = CLng(j) * CLng(_F5_CHUNK)
+                        Dim _F5_bSzCk As Integer = CInt(System.Math.Min(CLng(_F5_CHUNK), CLng(_F5_bSz) - _F5_bOff))
+                        If _F5_bSzCk <= 0 Then Continue For
+                        While _F5_bSzCk > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_F5_bD + (_F5_bOff + CLng(_F5_bSzCk - 1)) * 8L)) = 0L
+                            _F5_bSzCk -= 1
+                        End While
+                        If _F5_bSzCk <= 0 Then Continue For
+                        Runtime.InteropServices.Marshal.WriteInt32(_F5_ckB, 0, _F5_CHUNK)
+                        Runtime.InteropServices.Marshal.WriteInt32(_F5_ckB, 4, _F5_bSzCk)
+                        Runtime.InteropServices.Marshal.WriteInt64(_F5_ckB, 8, _F5_bD + _F5_bOff * 8L)
+                        GmpRaw_mul(_F5_ckPartial, _F5_ckA, _F5_ckB)
+                        Dim _F5_shiftBits As ULong = CULng(_F5_qOff + _F5_bOff) * 64UL
+                        If _F5_shiftBits = 0UL Then
+                            GmpRaw_add(_F5_refAcc, _F5_refAcc, _F5_ckPartial)
+                        Else
+                            Runtime.InteropServices.Marshal.WriteInt32(_F5_ckShifted, 4, 0)
+                            Dim _F5_shiftSrc As IntPtr = _F5_ckPartial
+                            Dim _F5_shiftRem As ULong = _F5_shiftBits
+                            While _F5_shiftRem > 0UL
+                                Dim _F5_chunkBits As UInteger = CUInt(System.Math.Min(_F5_shiftRem, CULng(UInt32.MaxValue)))
+                                GmpRaw_mul_2exp(_F5_ckShifted, _F5_shiftSrc, _F5_chunkBits)
+                                _F5_shiftSrc = _F5_ckShifted
+                                _F5_shiftRem -= CULng(_F5_chunkBits)
+                            End While
+                            GmpRaw_add(_F5_refAcc, _F5_refAcc, _F5_ckShifted)
+                        End If
+                        _F5_ckCount += 1
+                    Next j
+                Next i
+                Dim _F5_refSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_F5_refAcc, 4))
+                Dim _F5_refDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_F5_refAcc, 8))
+                Dim _F5_qbDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_qbPtr, 8))
+                AppendLog($"[SafeMpzDiv§5B-f5] reference complete: subProducts={_F5_ckCount:N0} refSz={_F5_refSz:N0} ourQbSz={szQB:N0}{vbCrLf}")
+                Const _F5_NUM_SAMPLES As Integer = 1000
+                Dim _F5_mismatchCount As Integer = 0
+                Dim _F5_firstMismatchIdx As Long = -1L
+                Dim _F5_logCount As Integer = 0
+                Dim _F5_maxIdx As Long = CLng(System.Math.Min(_F5_refSz, szQB)) - 1L
+                For _F5s As Integer = 0 To _F5_NUM_SAMPLES - 1
+                    Dim _F5_idx As Long = If(_F5_NUM_SAMPLES > 1, CLng(_F5s) * _F5_maxIdx \ CLng(_F5_NUM_SAMPLES - 1), 0L)
+                    Dim _F5_refV As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_F5_refDPtr, CInt(_F5_idx * 8L)))
+                    Dim _F5_qbV As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_F5_qbDPtr, CInt(_F5_idx * 8L)))
+                    If _F5_refV <> _F5_qbV Then
+                        _F5_mismatchCount += 1
+                        If _F5_firstMismatchIdx = -1L Then _F5_firstMismatchIdx = _F5_idx
+                        If _F5_logCount < 10 Then
+                            AppendLog($"[SafeMpzDiv§5B-f5 MISMATCH] sample={_F5s} qb[{_F5_idx:N0}] reference={_F5_refV:X16} ourSafeMpzMul={_F5_qbV:X16}{vbCrLf}")
+                            _F5_logCount += 1
+                        End If
+                    End If
+                Next
+                AppendLog($"[SafeMpzDiv§5B-f5 SUMMARY] scanned {_F5_NUM_SAMPLES} qb positions across [0..{_F5_maxIdx:N0}], mismatches={_F5_mismatchCount}, firstMismatchQbIdx={_F5_firstMismatchIdx}{vbCrLf}")
+                Runtime.InteropServices.Marshal.FreeHGlobal(_F5_refAcc)
+                Runtime.InteropServices.Marshal.FreeHGlobal(_F5_ckShifted)
+                GmpRaw_clear(_F5_ckPartial) : Runtime.InteropServices.Marshal.FreeHGlobal(_F5_ckPartial)
+                Runtime.InteropServices.Marshal.FreeHGlobal(_F5_ckA)
+                Runtime.InteropServices.Marshal.FreeHGlobal(_F5_ckB)
+                VirtualFree(_F5_eAccBuf, UIntPtr.Zero, MEM_RELEASE)
+                VirtualFree(_F5_eShiftBuf, UIntPtr.Zero, MEM_RELEASE)
+            End If
+        End If
         ' §184: Allocate remainder as raw struct with pre-allocated limb buffer large enough
         ' to hold the result of a - qb (max szA limbs) — avoids GmpReallocFunc being called
         ' inside __gmpz_sub, which could trigger the §78 side-effect or pool interaction.
