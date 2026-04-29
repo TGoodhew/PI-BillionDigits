@@ -3778,6 +3778,19 @@ verified yet.  Candidates, ordered by likelihood:
 - **F-3 (FIRST — cheap)**: scan all q[0..szQ-1] against the
   `(ar[kLimb+i] >> 3) | (ar[kLimb+i+1] << 61)` formula.  If any disagreement
   ⇒ BigShiftRight is wrong at that index.  Runs in seconds; no extra mpz_mul.
+
+### Option F-3 in flight (2026-04-28)
+
+`§5B-f3` implemented in `SafeMpzDiv` — captures 100 evenly-spaced ar samples
+(at q indices 0, ~884K, ~1.77M, …, 87.5M-1) plus their +1 neighbours BEFORE
+`BigShiftRight(ar, kBits)`, then post-shift verifies each q[i] against the
+predicted `(ar_pre[kLimb+i] >> 3) | (ar_pre[kLimb+i+1] << 61)`.  Logs first
+10 mismatches plus a summary count.
+
+Outcome:
+- mismatches > 0 ⇒ BigShiftRight is wrong at one or more positions
+- mismatches = 0 ⇒ BigShiftRight is faithful across the q range; bug is in
+  ar itself or upstream (escalate to Option F-1 next).
 - **F-1**: full chunked-grid reference for `a * r` (39 × 39 = 1,521
   sub-products); scan ar limbs against the reference at every k-th position
   (e.g., every 100K).  Finds the wrong ar limb if any exists.  ~5-10 min.

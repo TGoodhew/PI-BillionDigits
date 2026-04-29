@@ -3712,6 +3712,13 @@ Public Class Form1
         ' Mismatch ⇒ BigShiftRight middle bug.  Agreement ⇒ narrows bug to SafeMpzMul middle.
         Dim _5b_arMid0 As ULong = 0UL, _5b_arMid1 As ULong = 0UL
         Dim _5b_arQuart0 As ULong = 0UL, _5b_arQuart1 As ULong = 0UL
+        ' §5B-f3: capture 100 evenly-spaced ar samples (and their +1 neighbours) pre-shift
+        ' for post-shift verification of q[i] = (ar[kLimb+i] >> 3) | (ar[kLimb+i+1] << 61).
+        ' Any mismatch across the 100 samples ⇒ BigShiftRight has a bug at that index;
+        ' all 100 matching ⇒ shift is faithful, and the bug must be in ar itself or upstream.
+        Dim _f3_qIdx(99) As Long
+        Dim _f3_arLo(99) As ULong
+        Dim _f3_arHi(99) As ULong
         If _logLevel >= 2 AndAlso _5b_verify Then
             Dim _aD5 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(a.Pointer, 8))
             Dim _rD5 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
@@ -3771,6 +3778,17 @@ Public Class Form1
             _5b_arQuart0 = CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt(_5bQuartArIdx * 8L)))
             _5b_arQuart1 = CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt((_5bQuartArIdx + 1L) * 8L)))
             AppendLog($"[SafeMpzDiv§5B-arQ-src] ar[{_5bQuartArIdx:N0}]={_5b_arQuart0:X16} ar[{_5bQuartArIdx+1:N0}]={_5b_arQuart1:X16} ar[{_5bMidArIdx:N0}]={_5b_arMid0:X16} ar[{_5bMidArIdx+1:N0}]={_5b_arMid1:X16}{vbCrLf}")
+            ' §5B-f3 capture: 100 evenly-spaced ar samples covering q's full range [0..szQ-1].
+            ' szQ = 87,500,001, kLimb = 175,000,001.  Sample positions evenly across q indices.
+            For _f3s As Integer = 0 To 99
+                Dim _f3_qi As Long = CLng(_f3s) * 87499999L \ 99L  ' 0, 884K, 1.77M, ..., 87.5M-1
+                _f3_qIdx(_f3s) = _f3_qi
+                Dim _f3_arIdxLo As Long = _5bKLimb + _f3_qi
+                Dim _f3_arIdxHi As Long = _5bKLimb + _f3_qi + 1L
+                _f3_arLo(_f3s) = If(_f3_arIdxLo >= 0L AndAlso _f3_arIdxLo < CLng(szAR), CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt(_f3_arIdxLo * 8L))), 0UL)
+                _f3_arHi(_f3s) = If(_f3_arIdxHi >= 0L AndAlso _f3_arIdxHi < CLng(szAR), CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt(_f3_arIdxHi * 8L))), 0UL)
+            Next
+            AppendLog($"[SafeMpzDiv§5B-f3] captured 100 ar samples for post-shift verification (kLimb={_5bKLimb:N0} kRem=3, qIdx range 0..{87499999L \ 99L * 99L:N0}){vbCrLf}")
         End If
         ' §135 save slots: ar[64654664/65] captured inside §111 block, used after BigShiftRight.
         Dim _ar135_v0 As Long = 0L
@@ -3887,6 +3905,26 @@ Public Class Form1
                 Dim _actQQuartU As ULong = CULng(_qQuart5)
                 AppendLog($"[SafeMpzDiv§5B-q-quart] actual q[21,875,000]={_actQQuartU:X16}  expected (ar[{21875000L+_kLimbQ5:N0}]>>3)|(ar[+1]<<61)={_expQQuart:X16}  match={(_actQQuartU = _expQQuart)}{vbCrLf}")
                 AppendLog($"[SafeMpzDiv§5B-q-mid]   actual q[43,750,000]={_actQMidU:X16}  expected (ar[{43750000L+_kLimbQ5:N0}]>>3)|(ar[+1]<<61)={_expQMid:X16}  match={(_actQMidU = _expQMid)}{vbCrLf}")
+                ' §5B-f3 verify: scan all 100 captured pre-shift samples against actual q.
+                ' Mismatch ⇒ BigShiftRight is wrong at that index.  All match ⇒ shift is faithful
+                ' (so the bug must be in ar itself, or in the kBits computation, or upstream).
+                Dim _f3_mismatchCount As Integer = 0
+                Dim _f3_firstMismatch As Integer = -1
+                Dim _f3_logCount As Integer = 0
+                For _f3s As Integer = 0 To 99
+                    Dim _f3_expQ As ULong = (_f3_arLo(_f3s) >> 3) Or (_f3_arHi(_f3s) << 61)
+                    Dim _f3_qi As Long = _f3_qIdx(_f3s)
+                    Dim _f3_actQ As ULong = If(_f3_qi >= 0L AndAlso _f3_qi < CLng(szQ), CULng(Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, CInt(_f3_qi * 8L))), 0UL)
+                    If _f3_expQ <> _f3_actQ Then
+                        _f3_mismatchCount += 1
+                        If _f3_firstMismatch = -1 Then _f3_firstMismatch = _f3s
+                        If _f3_logCount < 10 Then
+                            AppendLog($"[SafeMpzDiv§5B-f3 MISMATCH] sample={_f3s} q[{_f3_qi:N0}] expected={_f3_expQ:X16} actual={_f3_actQ:X16} (ar_pre[{_kLimbQ5 + _f3_qi:N0}]={_f3_arLo(_f3s):X16} ar_pre[+1]={_f3_arHi(_f3s):X16}){vbCrLf}")
+                            _f3_logCount += 1
+                        End If
+                    End If
+                Next
+                AppendLog($"[SafeMpzDiv§5B-f3 SUMMARY] scanned 100 q positions, mismatches={_f3_mismatchCount}, firstMismatchSampleIdx={_f3_firstMismatch}{vbCrLf}")
             End If
             ' §113: log q middle limbs to verify BigShiftRight correctness.
             If szQ = 21875001 Then
