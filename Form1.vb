@@ -3280,6 +3280,7 @@ Public Class Form1
         Dim _nrBin As String = System.IO.Path.Combine(_nrSnapDir, "nr_r.bin")
         Dim _nrMeta As String = System.IO.Path.Combine(_nrSnapDir, "nr_meta.txt")
         Dim prec As Long = 62L
+        Dim _resumedIter As Long = 0L  ' §200: iter count from a resumed §NR-ckpt; 0 if no resume
         If _autoCheckpoint AndAlso System.IO.File.Exists(_nrBin) AndAlso System.IO.File.Exists(_nrMeta) Then
             Try
                 Dim _metaLines As String() = System.IO.File.ReadAllLines(_nrMeta)
@@ -3288,11 +3289,14 @@ Public Class Form1
                     Dim _eq As Integer = _ml.IndexOf("="c)
                     If _eq > 0 Then _meta(_ml.Substring(0, _eq)) = _ml.Substring(_eq + 1)
                 Next
-                Dim _snapKBits As Long = 0L, _snapBBits As Long = 0L, _snapPrec As Long = 0L
+                Dim _snapKBits As Long = 0L, _snapBBits As Long = 0L, _snapPrec As Long = 0L, _snapIter As Long = 0L
                 If _meta.ContainsKey("kBits") AndAlso Long.TryParse(_meta("kBits"), _snapKBits) AndAlso
                    _meta.ContainsKey("bBits") AndAlso Long.TryParse(_meta("bBits"), _snapBBits) AndAlso
                    _meta.ContainsKey("prec")  AndAlso Long.TryParse(_meta("prec"),  _snapPrec)  AndAlso
                    _snapKBits = kBits AndAlso _snapBBits = bBits AndAlso _snapPrec > 62L Then
+                    ' §200: also parse iter so resumed Newton can continue from the right iter count.
+                    If _meta.ContainsKey("iter") Then Long.TryParse(_meta("iter"), _snapIter)
+                    _resumedIter = _snapIter
                     Dim _nrStaging(4194303) As Byte
                     Using _fs As New FileStream(_nrBin, FileMode.Open, FileAccess.Read)
                         Using _br As New BinaryReader(_fs)
@@ -3321,8 +3325,18 @@ Public Class Form1
         Dim p As New mpz_t()
         gmp_lib.mpz_init(p)
         ' prec is declared and initialised in the §NR-ckpt block above (default 62L, or restored value).
-        Dim _nrIter As Integer = 0
-        Do While prec < rBits + 2L
+        Dim _nrIter As Integer = CInt(_resumedIter)  ' §200: continue from the resumed iter count
+        ' §200 (2026-04-29): Newton must iterate until full precision is reached.  The seed has
+        ' relative error ε_0 < 1/2 (since rSeed ≈ r_true / 2).  With Newton's quadratic convergence
+        ' (ε_n = ε_0^(2^n)), reaching ε ≤ 2^-rBits requires n ≥ log2(rBits) iterations — about 33
+        ' for rBits ≈ 5.6B.  The original loop terminated at prec >= rBits+2 (which happens after
+        ' 27 iters when prec doubles from 62), but that is FEWER iterations than Newton's true
+        ' convergence needs.  Result: r is short by ~2^(rBits - 2^27) ≈ 2^5.45B (verified
+        ' empirically via Option H r×b chunked-grid logging).  Fix: require min_nrIters =
+        ' ceil(log2(rBits)) + 3 slack iterations.  Subsequent iters at capped prec use bShift=0
+        ' (full b), which keeps doubling Newton's precision until ε is below 2^-rBits.
+        Dim _minNrIters As Integer = CInt(System.Math.Ceiling(System.Math.Log(System.Math.Max(2L, rBits), 2))) + 3
+        Do While prec < rBits + 2L OrElse _nrIter < _minNrIters
             _nrIter += 1
             prec = System.Math.Min(prec * 2L + 4L, rBits + 2L)
 
