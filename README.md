@@ -3879,7 +3879,68 @@ pattern (117 × 117 = 13,689 sub-products — about double F-1's count, so
 If r * b has bits set above kLimb ⇒ r is too big.
 If 2^kBits - r*b ≥ b ⇒ r is too small (Newton converged short).
 
-### Option F-2 in flight (2026-04-28)
+### Option F-2 result (2026-04-29 00:48 — run 15, 1h 40m to §171)
+
+```
+refSz = 175,000,002 (= kLimb + 1)
+r×b[kLimb-1] = FFFFFFFFFFFFFFFF        ← saturated (maximum)
+r×b[kLimb]   = 0000000000000007        ← exactly 2^kRem - 1 (kRem=3)
+r×b[kLimb+1] = 0                       ← zero above kLimb
+inKBitsRange = True
+aboveKLimbAllZero = True
+```
+
+This is the textbook signature of a correct Barrett reciprocal: r×b ∈
+[2^kBits - δ, 2^kBits) with small δ.  **r is correct.**
+
+So now we have ALL of:
+- r correct (F-2)
+- ar = a × r correct at 1003 positions (F-1 + Option E + boundaries)
+- q = ar >> kBits correct at 102 positions (F-3 + Option A)
+
+But §171 still throws with rem ≈ 2^5.45B × b.  The math is solid;
+something deeper is broken.
+
+### Critical insight — §39 column-group path
+
+a × r (175M × 87.5M asymmetric) and q × b (87.5M × 87.5M symmetric) take
+DIFFERENT code paths inside SafeMpzMul:
+
+| Operation | Outer call | Recursion | §39 fires? |
+|---|---|---|---|
+| `a × r` | 175M × 87.5M | §gen (asymmetric) | **NEVER** |
+| `q × b` | 87.5M × 87.5M | §gen at top, **§39 at level 2+** | **YES** |
+
+§39 (the column-group fast path at Form1.vb line 2776) fires when
+`mA = mB ∧ mA + mB ≤ 50M`.  For q × b at 5B scale:
+- Outer 87.5M × 87.5M: sum 58.3M > 50M → §gen
+- Inner 29.2M × 29.2M sub-products: sum 19.4M ≤ 50M → **§39**
+- Inner-inner 9.72M × 9.72M: sum 6.48M ≤ 50M → **§39**
+
+So q × b's inner sub-products use §39's column-group accumulation
+(combining 9 sub-products into 5 columns by shift, with adds-before-shifts).
+
+**Every diagnostic up to F-3 missed §39 entirely:**
+- F-1 verified a × r via §gen (asymmetric — never §39).
+- F-2 verified r × b via chunked-grid (each sub-product ≤ 3M total via
+  direct mpz_mul; never §39 nor §gen).
+- F-3 verified BigShiftRight (no SafeMpzMul involved).
+- Option E verified prods(7), prods(8) of a × r — these are 58.3M × 29.2M
+  sub-products at level 2 (asymmetric — §gen, never §39).
+
+If §39 has a bug, **q × b is wrong**.  Then rem = a − q×b is garbage and
+§171 throws — exactly matching the observed symptom.
+
+### Next step (recommended): Option G — disable §39 (force §gen for symmetric)
+
+Change the §39 gate at Form1.vb line 2776 to never fire (`If False Then`)
+and run the 5B test.  Outcome:
+- §171 throw disappears ⇒ §39 was buggy at q×b inner sizes; fix is to
+  shrink §39's size threshold OR rewrite §39's accumulation logic.
+- §171 throw persists ⇒ §39 is not the culprit; bug is elsewhere we
+  haven't imagined.
+
+Cost: one constant toggle; ~1h 14m run (no diagnostic overhead).
 
 `§5B-f2` implemented in `SafeMpzDiv` immediately after the (now-disabled)
 F-1 block.  F-1 disabled via `_F1_ENABLED = False` to save ~80 min — its

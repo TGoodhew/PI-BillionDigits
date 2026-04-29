@@ -2773,7 +2773,13 @@ Public Class Form1
           ' abort(), killing the process silently. The §gen path (below) accumulates
           ' each sub-product one at a time into the pre-sized accumulator and shifted
           ' buffer, so no GMP realloc is triggered. Skip §39 for large sub-products.
-          If mA = mB AndAlso
+          ' Option G (2026-04-29): disable §39 column-group fast path to test the
+          ' hypothesis that §39 produces a wrong q×b at 5B scale.  Set _OPT_G_DISABLE_S39
+          ' = True to force every symmetric SafeMpzMul to go through §gen.  If §171 stops
+          ' throwing with §39 disabled, the bug is in §39's accumulation logic.
+          Const _OPT_G_DISABLE_S39 As Boolean = True
+          If Not _OPT_G_DISABLE_S39 AndAlso
+              mA = mB AndAlso
               CLng(mA) + CLng(mB) <= 50_000_000L AndAlso
               _A0_szT > 0 AndAlso _A1_szT > 0 AndAlso _A2_szT > 0 AndAlso
               _B0_szT > 0 AndAlso _B1_szT > 0 AndAlso _B2_szT > 0 Then
