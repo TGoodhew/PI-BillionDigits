@@ -4383,6 +4383,30 @@ Public Class Form1
             If _f4_qbTop > _f4_aTop Then
                 AppendLog($"[SafeMpzDiv§5B-f4 ALARM] qb[top]={_f4_qbTop:X16} > a[top]={_f4_aTop:X16} — qb is bigger than a in top limb (extreme overshoot){vbCrLf}")
             End If
+
+            ' §5B-f6: re-read a at the same positions §5B-a captured, verify integrity.
+            ' If a's data was modified (e.g., by SafeMpzMul writing through input pieces),
+            ' we'd see a mismatch here.  Captures: a[0]=A514E7911325F190, a[1]=96FCE3B61243D2E0,
+            ' a[mid=87,500,000]=9A776346843EEB7A, a[szA-2]=A4CCDE102251DA76, a[szA-1]=0479BC06C17340EB.
+            Dim _f6_a0 As ULong = _f4_a0
+            Dim _f6_a1 As ULong = _f4_a1
+            Dim _f6_aMid As ULong = If(szA > 87500000, CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_aD, CInt(87500000L * 8L))), 0UL)
+            Dim _f6_aTop2 As ULong = _f4_aTop1
+            Dim _f6_aTop As ULong = _f4_aTop
+            Const _F6_EXP_A0 As ULong = &HA514E7911325F190UL
+            Const _F6_EXP_A1 As ULong = &H96FCE3B61243D2E0UL
+            Const _F6_EXP_AMID As ULong = &H9A776346843EEB7AUL
+            Const _F6_EXP_ATOP2 As ULong = &HA4CCDE102251DA76UL
+            Const _F6_EXP_ATOP As ULong = &H479BC06C17340EBUL
+            Dim _f6_okBot As Boolean = (_f6_a0 = _F6_EXP_A0 AndAlso _f6_a1 = _F6_EXP_A1)
+            Dim _f6_okMid As Boolean = (_f6_aMid = _F6_EXP_AMID)
+            Dim _f6_okTop As Boolean = (_f6_aTop2 = _F6_EXP_ATOP2 AndAlso _f6_aTop = _F6_EXP_ATOP)
+            AppendLog($"[SafeMpzDiv§5B-f6 a-integrity] a[0]={_f6_a0:X16} (exp {_F6_EXP_A0:X16}) a[1]={_f6_a1:X16} (exp {_F6_EXP_A1:X16}) okBot={_f6_okBot}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-f6 a-integrity] a[mid=87,500,000]={_f6_aMid:X16} (exp {_F6_EXP_AMID:X16}) okMid={_f6_okMid}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-f6 a-integrity] a[szA-2]={_f6_aTop2:X16} (exp {_F6_EXP_ATOP2:X16}) a[szA-1]={_f6_aTop:X16} (exp {_F6_EXP_ATOP:X16}) okTop={_f6_okTop}{vbCrLf}")
+            If Not (_f6_okBot AndAlso _f6_okMid AndAlso _f6_okTop) Then
+                AppendLog($"[SafeMpzDiv§5B-f6 ALARM] a was corrupted between SafeMpzDiv entry and qb completion!{vbCrLf}")
+            End If
         End If
         ' §184: Allocate remainder as raw struct with pre-allocated limb buffer large enough
         ' to hold the result of a - qb (max szA limbs) — avoids GmpReallocFunc being called
