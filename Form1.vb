@@ -2777,7 +2777,7 @@ Public Class Form1
           ' hypothesis that §39 produces a wrong q×b at 5B scale.  Set _OPT_G_DISABLE_S39
           ' = True to force every symmetric SafeMpzMul to go through §gen.  If §171 stops
           ' throwing with §39 disabled, the bug is in §39's accumulation logic.
-          Const _OPT_G_DISABLE_S39 As Boolean = True
+          Const _OPT_G_DISABLE_S39 As Boolean = False  ' Reverted after run 16 ruled out §39
           If Not _OPT_G_DISABLE_S39 AndAlso
               mA = mB AndAlso
               CLng(mA) + CLng(mB) <= 50_000_000L AndAlso
@@ -3943,7 +3943,8 @@ Public Class Form1
         ' Grid: 59 × 59 = 3,481 sub-products at ≤ 1.5M × 1.5M (≤ 3M total).
         ' Result: 175M limbs ≈ 1.4 GB.  Pre-alloc 180M-limb buffers ≈ 1.44 GB each.
         ' Estimated time: ~40 min (fewer sub-products than F-1, smaller buffers).
-        If _logLevel >= 2 AndAlso _5b_verify Then
+        Const _F2_ENABLED As Boolean = False  ' DONE — run 15 confirmed r is correct (refSz=kLimb+1, top=2^kRem-1)
+        If _logLevel >= 2 AndAlso _5b_verify AndAlso _F2_ENABLED Then
             Const _F2_CHUNK As Integer = 1500000
             Const _F2_MAX_LIMBS As Integer = 180_000_000
             Dim _F2_MAX_BYTES As Long = CLng(_F2_MAX_LIMBS) * 8L
@@ -4348,6 +4349,41 @@ Public Class Form1
         Dim _qbPtr As IntPtr = qb.Pointer   ' = savedResultPtr set by SafeMpzMul
         Dim szQB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4))
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§184] qb raw: alloc={Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 0):N0} size={Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4):N0} _mp_d={Runtime.InteropServices.Marshal.ReadInt64(_qbPtr, 8):X16}{vbCrLf}")
+
+        ' §5B-f4: Cheap qb sanity checks (post-SafeMpzMul(qb, q, b), pre-subtract).
+        ' Mathematically q ≈ q_true (within ±1 by Barrett), so q × b ≈ a (within b).
+        ' qb's TOP limbs should match a's TOP limbs almost exactly; qb[0] should equal
+        ' (q[0] × b[0]) mod 2^64 by integer-multiplication identity.
+        ' If qb[top] differs significantly from a[top] ⇒ SafeMpzMul has a bug specific
+        ' to symmetric q × b at this scale (the OPPOSITE of F-1's a × r verification).
+        ' If qb[0] ≠ (q[0] × b[0]) mod 2^64 ⇒ SafeMpzMul has a bottom-limb bug for qb.
+        If _logLevel >= 2 AndAlso szQ = 87500001 AndAlso szB = 87500001 Then
+            Dim _f4_aD As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_aPtr, 8))
+            Dim _f4_qD As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_qPtr, 8))
+            Dim _f4_bD As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_bPtr, 8))
+            Dim _f4_qbD As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_qbPtr, 8))
+            Dim _f4_q0 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_qD, 0))
+            Dim _f4_b0 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_bD, 0))
+            Dim _f4_qb0 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_qbD, 0))
+            Dim _f4_qb1 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_qbD, 8))
+            Dim _f4_a0 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_aD, 0))
+            Dim _f4_a1 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_aD, 8))
+            Dim _f4_expQb0 As ULong = _f4_q0 * _f4_b0
+            Dim _f4_qbTop As ULong = If(szQB >= 1, CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_qbD, CInt(CLng(szQB - 1) * 8L))), 0UL)
+            Dim _f4_qbTop1 As ULong = If(szQB >= 2, CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_qbD, CInt(CLng(szQB - 2) * 8L))), 0UL)
+            Dim _f4_qbTop2 As ULong = If(szQB >= 3, CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_qbD, CInt(CLng(szQB - 3) * 8L))), 0UL)
+            Dim _f4_aTop As ULong = If(szA >= 1, CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_aD, CInt(CLng(szA - 1) * 8L))), 0UL)
+            Dim _f4_aTop1 As ULong = If(szA >= 2, CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_aD, CInt(CLng(szA - 2) * 8L))), 0UL)
+            Dim _f4_aTop2 As ULong = If(szA >= 3, CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_aD, CInt(CLng(szA - 3) * 8L))), 0UL)
+            AppendLog($"[SafeMpzDiv§5B-f4 inputs] q[0]={_f4_q0:X16} q[1]={CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_qD, 8)):X16} b[0]={_f4_b0:X16} b[1]={CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_bD, 8)):X16}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-f4 qbBot] qb[0]={_f4_qb0:X16} qb[1]={_f4_qb1:X16} (q[0]*b[0])_lo={_f4_expQb0:X16} match={(_f4_qb0 = _f4_expQb0)}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-f4 qbTop] qb[szQB-1..-3]=[{_f4_qbTop:X16} {_f4_qbTop1:X16} {_f4_qbTop2:X16}] vs a[szA-1..-3]=[{_f4_aTop:X16} {_f4_aTop1:X16} {_f4_aTop2:X16}] szQB={szQB:N0} szA={szA:N0}{vbCrLf}")
+            ' Sanity: q × b should be ≤ a (since q = floor(a/b) ≈ q_true, q × b ≤ q_true × b ≤ a).
+            ' qb's top limb should equal or be just below a's top.
+            If _f4_qbTop > _f4_aTop Then
+                AppendLog($"[SafeMpzDiv§5B-f4 ALARM] qb[top]={_f4_qbTop:X16} > a[top]={_f4_aTop:X16} — qb is bigger than a in top limb (extreme overshoot){vbCrLf}")
+            End If
+        End If
         ' §184: Allocate remainder as raw struct with pre-allocated limb buffer large enough
         ' to hold the result of a - qb (max szA limbs) — avoids GmpReallocFunc being called
         ' inside __gmpz_sub, which could trigger the §78 side-effect or pool interaction.
