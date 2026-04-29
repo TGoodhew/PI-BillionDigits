@@ -3720,3 +3720,66 @@ Logs include the `idx-1` and `idx+1` neighbours so we can see whether any
 disagreement is just a one-limb carry quirk or a substantive divergence.
 
 Result expected after the next ~1h 14m run.
+
+### Option E v1 result (2026-04-28 17:00 — run 11 ABORTED)
+
+`gmp: overflow in mpz type` aborted run 11 at the start of the §5B-e prods(7)
+loop.  Root cause: GMP's realloc path (NativeReallocFunc) misbehaving when
+freshly `GmpRaw_init`'d `_ckShifted`/`_refAcc` (1-limb initial alloc) tried to
+grow to ~87.5M limbs across the 780-iteration grid.  Fix in v2: pre-allocate
+both buffers via VirtualAlloc to 90M limbs (~720 MB) and swap them into the
+mpz_t struct's `_mp_d` slot, mirroring §gen's `_sharedSjBuf` /
+`_sv_shifted_hdr` pattern — `_mp_alloc` set to the full pre-allocated size,
+so `mul_2exp` and `add` never trigger realloc.
+
+### Option E v2 result (2026-04-28 18:35 — run 12, 1h 26m to §171)
+
+**MAJOR PIVOT.**  The chunked-grid reference completed cleanly and revealed:
+
+```
+prods(7) idx=72,916,666 (and idx-1, idx+1):
+  reference:    EA6244050D44001F  3E924C7A243168E4  6AD0F6B6D638BF07
+  ourSafeMpz:   EA6244050D44001F  3E924C7A243168E4  6AD0F6B6D638BF07
+  → MATCH (all 3 adjacent limbs identical).
+
+prods(8) idx=43,749,999 (and idx-1, idx+1):
+  reference:    751C4E2F65EC4FA6  B8B767941F0A2E5D  11D57DC8288B6585
+  ourSafeMpz:   751C4E2F65EC4FA6  B8B767941F0A2E5D  11D57DC8288B6585
+  → MATCH (all 3 adjacent limbs identical).
+```
+
+**Both `prods(7)` and `prods(8)` are CORRECT.**  Combined with the level-1
+shift+add structure, this means `ar[218,750,001] = F749B40E433B9742` is the
+**correct** value, not the wrong value we had presumed.
+
+The "ar[218,750,001] is wrong" assumption was an INFERENCE ("q is off by
+2^5.45B ⇒ some ar limb must be wrong ⇒ we picked 218,750,001 because it was
+already logged in early diagnostics"), never proven against an independent
+oracle.  Option E disproves the assumption.
+
+### What this opens up — bug is somewhere we never checked
+
+The real wrong limb (or wrong operation) lives in territory we haven't
+verified yet.  Candidates, ordered by likelihood:
+
+1. **A different ar limb** — we've only verified ar at indices 0, szAR-1,
+   and 218,750,001.  ar has 262,500,002 limbs total.  Some other mid-position
+   is the culprit.
+2. **BigShiftRight(ar, kBits) → q at unchecked positions** — Option A
+   verified q at 4 indices (0, quart, mid, szQ-1).  The shift could be wrong
+   elsewhere.
+3. **r itself has wrong middle limbs** — fresh-Newton verified r is
+   bit-identical to checkpoint at 5 boundary positions; the middle of r was
+   never verified against `r * b ∈ [2^kBits - b, 2^kBits)`.
+4. **a has wrong middle limbs** — same coverage gap as r.
+
+### Next step (recommended): Option F
+
+- **F-3 (FIRST — cheap)**: scan all q[0..szQ-1] against the
+  `(ar[kLimb+i] >> 3) | (ar[kLimb+i+1] << 61)` formula.  If any disagreement
+  ⇒ BigShiftRight is wrong at that index.  Runs in seconds; no extra mpz_mul.
+- **F-1**: full chunked-grid reference for `a * r` (39 × 39 = 1,521
+  sub-products); scan ar limbs against the reference at every k-th position
+  (e.g., every 100K).  Finds the wrong ar limb if any exists.  ~5-10 min.
+- **F-2**: chunked-grid `r * b` and verify it's in `[2^kBits - b, 2^kBits)`.
+  Catches Newton convergence shortfall in the middle of r.
