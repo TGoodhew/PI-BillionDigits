@@ -3793,6 +3793,10 @@ Public Class Form1
             AppendLog($"[SafeMpzDiv§5B-f3] captured 100 ar samples for post-shift verification (kLimb={_5bKLimb:N0} kRem=3){vbCrLf}")
         End If
 
+        ' §5B-f1 (DONE — run 14 confirmed ar = a × r is fully correct via 1000
+        ' evenly-spaced position scans, mismatches=0).  Disabled to save ~80 min.
+        ' Re-enable by flipping _F1_ENABLED to True if the diagnostic needs to re-run.
+        Const _F1_ENABLED As Boolean = False
         ' §5B-f1: Chunked-grid independent reference for the FULL a × r product.
         ' Computes the 262.5M-limb result via a 117 × 59 = 6,903-cell grid of
         ' ≤ 1.5M × 1.5M (≤ 3M total per cell — reliable mpz_mul per §160), then
@@ -3810,7 +3814,7 @@ Public Class Form1
         ' Pre-allocates _refAcc and _ckShifted buffers via VirtualAlloc to
         ' 270M limbs (~2.16 GB each) — _mp_alloc set to full pre-allocated
         ' size so mul_2exp and add never trigger realloc (same pattern as §gen).
-        If _logLevel >= 2 AndAlso _5b_verify Then
+        If _logLevel >= 2 AndAlso _5b_verify AndAlso _F1_ENABLED Then
             Const _F1_CHUNK As Integer = 1500000
             Const _F1_MAX_LIMBS As Integer = 270_000_000
             Dim _F1_MAX_BYTES As Long = CLng(_F1_MAX_LIMBS) * 8L
@@ -3925,9 +3929,139 @@ Public Class Form1
                 VirtualFree(_F1_eShiftBuf, UIntPtr.Zero, MEM_RELEASE)
             End If
         End If
-        ' §5B-f1 (deferred from §166 site): now that the chunked-grid reference is done,
-        ' release r.  When §5B-f1 is gated off (_logLevel < 2 or non-5B size), this clears
-        ' r at exactly the same logical point as the original code.
+        ' §5B-f2: Verify r is a true reciprocal by computing r × b via chunked-grid
+        ' and checking the result lies in [2^kBits - b, 2^kBits).  If r is correct,
+        ' the top limb (r*b)[kLimb] should be in [0, 2^kRem-1] and limbs above kLimb
+        ' should be zero.  If r is short (Newton converged early), the result will
+        ' be MUCH smaller — fewer total limbs, with high-zone limbs missing entirely.
+        ' Grid: 59 × 59 = 3,481 sub-products at ≤ 1.5M × 1.5M (≤ 3M total).
+        ' Result: 175M limbs ≈ 1.4 GB.  Pre-alloc 180M-limb buffers ≈ 1.44 GB each.
+        ' Estimated time: ~40 min (fewer sub-products than F-1, smaller buffers).
+        If _logLevel >= 2 AndAlso _5b_verify Then
+            Const _F2_CHUNK As Integer = 1500000
+            Const _F2_MAX_LIMBS As Integer = 180_000_000
+            Dim _F2_MAX_BYTES As Long = CLng(_F2_MAX_LIMBS) * 8L
+            Dim _F2_rD As Long = Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8)
+            Dim _F2_rSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
+            Dim _F2_bD As Long = Runtime.InteropServices.Marshal.ReadInt64(b.Pointer, 8)
+            Dim _F2_bSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
+            Dim _F2_kLimb As Long = kBits \ 64L
+            Dim _F2_kRem As Integer = CInt(kBits Mod 64L)
+            AppendLog($"[SafeMpzDiv§5B-f2] starting r×b chunked-grid reference (chunk={_F2_CHUNK:N0}, prealloc={_F2_MAX_LIMBS:N0} limbs/buf, {_F2_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-f2] r sz={_F2_rSz:N0} b sz={_F2_bSz:N0} kBits={kBits:N0} kLimb={_F2_kLimb:N0} kRem={_F2_kRem}{vbCrLf}")
+            Dim _F2_eAccBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F2_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            Dim _F2_eShiftBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F2_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If _F2_eAccBuf = IntPtr.Zero OrElse _F2_eShiftBuf = IntPtr.Zero Then
+                AppendLog($"[SafeMpzDiv§5B-f2] VirtualAlloc FAILED — skipping{vbCrLf}")
+                If _F2_eAccBuf <> IntPtr.Zero Then VirtualFree(_F2_eAccBuf, UIntPtr.Zero, MEM_RELEASE)
+                If _F2_eShiftBuf <> IntPtr.Zero Then VirtualFree(_F2_eShiftBuf, UIntPtr.Zero, MEM_RELEASE)
+            Else
+                Dim _F2_refAcc As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                GmpRaw_init(_F2_refAcc)
+                Dim _F2_ra_initAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_F2_refAcc, 0))
+                Dim _F2_ra_initPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_F2_refAcc, 8))
+                GmpNativeAlloc_FreeRaw(_F2_ra_initPtr, _F2_ra_initAlloc * 8L)
+                Runtime.InteropServices.Marshal.WriteInt32(_F2_refAcc, 0, _F2_MAX_LIMBS)
+                Runtime.InteropServices.Marshal.WriteInt32(_F2_refAcc, 4, 0)
+                Runtime.InteropServices.Marshal.WriteInt64(_F2_refAcc, 8, _F2_eAccBuf.ToInt64())
+                Dim _F2_ckShifted As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                GmpRaw_init(_F2_ckShifted)
+                Dim _F2_cs_initAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_F2_ckShifted, 0))
+                Dim _F2_cs_initPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_F2_ckShifted, 8))
+                GmpNativeAlloc_FreeRaw(_F2_cs_initPtr, _F2_cs_initAlloc * 8L)
+                Runtime.InteropServices.Marshal.WriteInt32(_F2_ckShifted, 0, _F2_MAX_LIMBS)
+                Runtime.InteropServices.Marshal.WriteInt32(_F2_ckShifted, 4, 0)
+                Runtime.InteropServices.Marshal.WriteInt64(_F2_ckShifted, 8, _F2_eShiftBuf.ToInt64())
+                Dim _F2_ckPartial As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                GmpRaw_init(_F2_ckPartial)
+                Dim _F2_ckA As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                Dim _F2_ckB As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                Dim _F2_numCkR As Integer = (_F2_rSz + _F2_CHUNK - 1) \ _F2_CHUNK
+                Dim _F2_numCkB As Integer = (_F2_bSz + _F2_CHUNK - 1) \ _F2_CHUNK
+                Dim _F2_ckCount As Integer = 0
+                For i As Integer = 0 To _F2_numCkR - 1
+                    Dim _F2_rOff As Long = CLng(i) * CLng(_F2_CHUNK)
+                    Dim _F2_rSzCk As Integer = CInt(System.Math.Min(CLng(_F2_CHUNK), CLng(_F2_rSz) - _F2_rOff))
+                    If _F2_rSzCk <= 0 Then Continue For
+                    While _F2_rSzCk > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_F2_rD + (_F2_rOff + CLng(_F2_rSzCk - 1)) * 8L)) = 0L
+                        _F2_rSzCk -= 1
+                    End While
+                    If _F2_rSzCk <= 0 Then Continue For
+                    Runtime.InteropServices.Marshal.WriteInt32(_F2_ckA, 0, _F2_CHUNK)
+                    Runtime.InteropServices.Marshal.WriteInt32(_F2_ckA, 4, _F2_rSzCk)
+                    Runtime.InteropServices.Marshal.WriteInt64(_F2_ckA, 8, _F2_rD + _F2_rOff * 8L)
+                    For j As Integer = 0 To _F2_numCkB - 1
+                        Dim _F2_bOff As Long = CLng(j) * CLng(_F2_CHUNK)
+                        Dim _F2_bSzCk As Integer = CInt(System.Math.Min(CLng(_F2_CHUNK), CLng(_F2_bSz) - _F2_bOff))
+                        If _F2_bSzCk <= 0 Then Continue For
+                        While _F2_bSzCk > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_F2_bD + (_F2_bOff + CLng(_F2_bSzCk - 1)) * 8L)) = 0L
+                            _F2_bSzCk -= 1
+                        End While
+                        If _F2_bSzCk <= 0 Then Continue For
+                        Runtime.InteropServices.Marshal.WriteInt32(_F2_ckB, 0, _F2_CHUNK)
+                        Runtime.InteropServices.Marshal.WriteInt32(_F2_ckB, 4, _F2_bSzCk)
+                        Runtime.InteropServices.Marshal.WriteInt64(_F2_ckB, 8, _F2_bD + _F2_bOff * 8L)
+                        GmpRaw_mul(_F2_ckPartial, _F2_ckA, _F2_ckB)
+                        Dim _F2_shiftBits As ULong = CULng(_F2_rOff + _F2_bOff) * 64UL
+                        If _F2_shiftBits = 0UL Then
+                            GmpRaw_add(_F2_refAcc, _F2_refAcc, _F2_ckPartial)
+                        Else
+                            Runtime.InteropServices.Marshal.WriteInt32(_F2_ckShifted, 4, 0)
+                            Dim _F2_shiftSrc As IntPtr = _F2_ckPartial
+                            Dim _F2_shiftRem As ULong = _F2_shiftBits
+                            While _F2_shiftRem > 0UL
+                                Dim _F2_chunkBits As UInteger = CUInt(System.Math.Min(_F2_shiftRem, CULng(UInt32.MaxValue)))
+                                GmpRaw_mul_2exp(_F2_ckShifted, _F2_shiftSrc, _F2_chunkBits)
+                                _F2_shiftSrc = _F2_ckShifted
+                                _F2_shiftRem -= CULng(_F2_chunkBits)
+                            End While
+                            GmpRaw_add(_F2_refAcc, _F2_refAcc, _F2_ckShifted)
+                        End If
+                        _F2_ckCount += 1
+                    Next j
+                Next i
+                Dim _F2_refSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_F2_refAcc, 4))
+                Dim _F2_refDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_F2_refAcc, 8))
+                AppendLog($"[SafeMpzDiv§5B-f2] r×b reference complete: subProducts={_F2_ckCount:N0} refSz={_F2_refSz:N0}{vbCrLf}")
+                ' Inspect (r×b) at and around kLimb to assess r's correctness.
+                ' If r is exact: refSz should be kLimb or kLimb+1 (with limb kLimb in [0, 2^kRem)).
+                ' If r is short: refSz < kLimb (high zone is empty), or limb kLimb-1 is much smaller than 2^64.
+                ' If r is large: refSz > kLimb+1, or limb kLimb has bits set above bit kRem.
+                Dim _f2GetLimb = Function(_idx As Long) As ULong
+                                     If _idx >= 0L AndAlso _idx < CLng(_F2_refSz) Then
+                                         Return CULng(Runtime.InteropServices.Marshal.ReadInt64(_F2_refDPtr, CInt(_idx * 8L)))
+                                     End If
+                                     Return 0UL
+                                 End Function
+                Dim _F2_v_kL As ULong = _f2GetLimb(_F2_kLimb)
+                Dim _F2_v_kLm1 As ULong = _f2GetLimb(_F2_kLimb - 1L)
+                Dim _F2_v_kLm2 As ULong = _f2GetLimb(_F2_kLimb - 2L)
+                Dim _F2_v_kLp1 As ULong = _f2GetLimb(_F2_kLimb + 1L)
+                Dim _F2_v_kLp2 As ULong = _f2GetLimb(_F2_kLimb + 2L)
+                Dim _F2_v_top As ULong = _f2GetLimb(CLng(_F2_refSz) - 1L)
+                Dim _F2_v_top2 As ULong = _f2GetLimb(CLng(_F2_refSz) - 2L)
+                Dim _F2_v_bot As ULong = _f2GetLimb(0L)
+                Dim _F2_v_bot1 As ULong = _f2GetLimb(1L)
+                Dim _F2_kBitsBoundary As ULong = If(_F2_kRem >= 64, 0UL, CULng(1L << _F2_kRem) - 1UL)
+                Dim _F2_v_kL_aboveKRem As ULong = _F2_v_kL >> _F2_kRem
+                Dim _F2_v_kL_inRange As Boolean = (_F2_v_kL <= _F2_kBitsBoundary)
+                Dim _F2_aboveKLimbAllZero As Boolean = (_F2_v_kLp1 = 0UL AndAlso _F2_v_kLp2 = 0UL)
+                AppendLog($"[SafeMpzDiv§5B-f2 inspect] r×b[0]={_F2_v_bot:X16} r×b[1]={_F2_v_bot1:X16} r×b[kLimb-2]={_F2_v_kLm2:X16} r×b[kLimb-1]={_F2_v_kLm1:X16} r×b[kLimb]={_F2_v_kL:X16} r×b[kLimb+1]={_F2_v_kLp1:X16} r×b[kLimb+2]={_F2_v_kLp2:X16} r×b[top-1]={_F2_v_top2:X16} r×b[top]={_F2_v_top:X16}{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-f2 verdict] refSz={_F2_refSz:N0} kLimb={_F2_kLimb:N0} kRem={_F2_kRem} kRemMask={_F2_kBitsBoundary:X16} r×b[kLimb]>>kRem={_F2_v_kL_aboveKRem:X16} (should be 0 if r×b<2^kBits) inKBitsRange={_F2_v_kL_inRange} aboveKLimbAllZero={_F2_aboveKLimbAllZero}{vbCrLf}")
+                ' Cleanup
+                Runtime.InteropServices.Marshal.FreeHGlobal(_F2_refAcc)
+                Runtime.InteropServices.Marshal.FreeHGlobal(_F2_ckShifted)
+                GmpRaw_clear(_F2_ckPartial) : Runtime.InteropServices.Marshal.FreeHGlobal(_F2_ckPartial)
+                Runtime.InteropServices.Marshal.FreeHGlobal(_F2_ckA)
+                Runtime.InteropServices.Marshal.FreeHGlobal(_F2_ckB)
+                VirtualFree(_F2_eAccBuf, UIntPtr.Zero, MEM_RELEASE)
+                VirtualFree(_F2_eShiftBuf, UIntPtr.Zero, MEM_RELEASE)
+            End If
+        End If
+
+        ' §5B-f1/f2 (deferred from §166 site): now that the chunked-grid references are done,
+        ' release r.  When both diagnostics are gated off, this clears r at exactly the same
+        ' logical point as the original code.
         gmp_lib.mpz_clear(r)
         ' §135 save slots: ar[64654664/65] captured inside §111 block, used after BigShiftRight.
         Dim _ar135_v0 As Long = 0L

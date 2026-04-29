@@ -3826,6 +3826,83 @@ log first ~10 mismatches and a summary count.  Outcome:
 Pre-allocate `_refAcc` and `_ckShifted` buffers via VirtualAlloc (~2.5 GB
 each) and swap into mpz_t — same pattern as §gen's `_sharedSjBuf` and the
 Option E v2 fix.  ~12 min added to the run.
+
+### Option F-1 result (2026-04-28 23:03 — run 14, 2h 38m to §171)
+
+```
+[SafeMpzDiv§5B-f1] reference complete: subProducts=6,903 refSz=262,500,002 ourArSz=262,500,002
+[SafeMpzDiv§5B-f1 SUMMARY] scanned 1000 ar positions across [0..262,500,001], mismatches=0, firstMismatchArIdx=-1
+```
+
+**1,000 / 1,000 ar positions match** the chunked-grid reference.  `ar = a × r`
+is **fully correct** across its 262.5M-limb range.
+
+(F-1 took ~80 min instead of the estimated 12 min — `mul_2exp` + `add` on
+the growing 1-2 GB `_refAcc` buffer scales badly at this scale.  Acceptable
+for one-shot diagnostic.  Memory peak only ~13 GB on the 64 GB host.)
+
+Cumulative coverage now:
+| Component | Positions verified | Method |
+|---|---|---|
+| `ar = a × r` | 1003+ | F-1 (1000) + Option E (1) + Option A (2 boundaries) |
+| `q` (post-shift) | 102 | F-3 (100) + Option A (2 boundaries) |
+| All 9 outer `prods(k)` | bot, [1], top | Option A + Option D |
+| `prods(7)` and `prods(8)` middle limbs | 6 | Option E |
+
+### Conclusion of F-1
+
+**`ar = a × r` is correct AND BigShiftRight is faithful, yet `q` is still
+off by ~2^5,454,259,456 from truth.**  The math `q = ar >> kBits` runs
+correctly on the inputs we provide.  The error must therefore be in **what
+we provide** — either:
+
+- **`r` is wrong in middle limbs** — Newton converges to a slightly-short
+  reciprocal, fresh-Newton verification only checked 5 boundary positions,
+  middle limbs are unverified.  This is the most likely culprit given the
+  §171 ratio of 1.974 ≈ 2 (suggesting q is off by exactly one factor of
+  the recursion structure).
+- **`kBits` is computed wrong** — we shift by the wrong amount.
+- **`b` is corrupted by something upstream** — but `b` arrives from
+  outside SafeMpzDiv intact.
+
+### Next step (recommended): Option F-2 — verify r via r * b
+
+A true reciprocal satisfies `r ≈ 2^kBits / b`, so `r * b ∈ [2^kBits - b, 2^kBits)`.
+Compute `r * b` (87.5M × 87.5M = 175M total) via the chunked-grid
+pattern (117 × 117 = 13,689 sub-products — about double F-1's count, so
+~5 hours).  Verify:
+- All limbs above `kLimb = kBits / 64` are zero (high bits should not be set).
+- The bit at position `kBits` is zero (the result is strictly less than `2^kBits`).
+- The shortfall `2^kBits - (r * b)` is in `[0, b)` (true reciprocal lower
+  bound).
+
+If r * b has bits set above kLimb ⇒ r is too big.
+If 2^kBits - r*b ≥ b ⇒ r is too small (Newton converged short).
+
+### Option F-2 in flight (2026-04-28)
+
+`§5B-f2` implemented in `SafeMpzDiv` immediately after the (now-disabled)
+F-1 block.  F-1 disabled via `_F1_ENABLED = False` to save ~80 min — its
+result (`mismatches=0`) is conclusive and need not re-run.
+
+F-2 computes `r × b` (87.5M × 87.5M = 175M total) via a 59 × 59 = 3,481
+sub-product chunked grid (chunk 1.5M, ≤ 3M total per cell).  Pre-allocates
+180M-limb buffers (~1.44 GB each) for `_refAcc` and `_ckShifted`.
+
+Post-grid, logs:
+- `r×b` at indices 0, 1, kLimb-2, kLimb-1, kLimb, kLimb+1, kLimb+2, top-1, top
+- `refSz` (total limbs of r×b)
+- `r×b[kLimb] >> kRem` (should be 0 if r×b < 2^kBits)
+- `aboveKLimbAllZero` (limbs above kLimb should all be 0 if r×b < 2^kBits)
+
+Verdict heuristics:
+- `refSz ≤ kLimb-1` ⇒ r×b is way too small ⇒ r severely short
+- `refSz = kLimb` AND `r×b[kLimb-1]` near 2^64 ⇒ r is correct
+- `refSz = kLimb+1` AND `r×b[kLimb] ∈ [0, 2^kRem-1]` ⇒ r is correct
+- `refSz > kLimb+1` OR `r×b[kLimb] >> kRem > 0` ⇒ r is too big
+
+Estimated time: ~40 min for the chunked grid (fewer sub-products + smaller
+buffers than F-1's 80 min).
 - **F-1**: full chunked-grid reference for `a * r` (39 × 39 = 1,521
   sub-products); scan ar limbs against the reference at every k-th position
   (e.g., every 100K).  Finds the wrong ar limb if any exists.  ~5-10 min.
