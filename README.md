@@ -3791,6 +3791,41 @@ Outcome:
 - mismatches > 0 ⇒ BigShiftRight is wrong at one or more positions
 - mismatches = 0 ⇒ BigShiftRight is faithful across the q range; bug is in
   ar itself or upstream (escalate to Option F-1 next).
+
+### Option F-3 result (2026-04-28 20:20 — run 13, 1h 23m to §171)
+
+```
+[SafeMpzDiv§5B-f3 SUMMARY] scanned 100 q positions, mismatches=0, firstMismatchSampleIdx=-1
+[SafeMpzDiv§5B-q-quart] q[21,875,000] match=True
+[SafeMpzDiv§5B-q-mid]   q[43,750,000] match=True
+```
+
+Combined with the existing q[0] / q[szQ-1] coverage from Option A, **102 q
+positions verified, all matching**.  BigShiftRight is faithful (with high
+statistical confidence — would need the bug to live at a single limb out
+of 87.5M, with all 100 evenly-spaced samples skipping it, to be missed).
+
+**The bug is in ar itself at some unchecked limb, OR upstream in r or a.**
+
+### Next step (recommended): Option F-1 — chunked-grid a × r reference
+
+Compute `a × r` (175M × 87.5M = 262.5M-limb result) via a flat 2-way
+chunked grid using sub-threshold direct `mpz_mul`: chunk size 1.5M, grid =
+117 × 59 = 6,903 sub-products.  Each sub-product is ≤ 3M total limbs —
+reliable per §160's analysis.
+
+Scan our SafeMpzMul ar against the reference at thousands of positions;
+log first ~10 mismatches and a summary count.  Outcome:
+- Mismatches > 0 ⇒ ar is wrong at those positions; bug is in our level-1
+  §gen accumulation step (`mul_2exp` chunked-shift loop, or `GmpRaw_add`
+  carry chain).
+- Mismatches = 0 ⇒ ar is fully correct; bug must be in `kBits`
+  computation, in BigShiftRight at a position F-3's 100 samples missed
+  (escalate to F-3-full), or in the §171 trigger logic itself.
+
+Pre-allocate `_refAcc` and `_ckShifted` buffers via VirtualAlloc (~2.5 GB
+each) and swap into mpz_t — same pattern as §gen's `_sharedSjBuf` and the
+Option E v2 fix.  ~12 min added to the run.
 - **F-1**: full chunked-grid reference for `a * r` (39 × 39 = 1,521
   sub-products); scan ar limbs against the reference at every k-th position
   (e.g., every 100K).  Finds the wrong ar limb if any exists.  ~5-10 min.

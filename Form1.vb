@@ -3746,7 +3746,9 @@ Public Class Form1
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§166] forcing all-serial for a×r (savedDop={_saved166Dop}){vbCrLf}")
         SafeMpzMul(ar, a, r)
         System.Threading.Volatile.Write(_safeMulDop, _saved166Dop)
-        gmp_lib.mpz_clear(r)
+        ' §5B-f1: r's data buffer is needed by the §5B-f1 chunked-grid reference (below).
+        ' Defer mpz_clear(r) until AFTER §5B-f1 completes to keep r alive.  Before §5B-f1
+        ' was added the clear lived here directly; now it's at the end of the §5B-f1 block.
         Dim szAR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(ar.Pointer, 4))
 
         ' §5B-investigate (post-mul): verify ar boundary limbs against pre-mul a, r values.
@@ -3788,8 +3790,145 @@ Public Class Form1
                 _f3_arLo(_f3s) = If(_f3_arIdxLo >= 0L AndAlso _f3_arIdxLo < CLng(szAR), CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt(_f3_arIdxLo * 8L))), 0UL)
                 _f3_arHi(_f3s) = If(_f3_arIdxHi >= 0L AndAlso _f3_arIdxHi < CLng(szAR), CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt(_f3_arIdxHi * 8L))), 0UL)
             Next
-            AppendLog($"[SafeMpzDiv§5B-f3] captured 100 ar samples for post-shift verification (kLimb={_5bKLimb:N0} kRem=3, qIdx range 0..{87499999L \ 99L * 99L:N0}){vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-f3] captured 100 ar samples for post-shift verification (kLimb={_5bKLimb:N0} kRem=3){vbCrLf}")
         End If
+
+        ' §5B-f1: Chunked-grid independent reference for the FULL a × r product.
+        ' Computes the 262.5M-limb result via a 117 × 59 = 6,903-cell grid of
+        ' ≤ 1.5M × 1.5M (≤ 3M total per cell — reliable mpz_mul per §160), then
+        ' scans our SafeMpzMul ar against the reference at 1,000 evenly-spaced
+        ' positions.  Mirrors the §5B-e pattern but for the full a × r product.
+        '
+        ' Outcome:
+        '   Mismatches > 0 ⇒ ar is wrong at those positions; bug is in §gen
+        '                    accumulation (mul_2exp shift / GmpRaw_add carry).
+        '   Mismatches = 0 ⇒ ar is fully correct; the §171 trigger must be
+        '                    driven by something else (kBits computation off,
+        '                    BigShiftRight wrong at a position F-3 missed, or
+        '                    the §171 trigger logic itself misjudges Barrett).
+        '
+        ' Pre-allocates _refAcc and _ckShifted buffers via VirtualAlloc to
+        ' 270M limbs (~2.16 GB each) — _mp_alloc set to full pre-allocated
+        ' size so mul_2exp and add never trigger realloc (same pattern as §gen).
+        If _logLevel >= 2 AndAlso _5b_verify Then
+            Const _F1_CHUNK As Integer = 1500000
+            Const _F1_MAX_LIMBS As Integer = 270_000_000
+            Dim _F1_MAX_BYTES As Long = CLng(_F1_MAX_LIMBS) * 8L
+            Dim _F1_aD As Long = Runtime.InteropServices.Marshal.ReadInt64(a.Pointer, 8)
+            Dim _F1_aSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(a.Pointer, 4))
+            Dim _F1_rD As Long = Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8)
+            Dim _F1_rSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
+            AppendLog($"[SafeMpzDiv§5B-f1] starting chunked-grid a × r reference (chunk={_F1_CHUNK:N0}, prealloc={_F1_MAX_LIMBS:N0} limbs/buf, {_F1_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-f1] a sz={_F1_aSz:N0} r sz={_F1_rSz:N0}{vbCrLf}")
+            Dim _F1_eAccBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F1_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            Dim _F1_eShiftBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F1_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+            If _F1_eAccBuf = IntPtr.Zero OrElse _F1_eShiftBuf = IntPtr.Zero Then
+                AppendLog($"[SafeMpzDiv§5B-f1] VirtualAlloc FAILED — skipping{vbCrLf}")
+                If _F1_eAccBuf <> IntPtr.Zero Then VirtualFree(_F1_eAccBuf, UIntPtr.Zero, MEM_RELEASE)
+                If _F1_eShiftBuf <> IntPtr.Zero Then VirtualFree(_F1_eShiftBuf, UIntPtr.Zero, MEM_RELEASE)
+            Else
+                Dim _F1_refAcc As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                GmpRaw_init(_F1_refAcc)
+                Dim _F1_ra_initAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_F1_refAcc, 0))
+                Dim _F1_ra_initPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_F1_refAcc, 8))
+                GmpNativeAlloc_FreeRaw(_F1_ra_initPtr, _F1_ra_initAlloc * 8L)
+                Runtime.InteropServices.Marshal.WriteInt32(_F1_refAcc, 0, _F1_MAX_LIMBS)
+                Runtime.InteropServices.Marshal.WriteInt32(_F1_refAcc, 4, 0)
+                Runtime.InteropServices.Marshal.WriteInt64(_F1_refAcc, 8, _F1_eAccBuf.ToInt64())
+                Dim _F1_ckShifted As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                GmpRaw_init(_F1_ckShifted)
+                Dim _F1_cs_initAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_F1_ckShifted, 0))
+                Dim _F1_cs_initPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_F1_ckShifted, 8))
+                GmpNativeAlloc_FreeRaw(_F1_cs_initPtr, _F1_cs_initAlloc * 8L)
+                Runtime.InteropServices.Marshal.WriteInt32(_F1_ckShifted, 0, _F1_MAX_LIMBS)
+                Runtime.InteropServices.Marshal.WriteInt32(_F1_ckShifted, 4, 0)
+                Runtime.InteropServices.Marshal.WriteInt64(_F1_ckShifted, 8, _F1_eShiftBuf.ToInt64())
+                Dim _F1_ckPartial As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                GmpRaw_init(_F1_ckPartial)
+                Dim _F1_ckA As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                Dim _F1_ckB As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                Dim _F1_numCkA As Integer = (_F1_aSz + _F1_CHUNK - 1) \ _F1_CHUNK
+                Dim _F1_numCkB As Integer = (_F1_rSz + _F1_CHUNK - 1) \ _F1_CHUNK
+                Dim _F1_ckCount As Integer = 0
+                For i As Integer = 0 To _F1_numCkA - 1
+                    Dim _F1_aOff As Long = CLng(i) * CLng(_F1_CHUNK)
+                    Dim _F1_aSzCk As Integer = CInt(System.Math.Min(CLng(_F1_CHUNK), CLng(_F1_aSz) - _F1_aOff))
+                    If _F1_aSzCk <= 0 Then Continue For
+                    While _F1_aSzCk > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_F1_aD + (_F1_aOff + CLng(_F1_aSzCk - 1)) * 8L)) = 0L
+                        _F1_aSzCk -= 1
+                    End While
+                    If _F1_aSzCk <= 0 Then Continue For
+                    Runtime.InteropServices.Marshal.WriteInt32(_F1_ckA, 0, _F1_CHUNK)
+                    Runtime.InteropServices.Marshal.WriteInt32(_F1_ckA, 4, _F1_aSzCk)
+                    Runtime.InteropServices.Marshal.WriteInt64(_F1_ckA, 8, _F1_aD + _F1_aOff * 8L)
+                    For j As Integer = 0 To _F1_numCkB - 1
+                        Dim _F1_bOff As Long = CLng(j) * CLng(_F1_CHUNK)
+                        Dim _F1_bSzCk As Integer = CInt(System.Math.Min(CLng(_F1_CHUNK), CLng(_F1_rSz) - _F1_bOff))
+                        If _F1_bSzCk <= 0 Then Continue For
+                        While _F1_bSzCk > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_F1_rD + (_F1_bOff + CLng(_F1_bSzCk - 1)) * 8L)) = 0L
+                            _F1_bSzCk -= 1
+                        End While
+                        If _F1_bSzCk <= 0 Then Continue For
+                        Runtime.InteropServices.Marshal.WriteInt32(_F1_ckB, 0, _F1_CHUNK)
+                        Runtime.InteropServices.Marshal.WriteInt32(_F1_ckB, 4, _F1_bSzCk)
+                        Runtime.InteropServices.Marshal.WriteInt64(_F1_ckB, 8, _F1_rD + _F1_bOff * 8L)
+                        GmpRaw_mul(_F1_ckPartial, _F1_ckA, _F1_ckB)
+                        Dim _F1_shiftBits As ULong = CULng(_F1_aOff + _F1_bOff) * 64UL
+                        If _F1_shiftBits = 0UL Then
+                            GmpRaw_add(_F1_refAcc, _F1_refAcc, _F1_ckPartial)
+                        Else
+                            Runtime.InteropServices.Marshal.WriteInt32(_F1_ckShifted, 4, 0)
+                            Dim _F1_shiftSrc As IntPtr = _F1_ckPartial
+                            Dim _F1_shiftRem As ULong = _F1_shiftBits
+                            While _F1_shiftRem > 0UL
+                                Dim _F1_chunkBits As UInteger = CUInt(System.Math.Min(_F1_shiftRem, CULng(UInt32.MaxValue)))
+                                GmpRaw_mul_2exp(_F1_ckShifted, _F1_shiftSrc, _F1_chunkBits)
+                                _F1_shiftSrc = _F1_ckShifted
+                                _F1_shiftRem -= CULng(_F1_chunkBits)
+                            End While
+                            GmpRaw_add(_F1_refAcc, _F1_refAcc, _F1_ckShifted)
+                        End If
+                        _F1_ckCount += 1
+                    Next j
+                Next i
+                Dim _F1_refSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_F1_refAcc, 4))
+                Dim _F1_refDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_F1_refAcc, 8))
+                Dim _F1_arDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
+                AppendLog($"[SafeMpzDiv§5B-f1] reference complete: subProducts={_F1_ckCount:N0} refSz={_F1_refSz:N0} ourArSz={szAR:N0}{vbCrLf}")
+                ' Scan ar against reference at 1,000 evenly-spaced positions across the full range.
+                Const _F1_NUM_SAMPLES As Integer = 1000
+                Dim _F1_mismatchCount As Integer = 0
+                Dim _F1_firstMismatchIdx As Long = -1L
+                Dim _F1_logCount As Integer = 0
+                Dim _F1_maxIdx As Long = CLng(System.Math.Min(_F1_refSz, szAR)) - 1L
+                For _F1s As Integer = 0 To _F1_NUM_SAMPLES - 1
+                    Dim _F1_idx As Long = If(_F1_NUM_SAMPLES > 1, CLng(_F1s) * _F1_maxIdx \ CLng(_F1_NUM_SAMPLES - 1), 0L)
+                    Dim _F1_refV As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_F1_refDPtr, CInt(_F1_idx * 8L)))
+                    Dim _F1_arV As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_F1_arDPtr, CInt(_F1_idx * 8L)))
+                    If _F1_refV <> _F1_arV Then
+                        _F1_mismatchCount += 1
+                        If _F1_firstMismatchIdx = -1L Then _F1_firstMismatchIdx = _F1_idx
+                        If _F1_logCount < 10 Then
+                            AppendLog($"[SafeMpzDiv§5B-f1 MISMATCH] sample={_F1s} ar[{_F1_idx:N0}] reference={_F1_refV:X16} ourSafeMpzMul={_F1_arV:X16}{vbCrLf}")
+                            _F1_logCount += 1
+                        End If
+                    End If
+                Next
+                AppendLog($"[SafeMpzDiv§5B-f1 SUMMARY] scanned {_F1_NUM_SAMPLES} ar positions across [0..{_F1_maxIdx:N0}], mismatches={_F1_mismatchCount}, firstMismatchArIdx={_F1_firstMismatchIdx}{vbCrLf}")
+                ' Cleanup — _refAcc and _ckShifted have swapped-in VirtualAlloc'd buffers.
+                Runtime.InteropServices.Marshal.FreeHGlobal(_F1_refAcc)
+                Runtime.InteropServices.Marshal.FreeHGlobal(_F1_ckShifted)
+                GmpRaw_clear(_F1_ckPartial) : Runtime.InteropServices.Marshal.FreeHGlobal(_F1_ckPartial)
+                Runtime.InteropServices.Marshal.FreeHGlobal(_F1_ckA)
+                Runtime.InteropServices.Marshal.FreeHGlobal(_F1_ckB)
+                VirtualFree(_F1_eAccBuf, UIntPtr.Zero, MEM_RELEASE)
+                VirtualFree(_F1_eShiftBuf, UIntPtr.Zero, MEM_RELEASE)
+            End If
+        End If
+        ' §5B-f1 (deferred from §166 site): now that the chunked-grid reference is done,
+        ' release r.  When §5B-f1 is gated off (_logLevel < 2 or non-5B size), this clears
+        ' r at exactly the same logical point as the original code.
+        gmp_lib.mpz_clear(r)
         ' §135 save slots: ar[64654664/65] captured inside §111 block, used after BigShiftRight.
         Dim _ar135_v0 As Long = 0L
         Dim _ar135_v1 As Long = 0L
