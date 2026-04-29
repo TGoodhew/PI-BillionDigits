@@ -3943,7 +3943,11 @@ Public Class Form1
         ' Grid: 59 × 59 = 3,481 sub-products at ≤ 1.5M × 1.5M (≤ 3M total).
         ' Result: 175M limbs ≈ 1.4 GB.  Pre-alloc 180M-limb buffers ≈ 1.44 GB each.
         ' Estimated time: ~40 min (fewer sub-products than F-1, smaller buffers).
-        Const _F2_ENABLED As Boolean = False  ' DONE — run 15 confirmed r is correct (refSz=kLimb+1, top=2^kRem-1)
+        ' Re-enabled for Option H: F-2's original check was TOO WEAK (only verified top
+        ' ~130 bits of r×b).  Extended logging at multiple intermediate positions to
+        ' discriminate "r correct" from "r short by 2^5.45B".  See Option H discussion
+        ' in README §5B-investigate.
+        Const _F2_ENABLED As Boolean = True
         If _logLevel >= 2 AndAlso _5b_verify AndAlso _F2_ENABLED Then
             Const _F2_CHUNK As Integer = 1500000
             Const _F2_MAX_LIMBS As Integer = 180_000_000
@@ -4055,6 +4059,31 @@ Public Class Form1
                 Dim _F2_aboveKLimbAllZero As Boolean = (_F2_v_kLp1 = 0UL AndAlso _F2_v_kLp2 = 0UL)
                 AppendLog($"[SafeMpzDiv§5B-f2 inspect] r×b[0]={_F2_v_bot:X16} r×b[1]={_F2_v_bot1:X16} r×b[kLimb-2]={_F2_v_kLm2:X16} r×b[kLimb-1]={_F2_v_kLm1:X16} r×b[kLimb]={_F2_v_kL:X16} r×b[kLimb+1]={_F2_v_kLp1:X16} r×b[kLimb+2]={_F2_v_kLp2:X16} r×b[top-1]={_F2_v_top2:X16} r×b[top]={_F2_v_top:X16}{vbCrLf}")
                 AppendLog($"[SafeMpzDiv§5B-f2 verdict] refSz={_F2_refSz:N0} kLimb={_F2_kLimb:N0} kRem={_F2_kRem} kRemMask={_F2_kBitsBoundary:X16} r×b[kLimb]>>kRem={_F2_v_kL_aboveKRem:X16} (should be 0 if r×b<2^kBits) inKBitsRange={_F2_v_kL_inRange} aboveKLimbAllZero={_F2_aboveKLimbAllZero}{vbCrLf}")
+                ' Option H: extended r×b logging at intermediate positions to discriminate
+                ' "r correct" (FF block extends ~87.5M limbs from kLimb-1 down) from
+                ' "r short by 2^5.45B" (FF block extends only ~3M limbs).
+                ' Distances from kLimb (descending): 3M, 5M, 10M, 50M, 87M, 90M, 130M.
+                ' For correct r: all of 3M..87M should be 0xFFFFFFFFFFFFFFFF; 90M, 130M
+                ' may differ (within δ region).
+                ' For r short by 2^5.45B: only 3M is in FF block; 5M..130M all NOT FF.
+                Dim _F2_offsets As Long() = New Long() {3000000L, 5000000L, 10000000L, 50000000L, 87000000L, 90000000L, 130000000L}
+                Dim _F2_ffBoundary As Long = -1L  ' first non-FF position from top going down
+                For Each _F2_off As Long In _F2_offsets
+                    Dim _F2_idx As Long = _F2_kLimb - _F2_off
+                    Dim _F2_v As ULong = _f2GetLimb(_F2_idx)
+                    Dim _F2_isFF As Boolean = (_F2_v = &HFFFFFFFFFFFFFFFFUL)
+                    AppendLog($"[SafeMpzDiv§5B-f2 H] r×b[kLimb-{_F2_off:N0}={_F2_idx:N0}]={_F2_v:X16} isFF={_F2_isFF}{vbCrLf}")
+                    If Not _F2_isFF AndAlso _F2_ffBoundary = -1L Then _F2_ffBoundary = _F2_off
+                Next
+                If _F2_ffBoundary = -1L Then
+                    AppendLog($"[SafeMpzDiv§5B-f2 H verdict] All checked positions are 0xFF...FF: FF block extends >130M limbs → r is essentially correct.{vbCrLf}")
+                ElseIf _F2_ffBoundary < 5000000L Then
+                    AppendLog($"[SafeMpzDiv§5B-f2 H verdict] FF block ends within {_F2_ffBoundary:N0} limbs of top → r SHORT BY ≥ ~2^5.45B (Newton precision failure).{vbCrLf}")
+                ElseIf _F2_ffBoundary < 87000000L Then
+                    AppendLog($"[SafeMpzDiv§5B-f2 H verdict] FF block ends within {_F2_ffBoundary:N0} limbs of top → r SHORT BY some amount; investigate Newton precision.{vbCrLf}")
+                Else
+                    AppendLog($"[SafeMpzDiv§5B-f2 H verdict] FF block ends at {_F2_ffBoundary:N0} limbs (at/past expected ≈87.5M boundary) → r appears correct; bug is elsewhere.{vbCrLf}")
+                End If
                 ' Cleanup
                 Runtime.InteropServices.Marshal.FreeHGlobal(_F2_refAcc)
                 Runtime.InteropServices.Marshal.FreeHGlobal(_F2_ckShifted)
@@ -4424,7 +4453,8 @@ Public Class Form1
         '                    is in §gen for symmetric q × b (87.5M × 87.5M).
         '   Mismatches = 0 ⇒ qb is correct; bug is in the §171 algorithm itself or in
         '                    rem subtraction.
-        If _logLevel >= 2 AndAlso szQ = 87500001 AndAlso szB = 87500001 Then
+        Const _F5_ENABLED As Boolean = False  ' DONE — run 19 confirmed qb matches reference at 1000 positions
+        If _logLevel >= 2 AndAlso szQ = 87500001 AndAlso szB = 87500001 AndAlso _F5_ENABLED Then
             Const _F5_CHUNK As Integer = 1500000
             Const _F5_MAX_LIMBS As Integer = 180_000_000
             Dim _F5_MAX_BYTES As Long = CLng(_F5_MAX_LIMBS) * 8L
