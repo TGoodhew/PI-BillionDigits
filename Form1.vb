@@ -2517,7 +2517,12 @@ Public Class Form1
         ' prods(8) = A_2 × B_2 at the outer 175M × 87.5M call.  Compute each via
         ' a 39×20 grid (≤ 1.5M × 1.5M = ≤ 3M total per sub-product, well under
         ' SAFE_LIMB_THRESHOLD = 5M where direct GmpRaw_mul is reliable per §160's
-        ' analysis), then accumulate via mul_2exp + add into a fresh reference mpz_t.
+        ' analysis), then accumulate via mul_2exp + add into a reference mpz_t
+        ' whose limb buffer is PRE-ALLOCATED via VirtualAlloc to the max final size
+        ' (avoiding GMP-internal realloc paths through NativeReallocFunc that aborted
+        ' run 11 with "gmp: overflow in mpz type").  Same swap-in pattern as §gen's
+        ' _sharedSjBuf / _sv_shifted_hdr.
+        '
         ' Compare the suspect index to our SafeMpzMul prods(k):
         '   Match  ⇒ our prods(k) is correct (bug elsewhere — likely the other
         '             prods(k) or in the level-1 GmpRaw_add carry chain).
@@ -2526,7 +2531,10 @@ Public Class Form1
         '             our SafeMpzMul split with.
         If _logLevel >= 2 AndAlso szA = 175000001 AndAlso szB = 87500001 Then
             Const _CHUNK_E As Integer = 1500000
-            AppendLog($"[SafeMpzMul§5B-e] starting chunked-grid reference (chunk={_CHUNK_E:N0}){vbCrLf}")
+            ' Max final/intermediate buffer size: prods(7|8) = ≤ 87.5M limbs; pad to 90M for safety.
+            Const _E_MAX_LIMBS As Integer = 90_000_000
+            Dim _E_MAX_BYTES As Long = CLng(_E_MAX_LIMBS) * 8L
+            AppendLog($"[SafeMpzMul§5B-e] starting chunked-grid reference (chunk={_CHUNK_E:N0}, prealloc={_E_MAX_LIMBS:N0} limbs/buf, {_E_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}")
             For Each _refIdx As Integer In New Integer() {7, 8}
                 Dim _refTargetIdx As Long = If(_refIdx = 7, 72916666L, 43749999L)
                 Dim _ref_A_d As Long = Runtime.InteropServices.Marshal.ReadInt64(A_parts(2).Pointer, 8)
@@ -2535,16 +2543,39 @@ Public Class Form1
                 Dim _ref_B_d As Long = Runtime.InteropServices.Marshal.ReadInt64(B_parts(_ref_B_partIdx).Pointer, 8)
                 Dim _ref_B_sz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(B_parts(_ref_B_partIdx).Pointer, 4))
                 AppendLog($"[SafeMpzMul§5B-e prods({_refIdx})] A_2 sz={_ref_A_sz:N0} B_{_ref_B_partIdx} sz={_ref_B_sz:N0} target idx={_refTargetIdx:N0}{vbCrLf}")
+                ' Per-refIdx VirtualAlloc'd buffers (zeroed by VirtualAlloc, freed at end)
+                Dim _eAccBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_E_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                Dim _eShiftBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_E_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+                If _eAccBuf = IntPtr.Zero OrElse _eShiftBuf = IntPtr.Zero Then
+                    AppendLog($"[SafeMpzMul§5B-e prods({_refIdx})] VirtualAlloc FAILED — skipping{vbCrLf}")
+                    If _eAccBuf <> IntPtr.Zero Then VirtualFree(_eAccBuf, UIntPtr.Zero, MEM_RELEASE)
+                    If _eShiftBuf <> IntPtr.Zero Then VirtualFree(_eShiftBuf, UIntPtr.Zero, MEM_RELEASE)
+                    Continue For
+                End If
+                ' Setup _refAcc with swapped-in pre-allocated buffer (mirror §gen's _sv_shifted_hdr setup).
                 Dim _refAcc As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
                 GmpRaw_init(_refAcc)
-                ' Reusable zero-copy chunk headers (do NOT GmpRaw_clear — they alias opA/opB data)
-                Dim _ckA As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
-                Dim _ckB As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
-                ' Fresh result buffers
-                Dim _ckPartial As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
-                GmpRaw_init(_ckPartial)
+                Dim _ra_initAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_refAcc, 0))
+                Dim _ra_initPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_refAcc, 8))
+                GmpNativeAlloc_FreeRaw(_ra_initPtr, _ra_initAlloc * 8L)
+                Runtime.InteropServices.Marshal.WriteInt32(_refAcc, 0, _E_MAX_LIMBS)
+                Runtime.InteropServices.Marshal.WriteInt32(_refAcc, 4, 0)
+                Runtime.InteropServices.Marshal.WriteInt64(_refAcc, 8, _eAccBuf.ToInt64())
+                ' Same swap-in for _ckShifted
                 Dim _ckShifted As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
                 GmpRaw_init(_ckShifted)
+                Dim _cs_initAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(_ckShifted, 0))
+                Dim _cs_initPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_ckShifted, 8))
+                GmpNativeAlloc_FreeRaw(_cs_initPtr, _cs_initAlloc * 8L)
+                Runtime.InteropServices.Marshal.WriteInt32(_ckShifted, 0, _E_MAX_LIMBS)
+                Runtime.InteropServices.Marshal.WriteInt32(_ckShifted, 4, 0)
+                Runtime.InteropServices.Marshal.WriteInt64(_ckShifted, 8, _eShiftBuf.ToInt64())
+                ' _ckPartial uses GMP-managed buffer (small, ~3M limbs max — realloc is safe at this size).
+                Dim _ckPartial As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                GmpRaw_init(_ckPartial)
+                ' Zero-copy chunk headers (do NOT GmpRaw_clear — they alias opA/opB data).
+                Dim _ckA As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                Dim _ckB As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
                 Dim _numCkA As Integer = (_ref_A_sz + _CHUNK_E - 1) \ _CHUNK_E
                 Dim _numCkB As Integer = (_ref_B_sz + _CHUNK_E - 1) \ _CHUNK_E
                 Dim _ckCount As Integer = 0
@@ -2600,11 +2631,20 @@ Public Class Form1
                 Dim _ourV_lo As ULong = If(_refTargetIdx - 1L < CLng(_ourSz) AndAlso _refTargetIdx - 1L >= 0L, CULng(Runtime.InteropServices.Marshal.ReadInt64(_ourD, CInt((_refTargetIdx - 1L) * 8L))), 0UL)
                 Dim _ourV_hi As ULong = If(_refTargetIdx + 1L < CLng(_ourSz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_ourD, CInt((_refTargetIdx + 1L) * 8L))), 0UL)
                 AppendLog($"[SafeMpzMul§5B-e prods({_refIdx}) idx={_refTargetIdx:N0}] subProducts={_ckCount:N0} refSz={_refAccSz:N0} ourSz={_ourSz:N0} reference[idx-1,idx,idx+1]=[{_refV_lo:X16} {_refV:X16} {_refV_hi:X16}] ourSafeMpzMul[idx-1,idx,idx+1]=[{_ourV_lo:X16} {_ourV:X16} {_ourV_hi:X16}] match@idx={(_refV = _ourV)}{vbCrLf}")
-                GmpRaw_clear(_ckShifted) : Runtime.InteropServices.Marshal.FreeHGlobal(_ckShifted)
+                ' Cleanup — _refAcc and _ckShifted have swapped-in VirtualAlloc'd buffers.
+                ' Do NOT GmpRaw_clear (would call NativeFreeFunc on a pointer that has no
+                ' SLIST_ENTRY prefix → catastrophic).  Free the 16-byte struct headers and
+                ' VirtualFree the limb buffers separately.
+                Runtime.InteropServices.Marshal.FreeHGlobal(_refAcc)
+                Runtime.InteropServices.Marshal.FreeHGlobal(_ckShifted)
+                ' _ckPartial uses GMP-managed buffer — full GmpRaw_clear is correct.
                 GmpRaw_clear(_ckPartial) : Runtime.InteropServices.Marshal.FreeHGlobal(_ckPartial)
+                ' Chunk headers point into A_2/B_j data — header-only free.
                 Runtime.InteropServices.Marshal.FreeHGlobal(_ckA)
                 Runtime.InteropServices.Marshal.FreeHGlobal(_ckB)
-                GmpRaw_clear(_refAcc) : Runtime.InteropServices.Marshal.FreeHGlobal(_refAcc)
+                ' Release pre-allocated VirtualAlloc'd buffers.
+                VirtualFree(_eAccBuf, UIntPtr.Zero, MEM_RELEASE)
+                VirtualFree(_eShiftBuf, UIntPtr.Zero, MEM_RELEASE)
             Next
             AppendLog($"[SafeMpzMul§5B-e] chunked-grid reference complete{vbCrLf}")
         End If
