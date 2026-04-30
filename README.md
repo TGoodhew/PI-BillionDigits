@@ -3969,3 +3969,67 @@ buffers than F-1's 80 min).
   (e.g., every 100K).  Finds the wrong ar limb if any exists.  ~5-10 min.
 - **F-2**: chunked-grid `r * b` and verify it's in `[2^kBits - b, 2^kBits)`.
   Catches Newton convergence shortfall in the middle of r.
+
+## §201-raise — Newton-raising for SafeMpzReciprocal (NativeOptimization branch, 2026-04-27)
+
+### Motivation
+
+After §200 fixed the convergence shortfall, SafeMpzSqrt's outer Newton loop
+runs three steps at increasing scale (kBits ≈ 5.6B / 2.8B / 1.4B) and each
+step calls `SafeMpzReciprocal`.  Without raising, every call starts from a
+fresh 64-bit seed and performs ~`log2(rBits) + 3` iterations (≈ 33 at the
+largest scale, ≈ 32 at half-scale, etc.).  Each iter at ~5.6B-bit precision
+takes 50-150 minutes via SafeMpzMul, so the three-step sqrt would take
+several days.
+
+But Newton from step *n* converged to ~rBits/2 of correct precision at
+step *n+1*'s scale: the prior `r` left-shifted by `(rBits_new - rBits_prior)`
+is already a half-precision approximation to the new reciprocal.  Newton's
+quadratic convergence raises that to full precision in **1-2 iterations**
+(plus a few slack iters for seed-scaling rounding).  Replacing 33 iters
+with 5 cuts step-2 and step-3 runtime by ~85%.
+
+### Implementation (Form1.vb, SafeMpzReciprocal §201-raise)
+
+Two parts:
+
+1. **Load** at function entry, before the 64-bit seed setup: read
+   `snap_Phase3/nr_raise.bin` + `nr_raise_meta.txt` (prior `r`, kBits,
+   bBits, rBits).  If `priorKBits / kBits ∈ (0.4, 0.7)` AND
+   `priorRBits < rBits`, deserialize prior `r` and `BigShiftLeft` it by
+   `rBits - priorRBits` to scale into the new domain.  Set
+   `_raiseUsed = True`, `prec = priorRBits + 2`, and skip the 64-bit seed
+   block.
+
+2. **Save** after the Newton loop converges: write the freshly-converged
+   `r` + meta back to `nr_raise.bin` so the *next* (larger) call can
+   raise from it.  Also delete the §NR-ckpt mid-Newton snapshot
+   (`nr_r.bin`) since this call has finished — leaving a stale snap
+   would confuse a future call at a different scale.
+
+`_minNrIters` is also conditional: `5` when raised vs `log2(rBits) + 3`
+for a fresh seed.  Newton's outer loop condition
+(`prec < rBits + 2 OR _nrIter < _minNrIters`) ensures Newton runs both
+to full precision AND for enough iterations to absorb residual seed error.
+
+### Resume safety
+
+§NR-ckpt match-check (`_snapKBits = kBits`) takes precedence over §201-raise
+when both fire on restart — the mid-Newton snapshot at the current scale is
+more recent than any prior-scale raised seed.  Without this, a raised run
+that crashed at iter 3 would restart from priorRBits+2 (= half-precision)
+instead of the saved precision near full convergence.
+
+### Expected runtime impact
+
+For SafeMpzSqrt's three-step Newton (5.6B / 2.8B / 1.4B-bit scales):
+
+| Step | rBits  | Without raise | With raise | Saved |
+|------|--------|---------------|------------|-------|
+| 1    | 1.4B   | 33 iters      | 33 iters   | 0     |
+| 2    | 2.8B   | 33 iters      | 5 iters    | 28×   |
+| 3    | 5.6B   | 33 iters      | 5 iters    | 28×   |
+
+Step 1 cannot be raised (no prior `nr_raise.bin` at first launch).  Steps
+2 and 3 each shrink from ~50 hours to ~7-8 hours, taking the full sqrt
+from ~150h to ~65h.

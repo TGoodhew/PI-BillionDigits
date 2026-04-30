@@ -3242,35 +3242,84 @@ Public Class Form1
             Return
         End If
 
+        ' §201-raise: check for a prior converged Newton r at smaller scale.
+        ' If found at kBits ≈ new_kBits / 2, load and left-shift to use as a high-precision
+        ' seed for the new Newton. With prior_rBits worth of correct precision, only ~3-5
+        ' iters are needed (vs ~37 from a 1-bit seed via prec doubling).
+        Dim _raiseUsed As Boolean = False
+        Dim _raisePriorRBits As Long = 0L
+        Dim _nrSnapDirRaise As String = System.IO.Path.Combine(DISK_CACHE_DIR, "snap_Phase3")
+        Dim _nrRaiseBin As String = System.IO.Path.Combine(_nrSnapDirRaise, "nr_raise.bin")
+        Dim _nrRaiseMeta As String = System.IO.Path.Combine(_nrSnapDirRaise, "nr_raise_meta.txt")
+        If _autoCheckpoint AndAlso System.IO.File.Exists(_nrRaiseBin) AndAlso System.IO.File.Exists(_nrRaiseMeta) Then
+            Try
+                Dim _rmLines As String() = System.IO.File.ReadAllLines(_nrRaiseMeta)
+                Dim _rmDict As New Dictionary(Of String, String)()
+                For Each _ml As String In _rmLines
+                    Dim _eq As Integer = _ml.IndexOf("="c)
+                    If _eq > 0 Then _rmDict(_ml.Substring(0, _eq)) = _ml.Substring(_eq + 1)
+                Next
+                Dim _priorKBits As Long = 0L, _priorBBits As Long = 0L, _priorRBits As Long = 0L
+                If _rmDict.ContainsKey("kBits") AndAlso Long.TryParse(_rmDict("kBits"), _priorKBits) AndAlso
+                   _rmDict.ContainsKey("bBits") AndAlso Long.TryParse(_rmDict("bBits"), _priorBBits) AndAlso
+                   _rmDict.ContainsKey("rBits") AndAlso Long.TryParse(_rmDict("rBits"), _priorRBits) Then
+                    Dim _ratio As Double = If(kBits > 0L, CDbl(_priorKBits) / CDbl(kBits), 0.0)
+                    If _ratio > 0.4 AndAlso _ratio < 0.7 AndAlso _priorRBits > 0L AndAlso _priorRBits < rBits Then
+                        Dim _staging(4194303) As Byte
+                        Using _fs As New FileStream(_nrRaiseBin, FileMode.Open, FileAccess.Read)
+                            Using _br As New BinaryReader(_fs)
+                                DeserializeOneMpz(r, _br, _staging)
+                            End Using
+                        End Using
+                        Dim _scaleShift As Long = rBits - _priorRBits
+                        If _scaleShift > 0L Then
+                            BigShiftLeft(r, r, _scaleShift)
+                        End If
+                        AppendLog($"[SafeMpzReciprocal] §201-raise: loaded prior r (priorKBits={_priorKBits:N0} priorRBits={_priorRBits:N0}), scaled by 2^{_scaleShift:N0} → seed for Newton (kBits={kBits:N0} rBits={rBits:N0}){vbCrLf}")
+                        _raiseUsed = True
+                        _raisePriorRBits = _priorRBits
+                    Else
+                        AppendLog($"[SafeMpzReciprocal] §201-raise: prior found but ratio={_ratio:F3} or rBits mismatch — skipping raise (priorKBits={_priorKBits:N0} priorRBits={_priorRBits:N0} newKBits={kBits:N0} newRBits={rBits:N0}){vbCrLf}")
+                    End If
+                End If
+            Catch _ex As Exception
+                AppendLog($"[SafeMpzReciprocal] §201-raise load failed ({_ex.Message}) — falling back to fresh seed{vbCrLf}")
+                _raiseUsed = False
+            End Try
+        End If
+
         ' ── Seed: ~64-bit approximation from top 64 bits of b ──────────────
-        Dim bHiShift As Long = System.Math.Max(0L, bBits - 64L)
-        Dim bHi As New mpz_t()
-        gmp_lib.mpz_init(bHi)
-        If bHiShift > 0L Then
-            BigShiftRight(bHi, b, bHiShift)
-            gmp_lib.mpz_add_ui(bHi, bHi, 1UI)   ' ceiling → underestimate of reciprocal guaranteed
-        Else
-            GmpRaw_set(bHi.Pointer, b.Pointer)  ' §35
+        ' Skipped if §201-raise loaded a prior r as the seed.
+        If Not _raiseUsed Then
+            Dim bHiShift As Long = System.Math.Max(0L, bBits - 64L)
+            Dim bHi As New mpz_t()
+            gmp_lib.mpz_init(bHi)
+            If bHiShift > 0L Then
+                BigShiftRight(bHi, b, bHiShift)
+                gmp_lib.mpz_add_ui(bHi, bHi, 1UI)   ' ceiling → underestimate of reciprocal guaranteed
+            Else
+                GmpRaw_set(bHi.Pointer, b.Pointer)  ' §35
+            End If
+            ' rSeed = floor(2^64 / bHi)  [safe: both operands tiny]
+            Dim rSeed As New mpz_t()
+            gmp_lib.mpz_init(rSeed)
+            gmp_lib.mpz_set_ui(rSeed, 1UI)
+            gmp_lib.mpz_mul_2exp(rSeed, rSeed, New mp_bitcnt_t(64UI))
+            GmpRaw_tdiv_q(rSeed.Pointer, rSeed.Pointer, bHi.Pointer)  ' §35
+            gmp_lib.mpz_clear(bHi)
+            ' Scale to r's domain: rSeed * 2^(kBits-64-bHiShift) ≈ 2^kBits / b (underestimate)
+            Dim seedScale As Long = kBits - 64L - bHiShift
+            If seedScale > 0L Then
+                BigShiftLeft(rSeed, rSeed, seedScale)
+            ElseIf seedScale < 0L Then
+                BigShiftRight(rSeed, rSeed, -seedScale)
+            End If
+            ' §35: mpz_sgn is a GMP macro — read _mp_size field (offset +4) directly.
+            If System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(rSeed.Pointer, 4)) > 0 Then gmp_lib.mpz_sub_ui(rSeed, rSeed, 2UI)
+            If System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(rSeed.Pointer, 4)) <= 0 Then gmp_lib.mpz_set_ui(rSeed, 1UI)
+            GmpRaw_swap(r.Pointer, rSeed.Pointer)  ' §35
+            gmp_lib.mpz_clear(rSeed)
         End If
-        ' rSeed = floor(2^64 / bHi)  [safe: both operands tiny]
-        Dim rSeed As New mpz_t()
-        gmp_lib.mpz_init(rSeed)
-        gmp_lib.mpz_set_ui(rSeed, 1UI)
-        gmp_lib.mpz_mul_2exp(rSeed, rSeed, New mp_bitcnt_t(64UI))
-        GmpRaw_tdiv_q(rSeed.Pointer, rSeed.Pointer, bHi.Pointer)  ' §35
-        gmp_lib.mpz_clear(bHi)
-        ' Scale to r's domain: rSeed * 2^(kBits-64-bHiShift) ≈ 2^kBits / b (underestimate)
-        Dim seedScale As Long = kBits - 64L - bHiShift
-        If seedScale > 0L Then
-            BigShiftLeft(rSeed, rSeed, seedScale)
-        ElseIf seedScale < 0L Then
-            BigShiftRight(rSeed, rSeed, -seedScale)
-        End If
-        ' §35: mpz_sgn is a GMP macro — read _mp_size field (offset +4) directly.
-        If System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(rSeed.Pointer, 4)) > 0 Then gmp_lib.mpz_sub_ui(rSeed, rSeed, 2UI)
-        If System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(rSeed.Pointer, 4)) <= 0 Then gmp_lib.mpz_set_ui(rSeed, 1UI)
-        GmpRaw_swap(r.Pointer, rSeed.Pointer)  ' §35
-        gmp_lib.mpz_clear(rSeed)
 
         ' §NR-ckpt: Resume from a mid-NR checkpoint if one exists for this exact kBits/bBits.
         ' Saves r (the reciprocal estimate) and prec so a crash during a later NR iteration
@@ -3279,8 +3328,12 @@ Public Class Form1
         Dim _nrSnapDir As String = System.IO.Path.Combine(DISK_CACHE_DIR, "snap_Phase3")
         Dim _nrBin As String = System.IO.Path.Combine(_nrSnapDir, "nr_r.bin")
         Dim _nrMeta As String = System.IO.Path.Combine(_nrSnapDir, "nr_meta.txt")
-        Dim prec As Long = 62L
+        ' §201-raise: when raised, prec starts already at priorRBits+2 (Newton's seed has
+        ' priorRBits worth of correct bits).  Otherwise default to 62 (1-bit ε from rSeed).
+        Dim prec As Long = If(_raiseUsed, _raisePriorRBits + 2L, 62L)
         Dim _resumedIter As Long = 0L  ' §200: iter count from a resumed §NR-ckpt; 0 if no resume
+        ' §NR-ckpt match check (_snapKBits=kBits) takes precedence over §201-raise when both
+        ' apply: a matching mid-Newton snapshot is more recent than any prior-scale raise.
         If _autoCheckpoint AndAlso System.IO.File.Exists(_nrBin) AndAlso System.IO.File.Exists(_nrMeta) Then
             Try
                 Dim _metaLines As String() = System.IO.File.ReadAllLines(_nrMeta)
@@ -3335,7 +3388,11 @@ Public Class Form1
         ' empirically via Option H r×b chunked-grid logging).  Fix: require min_nrIters =
         ' ceil(log2(rBits)) + 3 slack iterations.  Subsequent iters at capped prec use bShift=0
         ' (full b), which keeps doubling Newton's precision until ε is below 2^-rBits.
-        Dim _minNrIters As Integer = CInt(System.Math.Ceiling(System.Math.Log(System.Math.Max(2L, rBits), 2))) + 3
+        ' §201-raise: when seed already has priorRBits ≈ rBits/2 worth of correct bits,
+        ' Newton's quadratic convergence reaches full precision in 1-2 iters.  Use 5 for
+        ' headroom (covers seed scaling rounding + convergence slack).  Without raising,
+        ' the seed has only 1 bit of precision, so log2(rBits)+3 iters are required.
+        Dim _minNrIters As Integer = If(_raiseUsed, 5, CInt(System.Math.Ceiling(System.Math.Log(System.Math.Max(2L, rBits), 2))) + 3)
         Do While prec < rBits + 2L OrElse _nrIter < _minNrIters
             _nrIter += 1
             prec = System.Math.Min(prec * 2L + 4L, rBits + 2L)
@@ -3562,6 +3619,42 @@ Public Class Form1
             Dim _rLimb1 As Long = If(_szRFinal >= 2, Runtime.InteropServices.Marshal.ReadInt64(_rDPtr, (_szRFinal - 2) * 8), 0L)
             AppendLog($"[SafeMpzReciprocal] done: szR={_szRFinal:N0} top2limbs=[{_rLimb2:X16} {_rLimb1:X16}] kBits={kBits:N0} rBits={rBits:N0}{vbCrLf}")
         End If
+
+        ' §201-raise: save converged r as nr_raise.bin so the NEXT (larger-scale)
+        ' SafeMpzReciprocal call can load it as a high-precision seed.  Overwrites any
+        ' prior nr_raise.bin — only the most recently converged r is kept.  The next call
+        ' decides whether to use it based on the kBits ratio (0.4..0.7).
+        If _autoCheckpoint Then
+            Try
+                If Not System.IO.Directory.Exists(_nrSnapDirRaise) Then
+                    System.IO.Directory.CreateDirectory(_nrSnapDirRaise)
+                End If
+                Dim _raiseSaveStaging(4194303) As Byte
+                Using _fs As New FileStream(_nrRaiseBin, FileMode.Create, FileAccess.Write)
+                    Using _bw As New BinaryWriter(_fs)
+                        SerializeOneMpz(r, _bw, _raiseSaveStaging)
+                    End Using
+                End Using
+                System.IO.File.WriteAllText(_nrRaiseMeta,
+                    $"kBits={kBits}{vbLf}bBits={bBits}{vbLf}rBits={rBits}{vbLf}")
+                BackupSnapshotToStore("snap_Phase3")
+                AppendLog($"[SafeMpzReciprocal] §201-raise: saved converged r (kBits={kBits:N0} bBits={bBits:N0} rBits={rBits:N0}) for future raise{vbCrLf}")
+            Catch _ex As Exception
+                AppendLog($"[SafeMpzReciprocal] §201-raise save failed: {_ex.Message}{vbCrLf}")
+            End Try
+        End If
+
+        ' §201-raise: clean up the §NR-ckpt mid-Newton checkpoint now that this call has
+        ' converged.  Otherwise a future call at a different kBits scale would see the
+        ' stale nr_r.bin from this call's mid-Newton state and either skip raise (since
+        ' nr_r.bin will not match the new kBits) or, worse, mis-resume.
+        Try
+            If System.IO.File.Exists(_nrBin) Then System.IO.File.Delete(_nrBin)
+            If System.IO.File.Exists(_nrMeta) Then System.IO.File.Delete(_nrMeta)
+        Catch
+            ' Cleanup is best-effort; leftover files are tolerated.
+        End Try
+
         ' §36: Clear loop-external temporaries once after loop completes.
         gmp_lib.mpz_clears(bTrunc, rSq, p, Nothing)
     End Sub
