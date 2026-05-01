@@ -6709,8 +6709,62 @@ NumeratorDone:
             '     → freed correctly via _savedGmpFree (CRT free of CRT pointer — no crash)
             '   new_size ≈ 744 MB ≥ GMP_LARGE_THRESHOLD → VirtualAlloc for new buffer — correct
             ' Net effect: one single realloc inside SafeMpzDiv, correctly handled, no pre-alloc needed.
-            _divCkptScope = "phase4"
-            SafeMpzDiv(gmpPi, gmpNumer, finalT)   ' §107 Gap 6: operands ~5B+ limbs — mpz_tdiv_q hits mpn_mul_fft overflow
+            ' §piCkpt: Resume from a saved gmpPi.bin if one exists for this digit count.
+            ' Closes the only unprotected post-Phase-3 window (mpz_get_str), which has
+            ' no internal checkpoint — without §piCkpt, a crash there forces re-running
+            ' the final divide.  With §piCkpt, gmpPi survives across that crash.
+            Dim _piCkptDir As String = System.IO.Path.Combine(DISK_CACHE_DIR, "snap_Phase3")
+            Dim _piCkptBin As String = System.IO.Path.Combine(_piCkptDir, "gmpPi.bin")
+            Dim _piCkptMeta As String = System.IO.Path.Combine(_piCkptDir, "gmpPi_meta.txt")
+            Dim _piCkptResumed As Boolean = False
+            If _autoCheckpoint AndAlso System.IO.File.Exists(_piCkptBin) AndAlso System.IO.File.Exists(_piCkptMeta) Then
+                Try
+                    Dim _piMetaLines As String() = System.IO.File.ReadAllLines(_piCkptMeta)
+                    Dim _piMeta As New Dictionary(Of String, String)()
+                    For Each _ml As String In _piMetaLines
+                        Dim _eq As Integer = _ml.IndexOf("="c)
+                        If _eq > 0 Then _piMeta(_ml.Substring(0, _eq)) = _ml.Substring(_eq + 1)
+                    Next
+                    Dim _snapDigits As Long = 0L
+                    If _piMeta.ContainsKey("digits") AndAlso Long.TryParse(_piMeta("digits"), _snapDigits) AndAlso _snapDigits = digits Then
+                        Dim _piStaging(4194303) As Byte
+                        Using _fs As New FileStream(_piCkptBin, FileMode.Open, FileAccess.Read)
+                            Using _br As New BinaryReader(_fs)
+                                DeserializeOneMpz(gmpPi, _br, _piStaging)
+                            End Using
+                        End Using
+                        _piCkptResumed = True
+                        WriteToLog($"[ComputePi§piCkpt] resumed: gmpPi.bin loaded (digits={digits:N0}) — skipping final SafeMpzDiv")
+                    End If
+                Catch _ex As Exception
+                    WriteToLog($"[ComputePi§piCkpt] load failed ({_ex.Message}) — running full divide")
+                End Try
+            End If
+
+            If Not _piCkptResumed Then
+                _divCkptScope = "phase4"
+                SafeMpzDiv(gmpPi, gmpNumer, finalT)   ' §107 Gap 6: operands ~5B+ limbs — mpz_tdiv_q hits mpn_mul_fft overflow
+
+                ' §piCkpt: save gmpPi after final divide so a crash during mpz_get_str
+                ' (the only unprotected segment of meaningful duration) does not force
+                ' re-running the divide.
+                If _autoCheckpoint Then
+                    Try
+                        If Not System.IO.Directory.Exists(_piCkptDir) Then System.IO.Directory.CreateDirectory(_piCkptDir)
+                        Dim _piSaveStaging(4194303) As Byte
+                        Using _fs As New FileStream(_piCkptBin, FileMode.Create, FileAccess.Write)
+                            Using _bw As New BinaryWriter(_fs)
+                                SerializeOneMpz(gmpPi, _bw, _piSaveStaging)
+                            End Using
+                        End Using
+                        System.IO.File.WriteAllText(_piCkptMeta, $"digits={digits}{vbLf}")
+                        BackupSnapshotToStore("snap_Phase3")
+                        WriteToLog($"[ComputePi§piCkpt] saved gmpPi.bin (digits={digits:N0})")
+                    Catch _ex As Exception
+                        WriteToLog($"[ComputePi§piCkpt] save failed: {_ex.Message}")
+                    End Try
+                End If
+            End If
             gmp_lib.mpz_clears(gmpNumer, finalT, Nothing)
             LogPhase("Division complete")
 
@@ -6735,6 +6789,14 @@ NumeratorDone:
             End Try
             _strConvSw.Stop()
             WriteToLog($"[ComputePi] mpz_get_str completed in {_strConvSw.Elapsed:mm\:ss\.fff}")
+            ' §piCkpt: mpz_get_str succeeded — gmpPi.bin no longer needed, delete to keep snap_Phase3 clean.
+            If _autoCheckpoint Then
+                Try
+                    If System.IO.File.Exists(_piCkptBin) Then System.IO.File.Delete(_piCkptBin)
+                    If System.IO.File.Exists(_piCkptMeta) Then System.IO.File.Delete(_piCkptMeta)
+                Catch
+                End Try
+            End If
             ' Capture the actual digit count BEFORE clearing gmpPi.
             ' mpz_sizeinbase returns an estimate within +1; add 2 to match GMP's internal
             ' alloc of (sizeinbase + 2) bytes.  Used to set _displayNativeLen correctly and

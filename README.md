@@ -4084,3 +4084,29 @@ sqrt-step checkpoint cannot be loaded into Phase 4 (or vice versa).
 
 The save itself costs ~1–2 minutes of disk I/O at each §171 boundary; the
 quotient `q` is ~1.4 GB at step 5 and ~2.1 GB at step 6.
+
+## §piCkpt — Save gmpPi after final divide, before mpz_get_str (NativeOptimization branch, 2026-05-01)
+
+After §171-ckpt closed the SafeMpzDiv crash window, the only remaining
+unprotected segment of meaningful duration in the post-Phase-3 pipeline was
+`mpz_get_str(gmpPi)` — the binary→base-10 conversion that produces the
+final digit string.  At 5B digits this is a single ~1–4h GMP call with no
+internal checkpoint; a crash during it would force re-running the final
+SafeMpzDiv (which, even with §171-ckpt protection, is still several hours).
+
+§piCkpt serializes `gmpPi` to `snap_Phase3/gmpPi.bin` immediately after the
+final SafeMpzDiv returns successfully.  On resume, a matching `gmpPi_meta.txt`
+(`digits=N`) causes `ComputePiGMP` to load `gmpPi` from disk and skip the
+final SafeMpzDiv entirely, jumping straight to `mpz_get_str`.  After
+`mpz_get_str` completes, both files are deleted (the digits are now in
+`pi_digits.txt` and the on-disk gmpPi is no longer load-bearing).
+
+### Worst-case post-Phase-3 replay after §piCkpt
+
+| Crash window | Pre-§piCkpt | Post-§piCkpt |
+|---|---|---|
+| Inside final SafeMpzDiv | ~5–7h (a×r) → ~3–5h (q×b+adj) via §171-ckpt | unchanged |
+| Inside `mpz_get_str` | ~5–9h (re-run divide + base conversion) | ~1–4h (base conversion only) |
+
+The save costs ~30 seconds and ~750 MB of disk; only matters for the single
+~1–4h window between final SafeMpzDiv completion and digit output.
