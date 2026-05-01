@@ -4033,3 +4033,54 @@ For SafeMpzSqrt's three-step Newton (5.6B / 2.8B / 1.4B-bit scales):
 Step 1 cannot be raised (no prior `nr_raise.bin` at first launch).  Steps
 2 and 3 each shrink from ~50 hours to ~7-8 hours, taking the full sqrt
 from ~150h to ~65h.
+
+## §171-ckpt — Save Barrett quotient `q` before `q×b` (NativeOptimization branch, 2026-04-30)
+
+`SafeMpzDiv` does two heavy multiplications inside what we call the §171
+window: `ar = a × r` (~half the cost) and `qb = q × b` (~the other half),
+followed by adj-down/adj-up corrections.  Until §171-ckpt, a crash anywhere
+inside that window forced the entire `SafeMpzDiv` call to be re-run from
+scratch on resume — the existing `sqrt_newton.bin` checkpoint is only saved
+*after* the surrounding outer step completes, so a step-6 crash mid-§171
+would replay ~65h of Newton reciprocal + a×r work.
+
+§171-ckpt closes that gap by saving the post-shift Barrett quotient `q` to
+`snap_Phase3/div_q.bin` immediately after `BigShiftRight(ar, ar, kBits)` and
+the q↔ar swap, just before `SafeMpzMul(qb, q, b)`.  On resume, the matching
+checkpoint causes `SafeMpzDiv` to skip the Newton reciprocal, `a×r`, the
+shift, and the swap — jumping straight to the q×b computation and adj loops.
+
+### Implementation (Form1.vb, SafeMpzDiv §171-ckpt)
+
+Three insertion points mirror the existing §NR-ckpt pattern:
+
+1. **Resume probe** at SafeMpzDiv entry (after `kBits` is computed): if
+   `div_meta.txt` matches the current call's `(szA, szB, aBits, kBits, scope)`
+   tuple, deserialize `q` from `div_q.bin`, set `_qPtr` and `szQ`, and
+   `GoTo PostShiftCheckpoint` — the label placed right after the existing
+   q↔ar swap and `mpz_clear(ar)`.
+2. **Save** at `PostShiftCheckpoint:` (only when not just resumed): serialize
+   `q` to `div_q.bin` + meta, then `BackupSnapshotToStore("snap_Phase3")`.
+3. **Cleanup** at successful end of SafeMpzDiv (after §171b adj-up complete):
+   delete `div_q.bin` and `div_meta.txt` so a stale checkpoint cannot poison
+   the next call.
+
+### Scope disambiguation
+
+`SafeMpzDiv` is called from two distinct sites that must not share a
+checkpoint: the SafeMpzSqrt outer Newton loop (one call per outer step) and
+the Phase 4 final `pi = numerator / finalT` divide.  A class-level
+`_divCkptScope` field, set by each caller before invocation
+(`"sqrt_step_{N}"` or `"phase4"`), is included in the meta key so a stale
+sqrt-step checkpoint cannot be loaded into Phase 4 (or vice versa).
+
+### Restart-window reduction
+
+| Crash window | Pre-§171-ckpt replay | Post-§171-ckpt replay |
+|---|---|---|
+| Inside step 5 §171 | ~30h | ~5h (q×b + adj only) |
+| Inside step 6 §171 | ~65h | ~13h (q×b + adj only) |
+| Inside Phase 4 div | full Phase 4 div | q×b + adj only |
+
+The save itself costs ~1–2 minutes of disk I/O at each §171 boundary; the
+quotient `q` is ~1.4 GB at step 5 and ~2.1 GB at step 6.

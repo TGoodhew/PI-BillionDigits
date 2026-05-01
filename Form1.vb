@@ -68,6 +68,9 @@ Public Class Form1
     '   work still runs in RAM; the snapshot is written as a batch after each level
     '   completes, before GC/FlushGmpPool while nodes are still live.
     Private Shared _autoCheckpoint As Boolean = False
+    ' §171-ckpt: scope label set by SafeMpzDiv callers (e.g., "sqrt_step_5", "phase4")
+    ' to disambiguate div_q.bin checkpoints across distinct call sites.
+    Private Shared _divCkptScope As String = ""
     ' Custom verify checks supplied via --verify-at "DIGITS:POSITION" and
     ' --verify-contains "DIGITS".  Populated during CLI arg parsing; consumed
     ' by RunCustomVerifications() which is called from BtnTest_Click.
@@ -3693,6 +3696,55 @@ Public Class Form1
         Dim kBits As Long = aBits + 3L
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] entry: szA={szA:N0} szB={szB:N0} aBits={aBits:N0} bBits={bBits:N0} kBits={kBits:N0}{vbCrLf}")
 
+        ' §171-ckpt: lifted declarations so the resume path can populate them.
+        ' Original assignments stay where they were (now without "Dim").
+        Dim _qPtr As IntPtr = IntPtr.Zero
+        Dim szQ As Integer = 0
+        Dim _ckpQResumed As Boolean = False
+
+        ' §171-ckpt: Resume from a saved div_q checkpoint if one exists for this exact call.
+        ' div_q.bin holds the post-shift Barrett quotient; on resume we skip the Newton
+        ' reciprocal, a×r, BigShiftRight, and the swap, and jump straight to q×b.
+        Dim _divCkptDir As String = System.IO.Path.Combine(DISK_CACHE_DIR, "snap_Phase3")
+        Dim _divCkptBin As String = System.IO.Path.Combine(_divCkptDir, "div_q.bin")
+        Dim _divCkptMeta As String = System.IO.Path.Combine(_divCkptDir, "div_meta.txt")
+        If _autoCheckpoint AndAlso System.IO.File.Exists(_divCkptBin) AndAlso System.IO.File.Exists(_divCkptMeta) Then
+            Try
+                Dim _metaLines As String() = System.IO.File.ReadAllLines(_divCkptMeta)
+                Dim _meta As New Dictionary(Of String, String)()
+                For Each _ml As String In _metaLines
+                    Dim _eq As Integer = _ml.IndexOf("="c)
+                    If _eq > 0 Then _meta(_ml.Substring(0, _eq)) = _ml.Substring(_eq + 1)
+                Next
+                Dim _snapSzA As Integer = 0, _snapSzB As Integer = 0
+                Dim _snapABits As Long = 0L, _snapKBits As Long = 0L
+                Dim _snapScope As String = ""
+                If _meta.ContainsKey("szA") AndAlso Integer.TryParse(_meta("szA"), _snapSzA) AndAlso
+                   _meta.ContainsKey("szB") AndAlso Integer.TryParse(_meta("szB"), _snapSzB) AndAlso
+                   _meta.ContainsKey("aBits") AndAlso Long.TryParse(_meta("aBits"), _snapABits) AndAlso
+                   _meta.ContainsKey("kBits") AndAlso Long.TryParse(_meta("kBits"), _snapKBits) AndAlso
+                   _meta.ContainsKey("scope") Then
+                    _snapScope = _meta("scope")
+                    If _snapSzA = szA AndAlso _snapSzB = szB AndAlso _snapABits = aBits AndAlso
+                       _snapKBits = kBits AndAlso _snapScope = _divCkptScope Then
+                        Dim _qStaging(4194303) As Byte
+                        Using _fs As New FileStream(_divCkptBin, FileMode.Open, FileAccess.Read)
+                            Using _br As New BinaryReader(_fs)
+                                DeserializeOneMpz(q, _br, _qStaging)
+                            End Using
+                        End Using
+                        _qPtr = q.Pointer
+                        szQ = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qPtr, 4))
+                        _ckpQResumed = True
+                        AppendLog($"[SafeMpzDiv§171-ckpt] resumed: skipping Newton+a×r+shift (szQ={szQ:N0} scope={_divCkptScope}){vbCrLf}")
+                    End If
+                End If
+            Catch _ex As Exception
+                AppendLog($"[SafeMpzDiv§171-ckpt] load failed ({_ex.Message}) — running full path{vbCrLf}")
+            End Try
+        End If
+        If _ckpQResumed Then GoTo PostShiftCheckpoint
+
         Dim r As New mpz_t()
         gmp_lib.mpz_init(r)
         ' §168: Force all-serial for SafeMpzReciprocal — bTrunc×rSq inside iter=25
@@ -4290,7 +4342,8 @@ Public Class Form1
         End If
         AppendLog($"[SafeMpzDiv] a*r done: szAR={szAR:N0}; shifting right by kBits={kBits:N0}...{vbCrLf}")
         BigShiftRight(ar, ar, kBits)
-        Dim szQ As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(ar.Pointer, 4))
+        ' §171-ckpt: szQ assignment lifted (Dim moved to top of SafeMpzDiv).
+        szQ = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(ar.Pointer, 4))
         If _logLevel >= 2 Then
             Dim _qDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
             Dim _qTop As Long = If(szQ >= 1, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, (szQ - 1) * 8), 0L)
@@ -4429,8 +4482,39 @@ Public Class Form1
             End If
         End If
         GmpRaw_swap(q.Pointer, ar.Pointer)  ' §35
-        Dim _qPtr As IntPtr = q.Pointer     ' §§78-qptr: capture before mpz_clear(ar) fires §78 and corrupts q.Pointer
+        _qPtr = q.Pointer     ' §§78-qptr: capture before mpz_clear(ar) fires §78 and corrupts q.Pointer
         gmp_lib.mpz_clear(ar)
+
+PostShiftCheckpoint:
+        ' §171-ckpt resume target.  On the normal path: _qPtr was captured above and
+        ' szQ was set after BigShiftRight.  On the resumed path: both were populated
+        ' from the loaded checkpoint at SafeMpzDiv entry.  Either way, q.Pointer holds
+        ' the post-shift Barrett quotient and we now save (if not resumed) and proceed.
+
+        ' §171-ckpt: save q so a crash during q×b or §171 adj loops can resume from here.
+        ' We skip the save when we just resumed from this same checkpoint — the file
+        ' on disk already matches our state.
+        If _autoCheckpoint AndAlso (Not _ckpQResumed) Then
+            Try
+                If Not System.IO.Directory.Exists(_divCkptDir) Then
+                    System.IO.Directory.CreateDirectory(_divCkptDir)
+                End If
+                Dim _saveStaging(4194303) As Byte
+                Dim _qMpz As New mpz_t()
+                _qMpz.Pointer = _qPtr
+                Using _fs As New FileStream(_divCkptBin, FileMode.Create, FileAccess.Write)
+                    Using _bw As New BinaryWriter(_fs)
+                        SerializeOneMpz(_qMpz, _bw, _saveStaging)
+                    End Using
+                End Using
+                System.IO.File.WriteAllText(_divCkptMeta,
+                    $"szA={szA}{vbLf}szB={szB}{vbLf}aBits={aBits}{vbLf}kBits={kBits}{vbLf}scope={_divCkptScope}{vbLf}")
+                BackupSnapshotToStore("snap_Phase3")
+                AppendLog($"[SafeMpzDiv§171-ckpt] saved div_q.bin (szQ={szQ:N0} scope={_divCkptScope}){vbCrLf}")
+            Catch _ex As Exception
+                AppendLog($"[SafeMpzDiv§171-ckpt] save failed: {_ex.Message}{vbCrLf}")
+            End Try
+        End If
 
         ' §118: log b limbs at key positions to compare vs q, and verify a at critical position
         If _logLevel >= 2 AndAlso szB = 21875001 Then
@@ -4826,6 +4910,17 @@ Public Class Form1
         q.Pointer = _qPtr  ' §§78-qptr: restore after adj loops used _qPtr directly
         GmpRaw_clear(_remRaw) : Runtime.InteropServices.Marshal.FreeHGlobal(_remRaw)
         remainder.Pointer = IntPtr.Zero
+
+        ' §171-ckpt: this SafeMpzDiv call has converged successfully — delete the div_q
+        ' checkpoint so it cannot poison the next SafeMpzDiv call (which will have a
+        ' different scope/szA/szB/kBits anyway, but explicit cleanup is safer).
+        If _autoCheckpoint Then
+            Try
+                If System.IO.File.Exists(_divCkptBin) Then System.IO.File.Delete(_divCkptBin)
+                If System.IO.File.Exists(_divCkptMeta) Then System.IO.File.Delete(_divCkptMeta)
+            Catch
+            End Try
+        End If
     End Sub
 
     ' Compute result = floor(sqrt(n)).  Safe for any size n.
@@ -5025,6 +5120,7 @@ Public Class Form1
             If CLng(szNT) + CLng(szXT) <= SAFE Then
                 GmpRaw_tdiv_q(q.Pointer, nTrunc.Pointer, xTrunc.Pointer)  ' §35
             Else
+                _divCkptScope = $"sqrt_step_{_newtonStep}"
                 SafeMpzDiv(q, nTrunc, xTrunc)
             End If
             ' §SqNewton: Use raw GmpRaw ops for cleanup — no managed mpz_clear/mpz_add.
@@ -6613,6 +6709,7 @@ NumeratorDone:
             '     → freed correctly via _savedGmpFree (CRT free of CRT pointer — no crash)
             '   new_size ≈ 744 MB ≥ GMP_LARGE_THRESHOLD → VirtualAlloc for new buffer — correct
             ' Net effect: one single realloc inside SafeMpzDiv, correctly handled, no pre-alloc needed.
+            _divCkptScope = "phase4"
             SafeMpzDiv(gmpPi, gmpNumer, finalT)   ' §107 Gap 6: operands ~5B+ limbs — mpz_tdiv_q hits mpn_mul_fft overflow
             gmp_lib.mpz_clears(gmpNumer, finalT, Nothing)
             LogPhase("Division complete")
