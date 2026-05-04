@@ -4988,6 +4988,11 @@ PostShiftCheckpoint:
         Dim sqrtCheckBin As String = System.IO.Path.Combine(sqrtSnapDir, "sqrt_newton.bin")
         Dim sqrtCheckMeta As String = System.IO.Path.Combine(sqrtSnapDir, "sqrt_newton_meta.txt")
         Dim kBitsX As Long = SEED_BITS
+        ' §203: resumed step counter — must match the OLD run's labeling so that
+        ' the next iter's _divCkptScope ("sqrt_step_N") agrees with any §171-ckpt
+        ' div_meta.txt left on disk by the prior run.  Without this, _newtonStep
+        ' restarted from 0 and §171-ckpt scope check would always fail on resume.
+        Dim _resumedNewtonStep As Integer = 0
 
         ' Try to load an existing Newton checkpoint.
         If _autoCheckpoint AndAlso System.IO.File.Exists(sqrtCheckBin) AndAlso System.IO.File.Exists(sqrtCheckMeta) Then
@@ -5010,7 +5015,13 @@ PostShiftCheckpoint:
                         End Using
                     End Using
                     kBitsX = snapKBitsX
-                    AppendLog($"[SafeMpzSqrt] Resumed from Newton checkpoint: kBitsX={kBitsX:N0} bits{vbCrLf}")
+                    ' §203: read the prior run's step counter.  Optional for backwards
+                    ' compat — older meta files may lack it; default 0 is harmless.
+                    Dim _snapStep As Integer = 0
+                    If meta.ContainsKey("step") AndAlso Integer.TryParse(meta("step"), _snapStep) Then
+                        _resumedNewtonStep = _snapStep
+                    End If
+                    AppendLog($"[SafeMpzSqrt] Resumed from Newton checkpoint: kBitsX={kBitsX:N0} bits, prior step={_resumedNewtonStep}{vbCrLf}")
                 End If
             Catch ex As Exception
                 AppendLog($"[SafeMpzSqrt] Newton checkpoint load failed ({ex.Message}) — starting from seed{vbCrLf}")
@@ -5029,8 +5040,10 @@ PostShiftCheckpoint:
         Dim _nNativePtr As IntPtr = n.Pointer
 
         ' Newton refinement — doubles precision each step
-        Dim _newtonStep As Integer = 0
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt§175] Newton loop entry: kBitsX={kBitsX:N0} bitsS={bitsS:N0} bitsN={bitsN:N0} szN={szN:N0} loop_cond={kBitsX < bitsS + 2L}{vbCrLf}")
+        ' §203: seed _newtonStep from the resumed step counter so that on resume,
+        ' the first iter's _divCkptScope continues the OLD run's numbering.
+        Dim _newtonStep As Integer = _resumedNewtonStep
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt§175] Newton loop entry: kBitsX={kBitsX:N0} bitsS={bitsS:N0} bitsN={bitsN:N0} szN={szN:N0} _newtonStep={_newtonStep} loop_cond={kBitsX < bitsS + 2L}{vbCrLf}")
         Do While kBitsX < bitsS + 2L
             _newtonStep += 1
             Dim target As Long = System.Math.Min(kBitsX * 2L + 4L, bitsS + 2L)
