@@ -5154,6 +5154,34 @@ PostShiftCheckpoint:
             Runtime.InteropServices.Marshal.FreeHGlobal(_nTruncRaw)
             AppendLog($"[SafeMpzSqrt§202-postdiv] nTrunc cleared and freed{vbCrLf}")
 
+            ' §204-trace: dump _xTruncRaw and _qRaw struct fields (alloc, size, _mp_d) immediately
+            ' before GmpRaw_add — second 5B-run-1 death (08:49 PT, log frozen at "nTrunc cleared
+            ' and freed" both times) is reproducibly inside or after this line.  If either struct
+            ' is corrupted, this trace catches it; if both look healthy, the crash is inside
+            ' __gmpz_add itself (allocator failure, GMP abort, etc.).
+            Dim _xtAlloc As Integer = Runtime.InteropServices.Marshal.ReadInt32(_xTruncRaw, 0)
+            Dim _xtSize As Integer = Runtime.InteropServices.Marshal.ReadInt32(_xTruncRaw, 4)
+            Dim _xtD As Long = Runtime.InteropServices.Marshal.ReadInt64(_xTruncRaw, 8)
+            Dim _qAlloc As Integer = Runtime.InteropServices.Marshal.ReadInt32(_qRaw, 0)
+            Dim _qSize As Integer = Runtime.InteropServices.Marshal.ReadInt32(_qRaw, 4)
+            Dim _qD As Long = Runtime.InteropServices.Marshal.ReadInt64(_qRaw, 8)
+            AppendLog($"[SafeMpzSqrt§204-pre-add] xTrunc struct: alloc={_xtAlloc:N0} size={_xtSize:N0} _mp_d={_xtD:X16} (raw={_xTruncRaw.ToInt64():X16}){vbCrLf}")
+            AppendLog($"[SafeMpzSqrt§204-pre-add] q      struct: alloc={_qAlloc:N0} size={_qSize:N0} _mp_d={_qD:X16} (raw={_qRaw.ToInt64():X16}){vbCrLf}")
+            ' Also probe first/last limb of each so we know the limb buffers are mapped (an AV
+            ' inside __gmpz_add reading the limb buffer would happen here too, but at least the
+            ' last log line written would point us at the operand whose buffer is bad).
+            If _xtD <> 0 AndAlso _xtSize > 0 Then
+                Dim _xtBot As Long = Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_xtD), 0)
+                Dim _xtTop As Long = Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_xtD), CInt((CLng(_xtSize) - 1L) * 8L))
+                AppendLog($"[SafeMpzSqrt§204-pre-add] xTrunc limbs: [0]={_xtBot:X16} [{_xtSize - 1}]={_xtTop:X16}{vbCrLf}")
+            End If
+            If _qD <> 0 AndAlso _qSize > 0 Then
+                Dim _qBot As Long = Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_qD), 0)
+                Dim _qTop As Long = Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_qD), CInt((CLng(_qSize) - 1L) * 8L))
+                AppendLog($"[SafeMpzSqrt§204-pre-add] q      limbs: [0]={_qBot:X16} [{_qSize - 1}]={_qTop:X16}{vbCrLf}")
+            End If
+            AppendLog($"[SafeMpzSqrt§204-pre-add] calling GmpRaw_add (in-place xTrunc += q)…{vbCrLf}")
+
             GmpRaw_add(_xTruncRaw, _xTruncRaw, _qRaw)                           ' xTrunc += q
             AppendLog($"[SafeMpzSqrt§202-postdiv] xTrunc += q complete (szXT={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_xTruncRaw, 4)):N0}){vbCrLf}")
             GmpRaw_clear(_qRaw)                                                   ' free q limb buffer
