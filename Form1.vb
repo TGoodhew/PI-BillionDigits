@@ -5076,9 +5076,15 @@ PostShiftCheckpoint:
             xTrunc.Pointer = _xTruncRaw
             If xHalf > 0L Then
                 BigShiftRight(xTrunc, x, xHalf)
+                ' §205: ensure xTrunc has +2 limbs of headroom for the in-place
+                ' xTrunc += q add later — without it GMP must realloc 2 GB inside
+                ' __gmpz_add at sqrt_step_2 which crashed reproducibly (3× on 5B run).
+                Dim _szXT205a As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_xTruncRaw, 4))
+                PreAllocMpzToLimbs(xTrunc, CLng(_szXT205a) + 2L)
             Else
                 Dim _szX As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_xNativePtr, 4))
-                PreAllocMpzToLimbs(xTrunc, CLng(_szX))  ' pre-alloc
+                ' §205: +2 limb headroom (see comment above) — eliminates the in-place add realloc.
+                PreAllocMpzToLimbs(xTrunc, CLng(_szX) + 2L)
                 GmpRaw_set(_xTruncRaw, _xNativePtr)     ' copy x using captured raw pointer
             End If
 
