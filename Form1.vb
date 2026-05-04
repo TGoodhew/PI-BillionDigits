@@ -4907,9 +4907,14 @@ PostShiftCheckpoint:
         Loop
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-up complete: {_adjUp} iter(s); SafeMpzDiv done{vbCrLf}")
 
+        ' §202-trace: dense logging through SafeMpzDiv exit cleanup.  The 5B-run-1 process
+        ' died silently between "SafeMpzDiv done" and the next outer Newton checkpoint —
+        ' this trace pinpoints which exit step (rem free, ckpt cleanup, return) was last.
+        AppendLog($"[SafeMpzDiv§202-exit] start cleanup; scope={_divCkptScope} szQ={szQ:N0}{vbCrLf}")
         q.Pointer = _qPtr  ' §§78-qptr: restore after adj loops used _qPtr directly
         GmpRaw_clear(_remRaw) : Runtime.InteropServices.Marshal.FreeHGlobal(_remRaw)
         remainder.Pointer = IntPtr.Zero
+        AppendLog($"[SafeMpzDiv§202-exit] remainder cleared and freed{vbCrLf}")
 
         ' §171-ckpt: this SafeMpzDiv call has converged successfully — delete the div_q
         ' checkpoint so it cannot poison the next SafeMpzDiv call (which will have a
@@ -4918,9 +4923,12 @@ PostShiftCheckpoint:
             Try
                 If System.IO.File.Exists(_divCkptBin) Then System.IO.File.Delete(_divCkptBin)
                 If System.IO.File.Exists(_divCkptMeta) Then System.IO.File.Delete(_divCkptMeta)
-            Catch
+                AppendLog($"[SafeMpzDiv§202-exit] §171-ckpt files deleted from NodeCache{vbCrLf}")
+            Catch _ckptDelEx As Exception
+                AppendLog($"[SafeMpzDiv§202-exit] §171-ckpt delete FAILED: {_ckptDelEx.Message}{vbCrLf}")
             End Try
         End If
+        AppendLog($"[SafeMpzDiv§202-exit] returning to caller{vbCrLf}")
     End Sub
 
     ' Compute result = floor(sqrt(n)).  Safe for any size n.
@@ -5123,6 +5131,7 @@ PostShiftCheckpoint:
                 _divCkptScope = $"sqrt_step_{_newtonStep}"
                 SafeMpzDiv(q, nTrunc, xTrunc)
             End If
+            AppendLog($"[SafeMpzSqrt§202-postdiv] step {_newtonStep}: SafeMpzDiv returned; entering post-divide cleanup (xHalf={xHalf:N0} target={target:N0}){vbCrLf}")
             ' §SqNewton: Use raw GmpRaw ops for cleanup — no managed mpz_clear/mpz_add.
             ' After SafeMpzDiv, all managed mpz_t.Pointer fields in this scope are potentially
             ' corrupted by §78. We use only the captured raw IntPtrs (_nTruncRaw, _xTruncRaw,
@@ -5130,14 +5139,21 @@ PostShiftCheckpoint:
             GmpRaw_clear(_nTruncRaw)                                              ' free nTrunc limb buffer
             nTrunc.Pointer = IntPtr.Zero                                          ' prevent finalizer mpz_clear
             Runtime.InteropServices.Marshal.FreeHGlobal(_nTruncRaw)
+            AppendLog($"[SafeMpzSqrt§202-postdiv] nTrunc cleared and freed{vbCrLf}")
 
             GmpRaw_add(_xTruncRaw, _xTruncRaw, _qRaw)                           ' xTrunc += q
+            AppendLog($"[SafeMpzSqrt§202-postdiv] xTrunc += q complete (szXT={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_xTruncRaw, 4)):N0}){vbCrLf}")
             GmpRaw_clear(_qRaw)                                                   ' free q limb buffer
             q.Pointer = IntPtr.Zero
             Runtime.InteropServices.Marshal.FreeHGlobal(_qRaw)
             GmpRaw_tdiv_q_2exp(_xTruncRaw, _xTruncRaw, 1UI)                     ' xTrunc >>= 1
+            AppendLog($"[SafeMpzSqrt§202-postdiv] q freed; xTrunc >>= 1 done{vbCrLf}")
 
-            If xHalf > 0L Then BigShiftLeft(xTrunc, xTrunc, xHalf)
+            If xHalf > 0L Then
+                AppendLog($"[SafeMpzSqrt§202-postdiv] BigShiftLeft xHalf={xHalf:N0} starting{vbCrLf}")
+                BigShiftLeft(xTrunc, xTrunc, xHalf)
+                AppendLog($"[SafeMpzSqrt§202-postdiv] BigShiftLeft done{vbCrLf}")
+            End If
             GmpRaw_swap(_xNativePtr, _xTruncRaw)  ' swap: x's native struct gets new Newton value
             x.Pointer = _xNativePtr               ' restore managed x.Pointer (corrupted by SafeMpzDiv §78)
             n.Pointer = _nNativePtr               ' restore managed n.Pointer for next iteration
@@ -5145,10 +5161,12 @@ PostShiftCheckpoint:
             xTrunc.Pointer = IntPtr.Zero
             Runtime.InteropServices.Marshal.FreeHGlobal(_xTruncRaw)
             kBitsX = target
+            AppendLog($"[SafeMpzSqrt§202-postdiv] swap+free complete; kBitsX advanced to {kBitsX:N0}{vbCrLf}")
 
             ' §106: Save Newton step checkpoint immediately after completion.
             If _autoCheckpoint Then
                 Try
+                    AppendLog($"[SafeMpzSqrt§202-ckpt] starting sqrt_newton.bin save (step={_newtonStep} kBitsX={kBitsX:N0}){vbCrLf}")
                     If Not System.IO.Directory.Exists(sqrtSnapDir) Then
                         System.IO.Directory.CreateDirectory(sqrtSnapDir)
                     End If
@@ -5158,14 +5176,17 @@ PostShiftCheckpoint:
                             SerializeOneMpz(x, bw, staging)
                         End Using
                     End Using
+                    AppendLog($"[SafeMpzSqrt§202-ckpt] sqrt_newton.bin written; writing meta{vbCrLf}")
                     System.IO.File.WriteAllText(sqrtCheckMeta,
                         $"bitsN={bitsN}{vbLf}kBitsX={kBitsX}{vbLf}step={_newtonStep}{vbLf}")
+                    AppendLog($"[SafeMpzSqrt§202-ckpt] meta written; calling BackupSnapshotToStore{vbCrLf}")
                     BackupSnapshotToStore("snap_Phase3")
                     AppendLog($"[SafeMpzSqrt] Newton step {_newtonStep} checkpoint saved (kBitsX={kBitsX:N0}){vbCrLf}")
                 Catch ex As Exception
                     AppendLog($"[SafeMpzSqrt] Newton checkpoint save failed: {ex.Message}{vbCrLf}")
                 End Try
             End If
+            AppendLog($"[SafeMpzSqrt§202-postdiv] step {_newtonStep} fully complete; looping (kBitsX={kBitsX:N0} bitsS+2={bitsS + 2L:N0} cont={kBitsX < bitsS + 2L}){vbCrLf}")
         Loop
 
         If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] Newton done; final adjustment{vbCrLf}")

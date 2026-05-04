@@ -4110,3 +4110,49 @@ final SafeMpzDiv entirely, jumping straight to `mpz_get_str`.  After
 
 The save costs ~30 seconds and ~750 MB of disk; only matters for the single
 ~1–4h window between final SafeMpzDiv completion and digit output.
+
+## §202-trace: SafeMpzDiv exit + SafeMpzSqrt post-divide tracing
+
+The 5B-run-1 process (PID 36244, NativeOptimization branch) died silently at
+2026-05-04 03:37 PT immediately after `[SafeMpzDiv] adj-up complete: 0 iter(s);
+SafeMpzDiv done` for `sqrt_step_2`.  No WER report, no Application event log
+entry, no exception in `pi_phase_log.txt` — the process simply stopped writing
+between the existing log line at the end of SafeMpzDiv and the next visible
+log line in the outer Newton loop checkpoint save.
+
+§202-trace adds dense `AppendLog` calls through the silent region so that the
+next time the process dies in this window we know exactly which step was last:
+
+**SafeMpzDiv exit cleanup** (Form1.vb, after the existing "SafeMpzDiv done"):
+- `[SafeMpzDiv§202-exit] start cleanup` — entered the cleanup block
+- `[SafeMpzDiv§202-exit] remainder cleared and freed` — `_remRaw` released
+- `[SafeMpzDiv§202-exit] §171-ckpt files deleted from NodeCache` — `div_q.bin`/`div_meta.txt` removed (or `delete FAILED: …` if I/O failed)
+- `[SafeMpzDiv§202-exit] returning to caller` — about to `End Sub`
+
+**SafeMpzSqrt post-divide block** (Form1.vb, inside the outer Newton `Do While` loop):
+- `[SafeMpzSqrt§202-postdiv] step N: SafeMpzDiv returned; entering post-divide cleanup` — control returned to the loop
+- `[SafeMpzSqrt§202-postdiv] nTrunc cleared and freed`
+- `[SafeMpzSqrt§202-postdiv] xTrunc += q complete (szXT=…)` — the GmpRaw_add of two ~16.6B-bit values completed
+- `[SafeMpzSqrt§202-postdiv] q freed; xTrunc >>= 1 done`
+- `[SafeMpzSqrt§202-postdiv] BigShiftLeft xHalf=… starting/done` (only when xHalf > 0; skipped at the final iteration where target=bitsS+2 makes xHalf=0)
+- `[SafeMpzSqrt§202-postdiv] swap+free complete; kBitsX advanced to …`
+- `[SafeMpzSqrt§202-ckpt] starting sqrt_newton.bin save` — entered the checkpoint Try block
+- `[SafeMpzSqrt§202-ckpt] sqrt_newton.bin written; writing meta`
+- `[SafeMpzSqrt§202-ckpt] meta written; calling BackupSnapshotToStore`
+- `[SafeMpzSqrt§202-postdiv] step N fully complete; looping (kBitsX=… bitsS+2=… cont=…)` — about to re-evaluate the loop condition
+
+The trace is unconditional (not gated by `_logLevel`) because the cost is a
+handful of `AppendLog` calls per outer Newton iteration (≤6 per run) and we
+only need the data once.
+
+### Recovery from the 2026-05-04 03:37 PT death
+
+§171-ckpt for `sqrt_step_2` was successfully written to `SnapshotStore` at
+00:09 PT before q×b ran.  The success-path cleanup in SafeMpzDiv removed it
+from `NodeCache` after q×b completed cleanly, but the `SnapshotStore` mirror
+(populated by `BackupCheckpoint` at save time, not deletion time) and the
+read-only preserved frozen copy at `C:\PiPreserved_5B_run1_2026-05-04\` both
+retained it.  Restoring `div_q.bin` + `div_meta.txt` to `NodeCache\snap_Phase3\`
+before relaunch lets the §171-ckpt resume path fire on the next sqrt_step_2
+SafeMpzDiv call, saving the ~50h reciprocal + ~3h a×r recomputation and
+leaving only ~3h of q×b + final adj + base conversion to redo.
