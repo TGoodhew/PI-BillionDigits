@@ -5251,13 +5251,26 @@ PostShiftCheckpoint:
             SafeMpzMul(xSq, x, x)
         Loop
         If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] adj-down done: {_adjDownSqrt} iter(s){vbCrLf}")
+        ' §206-trace: 5B-run-5 died silently between "adj-down done" and "final adj: computing (x+1)²"
+        ' on 2026-05-04 19:14 PT.  The likely cause is mpz_add_ui needing a silent 2 GB realloc
+        ' for x1 (same class of failure as §205).  Trace each step + pre-allocate x1 and x1Sq.
+        AppendLog($"[SafeMpzSqrt§206] freeing xSq (alloc={Runtime.InteropServices.Marshal.ReadInt32(xSq.Pointer, 0):N0} limbs){vbCrLf}")
         gmp_lib.mpz_clear(xSq)
+        AppendLog($"[SafeMpzSqrt§206] xSq cleared{vbCrLf}")
 
+        Dim _szX206 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(x.Pointer, 4))
         Dim x1 As New mpz_t()
         gmp_lib.mpz_init(x1)
+        AppendLog($"[SafeMpzSqrt§206] x1 init done; pre-alloc to {_szX206 + 2:N0} limbs to avoid mpz_add_ui realloc{vbCrLf}")
+        PreAllocMpzToLimbs(x1, CLng(_szX206) + 2L)  ' §206: avoid silent 2 GB realloc inside __gmpz_add_ui
+        AppendLog($"[SafeMpzSqrt§206] x1 pre-alloc done; calling mpz_add_ui(x1, x, 1){vbCrLf}")
         gmp_lib.mpz_add_ui(x1, x, 1UI)
+        AppendLog($"[SafeMpzSqrt§206] x1 = x+1 done (size={Runtime.InteropServices.Marshal.ReadInt32(x1.Pointer, 4):N0}){vbCrLf}")
         Dim x1Sq As New mpz_t()
         gmp_lib.mpz_init(x1Sq)
+        AppendLog($"[SafeMpzSqrt§206] x1Sq init done; pre-alloc to {2 * _szX206 + 4:N0} limbs to avoid SafeMpzMul realloc{vbCrLf}")
+        PreAllocMpzToLimbs(x1Sq, 2L * CLng(_szX206) + 4L)  ' §206: pre-alloc result buffer (~4 GB) up front
+        AppendLog($"[SafeMpzSqrt§206] x1Sq pre-alloc done{vbCrLf}")
         If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] final adj: computing (x+1)² to check (x+1)²>n{vbCrLf}")
         SafeMpzMul(x1Sq, x1, x1)
         Dim _adjUpSqrt As Integer = 0
