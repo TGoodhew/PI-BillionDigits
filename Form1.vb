@@ -6270,15 +6270,37 @@ Phase3Start:
             gmpSqrtInput.Pointer = _gmpSqrtInputRaw  ' §78: restore before SavePhase3Value uses val.Pointer
             SavePhase3Value("gmpSqrtInput", gmpSqrtInput, p3SnapDir)
 BeforeStep4:
-            LogPhase($"[ComputePi] Step 4: SafeMpzSqrt of {CLng(gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10)):N0}-digit number")
-            SafeMpzSqrt(gmpSqrt, gmpSqrtInput)
-            gmp_lib.mpz_clear(gmpSqrtInput)
+            ' §208a: gmpSqrt checkpoint — if a prior run completed SafeMpzSqrt but failed
+            ' before saving gmpNumer, gmpSqrt.bin lets us skip the entire 8+ hour sqrt
+            ' on this relaunch.  See companion save below right after SafeMpzSqrt returns.
+            If TryLoadPhase3Value("gmpSqrt", gmpSqrt, p3SnapDir) Then
+                LogPhase("[ComputePi§208a] gmpSqrt loaded from checkpoint — skipping SafeMpzSqrt")
+                gmp_lib.mpz_clear(gmpSqrtInput)
+            Else
+                LogPhase($"[ComputePi] Step 4: SafeMpzSqrt of {CLng(gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10)):N0}-digit number")
+                SafeMpzSqrt(gmpSqrt, gmpSqrtInput)
+                gmp_lib.mpz_clear(gmpSqrtInput)
+                ' §208a: save gmpSqrt immediately after sqrt completes so any subsequent
+                ' crash before the gmpNumer save can resume from here without redoing sqrt.
+                SavePhase3Value("gmpSqrt", gmpSqrt, p3SnapDir)
+                LogPhase("[ComputePi§208a] gmpSqrt saved")
+            End If
             LogPhase("Square root complete")
 
             If token.IsCancellationRequested Then Return ""
 
             If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_mul_ui: gmpNumer = gmpSqrt * 426880")
+            ' §208: pre-alloc gmpNumer to avoid silent ~2 GB realloc inside __gmpz_mul_ui.
+            ' Same root cause as §205/§206: gmpNumer was mpz_init'd to alloc=1, mpz_mul_ui
+            ' needs to grow it to gmpSqrt.size+1 (~259M+1 limbs / 2 GB) and the silent
+            ' realloc kills the process at 5B-scale.  7th relaunch (2026-05-05 06:51 PT)
+            ' died here right after logging "mpz_mul_ui: gmpNumer = gmpSqrt * 426880".
+            Dim _szGmpSqrt208 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpSqrt.Pointer, 4))
+            WriteToLog($"[ComputePi§208] pre-alloc gmpNumer to {_szGmpSqrt208 + 2:N0} limbs (gmpSqrt.size={_szGmpSqrt208:N0})")
+            PreAllocMpzToLimbs(gmpNumer, CLng(_szGmpSqrt208) + 2L)
+            WriteToLog($"[ComputePi§208] gmpNumer pre-alloc done; calling mpz_mul_ui")
             gmp_lib.mpz_mul_ui(gmpNumer, gmpSqrt, 426880UI)
+            WriteToLog($"[ComputePi§208] mpz_mul_ui done; gmpNumer.size={Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4):N0}")
             ' §SqrtDone-ckpt: Save gmpNumer immediately after the sqrt so a crash during
             ' Steps 5+ can restart from here (skipping all 10+ hours of Steps 1–4).
             ' Restore gmpNumer.Pointer first — §78 corrupted it during mpz_mul_ui above.
