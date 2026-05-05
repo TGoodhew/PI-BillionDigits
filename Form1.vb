@@ -5239,8 +5239,19 @@ PostShiftCheckpoint:
         If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] Newton done; final adjustment{vbCrLf}")
 
         ' Final adjustment: ensure result = floor(sqrt(n)) exactly (off by at most 1)
+        ' §207: force serial DOP for the entire final-adj SafeMpzMul region.  5B-run-6
+        ' (2026-05-04 20:59 PT) crashed in __gmpz_mul deep in 2-level parallel SafeMpzMul
+        ' recursion (stack: GmpRaw_mul ← SafeMpzMul ← Parallel.For ← SafeMpzMul ← Parallel.For).
+        ' AV in native code, no managed exception captured.  Forcing serial mirrors the §168
+        ' pattern used for SafeMpzReciprocal and eliminates parallel allocator pressure on the
+        ' two ~519M-limb (4 GB) results.  Restored to prior DOP after the SqRoot Sub returns.
+        Dim _saved207Dop As Integer = System.Threading.Volatile.Read(_safeMulDop)
+        System.Threading.Volatile.Write(_safeMulDop, 1)
+        AppendLog($"[SafeMpzSqrt§207] forcing all-serial for final-adj SafeMpzMul (savedDop={_saved207Dop}){vbCrLf}")
         Dim xSq As New mpz_t()
         gmp_lib.mpz_init(xSq)
+        ' §207: pre-alloc xSq to avoid silent realloc on first SafeMpzMul completion.
+        PreAllocMpzToLimbs(xSq, 2L * CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(x.Pointer, 4))) + 4L)
         If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] final adj: computing x² to check x²≤n{vbCrLf}")
         SafeMpzMul(xSq, x, x)
         Dim _adjDownSqrt As Integer = 0
@@ -5285,6 +5296,9 @@ PostShiftCheckpoint:
         gmp_lib.mpz_clear(x1)
         gmp_lib.mpz_clear(x1Sq)
 
+        ' §207: restore SafeMpzMul DOP after the final-adj region.
+        System.Threading.Volatile.Write(_safeMulDop, _saved207Dop)
+        AppendLog($"[SafeMpzSqrt§207] DOP restored to {_saved207Dop}{vbCrLf}")
         GmpRaw_swap(result.Pointer, x.Pointer)  ' §35
         gmp_lib.mpz_clear(x)
     End Sub
