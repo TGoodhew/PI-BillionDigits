@@ -6301,11 +6301,17 @@ BeforeStep4:
             WriteToLog($"[ComputePi§208] gmpNumer pre-alloc done; calling mpz_mul_ui")
             gmp_lib.mpz_mul_ui(gmpNumer, gmpSqrt, 426880UI)
             WriteToLog($"[ComputePi§208] mpz_mul_ui done; gmpNumer.size={Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4):N0}")
-            ' §SqrtDone-ckpt: Save gmpNumer immediately after the sqrt so a crash during
-            ' Steps 5+ can restart from here (skipping all 10+ hours of Steps 1–4).
             ' Restore gmpNumer.Pointer first — §78 corrupted it during mpz_mul_ui above.
             gmpNumer.Pointer = _gmpNumerRaw
-            SavePhase3Value("gmpNumer", gmpNumer, p3SnapDir)
+            ' §209a: REMOVED the SavePhase3Value("gmpNumer") here — the gmpNumer at this
+            ' point is the INTERMEDIATE value (= 426880*sqrt), not the FINAL post-multiply
+            ' numerator.  The resume logic at line ~6205 loads "gmpNumer.bin" and goes
+            ' straight to the final divide via NumeratorDone, bypassing the 3-piece split
+            ' and r0/r1/r2 multiplies.  If gmpNumer.bin contained the intermediate, the
+            ' divide would compute pi = 426880*sqrt / T (wrong).  The §208a gmpSqrt.bin
+            ' checkpoint protects the same code path — on crash before the post-combine
+            ' SavePhase3Value("gmpNumer") at line ~6821, resume falls through to §208a
+            ' gmpSqrt-ckpt and re-runs only the mul_ui + split + multiplies + combine.
             ' gmpSqrt value is now encoded in gmpNumer — free its ~198 MB before
             ' the large multiply.  finalP is also not used in the final formula
             ' (pi = 426880·sqrt(10005)·Q / T), so free its ~340 MB too.
