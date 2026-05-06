@@ -6342,18 +6342,31 @@ BeforeStep4:
             Dim totalBits As Long = CLng(gmp_lib.mpz_sizeinbase(finalQ, 2))
             WriteToLog($"[3PM-DBG] totalBits={totalBits:N0} finalQ._mp_size={Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer, 4):N0} _mp_alloc={Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer, 0):N0}")
             Dim thirdBits As Long = totalBits \ 3L
-            ' mp_bitcnt_t is 32-bit on Windows (MSVC unsigned long).  thirdBits ≈ 3 billion
-            ' which fits in UInt32 (max 4.29 billion).  2*thirdBits would overflow UInt32, so
-            ' all shifts use k1 only and are done in two single-k1 steps instead.
-            Dim k1 As New mp_bitcnt_t(CUInt(thirdBits))
-            WriteToLog($"[3PM-DBG] thirdBits={thirdBits:N0} k1.Value={k1.Value}")
+            ' §209: at 5B digits totalBits ≈ 47.3B and thirdBits ≈ 15.77B — far above
+            ' UInt32.MaxValue (4.29B).  The original code's `CUInt(thirdBits)` truncated
+            ' silently to 2.88B, producing wrong shifts AND making mpQ2 pre-alloc
+            ' (sized for k1Limbs) far smaller than the actual result Q2 (~649M limbs vs
+            ' 45M alloc'd), which triggered a silent ~5 GB realloc inside mpz_tdiv_q_2exp
+            ' on the 8th relaunch (2026-05-05 17:08 PT).
+            '
+            ' Fix: use BigShiftRight/BigShiftLeft (which chunk Long bit counts via
+            ' multiple ≤2.1B-bit GmpRaw_tdiv_q_2exp/mul_2exp calls) for the split AND
+            ' for the Combine A/C shifts.  k1 is kept as an mp_bitcnt_t (still used
+            ' for log formatting and for older code paths that operate at smaller
+            ' digit counts where thirdBits fits in UInt32) but tracked alongside
+            ' thirdBits (Long) which is the authoritative shift amount.
+            Dim k1 As New mp_bitcnt_t(CUInt(System.Math.Min(thirdBits, CLng(UInt32.MaxValue))))
+            WriteToLog($"[3PM-DBG] thirdBits={thirdBits:N0} k1.Value={k1.Value} (mp_bitcnt_t clamped; actual shifts use BigShiftRight/Left)")
 
             ' Shared staging buffer for all spill I/O (sequential, never concurrent).
             Dim spillStaging(4194303) As Byte  ' 4 MB staging buffer (§56) — finalT spill only
 
             ' finalQ._mp_size / k1-limb counts used for pre-alloc sizing below.
             Dim _finalQSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer, 4)))
-            Dim _k1Limbs As Long = CLng(k1.Value) \ 64L   ' limb_cnt = k1 / GMP_NUMB_BITS
+            ' §209: use Long thirdBits (not UInt32 k1) for limb count.  At 5B scale
+            ' k1.Value is clamped to UInt32.MaxValue, so CLng(k1.Value)\64 would be
+            ' ~67M limbs instead of the actual ~246M limbs each Q-piece needs.
+            Dim _k1Limbs As Long = thirdBits \ 64L
 
             ' Extract Q0 = finalQ mod 2^k (low third) and shift finalQ to hold Q2*2^k + Q1.
             ' Using only k1-sized shifts avoids the 2k overflow in mp_bitcnt_t.
@@ -6386,11 +6399,20 @@ BeforeStep4:
             Else
                 WriteToLog($"[3PM-DBG] tmpHigh pre-alloc skipped ({_tHNeeded:N0} limbs, {_tHBytes:N0} B < GMP threshold; init2 buffer sufficient)")
             End If
-            WriteToLog($"[3PM-DBG] tmpHigh _mp_alloc={Runtime.InteropServices.Marshal.ReadInt32(tmpHigh.Pointer, 0):N0}  about to tdiv_q_2exp(tmpHigh, finalQ, k1)")
-            gmp_lib.mpz_tdiv_q_2exp(tmpHigh, finalQ, k1)  ' tmpHigh = Q2*2^k + Q1
-            WriteToLog($"[3PM-DBG] tdiv_q_2exp done: tmpHigh._mp_size={Runtime.InteropServices.Marshal.ReadInt32(tmpHigh.Pointer, 4):N0}  about to tdiv_r_2exp(finalQ, finalQ, k1)")
-            gmp_lib.mpz_tdiv_r_2exp(finalQ, finalQ, k1)   ' finalQ  = Q0 (fits in existing alloc; no realloc)
-            WriteToLog($"[3PM-DBG] tdiv_r_2exp done: finalQ._mp_size={Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer, 4):N0}")
+            WriteToLog($"[3PM-DBG] tmpHigh _mp_alloc={Runtime.InteropServices.Marshal.ReadInt32(tmpHigh.Pointer, 0):N0}  about to BigShiftRight(tmpHigh, finalQ, thirdBits={thirdBits:N0})")
+            BigShiftRight(tmpHigh, finalQ, thirdBits)  ' §209: tmpHigh = finalQ >> thirdBits = Q2*2^k + Q1
+            WriteToLog($"[3PM-DBG] BigShiftRight done: tmpHigh._mp_size={Runtime.InteropServices.Marshal.ReadInt32(tmpHigh.Pointer, 4):N0}  computing finalQ = Q0 = finalQ - (tmpHigh << thirdBits)")
+            ' §209: finalQ = Q0 = finalQ mod 2^thirdBits = finalQ - ((finalQ >> thirdBits) << thirdBits)
+            ' Express via existing scratch buffer.  Allocate _splitScratch with enough
+            ' headroom for (tmpHigh << thirdBits), which is ≈ finalQ size.
+            Dim _splitScratch As New mpz_t()
+            gmp_lib.mpz_init2(_splitScratch, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
+            PreAllocMpzToLimbs(_splitScratch, _finalQSz + 4L)
+            BigShiftLeft(_splitScratch, tmpHigh, thirdBits)
+            WriteToLog($"[3PM-DBG§209] _splitScratch (tmpHigh<<thirdBits) size={Runtime.InteropServices.Marshal.ReadInt32(_splitScratch.Pointer, 4):N0}; computing finalQ -= _splitScratch")
+            gmp_lib.mpz_sub(finalQ, finalQ, _splitScratch)
+            gmp_lib.mpz_clear(_splitScratch)
+            WriteToLog($"[3PM-DBG] sub done: finalQ._mp_size={Runtime.InteropServices.Marshal.ReadInt32(finalQ.Pointer, 4):N0} (= Q0)")
 
             ' Extract Q1 and Q2 from tmpHigh with another k1-sized shift.
             ' Both results are ≤ k1/64 limbs ≈ 373 MB — pre-alloc both for the same reason.
@@ -6430,11 +6452,21 @@ BeforeStep4:
             Else
                 WriteToLog($"[3PM-DBG] mpQ2 pre-alloc skipped ({_q2Needed:N0} limbs, {_q2Bytes:N0} B < GMP threshold; init2 buffer sufficient)")
             End If
-            WriteToLog($"[3PM-DBG] about to extract Q1/Q2 from tmpHigh")
-            gmp_lib.mpz_tdiv_r_2exp(mpQ1, tmpHigh, k1)   ' mpQ1 = Q1
-            WriteToLog($"[3PM-DBG] mpQ1._mp_size={Runtime.InteropServices.Marshal.ReadInt32(mpQ1.Pointer, 4):N0}  about to tdiv_q_2exp(mpQ2, tmpHigh, k1)")
-            gmp_lib.mpz_tdiv_q_2exp(mpQ2, tmpHigh, k1)   ' mpQ2 = Q2
-            WriteToLog($"[3PM-DBG] mpQ2._mp_size={Runtime.InteropServices.Marshal.ReadInt32(mpQ2.Pointer, 4):N0}  clearing tmpHigh")
+            WriteToLog($"[3PM-DBG] about to extract Q1/Q2 from tmpHigh via BigShiftRight (thirdBits={thirdBits:N0})")
+            ' §209: mpQ2 = tmpHigh >> thirdBits.  BigShiftRight chunks via ≤2.1B-bit
+            ' GmpRaw_tdiv_q_2exp calls and pre-allocs result, so this is safe at 5B scale.
+            BigShiftRight(mpQ2, tmpHigh, thirdBits)
+            WriteToLog($"[3PM-DBG] mpQ2._mp_size={Runtime.InteropServices.Marshal.ReadInt32(mpQ2.Pointer, 4):N0}  computing mpQ1 = tmpHigh - (mpQ2 << thirdBits)")
+            ' §209: mpQ1 = Q1 = tmpHigh mod 2^thirdBits = tmpHigh - ((tmpHigh >> thirdBits) << thirdBits)
+            Dim _splitScratch2 As New mpz_t()
+            gmp_lib.mpz_init2(_splitScratch2, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
+            Dim _tmpHighSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(tmpHigh.Pointer, 4)))
+            PreAllocMpzToLimbs(_splitScratch2, _tmpHighSz + 4L)
+            BigShiftLeft(_splitScratch2, mpQ2, thirdBits)
+            WriteToLog($"[3PM-DBG§209] _splitScratch2 (mpQ2<<thirdBits) size={Runtime.InteropServices.Marshal.ReadInt32(_splitScratch2.Pointer, 4):N0}; computing mpQ1 = tmpHigh - _splitScratch2")
+            gmp_lib.mpz_sub(mpQ1, tmpHigh, _splitScratch2)
+            gmp_lib.mpz_clear(_splitScratch2)
+            WriteToLog($"[3PM-DBG] mpQ1._mp_size={Runtime.InteropServices.Marshal.ReadInt32(mpQ1.Pointer, 4):N0}  clearing tmpHigh")
             gmp_lib.mpz_clear(tmpHigh)
             WriteToLog($"[3PM-DBG] Q split complete")
 
@@ -6629,10 +6661,13 @@ BeforeStep4:
                 Else
                     WriteToLog("[ComputePi] Combine A mpShiftA.Pointer is NULL — init2 failed silently")
                 End If
-                WriteToLog($"[ComputePi] Combine A: mpz_mul_2exp  k={CLng(k1):N0} bits  gmpNumer={CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits")
+                WriteToLog($"[ComputePi] Combine A: BigShiftLeft  thirdBits={thirdBits:N0}  gmpNumer={CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits")
             End If
-            gmp_lib.mpz_mul_2exp(mpShiftA, gmpNumer, k1)
-            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine A: mpz_mul_2exp returned OK")
+            ' §209: BigShiftLeft chunks Long bit count safely; mpz_mul_2exp(rop, op, k1)
+            ' would shift by clamped k1 = min(thirdBits, UInt32.MaxValue) which is wrong
+            ' at 5B scale where thirdBits > UInt32.
+            BigShiftLeft(mpShiftA, gmpNumer, thirdBits)
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine A: BigShiftLeft returned OK")
             If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine A: mpz_swap")
             gmp_lib.mpz_swap(gmpNumer, mpShiftA)
             If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine A: mpz_clear(mpShiftA)")
@@ -6716,8 +6751,9 @@ BeforeStep4:
                     End If
                 End If
             End If
-            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine C: mpz_mul_2exp  k={CLng(k1):N0} bits")
-            gmp_lib.mpz_mul_2exp(mpShiftC, gmpNumer, k1)
+            If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine C: BigShiftLeft  thirdBits={thirdBits:N0} bits")
+            ' §209: see Combine A above — use BigShiftLeft for Long bit counts safely.
+            BigShiftLeft(mpShiftC, gmpNumer, thirdBits)
             If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine C: mpz_swap")
             gmp_lib.mpz_swap(gmpNumer, mpShiftC)
             If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine C: mpz_clear(mpShiftC)")
