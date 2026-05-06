@@ -6602,17 +6602,44 @@ BeforeStep4:
                 LogPhase("[ComputePi] §61 all R0/R1/R2 loaded from checkpoint — skipping multiply")
                 gmp_lib.mpz_clears(finalQ, mpQ1, mpQ2, Nothing)
             Else
-                WriteToLog("[ComputePi] §61 calling r0=N*Q0, r1=N*Q1, r2=N*Q2 in parallel...")
-                System.Threading.Tasks.Parallel.Invoke(
-                    Sub() SafeMpzMul(mpR0, gmpNumer, finalQ),
-                    Sub() SafeMpzMul(mpR1, gmpNumer, mpQ1),
-                    Sub() SafeMpzMul(mpR2, gmpNumer, mpQ2))
-                WriteToLog("[ComputePi] §61 parallel r0/r1/r2 done")
-                gmp_lib.mpz_clears(finalQ, mpQ1, mpQ2, Nothing)
-                ' §106 checkpoint: save all three immediately so a later crash can reload.
-                SavePhase3Value("mpR0", mpR0, p3SnapDir)
-                SavePhase3Value("mpR1", mpR1, p3SnapDir)
-                SavePhase3Value("mpR2", mpR2, p3SnapDir)
+                ' §210: serialize the three multiplies (was parallel.invoke).  At 5B digits
+                ' each Q_i is ~246M limbs, gmpNumer is ~259M limbs, so each SafeMpzMul peaks
+                ' at ~10-12 GB during recursion.  Three in parallel exceeded the 64 GB
+                ' budget on the 10th relaunch (2026-05-05 17:33 PT) — OOM at a 47 MB
+                ' inner accum buffer.  Save each immediately on completion so a crash
+                ' during r1 or r2 keeps the previously-computed r_i values.
+                Dim _saved210Dop As Integer = System.Threading.Volatile.Read(_safeMulDop)
+                System.Threading.Volatile.Write(_safeMulDop, 1)
+                WriteToLog($"[ComputePi§210] forcing serial DOP for sequential r0/r1/r2 multiplies (savedDop={_saved210Dop})")
+                If Not _r0Done Then
+                    WriteToLog("[ComputePi§210] computing r0 = gmpNumer * Q0 (finalQ)...")
+                    SafeMpzMul(mpR0, gmpNumer, finalQ)
+                    WriteToLog($"[ComputePi§210] r0 done; saving mpR0 (size={Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer, 4):N0})")
+                    SavePhase3Value("mpR0", mpR0, p3SnapDir)
+                Else
+                    WriteToLog("[ComputePi§210] r0 already loaded; skipping")
+                End If
+                gmp_lib.mpz_clear(finalQ)
+                If Not _r1Done Then
+                    WriteToLog("[ComputePi§210] computing r1 = gmpNumer * Q1 (mpQ1)...")
+                    SafeMpzMul(mpR1, gmpNumer, mpQ1)
+                    WriteToLog($"[ComputePi§210] r1 done; saving mpR1 (size={Runtime.InteropServices.Marshal.ReadInt32(mpR1.Pointer, 4):N0})")
+                    SavePhase3Value("mpR1", mpR1, p3SnapDir)
+                Else
+                    WriteToLog("[ComputePi§210] r1 already loaded; skipping")
+                End If
+                gmp_lib.mpz_clear(mpQ1)
+                If Not _r2Done Then
+                    WriteToLog("[ComputePi§210] computing r2 = gmpNumer * Q2 (mpQ2)...")
+                    SafeMpzMul(mpR2, gmpNumer, mpQ2)
+                    WriteToLog($"[ComputePi§210] r2 done; saving mpR2 (size={Runtime.InteropServices.Marshal.ReadInt32(mpR2.Pointer, 4):N0})")
+                    SavePhase3Value("mpR2", mpR2, p3SnapDir)
+                Else
+                    WriteToLog("[ComputePi§210] r2 already loaded; skipping")
+                End If
+                gmp_lib.mpz_clear(mpQ2)
+                System.Threading.Volatile.Write(_safeMulDop, _saved210Dop)
+                WriteToLog($"[ComputePi§210] DOP restored to {_saved210Dop}; all r0/r1/r2 done")
             End If
             ' Swap r2 into gmpNumer (same pattern as the old serial Pass 2 end).
             ' The old gmpNumer buffer (~208 MB, the 426880*sqrt value) is freed by the swap.
