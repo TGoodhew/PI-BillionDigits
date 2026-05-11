@@ -1,8 +1,16 @@
 # PI-BillionDigits
 
+## Origin
+
+This project started with a request from my friend Mike Iem, one of the nicest guys I've ever worked with, who asked me to help him calculate Pi to a billion digits. I have no idea why he would want this, but it's Mike — and I'll help him out on whatever he asks for.
+
+Once I had it working at 1 billion digits, I figured: let's see if we can push it to 5 billion. That's where we are now.
+
+Details on the project below.
+
 ## What it is
 
-PI-BillionDigits is a Windows Forms application that computes Pi to an arbitrary number of decimal digits — up to and including one billion — and displays the result. It is written in VB.NET targeting .NET 10 and uses the [Math.Gmp.Native](https://www.nuget.org/packages/Math.Gmp.Native.NET/) wrapper around the GNU Multiple Precision Arithmetic Library (GMP) for all big-integer arithmetic.
+PI-BillionDigits is a Windows Forms application that computes Pi to an arbitrary number of decimal digits — verified at up to five billion — and displays the result. It is written in VB.NET targeting .NET 10 and uses the [Math.Gmp.Native](https://www.nuget.org/packages/Math.Gmp.Native.NET/) wrapper around the GNU Multiple Precision Arithmetic Library (GMP) for all big-integer arithmetic.
 
 ## UPDATE: Tested up to 5 billion digits
 
