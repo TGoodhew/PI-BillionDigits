@@ -4164,3 +4164,122 @@ retained it.  Restoring `div_q.bin` + `div_meta.txt` to `NodeCache\snap_Phase3\`
 before relaunch lets the §171-ckpt resume path fire on the next sqrt_step_2
 SafeMpzDiv call, saving the ~50h reciprocal + ~3h a×r recomputation and
 leaving only ~3h of q×b + final adj + base conversion to redo.
+
+## §211 — Defer §NR-ckpt cleanup until SafeMpzDiv succeeds (2026-05-15)
+
+### The crash
+
+2026-05-15 09:55:34 UTC: 5B run (PID 13540 on `NativeOptimization @ dc93def`) died
+with `System.AccessViolationException` (`0xc0000005`) inside the **top-level
+depth-0 §gen** of `a × r` in the final `SafeMpzDiv` — `szA=998,532,722
+szB=259,525,633`, the largest §gen pass ever attempted in this codebase.  The
+faulting module was reported as "unknown" with a stack hint inside KernelBase,
+consistent with a heap-allocator failure under memory pressure.  Log signal: the
+§gen accumulator logged `k=0 accumSz=419,352,786` and then the process exited
+mid-`k=1` (the next k's shift+add for prods(1)).  The previous `[SafeMpzMul§accum]
+shifted buffer OK (9,598 MB)` line confirms the buffer pre-alloc succeeded;
+death came during the `mul_2exp` or `GmpRaw_add` that consumed it.
+
+### The compounding bug — `nr_r.bin` got auto-deleted
+
+After `SafeMpzReciprocal` converged at iter 37 on 2026-05-14 00:20, its exit
+block (Form1.vb ~3654) deleted `nr_r.bin` and `nr_meta.txt` as defensive
+housekeeping ("a future call at a different kBits scale would see the stale
+nr_r.bin from this call's mid-Newton state and either skip raise … or, worse,
+mis-resume").  That concern is **already addressed** by the §NR-ckpt resume
+check (which verifies `_snapKBits = kBits AndAlso _snapBBits = bBits` and
+ignores non-matching files).  The cleanup was therefore over-eager: it left the
+entire ~50 h post-recip stretch (`a × r` → `BigShiftRight` → `q × b` → adj
+loops → `tdiv_q`) with NO mid-NR snapshot to fall back to.
+
+Recovery after the 09:55 crash required hand-restoring `nr_r.bin` + `nr_meta.txt`
+from a belt-and-braces backup at `C:\PiBackup_iter36_2026-05-13\` (taken at
+iter 36, one iter shy of iter 37, costing an extra ~13 h to redo the polish
+iter).  If that backup had not existed the only fallback would have been
+`sqrt_newton.bin` — ~10 days back.
+
+### The fix
+
+Two surgical edits:
+
+1. **SafeMpzReciprocal exit (~Form1.vb:3650)** — replace the `nr_r.bin` /
+   `nr_meta.txt` delete with a `[SafeMpzReciprocal] §211: deferring §NR-ckpt
+   cleanup` log line.  The files remain on disk after the Newton loop converges.
+
+2. **SafeMpzDiv §202-exit (~Form1.vb:4930)** — add `nr_r.bin` / `nr_meta.txt`
+   cleanup alongside the existing `div_q.bin` cleanup.  By the time §202-exit
+   fires, the entire post-recip stretch has succeeded, so the iter=N r snapshot
+   is genuinely no longer needed.
+
+### Why this closes the gap
+
+The §NR-ckpt resume path (Form1.vb ~3340) already gracefully ignores files whose
+`kBits` / `bBits` don't match the current call, so leaving them on disk between
+SafeMpzReciprocal exit and SafeMpzDiv §202-exit is safe — even if an interleaving
+SafeMpzDiv call at a different scope fired in the meantime (it can't, because
+SafeMpzReciprocal is only ever called from one site in SafeMpzDiv, and
+SafeMpzDiv calls are non-reentrant on the live state).
+
+### Replay impact
+
+Pre-§211: crash anywhere in the post-recip stretch lost the entire reciprocal
+(~13 h at 5B step-6 / final-divide scale) plus everything since.  Post-§211:
+crash anywhere in the same stretch resumes from §NR-ckpt iter N (the converged
+or near-converged r), skipping the Newton loop entirely.  Net saving at 5B
+final-divide scale: **~13 h per post-recip crash**.
+
+### Relates to
+
+- #65 ("Checkpoint gap: post-recip SafeMpzDiv") — §211 closes the dominant half
+  of #65 with two-line changes; the remaining `ar` checkpoint (#65 Option A)
+  would only protect the ~5 min `BigShiftRight` window between `a × r` complete
+  and §171-ckpt save and is marginal value.
+- §NR-ckpt save (Form1.vb ~3571) — unchanged; saves are still per-iter.
+- §171-ckpt (Form1.vb:4488 / 4497) — unchanged; still fires after BigShiftRight.
+
+## §212 — Depth-0 §gen RAM diagnostics (2026-05-15)
+
+Companion to §211.  The 5/15 09:55 AV happened during the **first ever**
+top-level §gen pass at 5B scale (998M × 259M).  We have no instrumentation
+on memory pressure at that depth — we only learned post-mortem that the run
+got through `k=0` and died in `k=1`.  §212 adds RAM probes so a re-occurrence
+gives us actionable telemetry.
+
+### What it logs
+
+At the end of each `k` iteration of the §gen accumulator (Form1.vb ~3044), when
+`szA + szB > 800_000_000` limbs (gates exactly the 5B-scale top-level call — at
+depth 1 the operand size is 333M + 86M ≈ 420M, below threshold):
+
+```
+[SafeMpzMul§212] depth-0 k={k} END  szA={szA} szB={szB} WS={MB} Priv={MB} accumSz={...} accumAlloc={...}
+```
+
+Captures:
+
+- **`WS`** — `Process.WorkingSet64`, the resident working set in MB.  Tells us
+  how close we are to the box's 64 GB physical limit at each k boundary.
+- **`Priv`** — `Process.PrivateMemorySize64`, total committed private memory.
+  Diverges from WS when pages are evicted to standby/pagefile under pressure;
+  the gap is a leading indicator of paging-induced slowdown or eventual OOM.
+- **`accumSz`** — `accumPtr->_mp_size`, current limb count of the accumulator.
+- **`accumAlloc`** — `accumPtr->_mp_alloc`, pre-allocated headroom.  If
+  `accumSz` ever approaches `accumAlloc` we are one realloc away from a GMP
+  buffer-grow that the §gen path is not designed for.
+
+### Cost
+
+Zero overhead at smaller depths (gate skips); at depth 0 exactly 9 log lines
+per top-level call, fired once per `SafeMpzDiv` post-recip.  Negligible.
+
+### Recovery expectation
+
+If the next 5B run crashes in the same place, §212 tells us:
+
+- Was WS climbing or stable?  (Climbing → leak / fragmentation hypothesis.)
+- Was WS far below the 64 GB ceiling?  (Yes → not a simple OOM.)
+- Did `accumAlloc` grow between k iterations?  (Yes → a realloc fired,
+  consistent with the AV being a realloc-induced heap corruption.)
+
+These distinguish the three candidate root causes for the AV: heap pressure,
+mpz_t 32-bit `_mp_size` overflow, and allocator heap corruption.

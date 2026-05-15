@@ -3040,6 +3040,25 @@ Public Class Form1
                     Dim _opB0_d2 As ULong = If(_opBd_d2 <> 0L, CULng(Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_opBd_d2), 0)), 0UL)
                     AppendLog($"[SafeMpzMul§5B-d-L2 k={k} opB[0]={_opB0_d2:X16}] post-add accum[{_IDX_D_P7:N0}]={_accD7:X16} accum[{_IDX_D_P8:N0}]={_accD8:X16} accumSz={_accDsz:N0}{vbCrLf}")
                 End If
+                ' §212 (2026-05-15): depth-0 RAM diagnostics for top-level §gen calls.
+                ' Gated on szA + szB > 800M limbs — at 5B scale this fires ONLY at the
+                ' outermost a×r (998M × 259M = 1.26B total).  The 5/15 crash was an
+                ' AccessViolation in KernelBase during k=1's shift+add at exactly this depth;
+                ' working-set + private-memory + accumPtr alloc-headroom logged here lets us
+                ' confirm whether the next crash (if any) is heap pressure vs mpz_t size limit
+                ' vs allocator corruption.
+                If CLng(szA) + CLng(szB) > 800_000_000L Then
+                    Try
+                        Dim _212proc As System.Diagnostics.Process = System.Diagnostics.Process.GetCurrentProcess()
+                        Dim _212ws As Long = _212proc.WorkingSet64
+                        Dim _212priv As Long = _212proc.PrivateMemorySize64
+                        Dim _212accSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
+                        Dim _212accAlloc As Integer = Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0)
+                        AppendLog($"[SafeMpzMul§212] depth-0 k={k} END  szA={szA:N0} szB={szB:N0} WS={_212ws \ 1048576L:N0}MB Priv={_212priv \ 1048576L:N0}MB accumSz={_212accSz:N0} accumAlloc={_212accAlloc:N0}{vbCrLf}")
+                    Catch _212ex As Exception
+                        AppendLog($"[SafeMpzMul§212] depth-0 k={k} diag failed: {_212ex.Message}{vbCrLf}")
+                    End Try
+                End If
                 GmpRaw_clear(prods(k).Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(prods(k).Pointer)
             Next k
         End If
@@ -3647,16 +3666,18 @@ Public Class Form1
             End Try
         End If
 
-        ' §201-raise: clean up the §NR-ckpt mid-Newton checkpoint now that this call has
-        ' converged.  Otherwise a future call at a different kBits scale would see the
-        ' stale nr_r.bin from this call's mid-Newton state and either skip raise (since
-        ' nr_r.bin will not match the new kBits) or, worse, mis-resume.
-        Try
-            If System.IO.File.Exists(_nrBin) Then System.IO.File.Delete(_nrBin)
-            If System.IO.File.Exists(_nrMeta) Then System.IO.File.Delete(_nrMeta)
-        Catch
-            ' Cleanup is best-effort; leftover files are tolerated.
-        End Try
+        ' §211 (2026-05-15): DEFER §NR-ckpt cleanup until SafeMpzDiv §202-exit fires.
+        ' Originally deleted here at end of SafeMpzReciprocal — but that left the entire
+        ' post-recip stretch (a×r → BigShiftRight → §171-ckpt save) UNPROTECTED.  Empirical
+        ' impact: 5/15 09:55 crash in top-level depth-0 §gen of a×r at 5B scale (kBits=63.9B)
+        ' lost iter=37 §NR-ckpt because this delete had already fired, forcing recovery from
+        ' the iter=36 backup and re-running the entire 13h Newton loop.  Stale-data concern
+        ' from the original cleanup (cross-call kBits mismatch) is already handled by the
+        ' §NR-ckpt resume check (_snapKBits = kBits AndAlso _snapBBits = bBits at line ~3352),
+        ' so leftover files are safely ignored by future calls.  Actual cleanup moved to
+        ' SafeMpzDiv §202-exit, which only fires when the entire divide succeeds — i.e., the
+        ' point at which the §NR-ckpt is guaranteed no longer needed.
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzReciprocal] §211: deferring §NR-ckpt cleanup to SafeMpzDiv §202-exit (kBits={kBits:N0}){vbCrLf}")
 
         ' §36: Clear loop-external temporaries once after loop completes.
         gmp_lib.mpz_clears(bTrunc, rSq, p, Nothing)
@@ -4926,6 +4947,30 @@ PostShiftCheckpoint:
                 AppendLog($"[SafeMpzDiv§202-exit] §171-ckpt files deleted from NodeCache{vbCrLf}")
             Catch _ckptDelEx As Exception
                 AppendLog($"[SafeMpzDiv§202-exit] §171-ckpt delete FAILED: {_ckptDelEx.Message}{vbCrLf}")
+            End Try
+        End If
+
+        ' §211 (2026-05-15): clean up §NR-ckpt now that this SafeMpzDiv has succeeded.
+        ' Cleanup moved here from SafeMpzReciprocal exit (was at line ~3654) — see the
+        ' §211 explanation block in SafeMpzReciprocal for the rationale.  By the time we
+        ' reach §202-exit, the entire post-recip stretch (a×r → BigShiftRight → q×b →
+        ' adj loops → tdiv_q) has converged, so the iter=N r snapshot is no longer needed.
+        If _autoCheckpoint Then
+            Try
+                Dim _nrBinCleanup As String = System.IO.Path.Combine(_divCkptDir, "nr_r.bin")
+                Dim _nrMetaCleanup As String = System.IO.Path.Combine(_divCkptDir, "nr_meta.txt")
+                Dim _nrDel As Boolean = False
+                If System.IO.File.Exists(_nrBinCleanup) Then
+                    System.IO.File.Delete(_nrBinCleanup)
+                    _nrDel = True
+                End If
+                If System.IO.File.Exists(_nrMetaCleanup) Then
+                    System.IO.File.Delete(_nrMetaCleanup)
+                    _nrDel = True
+                End If
+                If _nrDel Then AppendLog($"[SafeMpzDiv§202-exit] §211: §NR-ckpt files deleted from NodeCache{vbCrLf}")
+            Catch _ckptDelEx As Exception
+                AppendLog($"[SafeMpzDiv§202-exit] §211: §NR-ckpt delete FAILED: {_ckptDelEx.Message}{vbCrLf}")
             End Try
         End If
         AppendLog($"[SafeMpzDiv§202-exit] returning to caller{vbCrLf}")
