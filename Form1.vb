@@ -71,6 +71,13 @@ Public Class Form1
     ' §171-ckpt: scope label set by SafeMpzDiv callers (e.g., "sqrt_step_5", "phase4")
     ' to disambiguate div_q.bin checkpoints across distinct call sites.
     Private Shared _divCkptScope As String = ""
+    ' §214 (2026-05-15, issue #67): True iff TryLoadPhase3SnapshotTOnly fired during the
+    ' snap_Phase3 load — means finalP and finalQ are mpz_init'd to 0 (NOT populated).  The
+    ' gmpNumer-resume path at line ~6250 MUST fire when this is True; if it fails (corrupt
+    ' gmpNumer.bin or other surprise), control would fall through to Step 1+ which assumes
+    ' P and Q are loaded.  The defensive check at the §214-assert site throws if this
+    ' invariant is violated.
+    Private Shared _p3TOnlyLoadActive As Boolean = False
     ' Custom verify checks supplied via --verify-at "DIGITS:POSITION" and
     ' --verify-contains "DIGITS".  Populated during CLI arg parsing; consumed
     ' by RunCustomVerifications() which is called from BtnTest_Click.
@@ -1979,6 +1986,51 @@ Public Class Form1
             Return True
         Catch ex As Exception
             WriteToLog($"[Phase3Snap] Load FAILED: {ex.Message} — will run Phase 1/2")
+            Return False
+        End Try
+    End Function
+
+    ' §214 (2026-05-15, issue #67): T-only sibling of TryLoadPhase3Snapshot.
+    ' When the caller has confirmed gmpNumer.bin will resume the run (skipping Steps 1-5),
+    ' P and Q are dead weight — only T is needed downstream as the divisor in SafeMpzDiv.
+    ' Skipping P + Q loads saves ~9.3 GB of working set at startup (P ~3.6 GB + Q ~5.6 GB
+    ' at 5B scale).  outP and outQ are left mpz_init'd as 0; downstream code on the
+    ' gmpNumer-resume path never touches them.  Falls back gracefully (returns False) if
+    ' the snap dir is incomplete — caller then retries the full load.
+    Private Function TryLoadPhase3SnapshotTOnly(snapDir As String, digits As Long,
+                                                 outT As mpz_t) As Boolean
+        Try
+            If Not System.IO.Directory.Exists(snapDir) Then Return False
+            Dim tPath As String = System.IO.Path.Combine(snapDir, "T.bin")
+            Dim metaPath As String = System.IO.Path.Combine(snapDir, "meta.txt")
+            If Not (System.IO.File.Exists(tPath) AndAlso System.IO.File.Exists(metaPath)) Then
+                WriteToLog("[Phase3Snap§214] T.bin or meta.txt missing — falling back to full load")
+                Return False
+            End If
+            Dim meta As New Dictionary(Of String, String)()
+            For Each metaLine As String In System.IO.File.ReadAllLines(metaPath)
+                Dim eq As Integer = metaLine.IndexOf("="c)
+                If eq > 0 Then meta(metaLine.Substring(0, eq)) = metaLine.Substring(eq + 1)
+            Next
+            Dim snapDigits As Long = 0L
+            If Not meta.ContainsKey("digits") OrElse
+               Not Long.TryParse(meta("digits"), snapDigits) OrElse
+               snapDigits <> digits Then
+                WriteToLog($"[Phase3Snap§214] digits mismatch (want {digits:N0}, " &
+                           $"have {If(meta.ContainsKey("digits"), meta("digits"), "?")}) — falling back to full load")
+                Return False
+            End If
+            Dim staging(4194303) As Byte
+            LogPhase("[ComputePi§214] gmpNumer.bin resume detected — loading T only (skipping P + Q, saves ~9 GB)")
+            Using fs As New FileStream(tPath, FileMode.Open, FileAccess.Read)
+                Using br As New BinaryReader(fs)
+                    DeserializeOneMpz(outT, br, staging)
+                End Using
+            End Using
+            LogPhase($"[ComputePi] snap_Phase3 T loaded (~{CLng(gmp_lib.mpz_sizeinbase(outT, 10)):N0} digits)")
+            Return True
+        Catch ex As Exception
+            WriteToLog($"[Phase3Snap§214] T-only load FAILED: {ex.Message} — falling back to full load")
             Return False
         End Try
     End Function
@@ -3937,6 +3989,17 @@ Public Class Form1
         ' was added the clear lived here directly; now it's at the end of the §5B-f1 block.
         Dim szAR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(ar.Pointer, 4))
 
+        ' §213 (2026-05-15, issue #66): when _5b_verify is False (which is ALL 5B-scale calls
+        ' — _5b_verify is gated to szA=175,000,001 AndAlso szR=87,500,001, the 1B sqrt-step-4
+        ' shape), §5B-f1 and §5B-f2 below are skipped entirely, so r is dead from this point
+        ' on.  Free it now to drop ~2 GB of working set during the dangerous depth-0 §gen
+        ' window that follows.  The deferred clear at the end of the §5B-f1/§5B-f2 block
+        ' becomes conditional on _5b_verify so 1B-scale runs still defer.
+        If Not _5b_verify Then
+            gmp_lib.mpz_clear(r)
+            If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§213] r cleared eagerly (_5b_verify=False, ~{CLng(szR) * 8L \ 1048576L:N0} MB freed){vbCrLf}")
+        End If
+
         ' §5B-investigate (post-mul): verify ar boundary limbs against pre-mul a, r values.
         ' Bottom: ar[0] = (a[0]*r[0]) mod 2^64 — EXACT relation, mismatch ⇒ SafeMpzMul bug.
         ' Top: ar[szAR-1] should be ≈ high(a[szA-1]*r[szR-1]) plus accumulated carry from cross
@@ -4278,7 +4341,10 @@ Public Class Form1
         ' §5B-f1/f2 (deferred from §166 site): now that the chunked-grid references are done,
         ' release r.  When both diagnostics are gated off, this clears r at exactly the same
         ' logical point as the original code.
-        gmp_lib.mpz_clear(r)
+        ' §213 (2026-05-15, issue #66): now conditional — when _5b_verify=False the eager
+        ' clear above already fired.  Only the 1B sqrt-step-4 path (_5b_verify=True) reaches
+        ' the deferred clear here.
+        If _5b_verify Then gmp_lib.mpz_clear(r)
         ' §135 save slots: ar[64654664/65] captured inside §111 block, used after BigShiftRight.
         Dim _ar135_v0 As Long = 0L
         Dim _ar135_v1 As Long = 0L
@@ -6108,10 +6174,53 @@ Phase2:
 
             ' §103: If --auto-checkpoint is active and snap_Phase3 exists, load P/Q/T
             ' and jump straight to Phase 3, skipping the 10+ hour Phase 1/2 run.
+            ' §214 (2026-05-15, issue #67): probe gmpNumer.bin first.  If it exists and
+            ' snap_Phase3 meta.txt's digits matches the current run, the gmpNumer-resume
+            ' path at line ~6250 will fire — which jumps to NumeratorDone without ever
+            ' touching finalP or finalQ.  Loading them is dead weight (P ~3.6 GB + Q ~5.6 GB
+            ' at 5B).  In that case, load T only via the new T-only helper.  Saves ~9.3 GB
+            ' of working set during startup, easing depth-0 §gen RAM pressure later.
             If _autoCheckpoint Then
                 Dim _p3P As New mpz_t(), _p3Q As New mpz_t(), _p3T As New mpz_t()
                 gmp_lib.mpz_inits(_p3P, _p3Q, _p3T, Nothing)
-                If TryLoadPhase3Snapshot(p3SnapDir, digits, _p3P, _p3Q, _p3T) Then
+
+                Dim _gmpNumerBin As String = System.IO.Path.Combine(p3SnapDir, "gmpNumer.bin")
+                Dim _metaPath As String = System.IO.Path.Combine(p3SnapDir, "meta.txt")
+                Dim _gmpNumerExists As Boolean = System.IO.File.Exists(_gmpNumerBin)
+                Dim _metaDigitsMatch As Boolean = False
+                If _gmpNumerExists AndAlso System.IO.File.Exists(_metaPath) Then
+                    Try
+                        For Each _ml As String In System.IO.File.ReadAllLines(_metaPath)
+                            Dim _eq As Integer = _ml.IndexOf("="c)
+                            If _eq > 0 AndAlso _ml.Substring(0, _eq) = "digits" Then
+                                Dim _md As Long = 0L
+                                If Long.TryParse(_ml.Substring(_eq + 1), _md) AndAlso _md = digits Then
+                                    _metaDigitsMatch = True
+                                End If
+                                Exit For
+                            End If
+                        Next
+                    Catch
+                        _metaDigitsMatch = False
+                    End Try
+                End If
+
+                Dim _loadOK As Boolean
+                If _gmpNumerExists AndAlso _metaDigitsMatch Then
+                    _loadOK = TryLoadPhase3SnapshotTOnly(p3SnapDir, digits, _p3T)
+                    If _loadOK Then
+                        _p3TOnlyLoadActive = True
+                    Else
+                        ' T-only load failed unexpectedly after probe passed — try full load
+                        ' as a safety net so we don't quietly drop into the no-P-no-Q path.
+                        WriteToLog("[ComputePi§214] T-only load failed after probe passed — retrying full P/Q/T load")
+                        _loadOK = TryLoadPhase3Snapshot(p3SnapDir, digits, _p3P, _p3Q, _p3T)
+                    End If
+                Else
+                    _loadOK = TryLoadPhase3Snapshot(p3SnapDir, digits, _p3P, _p3Q, _p3T)
+                End If
+
+                If _loadOK Then
                     finalP = _p3P : finalQ = _p3Q : finalT = _p3T
                     GoTo Phase3Start
                 End If
@@ -6247,7 +6356,17 @@ Phase3Start:
 
             ' §106 checkpoint: if gmpNumer was already computed and saved, skip Steps 1–5
             ' (SafeMpzPow10, SafeMpzMul squaring, sqrt, and all three R*Q multiplies).
-            If TryLoadPhase3Value("gmpNumer", gmpNumer, p3SnapDir) Then
+            Dim _gmpNumerResumeOK As Boolean = TryLoadPhase3Value("gmpNumer", gmpNumer, p3SnapDir)
+            ' §214-assert (2026-05-15, issue #67): if the T-only Phase3 snapshot load fired,
+            ' finalP and finalQ are mpz_init'd to 0 — only the gmpNumer-resume path is safe
+            ' from here.  If TryLoadPhase3Value unexpectedly fails (e.g., corrupt gmpNumer.bin),
+            ' abort with a clear message rather than fall through to Step 1+ which needs P+Q.
+            If _p3TOnlyLoadActive AndAlso Not _gmpNumerResumeOK Then
+                Throw New Exception("[ComputePi§214-assert] gmpNumer.bin failed to load after T-only " &
+                                    "Phase3 snapshot was used (P+Q skipped).  Recovery: delete gmpNumer.bin " &
+                                    "to force a fresh full P/Q/T load on next launch.")
+            End If
+            If _gmpNumerResumeOK Then
                 LogPhase("[ComputePi] gmpNumer loaded from checkpoint — skipping Steps 1–5")
                 ' finalT is still needed for the divide — reload from spill or checkpoint.
                 gmp_lib.mpz_clear(finalT)   ' finalT was mpz_inits'd above as 0

@@ -4283,3 +4283,73 @@ If the next 5B run crashes in the same place, §212 tells us:
 
 These distinguish the three candidate root causes for the AV: heap pressure,
 mpz_t 32-bit `_mp_size` overflow, and allocator heap corruption.
+
+## §213 — Eager `r`-clear in SafeMpzDiv when `_5b_verify=False` (issue #66, 2026-05-15)
+
+`_5b_verify` ([Form1.vb:3890](Form1.vb#L3890)) is `(szA = 175000001 AndAlso szR = 87500001)`
+— a size-specific gate that fires only at the 1B-scale sqrt-step-4 shape.  At all
+5B-class operand sizes the gate is `False`, and the §5B-f1 ([Form1.vb:4003](Form1.vb#L4003))
+and §5B-f2 ([Form1.vb:4131](Form1.vb#L4131)) chunked-grid verification blocks that follow
+`SafeMpzMul(ar, a, r)` never run.  But the original code kept `r` alive (deferred
+`mpz_clear(r)` until [~line 4281](Form1.vb#L4281)) so the diagnostics could read its
+data buffer.  At 5B scale this meant a 1.98 GB buffer (259M limbs × 8 bytes) was
+held in the working set through the entire depth-0 §gen window — the exact window
+the 2026-05-15 09:55 AV crashed in.
+
+§213 adds an eager `mpz_clear(r)` immediately after `SafeMpzMul(ar, a, r)` returns
+when `_5b_verify` is `False` ([Form1.vb:~3940](Form1.vb#L3940)).  The deferred clear
+at line ~4281 becomes conditional on `_5b_verify` so the 1B-scale path still
+defers as before.
+
+**RAM saving at 5B**: ~2 GB working set during depth-0 §gen.
+**Perf impact**: zero — `r` is unused on the 5B path between the eager and deferred
+clear sites.
+
+## §214 — Skip P+Q load when `gmpNumer.bin` resume will fire (issue #67, 2026-05-15)
+
+When the 5B final-divide stage starts from a fully-checkpointed `snap_Phase3`
+that includes `gmpNumer.bin`, the run path is:
+
+```
+Phase3Start → mpz_init(...) → TryLoadPhase3Value("gmpNumer") succeeds
+            → GoTo NumeratorDone → SafeMpzDiv (the final divide)
+```
+
+Neither `finalP` nor `finalQ` is read between `Phase3Start` and `NumeratorDone`.
+The original `TryLoadPhase3Snapshot` ([Form1.vb:1931](Form1.vb#L1931)) eagerly
+deserialized **all three** of P/Q/T (~14.8 GB at 5B: P 3.6 GB + Q 5.6 GB + T 5.6
+GB) before the gmpNumer-resume check fired.  P and Q were then dead weight on the
+heap until the regular sqrt-completion cleanup freed P at ~[line 6364](Form1.vb#L6364)
+and Q piecemeal during r0/r1/r2 multiplies (which don't run on the gmpNumer-resume
+path).
+
+§214 adds `TryLoadPhase3SnapshotTOnly` ([Form1.vb:~1986](Form1.vb#L1986)) and a
+probe at the call site ([Form1.vb:~6111](Form1.vb#L6111)):
+
+1. Read `snap_Phase3/meta.txt` and check `digits` matches.
+2. Check `gmpNumer.bin` exists.
+3. If **both** pass, load T only.  Set `_p3TOnlyLoadActive = True` to record the
+   skip.
+4. Otherwise, fall through to the full P+Q+T load.
+
+A `§214-assert` block at the gmpNumer-resume site ([Form1.vb:~6250](Form1.vb#L6250))
+throws a clear error if `_p3TOnlyLoadActive` is `True` but `TryLoadPhase3Value("gmpNumer")`
+returns `False` (e.g., gmpNumer.bin became corrupted after the probe passed) — this
+prevents a silent fall-through to Step 1+ which would touch the empty finalP/finalQ.
+
+**RAM saving at 5B**: ~9.3 GB working set at startup peak (drops the post-Phase-3-load
+mark from ~15 GB to ~5.6 GB on the gmpNumer-resume path).
+**Perf impact**: zero — the work being skipped is I/O on dead-weight buffers.
+
+**Combined impact of §213 + §214 at 5B**: ~11.3 GB of working-set relief during the
+dangerous depth-0 §gen window, taking the projected peak from ~38 GB to ~27 GB on a
+64 GB box.
+
+### Recovery from a corrupt gmpNumer.bin under §214
+
+If `gmpNumer.bin` becomes corrupted between launches, the §214-assert throws.
+Recovery: delete `gmpNumer.bin` from both `NodeCache\snap_Phase3\` and
+`SnapshotStore\snap_Phase3\`.  Next launch will see `_gmpNumerExists = False`, fall
+through to the full P+Q+T load, and recompute Steps 1-5 from scratch (~50 h at 5B).
+A backup of `gmpNumer.bin` (currently at `C:\PiBackup_postcrash_2026-05-15\NodeCache\snap_Phase3\`)
+can shorten that to a file copy.
