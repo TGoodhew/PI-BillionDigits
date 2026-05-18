@@ -2926,9 +2926,15 @@ Public Class Form1
                 Dim _sv_prod As IntPtr = prods(k).Pointer
                 Dim _logPre As Integer = If(_logLevel >= 2, System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_prod, 4)), 0)
                 If _logLevel >= 2 Then
+                    ' §215: Int32 overflow in offset arithmetic.  _logPre is Integer; (_logPre-1)*8
+                    ' overflows Int32 when _logPre > 2^28 = 268,435,456 limbs.  At the topmost a×r
+                    ' recursion level for 5B (szA=998M × szB=259M), prods(k) reaches 419M limbs;
+                    ' (419,352,782)*8 = 3,354,822,256 wraps to -940,145,040 → AccessViolation in
+                    ' Marshal.ReadInt64.  Fix: compute the absolute limb address in 64-bit, then
+                    ' read at offset 0.  Same fix applied at §SafeMpzDiv a/ar/b log sites.
                     Dim _prodDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_prod, 8))
-                    Dim _prodTop As Long = If(_logPre >= 1, Runtime.InteropServices.Marshal.ReadInt64(_prodDPtr, (_logPre - 1) * 8), 0L)
-                    Dim _prodTop2 As Long = If(_logPre >= 2, Runtime.InteropServices.Marshal.ReadInt64(_prodDPtr, (_logPre - 2) * 8), 0L)
+                    Dim _prodTop As Long = If(_logPre >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_prodDPtr.ToInt64() + (CLng(_logPre) - 1L) * 8L), 0), 0L)
+                    Dim _prodTop2 As Long = If(_logPre >= 2, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_prodDPtr.ToInt64() + (CLng(_logPre) - 2L) * 8L), 0), 0L)
                     AppendLog($"[SafeMpzMul§gen] k={k} ki={ki} kj={kj} shift={shiftBits:N0} szProd={_logPre:N0} top2=[{_prodTop:X16} {_prodTop2:X16}]{vbCrLf}")
                     ' §111: For the final a*r call only, log product limb at the known error position.
                     If k = 8 AndAlso szA = 43750001 AndAlso szB = 21875001 Then
@@ -3916,9 +3922,10 @@ Public Class Form1
         gmp_lib.mpz_init(ar)
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] computing a*r (szA={szA:N0} szR={szR:N0})...{vbCrLf}")
         If _logLevel >= 2 Then
+            ' §215: 64-bit safe offset (szA can be 998M at 5B).
             Dim _aDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(a.Pointer, 8))
-            Dim _aTop As Long = If(szA >= 1, Runtime.InteropServices.Marshal.ReadInt64(_aDPtr, (szA - 1) * 8), 0L)
-            Dim _aTop2 As Long = If(szA >= 2, Runtime.InteropServices.Marshal.ReadInt64(_aDPtr, (szA - 2) * 8), 0L)
+            Dim _aTop As Long = If(szA >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_aDPtr.ToInt64() + (CLng(szA) - 1L) * 8L), 0), 0L)
+            Dim _aTop2 As Long = If(szA >= 2, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_aDPtr.ToInt64() + (CLng(szA) - 2L) * 8L), 0), 0L)
             AppendLog($"[SafeMpzDiv] a top2=[{_aTop:X16} {_aTop2:X16}]{vbCrLf}")
         End If
         ' §154: log r at key positions for independent ar verification.
@@ -4366,9 +4373,10 @@ Public Class Form1
         Dim _ar151_pairs(3, 1) As Long  ' (4 points) × (v0, v1)
         Dim _ar151_qIdx() As Long = {20600000L, 20700000L, 20800000L, 20900000L}
         If _logLevel >= 2 Then
+            ' §215: 64-bit safe offset (szAR can be 1.26B at 5B).
             Dim _arDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
-            Dim _arTop As Long = If(szAR >= 1, Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, (szAR - 1) * 8), 0L)
-            Dim _arTop2 As Long = If(szAR >= 2, Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, (szAR - 2) * 8), 0L)
+            Dim _arTop As Long = If(szAR >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_arDPtr.ToInt64() + (CLng(szAR) - 1L) * 8L), 0), 0L)
+            Dim _arTop2 As Long = If(szAR >= 2, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_arDPtr.ToInt64() + (CLng(szAR) - 2L) * 8L), 0), 0L)
             ' Boundary limbs: at index kBits\64 and kBits\64+1. q_bot = (bnd0 >> kBits%64) | (bnd1 << (64 - kBits%64))
             Dim _kLimb As Long = kBits \ 64L
             Dim _kRem As Integer = CInt(kBits Mod 64L)
@@ -4432,9 +4440,10 @@ Public Class Form1
         ' §171-ckpt: szQ assignment lifted (Dim moved to top of SafeMpzDiv).
         szQ = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(ar.Pointer, 4))
         If _logLevel >= 2 Then
+            ' §215: 64-bit safe offset (szQ ≈ 259M at 5B — just under Int32 threshold).
             Dim _qDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
-            Dim _qTop As Long = If(szQ >= 1, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, (szQ - 1) * 8), 0L)
-            Dim _qTop2 As Long = If(szQ >= 2, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, (szQ - 2) * 8), 0L)
+            Dim _qTop As Long = If(szQ >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_qDPtr.ToInt64() + (CLng(szQ) - 1L) * 8L), 0), 0L)
+            Dim _qTop2 As Long = If(szQ >= 2, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_qDPtr.ToInt64() + (CLng(szQ) - 2L) * 8L), 0), 0L)
             Dim _qBot As Long = If(szQ >= 1, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, 0), 0L)
             Dim _qBot2 As Long = If(szQ >= 2, Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, 8), 0L)
             AppendLog($"[SafeMpzDiv] q_approx ready: szQ={szQ:N0} top2limbs=[{_qTop:X16} {_qTop2:X16}] bot2limbs=[{_qBot:X16} {_qBot2:X16}]{vbCrLf}")
@@ -4863,10 +4872,11 @@ PostShiftCheckpoint:
         Dim remSign As Integer = System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
         Dim szRem As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
         If _logLevel >= 2 Then
+            ' §215: 64-bit safe offset (szB can be 739M at 5B).
             Dim _remDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_remRaw, 8))
-            Dim _remTop As Long = If(szRem >= 1, Runtime.InteropServices.Marshal.ReadInt64(_remDPtr, (szRem - 1) * 8), 0L)
+            Dim _remTop As Long = If(szRem >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_remDPtr.ToInt64() + (CLng(szRem) - 1L) * 8L), 0), 0L)
             Dim _bDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_bPtr, 8))
-            Dim _bTop As Long = If(szB >= 1, Runtime.InteropServices.Marshal.ReadInt64(_bDPtr, (szB - 1) * 8), 0L)
+            Dim _bTop As Long = If(szB >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_bDPtr.ToInt64() + (CLng(szB) - 1L) * 8L), 0), 0L)
             AppendLog($"[SafeMpzDiv] q*b done: szQB={szQB:N0}; remainder sign={remSign} szRem={szRem:N0} remTop={_remTop:X16} bTop={_bTop:X16}{vbCrLf}")
         End If
 

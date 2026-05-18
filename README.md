@@ -4353,3 +4353,40 @@ Recovery: delete `gmpNumer.bin` from both `NodeCache\snap_Phase3\` and
 through to the full P+Q+T load, and recompute Steps 1-5 from scratch (~50 h at 5B).
 A backup of `gmpNumer.bin` (currently at `C:\PiBackup_postcrash_2026-05-15\NodeCache\snap_Phase3\`)
 can shorten that to a file copy.
+
+## §215 — Int32 overflow in §gen / SafeMpzDiv log-offset arithmetic (2026-05-17)
+
+The 5B run resumed at §NR-ckpt iter 36, completed iter 37 (13h40m), and crashed
+**14h into the post-recip `a × r` Barrett multiply** with `System.AccessViolationException`
+in `Marshal.ReadInt64`, ~92% of the way through the top-level §gen accumulation.
+
+Root cause: diagnostic-only logging code in `SafeMpzMul.§gen` ([Form1.vb:2929-2931](Form1.vb#L2929-L2931))
+and four `SafeMpzDiv` log sites computed limb-array offsets as `(sz - 1) * 8` where
+both operands are `Integer` (Int32) — silently overflowing when `sz ≥ 2^28 = 268,435,456`
+limbs.  At the topmost a×r recursion (998M × 259M), each sub-product is ≈ 419M limbs,
+giving `(419,352,782) * 8 = 3,354,822,256` which wraps to `-940,145,040` in Int32.
+`Marshal.ReadInt64(ptr, -940M)` then reads outside the buffer → AccessViolation.
+
+This bug had been latent for every prior run because:
+- 1B-scale runs never exceeded ~67M-limb sub-products (well under 2^28).
+- Iter 37's two NR multiplies (r×r and bTrunc×rSq) had sub-products of 260M and 174M
+  limbs — close to but below the 2^28 boundary, so they didn't trigger it.
+- Only the post-recip `a × r` (with `a` ≈ 998M limbs) generates 419M-limb sub-products
+  in its top-level recursion.  5B is the first scale where this fires.
+
+Fix: compute the absolute limb address in 64-bit (`dPtr.ToInt64() + (CLng(sz) - N) * 8L`)
+and read at offset 0.  Applied at 5 active-at-5B logging sites:
+- [Form1.vb:2934-2936](Form1.vb#L2934-L2936) — §gen prod top-limb logging (the crash site)
+- [Form1.vb:3919-3924](Form1.vb#L3919-L3924) — `SafeMpzDiv` `a` top-limb logging
+- [Form1.vb:4373-4376](Form1.vb#L4373-L4376) — `SafeMpzDiv` `ar` top-limb logging
+- [Form1.vb:4438-4441](Form1.vb#L4438-L4441) — `SafeMpzDiv` `q` top-limb logging
+- [Form1.vb:4870-4874](Form1.vb#L4870-L4874) — `SafeMpzDiv` `rem` / `b` top-limb logging
+
+Twelve other occurrences of the same pattern exist in the file but are gated by
+size predicates that never fire at 5B (`mA = 7291667`, `szA = 21875001`, `bShift = 0`,
+etc.) and so cannot trigger overflow at this scale.  They are left as-is to keep the
+diff minimal; a comprehensive sweep is captured separately under "code hygiene."
+
+**Recovery path**: §NR-ckpt iter=37 is still on disk (§211 deferred cleanup); on resume
+the app reloads `r` in seconds and re-enters `SafeMpzDiv` from a×r start.  Expect
+another ~36h to reach the next §171-ckpt save (post-`a × r`, post-`BigShiftRight`).
