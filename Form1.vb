@@ -6207,12 +6207,24 @@ Phase2:
         AppendLog($"[§216] 10^{CHUNK_DIGITS:N0} computed in {(DateTime.Now - _powStart).TotalMinutes:F2} min{vbCrLf}")
 
         ' piMutable: working copy of pi, divided down each iteration.
+        ' §216a: PreAlloc to pi's size BEFORE mpz_set, otherwise GMP's MPZ_REALLOC inside
+        ' mpz_set aborts with "overflow in mpz type" when needed > INT_MAX/64 = 33,554,431
+        ' limbs.  At 5B digits pi is ~260M limbs.  PreAllocMpzToLimbs writes _mp_alloc
+        ' directly via Marshal.WriteInt32, bypassing GMP's check entirely.
         Dim piMutable As New mpz_t()
         gmp_lib.mpz_init(piMutable)
+        Dim _piSrcSize As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(pi.Pointer, 4)))
+        PreAllocMpzToLimbs(piMutable, _piSrcSize + 2L)
+        AppendLog($"[§216] piMutable PreAlloc'd to {(_piSrcSize + 2L):N0} limbs before mpz_set{vbCrLf}")
         gmp_lib.mpz_set(piMutable, pi)
 
+        ' chunkRem: pre-allocate to divisor size + a few limbs (max possible remainder size).
+        ' 15.5M < 33.5M so GMP's auto-realloc would also work, but PreAlloc avoids the
+        ' first-iteration small→large realloc round-trip.
         Dim chunkRem As New mpz_t()
         gmp_lib.mpz_init(chunkRem)
+        Dim _dAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(D.Pointer, 0))
+        PreAllocMpzToLimbs(chunkRem, _dAlloc + 2L)
 
         ' chunkEndPos: exclusive upper bound in outBuf where the next chunk will end.
         ' Starts at bufSize-1 (reserve last byte for null terminator).
