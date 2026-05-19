@@ -6186,8 +6186,13 @@ Phase2:
     ' Issue #37 plans a parallel recursive halving version of this — §216 is
     ' the minimal serial workaround to unblock the in-flight 5B run.
     Private Sub ChunkedMpzGetStr(pi As mpz_t, totalDigitsEstimate As Long)
-        Const CHUNK_DIGITS As Long = 300_000_000L
-        AppendLog($"[§216] Chunked decimal conversion start: totalDigitsEstimate={totalDigitsEstimate:N0} chunk={CHUNK_DIGITS:N0}{vbCrLf}")
+        ' §216d: reduced chunk from 300M → 50M.  At 300M chunk, mpz_get_str crashed
+        ' inside __gmpn_dc_get_str on a 15.5M-limb chunkRem producing 300M-char output.
+        ' At 50M chunk: chunkRem is ~2.6M limbs, mpz_get_str internal temps drop from
+        ' ~3 GB to ~200 MB.  Trade-off: 100 fdiv_qr iterations instead of 17, but each
+        ' is faster (smaller 10^50M divisor).  Net throughput is similar.
+        Const CHUNK_DIGITS As Long = 50_000_000L
+        AppendLog($"[§216d] Chunked decimal conversion start: totalDigitsEstimate={totalDigitsEstimate:N0} chunk={CHUNK_DIGITS:N0}{vbCrLf}")
 
         ' Allocate output buffer: totalDigits + 16 bytes slack (room for null terminator + a safety margin)
         Dim bufSize As Long = totalDigitsEstimate + 16L
@@ -6218,6 +6223,14 @@ Phase2:
         AppendLog($"[§216] piMutable PreAlloc'd to {(_piSrcSize + 2L):N0} limbs before mpz_set{vbCrLf}")
         gmp_lib.mpz_set(piMutable, pi)
 
+        ' §216d: free the caller's pi (= gmpPi) buffer NOW — we've copied to piMutable
+        ' and never reference pi again.  Saves ~2 GB during the chunked conversion,
+        ' lowering peak commit pressure.  Reinit to a 1-limb stub so the caller's
+        ' mpz_clear(gmpPi) at line 7192 is still safe.
+        gmp_lib.mpz_clear(pi)
+        gmp_lib.mpz_init(pi)
+        AppendLog($"[§216d] caller's pi buffer freed (~2 GB) after copy to piMutable{vbCrLf}")
+
         ' chunkRem: pre-allocate to divisor size + a few limbs (max possible remainder size).
         ' 15.5M < 33.5M so GMP's auto-realloc would also work, but PreAlloc avoids the
         ' first-iteration small→large realloc round-trip.
@@ -6247,11 +6260,17 @@ Phase2:
 
         While gmp_lib.mpz_sgn(piMutable) > 0
             Dim _chunkStart As DateTime = DateTime.Now
+            Dim _piSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(piMutable.Pointer, 4)))
+            AppendLog($"[§216c] iter {chunkIdx + 1L} start: piMutable_sz={_piSz:N0} → mpz_fdiv_qr...{vbCrLf}")
 
             ' §216b: de-aliased call — quot=quotTmp, num=piMutable, rem=chunkRem, den=D.
             ' Then mpz_set(piMutable, quotTmp) for next iteration (no realloc, alloc already 260M).
             gmp_lib.mpz_fdiv_qr(quotTmp, chunkRem, piMutable, D)
+            Dim _qSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(quotTmp.Pointer, 4)))
+            Dim _rSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(chunkRem.Pointer, 4)))
+            AppendLog($"[§216c] iter {chunkIdx + 1L}: fdiv_qr done, qSz={_qSz:N0} rSz={_rSz:N0} → mpz_set...{vbCrLf}")
             gmp_lib.mpz_set(piMutable, quotTmp)
+            AppendLog($"[§216c] iter {chunkIdx + 1L}: mpz_set done → mpz_get_str on rem...{vbCrLf}")
             Dim _divElapsed As TimeSpan = DateTime.Now - _chunkStart
 
             ' Convert rem to a string of up to CHUNK_DIGITS decimal digits (no leading zeros).
