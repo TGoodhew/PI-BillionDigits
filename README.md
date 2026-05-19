@@ -4390,3 +4390,58 @@ diff minimal; a comprehensive sweep is captured separately under "code hygiene."
 **Recovery path**: §NR-ckpt iter=37 is still on disk (§211 deferred cleanup); on resume
 the app reloads `r` in seconds and re-enters `SafeMpzDiv` from a×r start.  Expect
 another ~36h to reach the next §171-ckpt save (post-`a × r`, post-`BigShiftRight`).
+
+## §216 — Chunked decimal conversion to avoid mpz_get_str crash at 5B (2026-05-19)
+
+The 5B run resumed cleanly after §215, completed iter 37, a×r, q×b, and §171 adj
+loops (adj-down=0, adj-up=0 — Barrett quotient was exact), and **`§piCkpt` saved
+`gmpPi.bin` successfully**.  The next step — `mpz_get_str` converting `gmpPi` to a
+decimal string — then crashed with `0xC0000005 AccessViolation`:
+
+```
+Fatal error.
+0xC0000005
+   at Math.Gmp.Native.gmp_lib+SafeNativeMethods.__gmpz_get_str(IntPtr, Int32, IntPtr)
+   at Math.Gmp.Native.gmp_lib.mpz_get_str(...)
+   at PI_BillionDigits.Form1.ComputePiGMP(...)
+```
+
+Root cause appears to be **Int32 overflow in GMP's internal recursive
+`mpn_dc_get_str` divide-and-conquer**: each level computes buffer positions
+using `mp_size_t` (= `int` on Windows x64).  At 5B digits the output is
+≈ 5 GB > 2³¹ bytes, and once internal byte positions exceed 2³¹ they wrap to
+negative and dereference outside the buffer.  Same class of bug as §215, but
+inside GMP itself rather than in our diagnostic logging.
+
+Fix: route large outputs to a new **ChunkedMpzGetStr** helper
+([Form1.vb:6160-6280](Form1.vb#L6160-L6280)) that extracts 300M-digit slabs
+iteratively via:
+
+```
+rem = pi mod 10^300M
+pi  = pi //  10^300M
+```
+
+and calls `mpz_get_str` on each `rem` separately.  Each chunk produces ≤ 300M
+chars ≈ 300 MB output — well within GMP's safe range.  Slabs are written
+right-to-left into a pre-allocated 5 GB `VirtualAlloc` buffer, padded with
+leading zeros where needed, then `RtlMoveMemory`d back to offset 0.
+
+Routing threshold: outputs ≥ 1.5B digits use the chunked path; smaller outputs
+(1B and below) continue to use the native `mpz_get_str` directly.
+
+**Cost at 5B**: 17 chunks × `mpz_fdiv_qr` calls at progressively shrinking
+dividend sizes (5B → 4.7B → ... → 300M digits) divided by a fixed 300M-digit
+divisor (10^300M, ≈ 15.5M limbs).  Plus a one-time `mpz_ui_pow_ui(10, 300M)`
+to build the divisor.  Estimated wall time: 4-8 h.
+
+**Recovery for the in-flight 5B run**: `gmpPi.bin` (2.08 GB) is on disk at
+`snap_Phase3\gmpPi.bin` from the 2026-05-19 13:19 `§piCkpt` save.  On resume,
+`ComputePi` loads it directly (skipping every step from `gmpNumer` through the
+final `SafeMpzDiv`) and proceeds straight into `ChunkedMpzGetStr`.
+
+**Future direction**: issue #37 ("§110: Parallel decimal string conversion")
+proposes a parallel recursive halving version of this algorithm — same shape
+as §216 but with concurrent left/right sub-trees, predicted ~5-10× speedup
+on 24-core hardware.  §216 is the minimal serial workaround to unblock the
+in-flight 5B run; #37 is the proper optimisation.

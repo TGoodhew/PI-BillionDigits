@@ -268,6 +268,11 @@ Public Class Form1
     Private Shared Sub CopyMemory(dest As IntPtr, src As IntPtr, length As UIntPtr)
     End Sub
 
+    ' §216: strlen used to measure GMP-returned char buffers in chunked decimal conversion.
+    <DllImport("msvcrt.dll", CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Function strlen(s As IntPtr) As UIntPtr
+    End Function
+
     Private Const MEM_COMMIT_RESERVE As UInteger = &H3000UI  ' MEM_COMMIT | MEM_RESERVE
     Private Const MEM_RELEASE As UInteger = &H8000UI
     Private Const VA_PAGE_READWRITE As UInteger = &H4UI
@@ -6152,6 +6157,142 @@ Phase2:
     End Sub
 
     ' ════════════════════════════════════════════════════════════════════════
+    '  §216: Chunked decimal conversion (replaces mpz_get_str for huge outputs)
+    ' ════════════════════════════════════════════════════════════════════════
+    ' GMP's mpz_get_str crashes with 0xC0000005 AccessViolation when the output
+    ' exceeds approximately 2 GB.  Observed on the 2026-05-19 5B run: §piCkpt
+    ' fired (gmpPi safely saved), then mpz_get_str was called on the 5B-digit
+    ' result (output ≈ 5 GB) and crashed inside __gmpz_get_str.  The whole
+    ' multi-hour SafeMpzDiv pipeline ran to completion successfully — only
+    ' final decimal conversion failed.
+    '
+    ' Root cause is likely Int32 overflow in mpz_get_str's recursive
+    ' divide-and-conquer (mpn_dc_get_str / mpn_dc_get_str_powtab in GMP source).
+    ' Each recursion level computes positions in the output buffer using
+    ' mp_size_t (int = 32 bits on Windows x64).  Once output_size > 2^31 bytes,
+    ' those positions can wrap and dereference outside the buffer.
+    '
+    ' Fix: iteratively extract 300M-digit slabs from gmpPi via
+    '   rem = pi mod 10^300M ; pi = pi // 10^300M
+    ' and call mpz_get_str on each rem (output ≤ 300 MB, well within safe range).
+    ' Write each slab right-to-left into a pre-allocated VirtualAlloc buffer,
+    ' padding non-MSB slabs with leading zeros to 300M chars.  After all slabs
+    ' extracted, memmove the contents to offset 0.
+    '
+    ' For 5B digits: 17 slabs.  Cost dominated by 17 × mpz_fdiv_qr at
+    ' shrinking dividend sizes (5B → 4.7B → ... → 300M digits) divided by a
+    ' fixed 300M-digit divisor.  Expected wall time at 5B: ~4-8 h.
+    '
+    ' Issue #37 plans a parallel recursive halving version of this — §216 is
+    ' the minimal serial workaround to unblock the in-flight 5B run.
+    Private Sub ChunkedMpzGetStr(pi As mpz_t, totalDigitsEstimate As Long)
+        Const CHUNK_DIGITS As Long = 300_000_000L
+        AppendLog($"[§216] Chunked decimal conversion start: totalDigitsEstimate={totalDigitsEstimate:N0} chunk={CHUNK_DIGITS:N0}{vbCrLf}")
+
+        ' Allocate output buffer: totalDigits + 16 bytes slack (room for null terminator + a safety margin)
+        Dim bufSize As Long = totalDigitsEstimate + 16L
+        Dim outBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(bufSize)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+        If outBuf = IntPtr.Zero Then
+            Throw New OutOfMemoryException($"§216: VirtualAlloc {bufSize:N0} bytes for output buffer failed")
+        End If
+        AppendLog($"[§216] Output buffer: {bufSize:N0} bytes at 0x{outBuf.ToInt64():X16}{vbCrLf}")
+
+        ' Compute 10^CHUNK_DIGITS — one-time cost.  Result is a CHUNK_DIGITS-digit number,
+        ' ≈ 15.5M limbs ≈ 124 MB in mpz_t native form.  Cost: log2(CHUNK_DIGITS) ≈ 28 squarings,
+        ' last of which is (CHUNK_DIGITS/2)-digit × (CHUNK_DIGITS/2)-digit.  Takes ~minutes.
+        Dim _powStart As DateTime = DateTime.Now
+        Dim D As New mpz_t()
+        gmp_lib.mpz_init(D)
+        gmp_lib.mpz_ui_pow_ui(D, 10UI, CULng(CHUNK_DIGITS))
+        AppendLog($"[§216] 10^{CHUNK_DIGITS:N0} computed in {(DateTime.Now - _powStart).TotalMinutes:F2} min{vbCrLf}")
+
+        ' piMutable: working copy of pi, divided down each iteration.
+        Dim piMutable As New mpz_t()
+        gmp_lib.mpz_init(piMutable)
+        gmp_lib.mpz_set(piMutable, pi)
+
+        Dim chunkRem As New mpz_t()
+        gmp_lib.mpz_init(chunkRem)
+
+        ' chunkEndPos: exclusive upper bound in outBuf where the next chunk will end.
+        ' Starts at bufSize-1 (reserve last byte for null terminator).
+        Dim chunkEndPos As Long = bufSize - 1L
+        Runtime.InteropServices.Marshal.WriteByte(New IntPtr(outBuf.ToInt64() + chunkEndPos), CByte(0))   ' null terminator
+
+        Dim chunkIdx As Long = 0
+
+        While gmp_lib.mpz_sgn(piMutable) > 0
+            Dim _chunkStart As DateTime = DateTime.Now
+
+            ' rem = piMutable mod D ;  piMutable //= D
+            gmp_lib.mpz_fdiv_qr(piMutable, chunkRem, piMutable, D)
+            Dim _divElapsed As TimeSpan = DateTime.Now - _chunkStart
+
+            ' Convert rem to a string of up to CHUNK_DIGITS decimal digits (no leading zeros).
+            Dim chunkCharPtr As char_ptr = gmp_lib.mpz_get_str(char_ptr.Zero, 10, chunkRem)
+            Dim chunkLen As Long = CLng(strlen(chunkCharPtr.Pointer).ToUInt64())
+
+            Dim isTop As Boolean = (gmp_lib.mpz_sgn(piMutable) = 0)
+            Dim writeAt As Long
+            Dim zeroPadCount As Long = 0
+
+            If isTop Then
+                ' MSB chunk: write actual chunkLen bytes; no leading-zero padding.
+                writeAt = chunkEndPos - chunkLen
+                CopyMemory(New IntPtr(outBuf.ToInt64() + writeAt), chunkCharPtr.Pointer, New UIntPtr(CULng(chunkLen)))
+            Else
+                ' Non-top chunk: must fill exactly CHUNK_DIGITS columns, padded with leading zeros.
+                writeAt = chunkEndPos - CHUNK_DIGITS
+                zeroPadCount = CHUNK_DIGITS - chunkLen
+                ' Write ASCII '0's for the leading padding.  Byte-loop is ~250 MB/s; for 300M
+                ' this is ≈ 1 s per chunk — negligible relative to the mpz_fdiv_qr time.
+                Dim _padDest As Long = outBuf.ToInt64() + writeAt
+                For i As Long = 0 To zeroPadCount - 1
+                    Runtime.InteropServices.Marshal.WriteByte(New IntPtr(_padDest + i), CByte(48))   ' '0' = 0x30
+                Next
+                ' Copy the digits after the zero padding.
+                CopyMemory(New IntPtr(outBuf.ToInt64() + writeAt + zeroPadCount), chunkCharPtr.Pointer, New UIntPtr(CULng(chunkLen)))
+            End If
+
+            chunkEndPos = writeAt
+
+            ' Free the GMP-allocated chunk buffer via the registered free callback (= our NativeFreeFunc).
+            _savedGmpFree(New void_ptr(chunkCharPtr.Pointer), New size_t(CULng(chunkLen + 1L)))
+
+            chunkIdx += 1
+            Dim _chunkTotal As TimeSpan = DateTime.Now - _chunkStart
+            AppendLog($"[§216] chunk {chunkIdx} done: chunkLen={chunkLen:N0} isTop={isTop} pad={zeroPadCount:N0} writeAt={writeAt:N0} (div={_divElapsed.TotalMinutes:F1}m, total={_chunkTotal.TotalMinutes:F1}m){vbCrLf}")
+        End While
+
+        ' Clean up GMP scratch.
+        gmp_lib.mpz_clear(piMutable)
+        gmp_lib.mpz_clear(chunkRem)
+        gmp_lib.mpz_clear(D)
+
+        ' The actual content lives in outBuf[chunkEndPos .. bufSize-1] with a null terminator at bufSize-1.
+        ' Shift it back to offset 0 so downstream code sees the digits starting at outBuf[0].
+        Dim actualStart As Long = chunkEndPos
+        Dim actualLen As Long = (bufSize - 1L) - actualStart   ' excludes null terminator
+        AppendLog($"[§216] actualStart={actualStart:N0} actualLen={actualLen:N0}{vbCrLf}")
+
+        If actualStart > 0 Then
+            Dim _moveStart As DateTime = DateTime.Now
+            ' RtlMoveMemory handles overlap correctly.
+            CopyMemory(outBuf, New IntPtr(outBuf.ToInt64() + actualStart), New UIntPtr(CULng(actualLen)))
+            ' Re-place null terminator at the new end of content.
+            Runtime.InteropServices.Marshal.WriteByte(New IntPtr(outBuf.ToInt64() + actualLen), CByte(0))
+            AppendLog($"[§216] memmove of {actualLen:N0} bytes done in {(DateTime.Now - _moveStart).TotalSeconds:F2}s{vbCrLf}")
+        End If
+
+        ' Populate display state so downstream code (WritePiDigitsToFile, autoVerify) works unchanged.
+        _displayNativePtr = outBuf
+        _displayNativeLen = actualLen + 1L   ' includes null terminator (mirrors mpz_get_str path)
+        _displayNativeBufSize = bufSize
+
+        AppendLog($"[§216] Chunked decimal conversion complete: {actualLen:N0} digits in {chunkIdx} chunks{vbCrLf}")
+    End Sub
+
+    ' ════════════════════════════════════════════════════════════════════════
     '  Main computation entry point
     ' ════════════════════════════════════════════════════════════════════════
 
@@ -7164,11 +7305,24 @@ NumeratorDone:
                                        LblStatus.Text = $"String conversion... {elapsed:mm\:ss} elapsed"
                                    End Sub)
                 End Sub, Nothing, 1000, 1000)
-            Dim piCharPtr As char_ptr
+            ' §216: GMP's mpz_get_str crashes with AccessViolation when the output exceeds
+            ' ~2 GB (5B digits = 5 GB output).  Root cause appears to be Int32 overflow in
+            ' mpz_get_str's internal recursive divide-and-conquer.  Route large outputs to
+            ' ChunkedMpzGetStr which extracts 300M-digit slabs via mpz_fdiv_qr / 10^300M and
+            ' calls mpz_get_str on each (each chunk ≤ 300 MB output, well within safe range).
+            Dim _piDigitsEstimate As Long = CLng(gmp_lib.mpz_sizeinbase(gmpPi, 10))
+            Dim _usedChunkedPath As Boolean = False
+            Dim piCharPtr As char_ptr = char_ptr.Zero
             Dim _strConvSw As New Diagnostics.Stopwatch()
             _strConvSw.Start()
             Try
-                piCharPtr = gmp_lib.mpz_get_str(char_ptr.Zero, 10, gmpPi)
+                If _piDigitsEstimate >= 1_500_000_000L Then
+                    WriteToLog($"[ComputePi§216] Routing to chunked decimal converter (digits~={_piDigitsEstimate:N0} >= 1.5B threshold){vbCrLf}")
+                    ChunkedMpzGetStr(gmpPi, _piDigitsEstimate)   ' sets _displayNativePtr, _displayNativeLen, _displayNativeBufSize
+                    _usedChunkedPath = True
+                Else
+                    piCharPtr = gmp_lib.mpz_get_str(char_ptr.Zero, 10, gmpPi)
+                End If
             Finally
                 _strConvTimer.Dispose()
             End Try
@@ -7187,14 +7341,19 @@ NumeratorDone:
             ' alloc of (sizeinbase + 2) bytes.  Used to set _displayNativeLen correctly and
             ' to decide whether to free the buffer via VirtualFree or _savedGmpFree.
             Dim _piDigits As Long = CLng(gmp_lib.mpz_sizeinbase(gmpPi, 10))
-            _displayNativeBufSize = _piDigits + 2L   ' mirrors GmpAllocFunc's received size
+            ' §216: when chunked path was used, _displayNativePtr/Len/BufSize are already set.
+            If Not _usedChunkedPath Then
+                _displayNativeBufSize = _piDigits + 2L   ' mirrors GmpAllocFunc's received size
+            End If
             ' Free gmpPi now (~744 MB native); reinit 1-limb stub so Finally mpz_clears is safe.
             gmp_lib.mpz_clear(gmpPi)
             gmp_lib.mpz_init(gmpPi)
             ' Keep the native char buffer alive — the display timer will stream bytes
             ' directly from it, avoiding any large managed string allocation.
-            _displayNativePtr = piCharPtr.Pointer
-            _displayNativeLen = _piDigits + 1L   ' digits + null terminator position
+            If Not _usedChunkedPath Then
+                _displayNativePtr = piCharPtr.Pointer
+                _displayNativeLen = _piDigits + 1L   ' digits + null terminator position
+            End If
             LogPhase("String conversion complete")
 
             LogPhase($"Done! {digits:N0} digits computed")
