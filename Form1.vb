@@ -6226,6 +6226,18 @@ Phase2:
         Dim _dAlloc As Long = CLng(Runtime.InteropServices.Marshal.ReadInt32(D.Pointer, 0))
         PreAllocMpzToLimbs(chunkRem, _dAlloc + 2L)
 
+        ' §216b: GMP's mpz_fdiv_qr crashes silently (stack overflow in TMP_ALLOC) when
+        ' the quotient destination aliases the dividend (quot == num == piMutable).
+        ' At 244M-limb quotient, GMP's internal aliasing-handler allocates ~2 GB of
+        ' scratch via TMP_ALLOC_LIMBS, which on Windows's 1 MB default stack overflows
+        ' before our NativeAllocFunc even gets called.  Use a separate quotient mpz_t
+        ' to avoid aliasing entirely, then mpz_set the result back into piMutable for
+        ' the next iteration (mpz_set's MPZ_REALLOC sees alloc >= needed, skips abort).
+        Dim quotTmp As New mpz_t()
+        gmp_lib.mpz_init(quotTmp)
+        PreAllocMpzToLimbs(quotTmp, _piSrcSize + 2L)
+        AppendLog($"[§216b] quotTmp PreAlloc'd to {(_piSrcSize + 2L):N0} limbs (de-aliased fdiv_qr){vbCrLf}")
+
         ' chunkEndPos: exclusive upper bound in outBuf where the next chunk will end.
         ' Starts at bufSize-1 (reserve last byte for null terminator).
         Dim chunkEndPos As Long = bufSize - 1L
@@ -6236,8 +6248,10 @@ Phase2:
         While gmp_lib.mpz_sgn(piMutable) > 0
             Dim _chunkStart As DateTime = DateTime.Now
 
-            ' rem = piMutable mod D ;  piMutable //= D
-            gmp_lib.mpz_fdiv_qr(piMutable, chunkRem, piMutable, D)
+            ' §216b: de-aliased call — quot=quotTmp, num=piMutable, rem=chunkRem, den=D.
+            ' Then mpz_set(piMutable, quotTmp) for next iteration (no realloc, alloc already 260M).
+            gmp_lib.mpz_fdiv_qr(quotTmp, chunkRem, piMutable, D)
+            gmp_lib.mpz_set(piMutable, quotTmp)
             Dim _divElapsed As TimeSpan = DateTime.Now - _chunkStart
 
             ' Convert rem to a string of up to CHUNK_DIGITS decimal digits (no leading zeros).
@@ -6280,6 +6294,7 @@ Phase2:
         gmp_lib.mpz_clear(piMutable)
         gmp_lib.mpz_clear(chunkRem)
         gmp_lib.mpz_clear(D)
+        gmp_lib.mpz_clear(quotTmp)
 
         ' The actual content lives in outBuf[chunkEndPos .. bufSize-1] with a null terminator at bufSize-1.
         ' Shift it back to offset 0 so downstream code sees the digits starting at outBuf[0].
