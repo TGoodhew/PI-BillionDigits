@@ -6270,12 +6270,15 @@ Phase2:
             Dim _rSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(chunkRem.Pointer, 4)))
             AppendLog($"[§216c] iter {chunkIdx + 1L}: fdiv_qr done, qSz={_qSz:N0} rSz={_rSz:N0} → mpz_set...{vbCrLf}")
             gmp_lib.mpz_set(piMutable, quotTmp)
-            AppendLog($"[§216c] iter {chunkIdx + 1L}: mpz_set done → mpz_get_str on rem...{vbCrLf}")
+            AppendLog($"[§216c] iter {chunkIdx + 1L}: mpz_set done → mpz_get_str on rem (chunkRem alloc={Runtime.InteropServices.Marshal.ReadInt32(chunkRem.Pointer, 0):N0} size={Runtime.InteropServices.Marshal.ReadInt32(chunkRem.Pointer, 4):N0})...{vbCrLf}")
             Dim _divElapsed As TimeSpan = DateTime.Now - _chunkStart
 
-            ' Convert rem to a string of up to CHUNK_DIGITS decimal digits (no leading zeros).
+            ' §216e: log mpz_get_str's return value and strlen separately to pinpoint crash.
             Dim chunkCharPtr As char_ptr = gmp_lib.mpz_get_str(char_ptr.Zero, 10, chunkRem)
+            AppendLog($"[§216e] iter {chunkIdx + 1L}: mpz_get_str returned ptr=0x{chunkCharPtr.Pointer.ToInt64():X16}{vbCrLf}")
+
             Dim chunkLen As Long = CLng(strlen(chunkCharPtr.Pointer).ToUInt64())
+            AppendLog($"[§216e] iter {chunkIdx + 1L}: strlen returned chunkLen={chunkLen:N0}{vbCrLf}")
 
             Dim isTop As Boolean = (gmp_lib.mpz_sgn(piMutable) = 0)
             Dim writeAt As Long
@@ -6284,25 +6287,34 @@ Phase2:
             If isTop Then
                 ' MSB chunk: write actual chunkLen bytes; no leading-zero padding.
                 writeAt = chunkEndPos - chunkLen
+                AppendLog($"[§216e] iter {chunkIdx + 1L}: isTop=True writeAt={writeAt:N0} → CopyMemory({chunkLen:N0} bytes)...{vbCrLf}")
                 CopyMemory(New IntPtr(outBuf.ToInt64() + writeAt), chunkCharPtr.Pointer, New UIntPtr(CULng(chunkLen)))
+                AppendLog($"[§216e] iter {chunkIdx + 1L}: CopyMemory done{vbCrLf}")
             Else
                 ' Non-top chunk: must fill exactly CHUNK_DIGITS columns, padded with leading zeros.
                 writeAt = chunkEndPos - CHUNK_DIGITS
                 zeroPadCount = CHUNK_DIGITS - chunkLen
-                ' Write ASCII '0's for the leading padding.  Byte-loop is ~250 MB/s; for 300M
-                ' this is ≈ 1 s per chunk — negligible relative to the mpz_fdiv_qr time.
+                AppendLog($"[§216e] iter {chunkIdx + 1L}: isTop=False writeAt={writeAt:N0} zeroPad={zeroPadCount:N0} → write zeros...{vbCrLf}")
                 Dim _padDest As Long = outBuf.ToInt64() + writeAt
                 For i As Long = 0 To zeroPadCount - 1
                     Runtime.InteropServices.Marshal.WriteByte(New IntPtr(_padDest + i), CByte(48))   ' '0' = 0x30
                 Next
-                ' Copy the digits after the zero padding.
+                AppendLog($"[§216e] iter {chunkIdx + 1L}: zeros written → CopyMemory({chunkLen:N0} bytes)...{vbCrLf}")
                 CopyMemory(New IntPtr(outBuf.ToInt64() + writeAt + zeroPadCount), chunkCharPtr.Pointer, New UIntPtr(CULng(chunkLen)))
+                AppendLog($"[§216e] iter {chunkIdx + 1L}: CopyMemory done{vbCrLf}")
             End If
 
             chunkEndPos = writeAt
 
-            ' Free the GMP-allocated chunk buffer via the registered free callback (= our NativeFreeFunc).
-            _savedGmpFree(New void_ptr(chunkCharPtr.Pointer), New size_t(CULng(chunkLen + 1L)))
+            ' §216f: use GmpNativeAlloc_FreeRaw, NOT _savedGmpFree.  _savedGmpFree is the
+            ' ORIGINAL GMP allocator's free (CRT free) saved before GmpNativeAlloc_Install
+            ' replaced the callbacks.  The chunk buffer was allocated by our REPLACEMENT
+            ' NativeAllocFunc via VirtualAlloc — calling CRT free() on a VirtualAlloc'd
+            ' pointer crashes the process.  GmpNativeAlloc_FreeRaw routes correctly to
+            ' our NativeFreeFunc (VirtualFree for oversized blocks, pool return for ≤16 MB).
+            AppendLog($"[§216f] iter {chunkIdx + 1L}: about to GmpNativeAlloc_FreeRaw chunkCharPtr...{vbCrLf}")
+            GmpNativeAlloc_FreeRaw(chunkCharPtr.Pointer, chunkLen + 1L)
+            AppendLog($"[§216f] iter {chunkIdx + 1L}: chunkCharPtr freed{vbCrLf}")
 
             chunkIdx += 1
             Dim _chunkTotal As TimeSpan = DateTime.Now - _chunkStart
