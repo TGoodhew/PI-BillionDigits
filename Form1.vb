@@ -5036,43 +5036,24 @@ PostShiftCheckpoint:
         remainder.Pointer = IntPtr.Zero
         AppendLog($"[SafeMpzDiv§202-exit] remainder cleared and freed{vbCrLf}")
 
-        ' §171-ckpt: this SafeMpzDiv call has converged successfully — delete the div_q
-        ' checkpoint so it cannot poison the next SafeMpzDiv call (which will have a
-        ' different scope/szA/szB/kBits anyway, but explicit cleanup is safer).
-        If _autoCheckpoint Then
-            Try
-                If System.IO.File.Exists(_divCkptBin) Then System.IO.File.Delete(_divCkptBin)
-                If System.IO.File.Exists(_divCkptMeta) Then System.IO.File.Delete(_divCkptMeta)
-                AppendLog($"[SafeMpzDiv§202-exit] §171-ckpt files deleted from NodeCache{vbCrLf}")
-            Catch _ckptDelEx As Exception
-                AppendLog($"[SafeMpzDiv§202-exit] §171-ckpt delete FAILED: {_ckptDelEx.Message}{vbCrLf}")
-            End Try
-        End If
-
-        ' §211 (2026-05-15): clean up §NR-ckpt now that this SafeMpzDiv has succeeded.
-        ' Cleanup moved here from SafeMpzReciprocal exit (was at line ~3654) — see the
-        ' §211 explanation block in SafeMpzReciprocal for the rationale.  By the time we
-        ' reach §202-exit, the entire post-recip stretch (a×r → BigShiftRight → q×b →
-        ' adj loops → tdiv_q) has converged, so the iter=N r snapshot is no longer needed.
-        If _autoCheckpoint Then
-            Try
-                Dim _nrBinCleanup As String = System.IO.Path.Combine(_divCkptDir, "nr_r.bin")
-                Dim _nrMetaCleanup As String = System.IO.Path.Combine(_divCkptDir, "nr_meta.txt")
-                Dim _nrDel As Boolean = False
-                If System.IO.File.Exists(_nrBinCleanup) Then
-                    System.IO.File.Delete(_nrBinCleanup)
-                    _nrDel = True
-                End If
-                If System.IO.File.Exists(_nrMetaCleanup) Then
-                    System.IO.File.Delete(_nrMetaCleanup)
-                    _nrDel = True
-                End If
-                If _nrDel Then AppendLog($"[SafeMpzDiv§202-exit] §211: §NR-ckpt files deleted from NodeCache{vbCrLf}")
-            Catch _ckptDelEx As Exception
-                AppendLog($"[SafeMpzDiv§202-exit] §211: §NR-ckpt delete FAILED: {_ckptDelEx.Message}{vbCrLf}")
-            End Try
-        End If
-        AppendLog($"[SafeMpzDiv§202-exit] returning to caller{vbCrLf}")
+        ' §217 (2026-05-19, user directive after gmpPi.bin loss on 5B run):
+        ' NO CHECKPOINT IS DELETED MID-RUN.  The previous §171-ckpt and §211 §NR-ckpt
+        ' cleanup blocks fired at SafeMpzDiv exit — that is "this divide converged" but
+        ' NOT "the whole run succeeded".  Multiple SafeMpzDiv calls happen per run
+        ' (a×r, q×b, plus several in sqrt-Newton); deleting after the first one defeats
+        ' the point of having checkpoints to recover from a later failure.
+        '
+        ' Stale-file safety is handled at the LOAD side, not the WRITE side:
+        '   - §171-ckpt load at line ~3813 validates scope/szA/szB/aBits/kBits
+        '   - §NR-ckpt load at line ~3440 validates kBits/bBits/prec
+        '   - §piCkpt  load at line ~7341 validates digits
+        ' A stale file with mismatched metadata is silently rejected ("load failed —
+        ' running full path"), so leaving stale files on disk does not poison anything.
+        '
+        ' Cleanup happens externally between runs (Run-PiCompute.ps1's
+        ' Invoke-CheckpointBackup + the §94 stale-snapshot purge at the start of a
+        ' fresh non-resume run), never inside ComputePiGMP or SafeMpzDiv.
+        AppendLog($"[SafeMpzDiv§202-exit] returning to caller (§217: ckpt files preserved){vbCrLf}")
     End Sub
 
     ' Compute result = floor(sqrt(n)).  Safe for any size n.
@@ -7444,14 +7425,15 @@ NumeratorDone:
             End Try
             _strConvSw.Stop()
             WriteToLog($"[ComputePi] mpz_get_str completed in {_strConvSw.Elapsed:mm\:ss\.fff}")
-            ' §piCkpt: mpz_get_str succeeded — gmpPi.bin no longer needed, delete to keep snap_Phase3 clean.
-            If _autoCheckpoint Then
-                Try
-                    If System.IO.File.Exists(_piCkptBin) Then System.IO.File.Delete(_piCkptBin)
-                    If System.IO.File.Exists(_piCkptMeta) Then System.IO.File.Delete(_piCkptMeta)
-                Catch
-                End Try
-            End If
+            ' §217 (2026-05-19, user directive after the 2026-05-19 5B run lost gmpPi.bin):
+            ' NO CHECKPOINT IS DELETED MID-RUN.  This site previously fired right after
+            ' mpz_get_str (or ChunkedMpzGetStr) succeeded, but the run is not done at
+            ' that point — we still need to write pi_digits.txt, run autoverify, and
+            ' cleanly exit.  If any of those fail, the gmpPi.bin checkpoint is the only
+            ' thing standing between us and a 30+ hour SafeMpzDiv re-run from snap_Phase3.
+            ' The load-side validator at line ~7341 silently rejects stale gmpPi.bin
+            ' with a digit-count mismatch, so leaving the file on disk is safe.
+            ' Cleanup happens externally between runs, never here.
             ' Capture the actual digit count BEFORE clearing gmpPi.
             ' mpz_sizeinbase returns an estimate within +1; add 2 to match GMP's internal
             ' alloc of (sizeinbase + 2) bytes.  Used to set _displayNativeLen correctly and

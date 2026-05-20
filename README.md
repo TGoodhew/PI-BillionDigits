@@ -4561,3 +4561,60 @@ Once #75 lands, this bug is harder to trigger — but still latent for any
 other exception during compute/verify.  Both fixes belong in the same
 prerequisite batch for the parallelism rollout (#72), which requires
 unattended Phase 0+ runs to terminate cleanly on failure.
+
+## §217 — Checkpoint-preservation invariant: no checkpoint deleted mid-run (2026-05-19)
+
+The 2026-05-19 5B run lost `gmpPi.bin` (the §piCkpt artifact, ~2 GB) because
+the post-`mpz_get_str` cleanup at the old [Form1.vb:7447-7454](Form1.vb#L7447-L7454)
+fired AFTER `mpz_get_str` succeeded but BEFORE the file write, autoverify,
+and process exit.  When the autoverify subsequently crashed (see §75) and the
+post-run `Invoke-CheckpointBackup` mirrored the post-cleanup `NodeCache`
+back into `SnapshotStore`, every copy of `gmpPi.bin` was destroyed.
+Re-generating it now requires a ~30+ hour `SafeMpzDiv` re-run from
+`snap_Phase3`.
+
+Two similar mid-run cleanup blocks fired at `SafeMpzDiv§202-exit` — the
+§171-ckpt `div_q.bin` delete at the old line 5042-5050 and the §211
+§NR-ckpt `nr_r.bin` delete at the old line 5057-5074.  Both fired when "this
+SafeMpzDiv converged" but NOT when "the whole run succeeded".  A 5B run
+makes many SafeMpzDiv calls (a×r, q×b, plus several in sqrt-Newton);
+deleting after the first one wins minor disk-cleanup at the cost of
+unrecoverable checkpoint loss on a later failure.
+
+**Invariant introduced**: no checkpoint file is deleted from inside
+`ComputePiGMP` / `SafeMpzDiv` / `SafeMpzReciprocal` / `ChunkedMpzGetStr`
+during a run.  Cleanup happens externally between runs (Run-PiCompute.ps1's
+`Invoke-CheckpointBackup` + the §94 stale-snapshot purge on the next
+non-resume run start).
+
+**Stale-file safety** is handled at the LOAD side, not the WRITE side:
+
+- §171-ckpt load at [Form1.vb:3813-3847](Form1.vb#L3813-L3847) validates
+  `scope`, `szA`, `szB`, `aBits`, `kBits`.  Stale `div_q.bin` from a
+  previous SafeMpzDiv call with different scope/size is silently rejected
+  with `"§171-ckpt load failed — running full path"`.
+- §NR-ckpt load at [Form1.vb:3440-3469](Form1.vb#L3440-L3469) validates
+  `kBits`, `bBits`, `prec`.  Same silent-reject pattern.
+- §piCkpt load at [Form1.vb:7341-7363](Form1.vb#L7341-L7363) validates
+  `digits`.  Same.
+
+Because every load-side validator rejects metadata mismatches, leaving
+stale files on disk costs only a few GB of disk clutter (negligible at
+the 64 GB RAM / 3 TB SSD scale this project targets) and never poisons
+a subsequent call.
+
+**Phase 2 transient cleanup is unaffected**: the per-pair
+`File.Delete(diskNodes(...).FilePath)` calls at lines ~5810/5825/5911/5930
+and the `DeleteSnapshotDir(level-1)` call at ~line 6099 delete *transient
+intermediate combine nodes* that have already been written into a parent
+node — they are NOT preserved checkpoints, and deleting them is required
+to keep disk usage bounded during long runs.  The `finalT_spillPath`
+delete at line ~7299 is similarly safe (the value was restored to RAM
+before the delete fires).
+
+**User directive that drove this fix** (2026-05-19): *"you should
+maintain a complete checkpoint backup for every run either 5B or 1B — if
+you are going to do something that might impact the cache then you MUST
+back the cache up. ... Finally I want you to review the code and ensure
+that no checkpoint is deleted prior to the completion of a successful
+run."*
