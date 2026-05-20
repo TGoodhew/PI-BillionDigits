@@ -36,6 +36,35 @@
     directory, suitable for pasting into Claude for analysis.
     Requires: dotnet tool install --global dotnet-trace
 
+    Equivalent to -TraceMode cpu.  Kept for backwards compatibility.
+
+.PARAMETER TraceMode
+    Issue #50 multi-tool trace harness.  Wraps the run in the named profiler
+    and writes the raw trace + a summary.txt into a per-run subdir under
+    -TraceDir.  Modes:
+
+      none            no tracing (default)
+      cpu             dotnet-trace cpu-sampling + topN report
+      gc              dotnet-trace gc-verbose (GC events + alloc-tick)
+      alloc           dotnet-trace gc-collect (low overhead, full-run safe)
+      counters        dotnet-counters CSV (continuous, runs alongside exe)
+      perfview-cpu    PerfView CPU + .NET providers (.etl.zip)
+      perfview-block  PerfView ThreadTime + lock contention (.etl.zip)
+      wpr             Windows Performance Recorder CPU + Disk (.etl)
+      vtune-hotspots  Intel VTune hotspots collect (requires VTune install)
+      vtune-uarch     Intel VTune microarchitecture exploration (heavy)
+      uprof           AMD uProf time-based profiling (AMD CPUs only)
+
+    Tool locations (override via env var):
+      PerfView : %PERFVIEW_EXE%  or  C:\Tools\PerfView\PerfView.exe
+      VTune    : %VTUNE_EXE%     or  C:\Program Files (x86)\Intel\oneAPI\vtune\latest\bin64\vtune.exe
+      uProf    : %UPROF_EXE%     or  C:\Program Files\AMD\AMDuProf\bin\AMDuProfCLI.exe
+
+.PARAMETER TraceDir
+    Root directory for #50 trace artifacts.  Each run creates a subdir
+    {timestamp}_{mode}_{digits}d/ containing trace.* + summary.txt.
+    Defaults to .\traces next to this script.
+
 .PARAMETER Test
     Run the app at every power of 10 from 10 up to -Digits (default 1,000,000,000).
     Each run is isolated in its own subdirectory under OutputDir (test_10, test_100, …).
@@ -113,6 +142,11 @@
     .\Run-PiCompute.ps1 -Digits 5000000000 -ResumeFromLevel 15 -LogLevel 2
     .\Run-PiCompute.ps1 -Digits 5000000000 -AutoCheckpoint -LogLevel 2
     .\Run-PiCompute.ps1 -Digits 5000000000 -AutoCheckpoint -BackupCheckpoint -LogLevel 2
+    .\Run-PiCompute.ps1 -TraceMode cpu -Digits 1000000000
+    .\Run-PiCompute.ps1 -TraceMode gc -Digits 1000000000
+    .\Run-PiCompute.ps1 -TraceMode perfview-cpu -Digits 1000000000
+    .\Run-PiCompute.ps1 -TraceMode wpr -Digits 100000000
+    .\Run-PiCompute.ps1 -TraceMode vtune-hotspots -Digits 1000000000
 #>
 param(
     [string]$OutputDir           = 'C:\PiOutput',
@@ -125,9 +159,15 @@ param(
     [switch]$BackupCheckpoint,
     [switch]$UseRelease,
     [switch]$Trace,
+    [ValidateSet('none','cpu','gc','alloc','counters','perfview-cpu','perfview-block','wpr','vtune-hotspots','vtune-uarch','uprof')]
+    [string]$TraceMode           = 'none',
+    [string]$TraceDir            = (Join-Path $PSScriptRoot 'traces'),
     [switch]$Test,
     [string]$ReportOnly          = ""
 )
+
+# Back-compat: -Trace is an alias for -TraceMode cpu.
+if ($Trace -and $TraceMode -eq 'none') { $TraceMode = 'cpu' }
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -165,7 +205,7 @@ if ($CheckpointFromLevel -gt 0) { Write-Host "Checkpoint: from level $Checkpoint
 if ($ResumeFromLevel     -gt 0) { Write-Host "Resume   : from level $ResumeFromLevel" -ForegroundColor Cyan }
 if ($AutoCheckpoint)            { Write-Host "Mode     : Auto-checkpoint enabled" -ForegroundColor Green }
 if ($BackupCheckpoint)          { Write-Host "Backup   : Checkpoints backed up to SnapshotStore after run" -ForegroundColor Green }
-if ($Trace)                     { Write-Host "Mode     : CPU trace enabled" -ForegroundColor Magenta }
+if ($TraceMode -ne 'none')      { Write-Host "TraceMode: $TraceMode" -ForegroundColor Magenta }
 Write-Host ""
 
 # ── Ensure output directory exists ───────────────────────────────────────────
@@ -370,6 +410,186 @@ if ($Test) {
 # run always starts with the best available checkpoint  -  even if the app deleted
 # NodeCache entries during normal operation.
 
+# ── Issue #50 trace dispatcher ───────────────────────────────────────────────
+# Each mode wraps the launch in a different profiler.  The exe is a WinForms
+# GUI app that exits cleanly on its own when --autostart --autoverify finish
+# (§76 makes sure it exits with code 1 on exception).  For modes that need a
+# PID (counters), launch with Start-Process -PassThru and pass the Id.
+
+function Resolve-TraceTool {
+    param([string]$EnvVar, [string]$Default)
+    $candidate = [System.Environment]::GetEnvironmentVariable($EnvVar)
+    if ([string]::IsNullOrWhiteSpace($candidate)) { $candidate = $Default }
+    if (Test-Path $candidate) { return $candidate }
+    return $null
+}
+
+function Invoke-TraceRun {
+    param(
+        [string]$Mode,
+        [string]$ExePath,
+        [string[]]$ExeArgs,
+        [string]$RunDir,
+        [string]$Label
+    )
+
+    if (-not (Test-Path $RunDir)) { New-Item -ItemType Directory -Path $RunDir -Force | Out-Null }
+    $summaryFile = Join-Path $RunDir 'summary.txt'
+    "=== Trace run: $Mode @ $(Get-Date) ===" | Out-File -FilePath $summaryFile -Encoding utf8
+    "Exe   : $ExePath" | Out-File -FilePath $summaryFile -Append
+    "Args  : $($ExeArgs -join ' ')" | Out-File -FilePath $summaryFile -Append
+    "" | Out-File -FilePath $summaryFile -Append
+
+    $perfViewExe = Resolve-TraceTool 'PERFVIEW_EXE' 'C:\Tools\PerfView\PerfView.exe'
+    $vtuneExe    = Resolve-TraceTool 'VTUNE_EXE'    'C:\Program Files (x86)\Intel\oneAPI\vtune\latest\bin64\vtune.exe'
+    $uprofExe    = Resolve-TraceTool 'UPROF_EXE'    'C:\Program Files\AMD\AMDuProf\bin\AMDuProfCLI.exe'
+
+    switch ($Mode) {
+        'cpu' {
+            $traceFile = Join-Path $RunDir 'trace.nettrace'
+            Write-Host "--- dotnet-trace cpu-sampling ---" -ForegroundColor Magenta
+            dotnet-trace collect `
+                --output $traceFile `
+                --providers "Microsoft-DotNETCore-SampleProfiler:0xF00000000000:5,Microsoft-DotNETRuntime:0x1F000080018:5" `
+                -- $ExePath @ExeArgs
+            if (Test-Path $traceFile) {
+                "--- dotnet-trace topN (inclusive, top 50) ---" | Out-File -FilePath $summaryFile -Append
+                dotnet-trace report $traceFile topN -n 50 --inclusive | Tee-Object -FilePath $summaryFile -Append
+            }
+        }
+
+        'gc' {
+            $traceFile = Join-Path $RunDir 'trace.nettrace'
+            Write-Host "--- dotnet-trace gc-verbose ---" -ForegroundColor Magenta
+            dotnet-trace collect --output $traceFile --profile gc-verbose -- $ExePath @ExeArgs
+            if (Test-Path $traceFile) {
+                "Trace: $traceFile" | Out-File -FilePath $summaryFile -Append
+                "Open in PerfView (File → Open → trace.nettrace) for GC pause histogram + alloc-by-type." | Out-File -FilePath $summaryFile -Append
+                "" | Out-File -FilePath $summaryFile -Append
+                "--- dotnet-trace topN (inclusive, top 30) ---" | Out-File -FilePath $summaryFile -Append
+                dotnet-trace report $traceFile topN -n 30 --inclusive | Out-File -FilePath $summaryFile -Append
+            }
+        }
+
+        'alloc' {
+            $traceFile = Join-Path $RunDir 'trace.nettrace'
+            Write-Host "--- dotnet-trace gc-collect (low overhead) ---" -ForegroundColor Magenta
+            dotnet-trace collect --output $traceFile --profile gc-collect -- $ExePath @ExeArgs
+            if (Test-Path $traceFile) {
+                "Trace: $traceFile" | Out-File -FilePath $summaryFile -Append
+                "--- dotnet-trace topN (inclusive, top 30) ---" | Out-File -FilePath $summaryFile -Append
+                dotnet-trace report $traceFile topN -n 30 --inclusive | Out-File -FilePath $summaryFile -Append
+            }
+        }
+
+        'counters' {
+            $countersFile = Join-Path $RunDir 'counters.csv'
+            Write-Host "--- dotnet-counters collect (continuous CSV alongside exe) ---" -ForegroundColor Magenta
+            # Launch exe in background; use PassThru to get the Id.
+            $proc = Start-Process -FilePath $ExePath -ArgumentList $ExeArgs -NoNewWindow -PassThru
+            Start-Sleep -Seconds 3
+            if (-not $proc.HasExited) {
+                # dotnet-counters runs in foreground; it exits when the target exits.
+                dotnet-counters collect --process-id $proc.Id --output $countersFile --format csv --refresh-interval 5
+            }
+            if (-not $proc.HasExited) { $proc.WaitForExit() }
+            "Counters CSV: $countersFile" | Out-File -FilePath $summaryFile -Append
+            "Open in Excel; rows are per-counter, columns are 5-second samples." | Out-File -FilePath $summaryFile -Append
+        }
+
+        'perfview-cpu' {
+            if (-not $perfViewExe) {
+                Write-Warning "PerfView not found. Download single .exe from https://github.com/microsoft/perfview/releases and either put at C:\Tools\PerfView\PerfView.exe or set `$env:PERFVIEW_EXE."
+                "SKIPPED: PerfView not installed." | Out-File -FilePath $summaryFile -Append
+                return
+            }
+            $traceFile = Join-Path $RunDir 'trace.etl.zip'
+            $perfLog   = Join-Path $RunDir 'perfview.log'
+            Write-Host "--- PerfView CPU + .NET providers ---" -ForegroundColor Magenta
+            $argString = ($ExeArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+            $cmd = '"' + $ExePath + '" ' + $argString
+            & $perfViewExe /AcceptEULA /NoGui /BufferSizeMB=512 /CircularMB=8192 /DataFile=$traceFile /LogFile=$perfLog Run -- $cmd
+            "PerfView trace: $traceFile" | Out-File -FilePath $summaryFile -Append
+            "Open in PerfView (CPU Stacks → expand by process / thread). Use GroupPats `[group module entries]` for native frames (libgmp, GmpNativeAlloc)." | Out-File -FilePath $summaryFile -Append
+        }
+
+        'perfview-block' {
+            if (-not $perfViewExe) {
+                Write-Warning "PerfView not found (see perfview-cpu mode for install)."
+                "SKIPPED: PerfView not installed." | Out-File -FilePath $summaryFile -Append
+                return
+            }
+            $traceFile = Join-Path $RunDir 'trace.etl.zip'
+            $perfLog   = Join-Path $RunDir 'perfview.log'
+            Write-Host "--- PerfView ThreadTime + lock contention ---" -ForegroundColor Magenta
+            $argString = ($ExeArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+            $cmd = '"' + $ExePath + '" ' + $argString
+            & $perfViewExe /AcceptEULA /NoGui /ThreadTime /BufferSizeMB=512 /CircularMB=8192 /DataFile=$traceFile /LogFile=$perfLog Run -- $cmd
+            "PerfView ThreadTime trace: $traceFile" | Out-File -FilePath $summaryFile -Append
+            "Open in PerfView → 'Thread Time Stacks' → 'CPU_TIME' vs 'BLOCKED_TIME'. Lock contention shows in 'BLOCKED_TIME on Lock'." | Out-File -FilePath $summaryFile -Append
+        }
+
+        'wpr' {
+            $traceFile = Join-Path $RunDir 'trace.etl'
+            Write-Host "--- WPR (Windows Performance Recorder) CPU + Disk + FileIO ---" -ForegroundColor Magenta
+            # System-wide recording. -filemode writes incrementally rather than circular buffer.
+            $startOut = & wpr -start CPU -start DiskIO -start FileIO -filemode 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "wpr -start failed: $startOut. Try: wpr -cancel; check Admin rights."
+                "SKIPPED: wpr -start failed ($LASTEXITCODE). $startOut" | Out-File -FilePath $summaryFile -Append
+                return
+            }
+            try {
+                Start-Process -FilePath $ExePath -ArgumentList $ExeArgs -NoNewWindow -Wait
+            } finally {
+                & wpr -stop $traceFile "PI BillionDigits CPU+Disk (issue #50)" 2>&1 | Out-Null
+            }
+            "WPR ETL: $traceFile" | Out-File -FilePath $summaryFile -Append
+            "Open in WPA (Windows Performance Analyzer, from Windows ADK)." | Out-File -FilePath $summaryFile -Append
+        }
+
+        { $_ -in 'vtune-hotspots','vtune-uarch' } {
+            if (-not $vtuneExe) {
+                Write-Warning "VTune not installed. Get it from https://www.intel.com/content/www/us/en/developer/tools/oneapi/vtune-profiler-download.html (free, ~3 GB)."
+                "SKIPPED: VTune not installed." | Out-File -FilePath $summaryFile -Append
+                "Install: https://www.intel.com/content/www/us/en/developer/tools/oneapi/vtune-profiler-download.html" | Out-File -FilePath $summaryFile -Append
+                return
+            }
+            $collect = if ($Mode -eq 'vtune-hotspots') { 'hotspots' } else { 'uarch-exploration' }
+            $resultDir = Join-Path $RunDir "vtune-$collect"
+            Write-Host "--- VTune -collect $collect ---" -ForegroundColor Magenta
+            & $vtuneExe -collect $collect -result-dir $resultDir -- $ExePath @ExeArgs
+            "VTune result: $resultDir" | Out-File -FilePath $summaryFile -Append
+            "" | Out-File -FilePath $summaryFile -Append
+            "--- VTune -report summary ---" | Out-File -FilePath $summaryFile -Append
+            & $vtuneExe -report summary -result-dir $resultDir 2>&1 | Out-File -FilePath $summaryFile -Append
+        }
+
+        'uprof' {
+            if (-not $uprofExe) {
+                Write-Warning "AMD uProf not installed (and this box has an Intel CPU — use vtune-* modes instead)."
+                "SKIPPED: AMD uProf not installed (CPU vendor: $((Get-CimInstance Win32_Processor).Manufacturer))." | Out-File -FilePath $summaryFile -Append
+                return
+            }
+            $traceFile = Join-Path $RunDir 'uprof.caperf'
+            Write-Host "--- AMD uProf time-based profiling ---" -ForegroundColor Magenta
+            & $uprofExe collect -e tbp -o $traceFile -- $ExePath @ExeArgs
+            "uProf trace: $traceFile" | Out-File -FilePath $summaryFile -Append
+        }
+
+        default {
+            throw "Unknown TraceMode: $Mode"
+        }
+    }
+
+    # Append to traces/README.md index.
+    $indexFile = Join-Path $TraceDir 'README.md'
+    $rel = Split-Path $RunDir -Leaf
+    Add-Content -Path $indexFile -Value "- [$Label]($rel/summary.txt) — $Mode @ $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+
+    Write-Host "Trace summary: $summaryFile" -ForegroundColor Green
+}
+
 function Invoke-CheckpointBackup {
     param([string]$NodeCacheDir, [string]$StoreDir)
     $snaps = @(Get-ChildItem $NodeCacheDir -Directory -ErrorAction SilentlyContinue |
@@ -430,51 +650,40 @@ Write-Host ""
 Write-Host "Suppressed dialogs will appear in $logFile with [DIALOG] prefix."
 Write-Host ""
 
-if ($Trace) {
-    $timestamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $traceFile  = Join-Path $projectDir "pi_trace_$timestamp.nettrace"
-    $reportFile = Join-Path $projectDir "pi_trace_$timestamp`_report.txt"
+# Common exe argument list (used by every dispatch path below).
+$mainArgs = @("--digits", $Digits, "--autostart", "--autoverify", "--log-level", $LogLevel, "--output-dir", $OutputDir)
+if ($Threshold           -gt 0) { $mainArgs += @("--threshold",             $Threshold) }
+if ($CheckpointFromLevel -gt 0) { $mainArgs += @("--checkpoint-from-level", $CheckpointFromLevel) }
+if ($ResumeFromLevel     -gt 0) { $mainArgs += @("--resume-from-level",     $ResumeFromLevel) }
+if ($AutoCheckpoint)            { $mainArgs += "--auto-checkpoint" }
 
-    Write-Host "--- dotnet trace collect ---" -ForegroundColor Yellow
-    Write-Host "Trace  : $traceFile"
-    Write-Host "Report : $reportFile"
-    Write-Host ""
+if ($TraceMode -ne 'none') {
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $runDir    = Join-Path $TraceDir "${timestamp}_${TraceMode}_${Digits}d"
+    if (-not (Test-Path $TraceDir)) { New-Item -ItemType Directory -Path $TraceDir -Force | Out-Null }
 
-    $mainArgs = @("--digits", $Digits, "--autostart", "--autoverify", "--log-level", $LogLevel, "--output-dir", $OutputDir)
-    if ($Threshold           -gt 0) { $mainArgs += @("--threshold",             $Threshold) }
-    if ($CheckpointFromLevel -gt 0) { $mainArgs += @("--checkpoint-from-level", $CheckpointFromLevel) }
-    if ($ResumeFromLevel     -gt 0) { $mainArgs += @("--resume-from-level",     $ResumeFromLevel) }
-    if ($AutoCheckpoint)            { $mainArgs += "--auto-checkpoint" }
-    dotnet-trace collect `
-        --output $traceFile `
-        --providers "Microsoft-DotNETCore-SampleProfiler:0xF00000000000:5,Microsoft-DotNETRuntime:0x1F000080018:5" `
-        -- $exePath @mainArgs
+    # Seed traces/README.md if it doesn't exist.
+    $indexFile = Join-Path $TraceDir 'README.md'
+    if (-not (Test-Path $indexFile)) {
+        @(
+            '# Trace bundle index (issue #50)',
+            '',
+            'One entry per trace run.  Open the linked summary.txt for the report; the raw',
+            'trace artifacts (.nettrace / .etl / vtune dirs) live next to each summary.txt',
+            'and are gitignored.',
+            ''
+        ) | Out-File -FilePath $indexFile -Encoding utf8
+    }
 
-    if ($LASTEXITCODE -ne 0) { Write-Warning "dotnet trace exited with code $LASTEXITCODE" }
+    $label = "$($Digits.ToString('N0')) digits @ $timestamp"
+    Invoke-TraceRun -Mode $TraceMode -ExePath $exePath -ExeArgs $mainArgs -RunDir $runDir -Label $label
 
     if ($BackupCheckpoint) {
         Invoke-CheckpointBackup -NodeCacheDir (Join-Path $OutputDir 'NodeCache') `
                                 -StoreDir     (Join-Path $OutputDir 'SnapshotStore')
     }
-
-    # ── 4. Generate plain-text report ────────────────────────────────────────
-    if (Test-Path $traceFile) {
-        Write-Host ""
-        Write-Host "--- dotnet trace report (topN) ---" -ForegroundColor Yellow
-        dotnet-trace report $traceFile topN -n 50 --inclusive | Tee-Object -FilePath $reportFile
-        Write-Host ""
-        Write-Host "Report written: $reportFile" -ForegroundColor Green
-        Write-Host "Paste the contents of that file into Claude for analysis."
-    } else {
-        Write-Warning "Trace file not found  -  report skipped."
-    }
 } else {
     Write-Host "--- Launching ($Digits digits, autostart, autoverify, log-level $LogLevel) ---" -ForegroundColor Yellow
-    $mainArgs = @("--digits", $Digits, "--autostart", "--autoverify", "--log-level", $LogLevel, "--output-dir", $OutputDir)
-    if ($Threshold           -gt 0) { $mainArgs += @("--threshold",             $Threshold) }
-    if ($CheckpointFromLevel -gt 0) { $mainArgs += @("--checkpoint-from-level", $CheckpointFromLevel) }
-    if ($ResumeFromLevel     -gt 0) { $mainArgs += @("--resume-from-level",     $ResumeFromLevel) }
-    if ($AutoCheckpoint)            { $mainArgs += "--auto-checkpoint" }
     Start-Process -FilePath $exePath -ArgumentList $mainArgs -NoNewWindow -Wait
 
     if ($BackupCheckpoint) {

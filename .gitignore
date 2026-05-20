@@ -41,6 +41,19 @@ pi_trace_*
 launch_stdout.txt
 launch_stderr.txt
 
+# Issue #50 traces/ — keep .md summaries + README, ignore everything binary.
+# VTune writes a per-collection directory (r000hs, r001ue, ...) — gitignore them too.
+traces/**/*.nettrace
+traces/**/*.etl
+traces/**/*.etl.zip
+traces/**/*.etlx
+traces/**/*.speedscope.json
+traces/**/*.csv
+traces/**/r*hs/
+traces/**/r*ue/
+traces/**/r*th/
+traces/**/*.caperf/
+
 # Run-PiCompute.ps1 redirected stdout/stderr per-run logs
 run_5B_*.log
 run_5B_*.log.err
