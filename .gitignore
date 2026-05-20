@@ -2,6 +2,15 @@
 bin/
 obj/
 
+# Native project build artifacts (intermediate/standalone builds)
+GmpNativeAlloc/GmpNativeAlloc/
+GmpNativeAlloc/*/obj/
+*.dll
+*.pdb
+
+# Claude Code session data
+.claude/
+
 # Visual Studio user-specific files
 *.user
 *.suo
@@ -16,3 +25,25 @@ packages/
 # Windows
 Thumbs.db
 Desktop.ini
+
+# dotnet-trace / PerfView output
+*.nettrace
+*.nettrace.etlx
+*.etlx
+*.etl
+*.etl.zip
+*.speedscope.json
+*.diagsession
+*.vspx
+*.psess
+*_report.txt
+pi_trace_*
+launch_stdout.txt
+launch_stderr.txt
+
+# Run-PiCompute.ps1 redirected stdout/stderr per-run logs
+run_5B_*.log
+run_5B_*.log.err
+
+# Claude-session workflow scratch scripts (underscore-prefix convention)
+_*.ps1

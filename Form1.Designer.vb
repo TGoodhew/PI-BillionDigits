@@ -24,10 +24,14 @@ Partial Class Form1
     Private Sub InitializeComponent()
         components = New ComponentModel.Container()
         Timer1 = New Timer(components)
+        TipMain = New ToolTip(components)
         Panel1 = New Panel()
         LstBoxPhases = New ListBox()
-        Label5 = New Label()
-        TxtChunkSize = New TextBox()
+        LblRamThreshold = New Label()
+        NudRamThreshold = New NumericUpDown()
+        LblLogLevel = New Label()
+        NudLogLevel = New NumericUpDown()
+        ChkAutoVerify = New CheckBox()
         BtnTest = New Button()
         LblDigitsDisplayed = New Label()
         LblRunningTime = New Label()
@@ -42,6 +46,8 @@ Partial Class Form1
         LblStatus = New TextBox()
         BtnCompute = New Button()
         RtbPiDigits = New RichTextBox()
+        CType(NudRamThreshold, System.ComponentModel.ISupportInitialize).BeginInit()
+        CType(NudLogLevel, System.ComponentModel.ISupportInitialize).BeginInit()
         Panel1.SuspendLayout()
         SuspendLayout()
         ' 
@@ -51,8 +57,11 @@ Partial Class Form1
         ' Panel1
         ' 
         Panel1.Controls.Add(LstBoxPhases)
-        Panel1.Controls.Add(Label5)
-        Panel1.Controls.Add(TxtChunkSize)
+        Panel1.Controls.Add(LblRamThreshold)
+        Panel1.Controls.Add(NudRamThreshold)
+        Panel1.Controls.Add(LblLogLevel)
+        Panel1.Controls.Add(NudLogLevel)
+        Panel1.Controls.Add(ChkAutoVerify)
         Panel1.Controls.Add(BtnTest)
         Panel1.Controls.Add(LblDigitsDisplayed)
         Panel1.Controls.Add(LblRunningTime)
@@ -69,7 +78,7 @@ Partial Class Form1
         Panel1.Dock = DockStyle.Top
         Panel1.Location = New Point(0, 0)
         Panel1.Name = "Panel1"
-        Panel1.Size = New Size(3121, 319)
+        Panel1.Size = New Size(3121, 205)
         Panel1.TabIndex = 25
         ' 
         ' LstBoxPhases
@@ -77,40 +86,59 @@ Partial Class Form1
         LstBoxPhases.FormattingEnabled = True
         LstBoxPhases.Location = New Point(1745, 12)
         LstBoxPhases.Name = "LstBoxPhases"
-        LstBoxPhases.Size = New Size(1106, 279)
+        LstBoxPhases.Size = New Size(1106, 181)
         LstBoxPhases.TabIndex = 39
-        ' 
-        ' Label5
-        ' 
-        Label5.AutoSize = True
-        Label5.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        Label5.Location = New Point(1260, 91)
-        Label5.Name = "Label5"
-        Label5.Size = New Size(160, 38)
-        Label5.TabIndex = 38
-        Label5.Text = "Chunk Size:"
-        ' 
-        ' TxtChunkSize
-        ' 
-        TxtChunkSize.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        TxtChunkSize.Location = New Point(1438, 93)
-        TxtChunkSize.Name = "TxtChunkSize"
-        TxtChunkSize.Size = New Size(185, 39)
-        TxtChunkSize.TabIndex = 37
-        ' 
+        '
+        ' ChkAutoVerify
+        '
+        ChkAutoVerify.AutoSize = True
+        ChkAutoVerify.Checked = True
+        ChkAutoVerify.CheckState = CheckState.Checked
+        ChkAutoVerify.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        ChkAutoVerify.Location = New Point(368, 84)
+        ChkAutoVerify.Name = "ChkAutoVerify"
+        ChkAutoVerify.Size = New Size(260, 36)
+        ChkAutoVerify.TabIndex = 42
+        ChkAutoVerify.Text = "Verify after compute"
+        ChkAutoVerify.UseVisualStyleBackColor = True
+        '
         ' BtnTest
-        ' 
-        BtnTest.Location = New Point(403, 91)
+        '
+        BtnTest.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        BtnTest.Location = New Point(648, 79)
         BtnTest.Name = "BtnTest"
-        BtnTest.Size = New Size(112, 34)
+        BtnTest.Size = New Size(134, 47)
         BtnTest.TabIndex = 28
-        BtnTest.Text = "Test"
+        BtnTest.Text = "Verify Now"
+        BtnTest.TextAlign = ContentAlignment.MiddleCenter
         BtnTest.UseVisualStyleBackColor = True
+        '
+        ' LblRamThreshold
+        '
+        LblRamThreshold.AutoSize = True
+        LblRamThreshold.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        LblRamThreshold.Location = New Point(810, 83)
+        LblRamThreshold.Name = "LblRamThreshold"
+        LblRamThreshold.Size = New Size(200, 38)
+        LblRamThreshold.TabIndex = 40
+        LblRamThreshold.Text = "RAM Threshold:"
+        '
+        ' NudRamThreshold
+        '
+        NudRamThreshold.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        NudRamThreshold.Location = New Point(1028, 83)
+        NudRamThreshold.Minimum = New Decimal(New Integer() {1, 0, 0, 0})
+        NudRamThreshold.Maximum = New Decimal(New Integer() {500000, 0, 0, 0})
+        NudRamThreshold.Increment = New Decimal(New Integer() {1000, 0, 0, 0})
+        NudRamThreshold.Value = New Decimal(New Integer() {200000, 0, 0, 0})
+        NudRamThreshold.Name = "NudRamThreshold"
+        NudRamThreshold.Size = New Size(185, 39)
+        NudRamThreshold.TabIndex = 41
         ' 
         ' LblDigitsDisplayed
         ' 
         LblDigitsDisplayed.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        LblDigitsDisplayed.Location = New Point(971, 35)
+        LblDigitsDisplayed.Location = New Point(971, 16)
         LblDigitsDisplayed.Name = "LblDigitsDisplayed"
         LblDigitsDisplayed.Size = New Size(259, 38)
         LblDigitsDisplayed.TabIndex = 36
@@ -118,16 +146,37 @@ Partial Class Form1
         ' LblRunningTime
         ' 
         LblRunningTime.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        LblRunningTime.Location = New Point(1438, 35)
+        LblRunningTime.Location = New Point(1438, 16)
         LblRunningTime.Name = "LblRunningTime"
         LblRunningTime.Size = New Size(313, 38)
         LblRunningTime.TabIndex = 35
-        ' 
+        '
+        ' LblLogLevel
+        '
+        LblLogLevel.AutoSize = True
+        LblLogLevel.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        LblLogLevel.Location = New Point(1762, 16)
+        LblLogLevel.Name = "LblLogLevel"
+        LblLogLevel.Size = New Size(120, 38)
+        LblLogLevel.TabIndex = 43
+        LblLogLevel.Text = "Log Level:"
+        '
+        ' NudLogLevel
+        '
+        NudLogLevel.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        NudLogLevel.Location = New Point(1900, 12)
+        NudLogLevel.Minimum = New Decimal(New Integer() {0, 0, 0, 0})
+        NudLogLevel.Maximum = New Decimal(New Integer() {5, 0, 0, 0})
+        NudLogLevel.Value = New Decimal(New Integer() {1, 0, 0, 0})
+        NudLogLevel.Name = "NudLogLevel"
+        NudLogLevel.Size = New Size(75, 39)
+        NudLogLevel.TabIndex = 44
+        '
         ' Label4
-        ' 
+        '
         Label4.AutoSize = True
         Label4.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        Label4.Location = New Point(1236, 31)
+        Label4.Location = New Point(1236, 16)
         Label4.Name = "Label4"
         Label4.Size = New Size(196, 38)
         Label4.TabIndex = 34
@@ -136,8 +185,8 @@ Partial Class Form1
         ' ChkboxWriteToFile
         ' 
         ChkboxWriteToFile.AutoSize = True
-        ChkboxWriteToFile.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        ChkboxWriteToFile.Location = New Point(180, 89)
+        ChkboxWriteToFile.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        ChkboxWriteToFile.Location = New Point(180, 84)
         ChkboxWriteToFile.Name = "ChkboxWriteToFile"
         ChkboxWriteToFile.Size = New Size(170, 36)
         ChkboxWriteToFile.TabIndex = 33
@@ -147,8 +196,8 @@ Partial Class Form1
         ' ChkboxDisplay
         ' 
         ChkboxDisplay.AutoSize = True
-        ChkboxDisplay.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        ChkboxDisplay.Location = New Point(25, 89)
+        ChkboxDisplay.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        ChkboxDisplay.Location = New Point(25, 84)
         ChkboxDisplay.Name = "ChkboxDisplay"
         ChkboxDisplay.Size = New Size(117, 36)
         ChkboxDisplay.TabIndex = 32
@@ -159,16 +208,16 @@ Partial Class Form1
         ' 
         Label3.AutoSize = True
         Label3.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        Label3.Location = New Point(754, 31)
+        Label3.Location = New Point(754, 16)
         Label3.Name = "Label3"
         Label3.Size = New Size(223, 38)
         Label3.TabIndex = 31
-        Label3.Text = "Digits Displayed:"
+        Label3.Text = "Displayed:"
         ' 
         ' TxtDigitsofPI
         ' 
-        TxtDigitsofPI.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        TxtDigitsofPI.Location = New Point(508, 26)
+        TxtDigitsofPI.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        TxtDigitsofPI.Location = New Point(508, 16)
         TxtDigitsofPI.Name = "TxtDigitsofPI"
         TxtDigitsofPI.Size = New Size(205, 39)
         TxtDigitsofPI.TabIndex = 30
@@ -177,7 +226,7 @@ Partial Class Form1
         ' 
         Label2.AutoSize = True
         Label2.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        Label2.Location = New Point(344, 28)
+        Label2.Location = New Point(344, 16)
         Label2.Name = "Label2"
         Label2.Size = New Size(158, 38)
         Label2.TabIndex = 29
@@ -187,7 +236,7 @@ Partial Class Form1
         ' 
         Label1.AutoSize = True
         Label1.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        Label1.Location = New Point(45, 162)
+        Label1.Location = New Point(45, 150)
         Label1.Name = "Label1"
         Label1.Size = New Size(97, 38)
         Label1.TabIndex = 28
@@ -195,36 +244,38 @@ Partial Class Form1
         ' 
         ' BtnPause
         ' 
-        BtnPause.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        BtnPause.Location = New Point(180, 26)
+        BtnPause.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        BtnPause.Location = New Point(180, 12)
         BtnPause.Name = "BtnPause"
         BtnPause.Size = New Size(134, 47)
         BtnPause.TabIndex = 27
-        BtnPause.Text = "Pause"
+        BtnPause.Text = "Cancel"
+        BtnPause.TextAlign = ContentAlignment.MiddleCenter
         BtnPause.UseVisualStyleBackColor = True
         ' 
         ' LblStatus
         ' 
-        LblStatus.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        LblStatus.Location = New Point(148, 161)
+        LblStatus.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        LblStatus.Location = New Point(148, 150)
         LblStatus.Name = "LblStatus"
         LblStatus.Size = New Size(1125, 39)
         LblStatus.TabIndex = 26
         ' 
         ' BtnCompute
         ' 
-        BtnCompute.Font = New Font("Segoe UI", 12F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
-        BtnCompute.Location = New Point(25, 26)
+        BtnCompute.Font = New Font("Segoe UI", 14F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+        BtnCompute.Location = New Point(25, 12)
         BtnCompute.Name = "BtnCompute"
         BtnCompute.Size = New Size(134, 47)
         BtnCompute.TabIndex = 25
         BtnCompute.Text = "Start"
+        BtnCompute.TextAlign = ContentAlignment.MiddleCenter
         BtnCompute.UseVisualStyleBackColor = True
         ' 
         ' RtbPiDigits
         ' 
         RtbPiDigits.Dock = DockStyle.Fill
-        RtbPiDigits.Location = New Point(0, 319)
+        RtbPiDigits.Location = New Point(0, 205)
         RtbPiDigits.Name = "RtbPiDigits"
         RtbPiDigits.Size = New Size(3121, 1028)
         RtbPiDigits.TabIndex = 27
@@ -240,10 +291,13 @@ Partial Class Form1
         Name = "Form1"
         Text = "Calculate PI to 1 Billion"
         WindowState = FormWindowState.Maximized
+        CType(NudRamThreshold, System.ComponentModel.ISupportInitialize).EndInit()
+        CType(NudLogLevel, System.ComponentModel.ISupportInitialize).EndInit()
         Panel1.ResumeLayout(False)
         Panel1.PerformLayout()
         ResumeLayout(False)
     End Sub
+    Friend WithEvents TipMain As ToolTip
     Friend WithEvents Timer1 As Timer
     Friend WithEvents Panel1 As Panel
     Friend WithEvents LblDigitsDisplayed As Label
@@ -260,8 +314,11 @@ Partial Class Form1
     Friend WithEvents BtnCompute As Button
     Friend WithEvents RtbPiDigits As RichTextBox
     Friend WithEvents BtnTest As Button
-    Friend WithEvents Label5 As Label
-    Friend WithEvents TxtChunkSize As TextBox
     Friend WithEvents LstBoxPhases As ListBox
+    Friend WithEvents LblRamThreshold As Label
+    Friend WithEvents NudRamThreshold As NumericUpDown
+    Friend WithEvents ChkAutoVerify As CheckBox
+    Friend WithEvents LblLogLevel As Label
+    Friend WithEvents NudLogLevel As NumericUpDown
 
 End Class

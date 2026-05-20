@@ -81,6 +81,16 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Link>libgmp-10.dll</Link>
     </None>
+    <!-- Issue #30: Copy native pool DLL built by GmpNativeAlloc project. -->
+    <None Include="$(MSBuildThisFileDirectory)GmpNativeAlloc\$(Configuration)\GmpNativeAlloc.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>GmpNativeAlloc.dll</Link>
+    </None>
   </ItemGroup>
+
+  <!-- Issue #30: Build dependency on native C DLL is expressed in the .sln file
+       (ProjectDependencies section) so that Visual Studio builds GmpNativeAlloc
+       first.  Run-PiCompute.ps1 invokes VS MSBuild for the native project before
+       dotnet build.  No ProjectReference here — dotnet CLI cannot load VC++ targets. -->
 
 </Project>

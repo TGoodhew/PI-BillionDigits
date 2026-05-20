@@ -1,8 +1,58 @@
 # PI-BillionDigits
 
+## Origin
+
+This project started with a request from my friend Mike Iem, one of the nicest guys I've ever worked with, who asked me to help him calculate Pi to a billion digits. I have no idea why he would want this, but it's Mike — and I'll help him out on whatever he asks for.
+
+Once I had it working at 1 billion digits, I figured: let's see if we can push it to 5 billion. That's where we are now.
+
+Details on the project below.
+
 ## What it is
 
-PI-BillionDigits is a Windows Forms application that computes Pi to an arbitrary number of decimal digits — up to and including one billion — and displays the result. It is written in VB.NET targeting .NET 10 and uses the [Math.Gmp.Native](https://www.nuget.org/packages/Math.Gmp.Native.NET/) wrapper around the GNU Multiple Precision Arithmetic Library (GMP) for all big-integer arithmetic.
+PI-BillionDigits is a Windows Forms application that computes Pi to an arbitrary number of decimal digits — verified at up to five billion — and displays the result. It is written in VB.NET targeting .NET 10 and uses the [Math.Gmp.Native](https://www.nuget.org/packages/Math.Gmp.Native.NET/) wrapper around the GNU Multiple Precision Arithmetic Library (GMP) for all big-integer arithmetic.
+
+## UPDATE: Tested up to 5 billion digits
+
+The application has been extended beyond its original 1-billion-digit target and successfully tested at **5,000,000,000 decimal digits** of Pi.
+
+### What changed
+
+The original implementation hit three 32-bit integer limits that are not reached at 1 billion digits but are exceeded at 5 billion:
+
+**1. `mpz_ui_pow_ui` argument overflow**
+Computing `10^N` for the final decimal scaling calls `mpz_ui_pow_ui(result, 10, N)`. GMP's `mp_bitcnt_t` is a 32-bit `unsigned long` on Windows (MSVC LLP64), so `N` is silently truncated when `N > 4,294,967,295`. At 5 billion digits this wraps to 705,032,704, producing the wrong scale factor. Fix: split into two halves (`mpz_ui_pow_ui(a, 10, N/2)` × `mpz_ui_pow_ui(b, 10, N-N/2)`) and combine with `SafeMpzMul`.
+
+**2. Shift-accumulation overflow in `SafeMpzMul`**
+During the 3×3 sub-product accumulation loop, each sub-product is shifted left by up to `2×bitsA + 2×bitsB` bits before being added to the accumulator. At 5 billion digits the maximum shift reaches ~22 billion bits — roughly 5× UInt32.MaxValue. The previous two-step split (`shift/2` twice) still overflowed because each half is ~11 billion bits. Fix: a chunk-based loop that applies at most `UInt32.MaxValue` bits per `mul_2exp` call, repeating until the full shift is applied.
+
+**3. Piece-extraction overflow in `SafeMpzMul`**
+The 3-way operand split extracts three sub-pieces (A0, A1, A2 and B0, B1, B2) from each input. The previous code used `mpz_init2(piece, bitsA)` to pre-allocate the piece buffer and `mpz_tdiv_r_2exp(piece, op, bitsA)` to extract the limbs — both of which take a 32-bit bit count on Windows. At 5 billion digits `bitsA ≈ 5.5 billion > UInt32.MaxValue`, so `init2` allocated far too few limbs and `tdiv` extracted the wrong range. Fix: **zero-copy limb windows** — each piece struct header is wired to point directly into the source operand's existing limb array at the correct offset, with no allocation and no data copying. This is safe because GMP only reads the piece values as multiplication inputs and never writes to them.
+
+### Performance impact of the zero-copy change
+
+The zero-copy piece extraction is also a **performance improvement at 1 billion digits**, because it eliminates:
+- Two `CopyMemory` calls of ~230 MB each per top-level `SafeMpzMul` entry (the old A1/A2 extraction copies)
+- Six `GmpRaw_init`/`GmpRaw_init2` calls and their matching allocations/frees
+- Four `mpz_tdiv_r/q_2exp` calls
+
+Profiling (dotnet-trace topN) shows `SafeMpzMul` exclusive time dropped from **17.98% → 14.82%** at 1 billion digits.
+
+### How to run at 5 billion digits
+
+The `Run-PiCompute.ps1` script accepts a `-Threshold` parameter that overrides the RAM/disk threshold. At 5 billion digits the number of Phase 1 chunks (~688,000) exceeds the default threshold; pass a large value to keep everything in RAM and avoid disk I/O during the combine phase.
+
+**Requirements:** ~25–30 GB available RAM, 64-bit Windows, .NET 10.
+
+Use `-AutoCheckpoint` so that if the run is interrupted (the combine phase takes several hours), the next run automatically resumes from the last completed level rather than starting over:
+
+```powershell
+.\Run-PiCompute.ps1 -Digits 5000000000 -Threshold 1000000 -AutoCheckpoint -LogLevel 2
+```
+
+The run takes several hours. Progress is written to `C:\PiOutput\pi_phase_log.txt` as it proceeds. If interrupted, re-run the same command — it will detect the latest snapshot in `C:\PiOutput\NodeCache\snap_L{N}\` and resume from there automatically.
+
+---
 
 ## How it works
 
@@ -28,7 +78,7 @@ The computation uses the **Chudnovsky algorithm** with **binary splitting**, whi
 | **Display** checkbox | When checked, the computed digits are streamed into the output panel after computation completes. Unchecking this is useful when only the file output matters, since displaying a billion digits takes significant time. |
 | **Write to File** checkbox | When checked, the full digit string is saved to `C:\PiOutput\pi_digits.txt` after computation. |
 | **Chunk Size** text box | Number of characters pushed into the display per timer tick during streaming. Higher values stream faster but may make the UI less responsive. Default: 500. Range: 1–1,000,000. |
-| **Test** button | Searches the computed digits for three known substrings and reports whether they appear at the correct positions: `999999` (expected at position 762, the Feynman point), `777777777` (expected at position 24,658,601), and `27182818284` (first digits of e). Searches the full native buffer when available, otherwise searches the display text box. |
+| **Test** button | Searches the computed digits for three known substrings and reports whether they appear at the correct positions: `999999` (expected at position 762, the Feynman point), `777777777` (expected at position 24,658,601), and `999999999` (nine 9s, expected at position 564,665,206). Searches the full native buffer when available, otherwise searches the display text box. |
 | **Status** bar | Shows the current phase (e.g., "Streaming 1,000,000,000 digits...") or any error message. |
 | **Running Time** label | Elapsed wall-clock time since Start was clicked, updated every second. |
 | **Digits Displayed** label | Running count of digits streamed to the output panel so far. |
@@ -94,6 +144,131 @@ A high-level overview of everything that was changed from the original implement
 - `LOGGING_DETAIL` compile-time constant: 0 = phases only, 1 = detail on final combine + all ComputePiGMP steps (default), 2 = full trace (§2).
 - Native buffer streaming: the billion-digit result is kept as a native `char*` rather than a managed string, avoiding a 1 GB managed allocation and GC pressure during display (§13).
 - Thread priority `AboveNormal` + `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` to prevent Windows from throttling the compute thread (§27).
+- Headless / automation mode (§63): `--digits N --autostart --autoverify` runs end-to-end without any UI dialogs; suppressed dialogs written to the phase log with a `[DIALOG]` prefix.
+- Custom digit verification (§67): `--verify-at "DIGITS:POSITION"` and `--verify-contains "DIGITS"` CLI options for automated correctness checks.
+
+### P-Core Affinity on Hybrid CPUs
+
+Intel 12th-gen+ (Alder Lake, Raptor Lake) and AMD Zen 4c CPUs expose two classes of cores: **P-cores** (full-power, high IPC, preferred for GMP math) and **E-cores** (lower power, lower single-thread performance, shared L2). Without affinity pinning, the Windows thread pool schedules tasks onto whichever logical processors are available — including E-cores — which can unpredictably slow down bandwidth-bound GMP operations.
+
+**How it works (§66):**
+
+The Win32 API `GetLogicalProcessorInformationEx(RelationProcessorCore, ...)` returns one `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` record per physical core. The `EfficiencyClass` byte in each record tells you whether the core is a P-core (`EfficiencyClass > 0`) or an E-core (`EfficiencyClass = 0`). Accumulate a bitmask for each class, then call `SetProcessAffinityMask` if both classes are present.
+
+**P/Invoke declarations:**
+```vb
+<DllImport("kernel32.dll", SetLastError:=True)>
+Private Shared Function SetProcessAffinityMask(
+    hProcess As IntPtr,
+    dwProcessAffinityMask As IntPtr) As Boolean
+End Function
+
+<DllImport("kernel32.dll", SetLastError:=True)>
+Private Shared Function GetLogicalProcessorInformationEx(
+    relationshipType As Integer,
+    buffer As IntPtr,
+    ByRef returnedLength As UInteger) As Boolean
+End Function
+
+Private Const RelationProcessorCore As Integer = 0
+```
+
+**Detection and pinning:**
+```vb
+Private Shared Sub SetPCoreAffinity()
+    Try
+        ' Step 1: two-call pattern — first call returns required buffer size
+        Dim bufferSize As UInteger = 0
+        GetLogicalProcessorInformationEx(RelationProcessorCore, IntPtr.Zero, bufferSize)
+        If bufferSize = 0 Then Return
+
+        Dim buffer As IntPtr = Marshal.AllocHGlobal(CInt(bufferSize))
+        Try
+            If Not GetLogicalProcessorInformationEx(RelationProcessorCore, buffer, bufferSize) Then Return
+
+            ' Step 2: parse variable-length records.
+            ' SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX layout (RelationProcessorCore):
+            '   +0   Relationship   : DWORD  (4 bytes)
+            '   +4   Size           : DWORD  (4 bytes) — record length, varies
+            '   +8   Flags          : BYTE   (1 byte)
+            '   +9   EfficiencyClass: BYTE   (1 byte)  — 0=E-core, >0=P-core
+            '  +10   Reserved[20]   : BYTE  (20 bytes)
+            '  +30   GroupCount     : WORD   (2 bytes)
+            '  +32   GroupMask[0].Mask : ULONG_PTR (8 bytes on x64) — logical processor bitmask
+            Dim pCoreMask As Long = 0L
+            Dim eCoreMask As Long = 0L
+            Dim offset As Integer = 0
+
+            Do While offset < CInt(bufferSize)
+                Dim recordSize As Integer = Marshal.ReadInt32(buffer, offset + 4)
+                If recordSize <= 0 Then Exit Do
+
+                Dim efficiencyClass As Byte = Marshal.ReadByte(buffer, offset + 9)
+                Dim mask As Long = Marshal.ReadInt64(buffer, offset + 32)
+
+                If efficiencyClass > 0 Then
+                    pCoreMask = pCoreMask Or mask   ' P-core logical processors
+                Else
+                    eCoreMask = eCoreMask Or mask   ' E-core logical processors
+                End If
+
+                offset += recordSize  ' advance to next record
+            Loop
+
+            ' Step 3: only pin if this is actually a hybrid CPU
+            If pCoreMask <> 0L AndAlso eCoreMask <> 0L Then
+                SetProcessAffinityMask(GetCurrentProcess(), New IntPtr(pCoreMask))
+                ' Log: $"Hybrid CPU. P-core mask=0x{pCoreMask:X}  E-core mask=0x{eCoreMask:X}"
+            Else
+                ' Uniform CPU — all cores same class, leave affinity unchanged
+            End If
+        Finally
+            Marshal.FreeHGlobal(buffer)
+        End Try
+    Catch ex As Exception
+        ' Log and continue — affinity is an optimisation, not a correctness requirement
+    End Try
+End Sub
+```
+
+**Call site — invoke once before the first `Parallel.For`:**
+```vb
+SetPCoreAffinity()
+ThreadPool.SetMinThreads(Environment.ProcessorCount, Environment.ProcessorCount)
+```
+
+**Key points:**
+- The two-call pattern (size query with `IntPtr.Zero`, then data query) is required — the buffer size varies with the number of cores.
+- `Size` at offset +4 is the actual record length and must be used to advance the offset; do not assume a fixed struct size.
+- On a non-hybrid machine all records have the same `EfficiencyClass`, so `eCoreMask` stays 0 and the affinity mask is left unchanged — the function is safe to call unconditionally.
+- `GetCurrentProcess()` returns a pseudo-handle that is always valid; no `CloseHandle` required.
+- The affinity mask is inherited by all threads including thread pool workers, so one call from the UI/compute thread is sufficient.
+
+### Automation
+
+**Headless mode (§63):** All three `MessageBox.Show` dialogs are gated behind `If Not _headless Then`. In headless mode the text is written to the phase log with a `[DIALOG]` prefix so automated runs leave a full audit trail without blocking.
+
+**`Run-PiCompute.ps1` (§63, §70, §94):** PowerShell script that clean-builds and launches the exe. Machine-independent: the exe path is auto-detected by globbing `bin\Release\**\PI-BillionDigits.exe` after the build (no hardcoded TFM folder), and the output directory defaults to `C:\PiOutput` (overridable via `-OutputDir`). Parameters: `-Digits N` (default 1B), `-OutputDir <path>`, `-Threshold N`, `-CheckpointFromLevel N`, `-ResumeFromLevel N`, `-AutoCheckpoint`, `-Trace`, `-ReportOnly <path>`.
+
+**Quick start:**
+```powershell
+# Standard 1B run
+.\Run-PiCompute.ps1
+
+# Custom digit count and output location
+.\Run-PiCompute.ps1 -Digits 100000000 -OutputDir "D:\PiResults"
+
+# 5B run with auto-checkpoint (resumes automatically if interrupted)
+.\Run-PiCompute.ps1 -Digits 5000000000 -Threshold 1000000 -AutoCheckpoint -LogLevel 2
+
+# With CPU trace
+.\Run-PiCompute.ps1 -Trace
+
+# Re-generate report from existing trace
+.\Run-PiCompute.ps1 -ReportOnly ".\pi_trace_20260331_121017.nettrace"
+```
+
+**P-core affinity + thread pool pre-warm (§66):** On hybrid CPUs (Intel P+E core), `GetLogicalProcessorInformationEx` is used to detect P-cores by `EfficiencyClass` and restrict the process affinity mask to those cores only. `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` pre-warms the thread pool before Phase 1 to eliminate first-task latency.
 
 ---
 
@@ -1021,15 +1196,15 @@ System.NotSupportedException: No data is available for encoding 1252.
 
 ---
 
-## Section 25 — Test Button Searches Native Buffer; Buffer Freed on Test or Compute
+## Section 25 — Verify Button Searches Full Native Buffer Without Interrupting Display
 
-**Problem:** the Test button searched `RtbPiDigits.Text`, which only contains digits streamed so far by the display timer. The nine-7s sequence (`777777777`) appears at position 24,658,601 and the digits-of-e sequence (`27182818284`) appears even later — both would return "not found" if the user clicked Test before streaming reached those positions.
+**Problem:** the Test button searched `RtbPiDigits.Text`, which only contains digits streamed so far by the display timer. The nine-7s sequence (`777777777`) appears at position 24,658,601 and the digits-of-e sequence (`27182818284`) appears even later — both would return "not found" if the user clicked Test before streaming reached those positions. Additionally, the original implementation freed `_displayNativePtr` after searching, which stopped the display timer mid-stream.
 
-**Change:** the native Pi buffer (`_displayNativePtr`, the `~1 GB` null-terminated ASCII string produced by `mpz_get_str`) is now retained after streaming completes instead of being freed immediately. When the user clicks Test, the button marshals the full native buffer to a managed string via `Marshal.PtrToStringAnsi`, runs all three searches against the complete digit sequence, then frees the buffer. This makes all searches correct regardless of display progress.
+**Change:** the native Pi buffer (`_displayNativePtr`, the null-terminated ASCII string produced by `mpz_get_str`) is retained for the lifetime of the computation result. When the user clicks "Verify Now", the button marshals the full native buffer to a managed string via `Marshal.PtrToStringAnsi` and runs all searches against the complete digit sequence — without freeing the buffer. The display timer continues streaming uninterrupted.
 
-The buffer is also freed at the top of `BtnCompute_Click` so that starting a new computation always releases any buffer held from the previous run.
+The buffer is freed only at the top of `BtnCompute_Click` when a new computation starts.
 
-If `_displayNativePtr` is zero (buffer already freed, or a run that used the managed-string path), the Test button falls back to searching `RtbPiDigits.Text` as before.
+If `_displayNativePtr` is zero (no native buffer, or a run that used the managed-string path), verification falls back to searching `RtbPiDigits.Text`.
 
 ---
 
@@ -1597,3 +1772,2792 @@ gmp_lib.mpz_tdiv_q_2exp(tmpHigh, finalQ, k1)   ' MPZ_REALLOC short-circuits → 
 ```
 
 Sizes: `tmpHigh` = `finalQ._mp_size - k1/64 + 2` limbs ≈ 747 MB; `mpQ1` = `mpQ2` = `k1/64 + 2` limbs ≈ 373 MB each.
+
+---
+
+## Section 48 — Thread-Safe GMP Allocator Callbacks (`AppendLog` helper)
+
+**Branch:** PerfWork
+
+**Change:** Added a `_logLock As New Object()` shared field and an `AppendLog(message)` static helper that wraps `File.AppendAllText` in `SyncLock _logLock`. All `System.IO.File.AppendAllText(LOG_FILE, ...)` calls inside `GmpAllocFunc`, `GmpReallocFunc`, and `GmpFreeFunc` were replaced with `AppendLog(...)`.
+
+**Why:** The underlying memory operations in the three allocator callbacks — `VirtualAlloc`, `VirtualFree`, MSVC CRT `malloc`/`realloc`/`free` — are all intrinsically thread-safe Win32/CRT APIs. The only non-thread-safe element was the `File.AppendAllText` log writes: concurrent calls from multiple worker threads can race on the log file and either lose entries or throw `IOException` (silently swallowed by the `Try/Catch`). The lock ensures log entries are never interleaved or dropped under parallel load.
+
+---
+
+## Section 49 — Parallel Phase 1: `Parallel.For` over 137,700 Independent Chunks
+
+**Branch:** PerfWork
+
+**Change:** Replaced the serial `For i As Long = 0 To numChunks - 1` loop in `BinarySplitGMP` Phase 1 with `Parallel.For(0L, numChunks, Sub(i) ...)`. Results are written into a pre-sized `DiskNode()` array by index (no locking needed — each index is written exactly once by exactly one thread). After the parallel section, `diskNodes.AddRange(chunkResults)` populates the list in order. Progress is tracked with `Interlocked.Increment` and the status label is updated every ~1% of chunks (`statusUpdateInterval = Math.Max(1, numChunks \ 100)`). Per-chunk `SerializeNodeToDisk` log entries are suppressed (`detailLog:=False`) to avoid 137K concurrent log writes.
+
+---
+
+## Section 50 — Progress Updates During Old Cache Deletion
+
+**Branch:** PerfWork
+
+**Change:** Before deleting old `.bin` cache files, the file list is now fetched with `Directory.GetFiles` so the total count is known. An initial `BeginInvoke` sets `LblStatus` to `"Clearing N cached files from previous run..."`. During the deletion loop a further update fires every 1,000 files showing `"Clearing cache: X / N files deleted..."`.
+
+**Why:** Deleting ~137,739 small files from a previous run is a pure NVMe metadata workload taking ~2 minutes. The thread pool is idle at this point (the `Parallel.For` hasn't started) so `BeginInvoke` reaches the UI thread promptly. Without this change the status label was frozen at the `LogPhase` message for the entire deletion period with no indication of progress.
+
+---
+
+## Section 51 — Fix Phase 1 Status Label Never Updating for Small Chunk Counts
+
+**Branch:** PerfWork
+
+**Change:** Replaced the hard-coded `done Mod 1000L = 0L` update condition with `done Mod statusUpdateInterval = 0L`, where `statusUpdateInterval = Math.Max(1L, numChunks \ 100L)`. The interval variable is computed once before the `Parallel.For`.
+
+**Why:** With 138 chunks (small digit counts), `done` only reaches 138, so `done Mod 1000 = 0` is never satisfied and `LblStatus` stays frozen on the initial `LogPhase` message for the entire duration of Phase 1. The dynamic interval fires at every ~1% of completion regardless of total chunk count — for 138 chunks it updates every 1–2 chunks; for 137,700 chunks it updates every ~1,377.
+
+---
+
+## Section 51 — Fix Phase 1 Status Label Not Updating on Full 1B Run (Timer-Based Polling)
+
+**Branch:** PerfWork
+
+**Change:** Replaced the `BeginInvoke`-inside-parallel-loop approach with a dedicated background `Thread` (not a thread-pool thread) that polls `completedChunks` via `Interlocked.Read` every 500 ms and posts a `BeginInvoke` to update `LblStatus`. The thread loops `While completedChunks < numChunks` and exits naturally when the parallel loop finishes; the calling thread calls `phase1PollThread.Join()` after `Parallel.For` returns. The `Parallel.For` body retains only `Interlocked.Increment` and a file log every 5,000 completions.
+
+**Why:** `System.Threading.Timer` callbacks execute on thread-pool threads. `Parallel.For` exhausts the thread pool, so timer callbacks are queued but cannot run — causing the status label to stay frozen at the initial `LogPhase` message for ~2 minutes. A dedicated `Thread` gets its own OS time-slice from the Windows scheduler, independent of thread-pool saturation, so the first status update appears within 500 ms of `Parallel.For` starting.
+
+---
+
+## Section 54 — Parallel Multiplications Within Phase 2 Serial Combines
+
+**Branch:** PerfWork
+
+**Change:** In the serial Phase 2 combine path (top levels, `pairCount < 4`), replaced the four sequential `SafeMpzMul` calls with two `Parallel.Invoke` pairs:
+- **Pair 1:** `newP = leftP × rightP` and `newQ = leftQ × rightQ` run simultaneously (disjoint operands).
+- **Pair 2:** `tempA = leftT × rightQ` and `tempB = leftP × rightT` run simultaneously (disjoint operands).
+
+The `mpz_clears` early-free calls and the final `mpz_add` are unchanged and still happen after both tasks in each pair complete. `LOGGING_DETAIL` pre-call size logs for each pair are emitted together before the `Parallel.Invoke` (read-only access; safe).
+
+**Why:** At the top 2–3 combine levels (1–3 pairs), each `SafeMpzMul` operates on operands hundreds of MB to over a GB in size and takes minutes. Since `newP`/`newQ` use completely disjoint operands, and `tempA`/`tempB` likewise, `Parallel.Invoke` gives ~2× wall-clock speedup on each pair. `SafeMpzMul` calls with distinct result and operand objects are thread-safe: GMP arithmetic on non-aliased `mpz_t` objects is safe concurrently, and all shared state (allocator logging) is already protected by `SyncLock _logLock` (§48).
+
+**Note:** The full 9 sub-product parallelism inside `SafeMpzMul` itself was considered but deferred — see memory file `project_safempzmul_parallel_future.md`.
+
+---
+
+## Section 62 — Degree-of-Parallelism Caps to Prevent Oversubscription
+
+**Branch:** AdvPerfWork
+
+**Change:** Added `ParallelOptions.MaxDegreeOfParallelism` to two sites:
+
+1. **SafeMpzMul `Parallel.For(0, 9)`** — capped to `Environment.ProcessorCount`. When `SafeMpzMul` is called from inside Phase 2's outer `Parallel.For`, uncapped inner parallelism creates `pairCount × 2 × 9` concurrent tasks on 24 cores (e.g. 8 pairs × 2 × 9 = 144 tasks). This saturates memory bandwidth without proportional throughput gain. Capping to `ProcessorCount` ensures the inner loop never exceeds the physical core count regardless of nesting depth.
+
+2. **Phase 2 outer `Parallel.For(pairCount)`** — capped to `Math.Max(1, Environment.ProcessorCount \ 2)`. Each outer task spawns 2 inner tasks via `Parallel.Invoke` (§60), so uncapped outer DOP × 2 = `2 × ProcessorCount` concurrent multiplications. Capping outer DOP to `ProcessorCount \ 2` keeps total concurrent multiplications at ~`ProcessorCount`, leaving the thread pool headroom to schedule the inner `Parallel.Invoke` tasks without queuing.
+
+**Why:** .NET's thread pool uses work-stealing so oversubscription doesn't deadlock, but it does cause excessive context switching and memory bus contention for GMP's FFT multiplications which are already memory-bandwidth-bound at the larger operand sizes. These caps keep effective concurrency at the physical core count without reducing throughput at levels where pairCount < ProcessorCount/2 (where the outer cap is non-binding anyway).
+
+---
+
+## Section 61 — Parallel Three-Pass Q Multiply + Non-Blocking GC Between Levels
+
+**Branch:** AdvPerfWork
+
+### Part A — Parallel three-pass Q multiply
+
+**Change:** The three serial passes `r0 = gmpNumer × Q0`, `r1 = gmpNumer × Q1`, `r2 = gmpNumer × Q2` now run simultaneously via `System.Threading.Tasks.Parallel.Invoke`. `gmpNumer` is read-only in all three calls; each result is a distinct `mpz_t`, so there is no shared mutable state between threads.
+
+Q1 and Q2 are no longer spilled to disk between extraction and use — they stay in RAM. r0 and r1 are no longer spilled and reloaded between passes — Combine B and D use the in-memory variables directly. This removes 6 disk I/O operations (4 serialize + 2 deserialize) and eliminates the disk round-trip latency entirely.
+
+**Why:** The three passes were purely serial because of the disk spill/reload pattern. Each pass took roughly the same time as one `SafeMpzMul` on ~400 MB operands. Running them in parallel gives up to 3× speedup on this section. The disk spilling was necessary when memory was constrained (before §58 raised `DISK_THRESHOLD`); with the full-RAM mode on a 64 GB machine the ~1.2 GB peak for all three simultaneous results is trivial.
+
+**Memory impact:** Peak during parallel multiply: gmpNumer (~208 MB) + Q0+Q1+Q2 (~549 MB) + r0+r1+r2 (~1.15 GB) + SafeMpzMul intermediates (~2.9 GB) ≈ ~4.8 GB. Well within the 64 GB budget.
+
+### Part B — Non-blocking GC between Phase 2 levels
+
+**Change:** The `GC.Collect(MaxGeneration, Aggressive, blocking:=True, compacting:=True)` call between Phase 2 levels now uses `GCCollectionMode.Optimized` with `blocking:=False` at all levels except the final level (where the aggressive blocking collect is retained to reclaim the large Phase 2 intermediates before the final arithmetic).
+
+**Why:** The aggressive blocking GC was pausing all threads at each of ~17 levels. At lower levels (many small nodes, fast combines) these pauses were a significant fraction of level time. A non-blocking optimized collect is sufficient to reclaim the `mpz_t` wrapper objects from freed pairs without stalling parallel work.
+
+---
+
+## Section 60 — Parallel.Invoke Inside Parallel Phase 2 Pairs
+
+**Branch:** AdvPerfWork
+
+**Change:** Added `Parallel.Invoke` for the two independent multiply pairs inside the `Parallel.For` lambda of the parallel Phase 2 path — the same §54 pattern already used in the serial top-level path:
+- **Invoke pair 1:** `newP = leftP × rightP` and `newQ = leftQ × rightQ` run simultaneously (disjoint operands).
+- **Invoke pair 2:** `tempA = leftT × rightQ` and `tempB = leftP × rightT` run simultaneously (disjoint operands).
+
+**Why:** As Phase 2 levels rise, the number of pairs halves each level while each pair's operands double in size (and multiply time grows quadratically). Without this change, each outer `Parallel.For` task uses only 1 core — the 4 multiplications per pair are serial. By Level 2 (34,435 pairs, each taking ~4× longer than Level 1), each task was using 1/24th of available cores. Adding `Parallel.Invoke` within each task doubles intra-pair parallelism, effectively maintaining the same number of concurrent multiplications as Level 1 (34,435 × 2 = 68,870 simultaneous multiplies vs Level 1's ~68,870 pairs × 1).
+
+This mirrors the §54 change applied to the serial top-level path. `SafeMpzMul` with non-aliased operands is thread-safe; all shared log writes are already serialised via `SyncLock _logLock`.
+
+---
+
+## Section 59 — Parallel 9 Sub-Products Inside SafeMpzMul
+
+**Branch:** AdvPerfWork
+
+**Change:** The 9 independent sub-products `A_i × B_j` (i,j ∈ {0,1,2}) inside `SafeMpzMul`'s slow path now run concurrently via `Parallel.For(0, 9, ...)` instead of serially in nested `For i / For j` loops.
+
+Key design points:
+- **A-piece extraction moved upfront:** A0, A1, A2 are all extracted before the parallel section (previously A_part was lazily re-extracted per-i iteration). Each is `mpz_init2`'d to ensure `_mp_alloc >= mA` before direct limb copies for A1 and A2.
+- **9 distinct `prods(k)` result buffers:** Each thread writes into its own `prods(k)` object; no shared mutable state between threads.
+- **Thread safety:** A_parts and B_parts are read-only during the parallel section. GMP arithmetic on non-aliased `mpz_t` objects is intrinsically thread-safe. The §44 accumPtr stash lives in `result`'s native struct; inner calls stash into `prods(k)` structs and never touch `result`'s struct, preserving the outer stash.
+- **Serial accumulation after:** After `Parallel.For`, a serial `For k = 0 To 8` loop shifts each `prod_k` into its positional slot (`shiftBits = i*bitsA + j*bitsB`) and accumulates into `accum`. No inner `SafeMpzMul` calls in this loop — no §42/§44 corruption risk. Each `prods(k)` is freed immediately after use to limit peak RAM.
+- **Existing shift/add/free logic preserved:** The VirtualAlloc pre-sizing for `shifted`, two-step shift for large `shiftBits`, and `GmpRaw_add` accumulation are unchanged from the serial path.
+
+**Why:** At Levels 14–17 of Phase 2, `SafeMpzMul` hits the slow path because `szA + szB > 33,554,431` limbs. The 9 sub-products were computed serially, leaving 23 cores idle during each multiply. Running them in parallel gives up to 9× speedup on the sub-product step — the dominant cost at the top combine levels.
+
+**Memory impact:** At Level 17, 9 simultaneous sub-products × ~374 MB each = ~3.4 GB extra peak RAM. Plus A0+A1+A2 simultaneously (~1.1 GB vs ~374 MB lazy). Total ~3.1 GB extra vs serial — well within the 64 GB machine's headroom.
+
+---
+
+## Section 58 — Full RAM Mode (DISK_THRESHOLD raised to 200,000)
+
+**Branch:** AdvPerfWork
+
+**Change:** `DISK_THRESHOLD` raised from `1` to `200_000` in `BinarySplitGMP`. Since `numChunks = 137,739 < 200,000`, Phase 1 keeps all chunk results in the `chunkResults()` array in RAM (no `L0.bin` written). Since every Phase 2 level produces `nextSize < 200,000` nodes, all levels also stay in RAM. The NVMe is no longer touched during computation at all — only for writing the final digit string.
+
+**Why:** `DISK_THRESHOLD = 1` was set defensively during the §40–§44 allocator crash fixes, not because RAM was insufficient. The machine has 64 GB RAM; the total P+Q+T data across any single Phase 2 level is ~1.7 GB (constant across all levels), and peak RAM during a combine (current level + next level + multiply intermediates) is ~6–8 GB. With the allocator now stable, there is no reason to use disk as a crutch. Eliminating disk I/O from Phase 2 removes the NVMe read/write overhead that dominated wall-clock time at Levels 1–13.
+
+---
+
+## Section 57 — Phase 2 Level Progress in Status Label
+
+**Branch:** PerfWork
+
+**Change:** The status label now shows pair progress for every Phase 2 combine level:
+
+- **Parallel path** (`pairCount >= 4`): A dedicated background `Thread` (not thread-pool) polls an `Interlocked`-incremented `completedPairs` counter every 500 ms and posts `BeginInvoke` updates showing `"Phase 2 Level N: X / Y pairs"`. `Interlocked.Increment(completedPairs)` is called at the end of each `Parallel.For` lambda body. The calling thread calls `phase2PollThread.Join()` after `Parallel.For` returns (same pattern as Phase 1 §51).
+- **Serial path** (`pairCount < 4`, top levels): A direct `BeginInvoke` is posted after each pair completes, showing the same `"Phase 2 Level N: X / Y pairs"` format. The thread pool is not exhausted at these levels (only 1–3 pairs, each taking minutes), so `BeginInvoke` reaches the UI thread promptly.
+
+**Why:** During Phase 2 the status label was frozen with no indication of progress within a level. For Level 1 (~68,869 pairs) running in parallel, users had no visibility into how far along the combine was. The dedicated-thread pattern is required for the parallel path for the same reason as Phase 1: `Parallel.For` exhausts the thread pool, starving any timer-based polling.
+
+---
+
+## Section 56 — Larger Staging Buffer in SerializeOneMpz / DeserializeOneMpz
+
+**Branch:** PerfWork
+
+**Change:** Increased the `staging` array from 64 KB (`staging(65535)`) to 4 MB (`staging(4194303)`) in three places:
+- `SerializeNodeToDisk` — the buffer passed to `SerializeOneMpz` for all three fields
+- `LoadNodeFromDisk` — the buffer passed to `DeserializeOneMpz` for all three fields
+- The `Parallel.For` lambda in Phase 1 (`stagingBuf`) — used for the per-chunk `MemoryStream` serialization path
+
+**Why:** `SerializeOneMpz` and `DeserializeOneMpz` read/write limb data in a `While remaining > 0` loop, each iteration copying `staging.Length` bytes via `Marshal.Copy` and writing/reading via `BinaryWriter`/`BinaryReader`. With a 64 KB buffer, a Level-17 value (~560 MB) requires ~8,738 loop iterations. A 4 MB buffer reduces this to ~137 iterations — a 64x reduction in loop overhead. The gains are largest at Levels 14–17 where each `mpz_t` is tens to hundreds of MB. The 4 MB buffer exceeds the .NET 85 KB LOH threshold but is short-lived (local to each call, collected promptly) so LOH fragmentation is not a concern.
+
+---
+
+## Section 55 — Single-File L0.bin Format for Level-0 Chunks
+
+**Branch:** PerfWork
+
+**Change:** Replaced 137,739 individual `L0_N{i}.bin` files with a single `L0.bin` file for all Level-0 chunks. Key design points:
+
+- A `FileStream` for `L0.bin` (4 MB buffer, `FileShare.None`) is opened once before the `Parallel.For`.
+- Each worker thread serializes its three `mpz_t` values to a `MemoryStream` outside any lock (no contention for large serialization work), then enters a `SyncLock` only to record the current stream position into `node.FileOffset` and write the pre-built bytes — minimising lock hold-time to a single seek + write.
+- `DiskNode` gains a `FileOffset As Long` field (0 for non-L0 nodes that use individual files).
+- `LoadNodeFromDisk` gains a `fileOffset As Long` parameter; if non-zero, `fs.Seek(fileOffset, SeekOrigin.Begin)` is called before reading.
+- All five `LoadNodeFromDisk` call sites pass `diskNodes(idx).FileOffset`.
+- Phase 2 combine loops skip `File.Delete` for Level-0 nodes (`diskNodes(idx).Level = 0`) — `L0.bin` is cleaned up by the single-file `Directory.GetFiles` + delete at the start of the next run (§50), which now removes 1 file instead of 137,739.
+
+**Why:** The ~2-minute NVMe metadata overhead at the start of every run was caused by deleting 137,739 small individual files (§50 visible). A single `L0.bin` file reduces the next run's cache clear from 137,739 `File.Delete` calls to 1, eliminating that entire overhead. The lock-outside-memorystream pattern keeps thread contention minimal even on 24 cores writing simultaneously.
+
+---
+
+## Section 53 — Parallel Phase 2 Combines (Levels 1–N-3)
+
+**Branch:** PerfWork
+
+**Change:** Replaced the serial `While nodeIdx < diskNodes.Count - 1` inner loop in the Phase 2 combine pass with a `Parallel.For` over pair indices when `pairCount >= 4`. Each pair is fully independent: it loads from two unique disk files, uses only thread-local `mpz_t` objects, and writes to a unique output file. Results are written into a pre-sized `nextResults(pairCount-1)` array by pair index (no locking needed), then `nextDiskNodes.AddRange(nextResults)` populates the list in order. The serial path is retained for `pairCount < 4` (the top levels where operands are very large and there are too few pairs for parallelism to help without excessive RAM pressure). The `LOGGING_DETAIL` diagnostic blocks and the per-100-pair `LogPhase` call remain in the serial path only.
+
+**Why:** At the lower combine levels there are thousands of independent node pairs per level — e.g. ~68,869 pairs at Level 1, ~34 at Level 12. Each pair's four `SafeMpzMul` calls are entirely independent of all other pairs. On a 24-logical-processor machine this is the same situation as Phase 1: a serial loop leaves 23 cores idle. The `pairCount >= 4` threshold keeps the top 1–2 levels serial where loading multiple pairs simultaneously would multiply already-large (~hundreds of MB to GB) operands across threads and risk OOM.
+
+---
+
+## Section 68 — GMP Pool Cap Raised to 256
+
+**Branch:** AdvPerfWork
+
+**Change:** `POOL_CAP` increased from 32 to 256.
+
+**Why:** With outer Phase 2 DOP=24 (§69) and each pair running `Parallel.Invoke(2 SafeMpzMul)`, up to 48 concurrent GMP operations can return pool blocks simultaneously. A cap of 32 meant the pool was constantly evicting via `VirtualFree` and missing on the next alloc via `VirtualAlloc`, negating the pool's purpose. Raising to 256 keeps all concurrently live blocks in the pool for immediate reuse.
+
+---
+
+## Section 69 — DOP Rebalance: Phase 2 Outer=ProcessorCount, SafeMpzMul Inner=1
+
+**Branch:** AdvPerfWork
+
+**Change:** Two coordinated DOP changes to eliminate nested thread-pool oversubscription:
+
+1. **Phase 2 parallel outer DOP:** raised from `ProcessorCount \ 2` (12) to `ProcessorCount` (24).
+2. **SafeMpzMul inner DOP:** controlled by new `Shared _safeMulDop As Integer` field. Set to `1` (serial) before the Phase 2 outer `Parallel.For`; restored to `ProcessorCount` after the parallel path completes (before the serial top-level path and `ComputePiGMP`). In `SafeMpzMul`, when `_safeMulDop <= 1`, the 9 sub-products run in a serial `For k = 0 To 8` loop instead of `Parallel.For`.
+
+**Effect:** `_safeMulDop = 1` eliminates the inner `Parallel.For` inside `SafeMpzMul` when called from the Phase 2 parallel path — sub-products run serially, no nested task submission. Serial Phase 2 top levels and `ComputePiGMP` restore `_safeMulDop = Environment.ProcessorCount` to keep full inner parallelism for those single-pair operations.
+
+**Why (trace 4 → trace 5 correction):** Trace 4 showed `LowLevelLifoSemaphore.WaitForSignal` at 18.77% — thread pool threads parking between sub-product tasks. Eliminating inner `Parallel.For` from the parallel path fixed that. However trace 5 revealed that raising outer DOP to `ProcessorCount` (24) was counterproductive: each outer task calls `Parallel.Invoke(newP, newQ)` which needs a free thread for the second task. With all 24 threads occupied by outer tasks, `Parallel.Invoke` could not immediately place its second task — `Task.WaitAll` jumped to 19.33% and the allocator worsened from 35% to 44% (48 concurrent GMP operations vs 24). Outer DOP is therefore restored to `ProcessorCount \ 2`, giving 12 outer tasks × 2 free threads per Invoke = both newP and newQ always run truly in parallel with no blocking.
+
+---
+
+## Section 63 — Headless / Automation Mode + PowerShell Script
+
+**Branch:** PerfWork / AdvPerfWork
+
+**Change:** Added three CLI arguments parsed in `Form1_Load`:
+
+- `--digits N` — sets the digit count programmatically (bypasses the UI spinner).
+- `--autostart` — triggers `BtnCompute_Click` from `Form1_Shown` so the computation starts without any user interaction.
+- `--autoverify` — triggers `BtnTest_Click` automatically after computation completes.
+
+All three `MessageBox.Show` dialogs (compute complete, verify result, error) are gated: in headless mode the dialog text is written to the phase log with a `[DIALOG]` prefix instead of blocking the process.
+
+Headless defaults applied at startup: `ChkboxDisplay.Checked = False`, `TxtChunkSize.Text = "500000"`, `ChkboxWriteToFile.Checked = True`.
+
+Added `Run-PiCompute.ps1`:
+- `dotnet clean` → `dotnet build --configuration Release` → launch exe with `--digits $Digits --autostart --autoverify`.
+- `-Trace` switch: wraps the run with `dotnet-trace collect` (providers: `Microsoft-DotNETCore-SampleProfiler:0xF00000000000:5` + `Microsoft-DotNETRuntime:0x1F000080018:5`), then calls `dotnet-trace report topN -n 50 --inclusive` and saves a `_report.txt` alongside the `.nettrace`.
+- `-ReportOnly <path>`: skips build/run; re-generates the topN report from an existing `.nettrace`.
+- Output directory hardcoded to `c:\PiOutput`; created if missing. (Replaced in §70 — see below.)
+- `.gitignore` updated to exclude `*.nettrace`, `*.nettrace.etlx`, `*.etlx`, `*.etl`, `*.etl.zip`, `*.speedscope.json`, `*.diagsession`, `*.vspx`, `*.psess`, `*_report.txt`, `pi_trace_*`.
+
+---
+
+## Section 70 — Make Run-PiCompute.ps1 Machine-Independent
+
+**Branch:** AdvPerfWork
+
+**Change:** Three portability improvements to `Run-PiCompute.ps1`:
+
+1. **Auto-detect exe path** — after the build, `Get-ChildItem -Recurse` globs `bin\Release\**\PI-BillionDigits.exe` and takes the most recently written match. No hardcoded TFM folder (`net10.0-windows10.0.26100.0`) — works correctly when the target framework version changes or on machines with a different Windows SDK.
+
+2. **Relative output directory** — `$piOutputDir` replaced by `-OutputDir` parameter defaulting to `.\PiOutput` (i.e. a `PiOutput` folder next to the script). No longer requires write access to `c:\`. Override with `-OutputDir "D:\SomeOtherPath"` without editing the script body.
+
+3. **Configurable digit count** — `-Digits` parameter (default `1000000000`) passed through to the exe, replacing the hardcoded `--digits 1000000000`. Useful for quick test runs at lower digit counts.
+
+**Why:** The original hardcoded `c:\PiOutput` and `bin\Release\net10.0-windows10.0.26100.0` paths break silently on any machine where the system drive letter differs, the user lacks root-write permission, or the .NET SDK target framework version is updated. All machine-specific values are now computed defaults that work on a clean clone without any manual configuration.
+
+---
+
+## Section 71 — Portable Output Paths + Remove Vestigial Chunk Size UI
+
+**Branch:** AdvPerfWork
+
+**Change:** Three related clean-up items addressing issue #5:
+
+**1. Machine-independent output paths in Form1.vb**
+
+All hardcoded `c:\PiOutput` paths replaced with a single `Shared _outputDir` field defaulting to `%LOCALAPPDATA%\PI-BillionDigits` (always writable, no admin rights, works on any drive letter). `outputFile`, `LOG_FILE`, and `DISK_CACHE_DIR` are now computed `ReadOnly Property` values derived from `_outputDir`. The two `File.AppendAllText("c:\PiOutput\pi_phase_log.txt", ...)` calls in `StreamPiToScreen` and `DisplayTimer_Tick` that bypassed the logging subsystem are replaced with `WriteToLog(...)` calls.
+
+**2. Remove Chunk Size UI control**
+
+`TxtChunkSize` (TextBox) and its `Label5` ("Chunk Size:") label removed from the form. The control originally configured Phase 1 chunk size, which has been a compile-time constant (`Const CHUNK_SIZE As Long = 512`) since §49. Its only remaining effect was controlling `DisplayTimer_Tick` streaming speed (chars per 100 ms tick), which is now a code constant (`Const chunkSize As Integer = 500`). The headless default-setting line (`TxtChunkSize.Text = "500000"`) is also removed.
+
+**Why:** `TxtChunkSize` was presenting a misleading "Chunk Size" label to users that no longer did what it implied (Phase 1 computation granularity). Its actual effect (display streaming rate) is invisible to users running headless or with display off, and the default of 500 chars/tick is appropriate for interactive viewing of smaller runs. Removing it declutters the UI and eliminates a potential source of confusion.
+
+## Section 64 — Skip Display Loop When Display Is Off
+
+**Branch:** PerfWork / AdvPerfWork
+
+**Change:** `StreamPiToScreen` now fast-paths at entry: if `ChkboxDisplay.Checked = False`, it calls `WriteResultToFile()` directly and returns without entering the streaming loop. `WriteResultToFile(digitCount As Long)` is extracted as a shared helper used by both the fast path and the display loop's final step.
+
+**Why:** In headless mode (or any interactive run with Display unchecked) the streaming loop was still iterating over the native buffer one chunk at a time for no visible effect, wasting several seconds.
+
+---
+
+## Section 65 — Bucketed VirtualAlloc Pool (GMP Allocator v3)
+
+**Branch:** AdvPerfWork
+
+**Change:** Replaced the per-call `VirtualAlloc`/`VirtualFree` allocator with a power-of-2 bucketed pool:
+
+- 64 fixed `ConcurrentStack(Of IntPtr)` slots, one per bit-length bucket (bucket `b` holds blocks of exactly `2^b` bytes).
+- `PoolBucket(sz)` computes `ceil(log2(sz))` via a shift loop — no `Math.Log`, no dictionary lookup.
+- `PoolGet`: if `sz ≤ POOL_MAX_BLOCK (16 MB)`, pops from the matching bucket (or calls `VirtualAlloc(2^b)` on miss). Blocks above 16 MB bypass the pool entirely (their sizes are unique per combine level and would never hit).
+- `PoolReturn`: if `sz ≤ POOL_MAX_BLOCK` and `stack.Count < POOL_CAP (32)`, pushes back; otherwise `VirtualFree`.
+- `FlushGmpPool()` drains all 64 stacks via `VirtualFree`, called between Phase 2 levels and in the `ComputePiGMP` Finally block to prevent committed-memory accumulation.
+- Pool stacks initialised in `InitGmpVirtualAllocFunctions`.
+
+**Why (v1 → v2 → v3 evolution):**
+- v1 (§6): per-call `VirtualAlloc`/`VirtualFree` — correct but ~41% of wall-clock time in allocator overhead per dotnet-trace.
+- v2: `ConcurrentDictionary(sz → stack)` pool — `Monitor.Wait` lock contention at 5.55% of runtime (visible in trace 3 as `LowLevelLock` and `ConcurrentDictionary.GetOrAdd`).
+- v3: fixed 64-bucket array — no dictionary, no Monitor; only lock-free `ConcurrentStack` push/pop.
+
+Crash fix during pool development: top-level combine blocks (e.g. Level 16–17, 107 MB–268 MB) exceeded `POOL_MAX_BLOCK`, so `VirtualAlloc` returned NULL when committed memory hit ~38 GB from un-flushed pool blocks. Fixed by the `POOL_MAX_BLOCK` bypass and per-level `FlushGmpPool()`.
+
+---
+
+## Section 66 — P-Core Affinity Detection + Thread Pool Pre-Warm
+
+**Branch:** AdvPerfWork
+
+**Change:** Added `SetPCoreAffinity()` called from `BtnCompute_Click` before Phase 1:
+
+- Calls `GetLogicalProcessorInformationEx(RelationProcessorCore, ...)` to enumerate all logical processor groups.
+- Each `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` entry for a processor core exposes `EfficiencyClass` (0 = E-core, 1+ = P-core on Intel hybrid CPUs; on non-hybrid CPUs all cores report the same class).
+- Accumulates a bitmask of all P-core logical processors; if the set is non-empty and not equal to all processors, calls `SetProcessAffinityMask` to restrict the process.
+- Logs the detected counts and final affinity mask with an `[Affinity]` prefix.
+- No-op on non-hybrid machines (all cores report the same `EfficiencyClass`).
+
+Added `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` immediately before Phase 1 to pre-warm the .NET thread pool, eliminating the ramp-up latency for the first `Parallel.For` tasks.
+
+**Why:** On Intel 12th-gen+ hybrid CPUs, Windows may schedule .NET thread pool threads onto E-cores. E-cores have lower single-thread IPC and share L3 differently, degrading GMP FFT performance which is memory-bandwidth-bound. Pinning to P-cores ensures consistent throughput. Thread pool pre-warming eliminates the ~100 ms first-task latency seen at Phase 1 start in trace runs.
+
+---
+
+## Section 88 — Raw DllImport in SafeMpzMul Slow Path; GmpRaw_add in Phase 2 (issues #25, #26)
+
+**Branch:** PerfWork
+
+### #25 — Math.Gmp.Native wrapper dispatch eliminated from SafeMpzMul slow path
+
+Added five new raw `DllImport` declarations (`GmpRaw_init`, `GmpRaw_init2`, `GmpRaw_clear`, `GmpRaw_tdiv_r_2exp`, `GmpRaw_tdiv_q_2exp`) and replaced all `gmp_lib.*` calls in the `SafeMpzMul` slow path with direct P/Invoke.
+
+The slow path calls the wrapper for B-piece splitting (4 init + 4 tdiv + 1 clear), A-piece init (3 × `mpz_init2` + 1 tdiv), 9 product inits, 9 product clears (inside the accumulation loop), and 7 final clears. Each wrapper call went through `Marshal.GetDelegateForFunctionPointerInternal` before every native call.
+
+**Pattern:** Struct headers for locally-created objects allocated via `Marshal.AllocHGlobal(16)`; limb buffers filled by `GmpRaw_init`/`GmpRaw_init2` via `GmpAllocFunc` (same path as `gmp_lib.mpz_init`). Cleanup: `GmpRaw_clear` + `Marshal.FreeHGlobal`. Matches the existing `accumPtr` pattern already in the slow path (§42).
+
+### #26 — GmpRaw_add for Phase 2 T-accumulation
+
+Replaced `gmp_lib.mpz_add(tempA, tempA, tempB)` with `GmpRaw_add(tempA.Pointer, tempA.Pointer, tempB.Pointer)` in both the parallel and serial Phase 2 combine paths. `GmpRaw_add` was already declared (§42). One wrapper dispatch eliminated per pair at every Phase 2 level — 68,869 calls at level 1 alone.
+
+The `newP`/`newQ`/`tempA`/`tempB` init and clear calls in Phase 2 are unchanged: their struct headers are allocated by `gmp_lib.mpz_init` and their lifetimes span levels (stored as `MemP`/`MemQ`/`MemT` in `DiskNode`), so switching ownership models there would require also changing `BinarySplitChunk` and `LoadNodeFromDisk`.
+
+**1B-digit trace results (§88 vs §87):**
+
+| Metric | §87 | §88 | Δ |
+|--------|-----|-----|---|
+| `SafeMpzMul` (excl) | 17.98% | 20.48% | +2.5 pp ¹ |
+| `GmpAllocFunc` (excl) | 23.4% | 23.5% | flat |
+| `GmpFreeFunc` (excl) | 22.42% | 22.42% | flat |
+| `LowLevelLifoSemaphore` (excl) | 13.9% | 14.09% | flat |
+| `gmp_lib.mpz_inits` (excl) | not in top 50 | 0.86% | Phase 2 remainder ² |
+| `gmp_lib.mpz_clears` (excl) | 0.58% | 0.75% | Phase 2 remainder ² |
+| Wall-clock | 27:47 | **27:28** | −19s |
+
+¹ The +2.5 pp SafeMpzMul exclusive is a sampling redistribution: `Thread.Sleep` dropped −2.6 pp (poll threads ran fewer cycles in a slightly faster run). `GmpAllocFunc`/`GmpFreeFunc` are flat — the irreducible thunk crossing dominates; eliminating the delegate dispatch layered on top had no measurable effect at 1B digits because the slow path is only triggered at the top few levels where each multiply takes hundreds of milliseconds.
+
+² `gmp_lib.mpz_inits`/`mpz_clears` now visible at 0.86%/0.75% exclusive are the Phase 2 `newP`/`newQ`/`tempA`/`tempB` wrapper calls intentionally left unchanged. Converting them requires a consistent ownership model from `BinarySplitChunk` through all Phase 2 levels — not worth the refactor risk. Issues #25 and #26 closed.
+
+---
+
+## Section 87 — Phase 2 Parallel Path: Remove Inner Parallel.Invoke (issue #24)
+
+**Branch:** PerfWork
+
+`Parallel.Invoke` appeared at 20.45% inclusive in the 1B-digit trace. It was called twice per pair inside the Phase 2 `Parallel.For` body — once for (newP, newQ) and once for (tempA, tempB) — creating and scheduling 2 thread-pool tasks per invocation × 2 invocations × pairCount = `4 × pairCount` task round-trips per level.
+
+**Changes:**
+
+- **Outer DOP raised** from `ProcessorCount \ 2` to `ProcessorCount`. The halved DOP existed only to leave free threads for the inner `Parallel.Invoke` tasks; removing `Parallel.Invoke` eliminates this constraint.
+- **Inner `Parallel.Invoke` removed.** The 4 `SafeMpzMul` calls per pair now run sequentially within each outer task. Parallelism across pairs comes from the outer `Parallel.For`; parallelism within each `SafeMpzMul` comes from `_safeMulDop`.
+- **`_safeMulDop` now scales with pairCount** (`= ProcessorCount \ pairCount`, minimum 1) so sub-product parallelism fills idle cores when the level has few large pairs:
+
+| pairCount | `_safeMulDop` | Active threads |
+|---|---|---|
+| ≥ 24 | 1 | 24 (outer For saturated) |
+| 8 | 3 | 8 × 3 = 24 |
+| 4 | 6 | 4 × 6 = 24 |
+
+No deadlock risk: outer tasks no longer block on `Parallel.Invoke`; the inner `Parallel.For` sub-tasks are short fast-path `GmpRaw_mul` calls with no further nesting. The serial path (pairCount < 4) is unchanged — it retains its `Parallel.Invoke` and uses `_safeMulDop = ProcessorCount` (restored after each parallel level).
+
+**1B-digit trace results (§87 vs §86 baseline):**
+
+| Metric | §86 | §87 | Δ |
+|--------|-----|-----|---|
+| `LowLevelLifoSemaphore.WaitForSignal` (excl) | 22.55% | 13.9% | −8.65 pp |
+| `Parallel.Invoke` (incl) | 20.45% | not in top 50 | eliminated |
+| `SafeMpzMul` (excl) | 19.24% | 17.98% | −1.26 pp |
+| `GmpAllocFunc` (excl) | 17.6% | 23.4% | +5.8 pp ¹ |
+| `GmpFreeFunc` (excl) | 16.49% | 22.43% | +5.94 pp ¹ |
+| Wall-clock (1B digits) | ~28 min | 27:47 | marginal |
+
+¹ `GmpAllocFunc`/`GmpFreeFunc` appear higher only because they're a larger fraction of what remains — absolute thunk cost is unchanged. The bottleneck has fully shifted to the managed→native P/Invoke crossing (~46% combined exclusive). Issue #24 closed.
+
+---
+
+## Section 86 — SafeMpzMul: Shared Shifted Buffer (issue #23)
+
+**Branch:** PerfWork
+
+The slow-path accumulation loop in `SafeMpzMul` (`Form1.vb` ~line 1809) previously called `VirtualAlloc` + `VirtualFree` for each of the 8 non-zero-shift k iterations — a total of 8 VirtualAlloc + 8 VirtualFree syscalls per slow-path call.
+
+**Fix:** A single shared buffer is now pre-allocated before the loop, sized to the maximum any iteration could need (`≤ 3·mA + 3·mB + 4` limbs, where `mA = ⌈szA/3⌉`, `mB = ⌈szB/3⌉`). Each iteration resets only `_mp_size = 0` and reuses the same buffer; `GmpRaw_mul_2exp` writes in place since the pre-alloc is always sufficient. The shared buffer is freed once after the loop and `shifted` is reinitialised to a 1-limb stub so the subsequent `mpz_clears` call remains safe.
+
+This reduces per-slow-path-call VirtualAlloc/VirtualFree count from 8+8 to 1+1 — saving 7 kernel round-trips each way.
+
+---
+
+## Section 85 — GMP Pool Allocator Hot-Path Optimisation (issues #20, #21, #22)
+
+**Branch:** PerfWork
+
+Three targeted fixes to the GMP limb-buffer pool, all motivated by the 1B-digit dotnet-trace report where `GmpAllocFunc` (18.08% exclusive) and `GmpFreeFunc` (17.25% exclusive) together accounted for **35% of total CPU time**.
+
+### §20 — Replace O(n) ConcurrentStack.Count with atomic counter (issue #20)
+
+`PoolReturn` previously called `_gmpPool(b).Count` to decide whether the pool was full. `ConcurrentStack(Of T).Count` is O(n) — it walks the entire linked list. With `POOL_CAP = 256`, every free could walk 256 nodes.
+
+**Fix:** Added `_gmpPoolCount(POOL_BUCKETS - 1) As Integer` — one `Interlocked` counter per bucket. `PoolReturn` now increments atomically and rolls back if the cap is exceeded; `PoolGet` decrements on a successful pop; `FlushGmpPool` decrements as it drains each bucket.
+
+### §21 — Remove Try/Catch from GmpAllocFunc / GmpFreeFunc / GmpReallocFunc (issue #21)
+
+All three native GMP callbacks were wrapped in `Try/Catch`. The .NET JIT cannot inline through `Try/Catch` boundaries, and even in the non-exception path the handler frame adds overhead on every call. Since the corrupt-size and failed-alloc paths already return `IntPtr.Zero` (causing GMP to abort, which is the correct behaviour), the `Catch` clause added no real safety.
+
+**Fix:** Removed the outer `Try/Catch` from all three functions.
+
+### §22 — PoolBucket bit-counting loop → BitOperations.Log2 (issue #22)
+
+`PoolBucket` used a managed `While` loop to count leading bits — up to 25 iterations for a typical 32 MB block. It is called on every alloc and free.
+
+**Fix:** Replaced with `System.Numerics.BitOperations.Log2(CULng(sz - 1L)) + 1`, which the JIT lowers to a single `LZCNT`/`BSR` instruction on x64.
+
+---
+
+## Section 84 — Power-of-10 Test Suite (issue #18)
+
+**Branch:** PerfWork
+
+### `--output-dir D` CLI argument (Form1.vb)
+
+Added `--output-dir D` to the exe's CLI arg parser. Sets `_outputDir` at startup, overriding the default `C:\PiOutput`. All derived paths (pi_digits.txt, pi_phase_log.txt, NodeCache) inherit the new directory. This allows multiple simultaneous or sequential runs to write to isolated directories.
+
+### `-Test` switch (Run-PiCompute.ps1)
+
+Runs the exe at every power of 10 from 10 up to `-Digits` (default 1,000,000,000). Each run writes to its own subdirectory (`test_10`, `test_100`, …) under `-OutputDir` via `--output-dir`.
+
+**Verification pass/fail rules:**
+
+| Sequence | Expected position | Checked when |
+|---|---|---|
+| `999999` | 762 | digits ≥ 768 |
+| `777777777` | 24,658,601 | digits ≥ 24,658,610 |
+| `27182818284` (e-digits) | unknown | always — informational only |
+
+Runs with too few digits to contain a sequence report `N/A` (not a failure). The e-digits check never causes a FAIL — its position in Pi is not known to be within 1B digits.
+
+**Output:** a combined timing and pass/fail table printed to the console and saved as `test_suite_report_YYYYMMDD_HHMMSS.txt` in `-OutputDir`.
+
+```
+.\Run-PiCompute.ps1 -Test                      # full suite, 10 → 1B
+.\Run-PiCompute.ps1 -Test -Digits 1000000      # suite up to 1M only
+```
+
+### Bug fix: log pattern anchor (Run-PiCompute.ps1)
+
+`WriteToLog` prefixes every log entry with a timestamp, thread ID, elapsed time, and RAM reading — so log lines read `2026-04-01 12:00:00 | T1 | ... | [Verify] Verify OK: ...`. The original `Select-String` pattern was `'^\[Verify\]'` (anchored to start of line), which never matched. Changed to `'\[Verify\]'` (unanchored) so the verify result is correctly parsed from any run's phase log.
+
+---
+
+## Section 83 — Runtime Logging Level (issue #15)
+
+**Branch:** PerfWork
+
+**Problem:** the logging detail level was controlled by `#Const LOGGING_DETAIL` — a compile-time constant requiring a rebuild to change. The three levels (0/1/2) were poorly defined and the existing level 1 was too coarse, mixing stage detail with full-trace diagnostics.
+
+**Changes:**
+
+### New 6-level runtime system
+
+| Level | Name | What it logs |
+|---|---|---|
+| **0** | None | Errors and crashes only. Silent on success. |
+| **1** | Performance *(default)* | `[PHASE]` markers with wall-clock timing — enough to reconstruct per-phase timing. |
+| **2** | Stages | Level 1 + serialization file names/sizes, node digit-count summaries, initial calc steps (pow, sqrt, mul_ui), division description, `mpz_get_str` wall time. |
+| **3** | Last stage | Level 2 + full per-operation trace for the final BinarySplitGMP combine level and all `ComputePiGMP` steps (§61 serial multiply call trace, combine A/B/C/D call trace, RAM snapshots). |
+| **4** | Full trace | Level 3 + `SafeMpzMul` fast-path and slow-path diagnostics, accum pre-alloc confirmation, B-piece extraction details, `BinarySplitChunk` entry/exit on every call, bit-size predictions for combine steps. |
+| **5** | Allocator | Level 4 + pool/affinity diagnostics (reserved for future use). |
+
+### Implementation
+
+- `#Const LOGGING_DETAIL` removed; all 74 `#If LOGGING_DETAIL` blocks converted to `If _logLevel >= N Then` runtime checks.
+- `Private _logLevel As Integer = 1` field added (default: Performance).
+- `--log-level N` CLI argument parsed in `Form1_Load`.
+- **`NudLogLevel` spinner** (0–5, default 1) added to the control panel row 1; read into `_logLevel` when Start is clicked. Disabled in headless mode.
+- Logging mode description in the phase log header updated to show the runtime level name.
+
+### Run-PiCompute.ps1
+
+- `-LogLevel` parameter added (default: 1); passed as `--log-level $LogLevel` to the exe in both normal and trace-mode runs.
+- Level names documented in `.PARAMETER LogLevel`.
+
+---
+
+## Section 82 — Auto-Verify Checkbox; Verification Results in Status Bar (issue #12)
+
+**Branch:** PerfWork
+
+**Changes (closes issue #12 / issue #3):**
+
+### UI changes
+- **`BtnTest` renamed to "Verify Now"** for clarity.
+- **`ChkAutoVerify` checkbox** ("Verify after compute") added to the control panel, defaulting to checked. Placed between `ChkboxWriteToFile` and "Verify Now" on the same row. `LblRamThreshold` and `NudRamThreshold` shifted right to make room.
+
+### Verification results: status bar only — no modal dialogs
+All verification results (built-in checks and `--verify-at` / `--verify-contains` custom checks) are now written to `LblStatus` and the phase log. **No `MessageBox.Show` is called** at any point during verification, in either interactive or headless mode. The status bar shows a compact summary:
+
+```
+Verify OK: 999999@762 OK | 777777777@24,658,601 OK | e-digits@{pos} OK
+Verify: 999999 not found | 777777777@24,658,601 OK | e-digits not found
+```
+
+### Auto-verify triggers
+- **After streaming completes** (`DisplayTimer_Tick` completion path): if `ChkAutoVerify.Checked`, `RunVerification()` is called automatically.
+- **When display is off** (`StreamPiToScreen` fast path): same check — `RunVerification()` is called after `WriteResultToFile`.
+- **Headless `--autoverify` flag**: calls `RunVerification()` directly (previously called `BtnTest_Click`).
+- **"Verify Now" button**: calls `RunVerification()` on demand at any time.
+
+### Code structure
+Verify logic consolidated into a single `RunVerification()` sub (previously duplicated across `BtnTest_Click` and the headless path). `BtnTest_Click` is now a one-liner that calls `RunVerification()`. `RunCustomVerifications` updated to write to `LblStatus`/log instead of `MessageBox`.
+
+---
+
+## Section 81 — Display Streaming Performance Improvements (issue #16)
+
+**Branch:** PerfWork
+
+**Problem:** `DisplayTimer_Tick` called `Marshal.ReadByte` in a loop (one P/Invoke per byte), rebuilt a `StringBuilder` character by character, called `ScrollToCaret` every 500-char tick, and used a fixed chunk size of 500 chars — severely limiting throughput.
+
+**Changes:**
+
+1. **Bulk copy in native path** — `Marshal.ReadByte` loop replaced by a single `Marshal.Copy` into a pre-allocated `_displayBuf()` byte array, followed by `Encoding.ASCII.GetString`. One P/Invoke per tick instead of one per byte. `_displayBuf` is a Form-level field reused across all ticks (no per-tick allocation).
+
+2. **Adaptive chunk size** — `_displayChunkSize` starts at 4,096 chars and is doubled each tick if the tick completes in under 60 ms, halved if it exceeds 90 ms, capped at 1,000,000. This converges quickly to the maximum throughput the machine can sustain without UI jank.
+
+3. **Scroll throttle** — `ScrollToCaret` (which forces a layout pass) is now called at most once per 10,000 chars displayed instead of every tick, tracked by `_displayScrollAccum`.
+
+4. **`mpz_get_str` wall-time logging** — a `Stopwatch` now wraps the `mpz_get_str` call; the elapsed time is written to the phase log so the conversion cost is visible alongside the compute phases.
+
+5. **`_displayChunkSize` and `_displayScrollAccum` reset** in `StreamPiToScreen` so each new computation starts fresh.
+
+---
+
+## Section 79 — Fix Pool Corruption: Pre-Alloc Blocks Must Use PoolGet Not VirtualAlloc
+
+**Branch:** PerfWork
+
+**Root cause (confirmed by struct-field diagnostics):** Every pre-alloc block that stores a limb buffer directly into an `mpz_t._mp_d` field via `Marshal.WriteInt64` was allocated with `VirtualAlloc(_xBytes)`, giving exactly `_xBytes` bytes (page-rounded). When the `mpz_t` is later freed via `mpz_clear` → `GmpFreeFunc(ptr, _mp_alloc * 8 = _xBytes)` → `PoolReturn(ptr, _xBytes)`, the pool places the block in bucket `PoolBucket(_xBytes) = b`. The pool's invariant for bucket `b` is that all blocks are `1L << b` bytes — but `_xBytes ≤ 1L << b`. When a subsequent `GmpAllocFunc` request in the same bucket pops this block, it uses up to `1L << b` bytes from a block that only has `_xBytes` (page-rounded) bytes → buffer overrun → access violation in native GMP.
+
+**Specific crash:** After `mpz_clear(tmpHigh)`, the `tmpHigh` pre-alloc block (`VirtualAlloc(571,736 bytes)` → only ~572 KB actual) enters bucket 20 (`1L << 20 = 1,048,576 bytes`). When `GmpRaw_mul` → `mpn_mul` → FFT internally calls `GmpAllocFunc` for a ~700 KB scratch buffer (bucket 20), it pops the 572 KB block and writes 700 KB to it → AV. This crash was consistent across all three SafeMpzMul fast-path calls for 1M digits.
+
+**Fix:** Replace `VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_xBytes)), ...)` with `PoolGet(_xBytes)` at all pre-alloc sites. `PoolGet` allocates `1L << PoolBucket(_xBytes)` bytes — exactly the capacity the bucket assumes — so any subsequent pop of that block uses memory that was actually allocated.
+
+**Sites fixed** (all in `Form1.vb`):
+- `DeserializeOneMpz`: `limbs` buffer
+- Three-pass multiply: `tmpHigh`, `mpQ1`, `mpQ2`, `mpR0`, `mpR1`, `mpR2`
+- Combine A/B/C/D: `_bigBufA`, `_bigBufB`, `_bigBufC`, `_bigBufD`
+- Pi quotient: `_bigBufPi`
+
+**Why 1B-digit runs were unaffected:** For 1B digits, the pre-alloc sizes are hundreds of MB, which are above `POOL_MAX_BLOCK = 16 MB`. `PoolReturn` calls `VirtualFree` directly for oversized blocks (they never enter the pool), so there's no bucket-size assumption to violate.
+
+## Section 78 — Fix SafeMpzMul Fast Path: Use Raw P/Invoke to Avoid Managed Wrapper Corruption
+
+**Branch:** PerfWork
+
+**Symptom:** App crashed at `[ComputePi] §61 calling r0 = N*Q0...` on 1M-digit runs. The granular §77 logging narrowed it to the very first `SafeMpzMul(mpR0, gmpNumer, finalQ)` call. Same 1B-digit run never crashed.
+
+**Root cause:** `SafeMpzMul`'s fast path (`szA+szB ≤ SAFE_LIMB_THRESHOLD`) called `gmp_lib.mpz_mul(result, opA, opB)` — the Math.Gmp.Native managed wrapper. This wrapper is known to corrupt `mpz_t.Pointer` fields during native calls (the §42 root cause, which the slow path already fixes by using raw `IntPtr` accumulators). For 1B-digit runs, `szA+szB ≈ 87.6M > SAFE_LIMB_THRESHOLD`, so those runs always take the slow path (already safe). For 1M-digit runs, `szA+szB = 87,639 ≤ SAFE_LIMB_THRESHOLD`, so they take the fast path and hit the wrapper corruption — crashing inside the native `__gmpz_mul` call when it tries to write to a corrupted result pointer.
+
+**Fix:** Added `GmpRaw_mul` P/Invoke declaration (`[DllImport("libgmp-10.dll", EntryPoint:="__gmpz_mul")]`) and replaced `gmp_lib.mpz_mul(result, opA, opB)` with `GmpRaw_mul(result.Pointer, opA.Pointer, opB.Pointer)` in the fast path. Passing the raw `IntPtr` values bypasses the managed wrapper entirely, so the wrapper never touches the `mpz_t` objects and cannot corrupt their Pointer fields.
+
+**Why 1B-digit runs were unaffected:** The §61 multiply operand sizes for 1B digits (`szA ≈ 51.9M`, `szB ≈ 35.7M`, sum ≈ 87.6M) exceed `SAFE_LIMB_THRESHOLD = 33,554,431`, so the slow path (which already uses raw IntPtrs) was always taken. 1M-digit operand sizes (87,639 total) fall well below the threshold, exposing the fast path wrapper bug for the first time.
+
+## Section 77 — Granular Per-Call Logging in §61 Multiply Block
+
+**Branch:** PerfWork
+
+**Change:** Added `WriteToLog` calls immediately before and after each of the six operations in the §61 serial multiply block (`Form1.vb` lines ~2779–2789):
+
+```
+[ComputePi] §61 calling r0 = N*Q0...
+[ComputePi] §61 r0 done
+[ComputePi] §61 calling r1 = N*Q1...
+[ComputePi] §61 r1 done
+[ComputePi] §61 calling r2 = N*Q2...
+[ComputePi] §61 r2 done
+[ComputePi] §61 calling mpz_clears(finalQ, mpQ1, mpQ2)...
+[ComputePi] §61 clears done
+[ComputePi] §61 calling mpz_swap(gmpNumer, mpR2)...
+[ComputePi] §61 swap done
+[ComputePi] §61 calling mpz_clear(mpR2)...
+[ComputePi] §61 clear r2 done
+```
+
+These logs are unconditional (not guarded by `LOGGING_DETAIL`) so they appear regardless of build configuration.
+
+**Why:** After the §76 fix, the app still crashes at the same log point on small (1M-digit) runs. The crash occurs somewhere in the six-operation block but without per-call markers it is impossible to tell which operation is responsible. The new markers will appear in the log before whichever operation crashes, pinpointing the exact call.
+
+## Section 76 — Fix Three-Pass Multiply Pre-Alloc Crash on Small Digit Counts
+
+**Branch:** PerfWork
+
+**Symptom:** App crashed immediately after `[ComputePi] §61 serial multiply start` log entry on any run with a small digit count (e.g. 1,000,000 digits). No log entry from the native crash handler.
+
+**Root cause:** The pre-alloc blocks for `tmpHigh`, `mpQ1`, `mpQ2`, `mpR0`, `mpR1`, and `mpR2` unconditionally replaced the `mpz_init2` limb buffer (524 KB, VirtualAlloc'd) with a smaller VirtualAlloc'd buffer sized to the actual result. For small digit counts, this replacement buffer was below `GMP_LARGE_THRESHOLD` (524,288 bytes). For example with 1M digits: `mpQ1` result = 35,733 limbs × 8 = 285,864 bytes. When `mpz_clears` later freed these objects, `GmpFreeFunc` saw `_mp_alloc * 8 < GMP_LARGE_THRESHOLD` and routed to `_savedGmpFree` (CRT `free()`). Calling CRT `free()` on a VirtualAlloc'd pointer is undefined behaviour; in .NET Core it terminates the process immediately without firing managed exception handlers or `SetUnhandledExceptionFilter`.
+
+**Fix:** Each pre-alloc block now guards the buffer replacement with `If _xBytes >= GMP_LARGE_THRESHOLD`. Below the threshold the `mpz_init2` buffer (65,536 limbs = 524,288 bytes, VirtualAlloc'd) is already large enough for the result — no replacement is needed and `GmpFreeFunc` correctly routes the free through `VirtualFree`. Above the threshold the behaviour is unchanged.
+
+**Why the 1B-digit run was unaffected:** All six buffers are hundreds of MB for a 1B-digit run, well above `GMP_LARGE_THRESHOLD`, so the guard condition is always true and the code path is identical to before.
+
+## Section 75 — Button Text Centering, Uniform Size, and Equal Row Spacing
+
+**Branch:** PerfWork
+
+**Change:** Three related UI polish fixes in `Form1.Designer.vb`:
+
+**1. Button text alignment**
+`TextAlign = ContentAlignment.MiddleCenter` set explicitly on `BtnCompute`, `BtnPause`, and `BtnTest`.
+
+**2. Uniform button size**
+`BtnTest` width corrected from 112 px to 134 px, matching `BtnCompute` and `BtnPause` (all now 134×47).
+
+**3. Equal row spacing**
+Panel1 height reduced from 319 px to 205 px. The three control rows are now evenly spaced with 12 px top/bottom margins and 20 px gaps between rows:
+- Row 1 (Start / Cancel / Digits / Displayed / Running Time): Y = 12
+- Row 2 (Display / Write to File / Test / RAM Threshold): Y = 79
+- Row 3 (Status bar): Y = 146
+
+Non-button controls within each row are vertically centred relative to the 47 px row height. `LstBoxPhases` height reduced from 279 px to 181 px to match the new panel height. `RtbPiDigits` design-time origin updated from Y=319 to Y=205 (runtime docking overrides this, but kept consistent for the designer).
+
+**Why:** `BtnTest` was 22 px narrower than the other buttons, and its text had unequal left/right margins. The gaps between rows were 16 px (rows 1→2) and 35 px (rows 2→3), making the header panel look uneven.
+
+## Section 74 — Revert Output Directory to C:\PiOutput
+
+**Branch:** PerfWork
+
+**Change:** `_outputDir` in `Form1.vb` and the `-OutputDir` default in `Run-PiCompute.ps1` both changed from the portable `%LOCALAPPDATA%\PI-BillionDigits` / `.\PiOutput` paths (introduced in §71) back to the fixed `C:\PiOutput`.
+
+Both output files derive from `_outputDir`:
+- `pi_digits.txt` → `C:\PiOutput\pi_digits.txt`
+- `pi_phase_log.txt` → `C:\PiOutput\pi_phase_log.txt`
+
+The directory is auto-created at compute time if it does not exist (via `Directory.CreateDirectory` in `StreamPiToScreen`). The script also creates it if missing before launching the exe.
+
+**Why:** The machine used for production runs always has `C:\PiOutput` available and the user prefers output there. The script's `.\PiOutput` default was resolving relative to the source tree, so output appeared under the project folder rather than `C:\PiOutput`.
+
+## Section 67 — `--verify-at` and `--verify-contains` CLI Options
+
+**Branch:** AdvPerfWork
+
+**Change:** Added two repeatable CLI arguments parsed in `Form1_Load`:
+
+- `--verify-at "DIGITS:POSITION"` — after computation, checks that the digit sequence `DIGITS` appears at exactly position `POSITION` (0-based, including the leading `3`). Multiple `--verify-at` arguments are all checked.
+- `--verify-contains "DIGITS"` — checks that `DIGITS` appears anywhere in the output. Multiple `--verify-contains` arguments are all checked.
+
+Both options populate `_verifyAt As List(Of Tuple(Of String, Long))` and `_verifyContains As List(Of String)` at startup. The new helper `RunCustomVerifications(piText As String)` is called at the end of `BtnTest_Click` (after the built-in fixed digit checks) when either list is non-empty.
+
+Results in interactive mode: `MessageBox.Show`. In headless mode: written to the phase log with a `[DIALOG]` prefix and `LblStatus.Text` is updated.
+
+**Example usage:**
+```
+PI-BillionDigits.exe --digits 1000000000 --autostart --autoverify ^
+    --verify-at "999999:762" ^
+    --verify-contains "27182818284"
+```
+
+**Why:** The built-in test checks three fixed digit sequences hardcoded in `BtnTest_Click`. For automated regression testing or validating known Pi digit positions, it is useful to pass expected values on the command line without modifying the source. The `--verify-at` form gives an exact-position assertion (fails if the sequence is found elsewhere); `--verify-contains` is a looser sanity check useful for sequences like Euler's number embedded in Pi.
+
+---
+
+## Section 94 — Level-Boundary Auto-Checkpoint / Resume
+
+**Branch:** PerfWork
+
+**Problem:** Phase 2 combine levels for 5B+ digit runs take hours each. If the run is interrupted (crash, user abort, power loss) all progress is lost and the run must restart from scratch.
+
+**Previous approach (§93):** `--checkpoint-from-level N` forced disk serialization of every combine result as it was produced, changing that level from RAM mode to disk mode. This added per-pair I/O into the hot path and required manually specifying `--resume-from-level N` on the next run.
+
+**New approach (`--auto-checkpoint`):** All combine work continues to run entirely in RAM — the hot path is unchanged. At the *end* of each Phase 2 level, after `diskNodes = nextDiskNodes` and while all nodes are still live, the completed node list is written to disk as a batch snapshot. On the next run with `--auto-checkpoint`, the highest valid snapshot is detected automatically and Phase 1 plus all completed levels are skipped.
+
+### Snapshot layout
+
+```
+C:\PiOutput\NodeCache\
+  snap_L3\           ← snapshot written after level 3 finishes
+    N0.bin
+    N1.bin
+    ...
+    meta.txt         ← written last; its presence marks the snapshot complete
+  snap_L2\           ← deleted once snap_L3 is confirmed written
+```
+
+Node files are written in parallel via `Parallel.For`. For in-memory nodes, `SerializeNodeToDisk` is called directly against the live GMP objects. For disk-mode nodes (rare; only when `--checkpoint-from-level` is also active), `File.Copy` is used — no GMP interpretation needed. Only the most recent level's snapshot is kept; the previous level's directory is deleted after the new one is confirmed complete.
+
+`meta.txt` records `digits`, `numTerms`, `numChunks`, `level`, `nodeCount`, and `timestamp`. On resume, `digits` and `numChunks` are validated against the current run parameters — a mismatch (different digit count) causes the snapshot to be silently skipped and a fresh run to start.
+
+### New methods
+
+- `WriteLevelSnapshot(level, nodes, numTerms, numChunks)` — parallel batch write; non-fatal on error (logs warning, computation continues).
+- `TryFindBestSnapshot(numChunks)` — scans `NodeCache\snap_L*\` directories, validates metadata and node file presence, returns highest valid level number.
+- `DeleteSnapshotDir(level)` — removes a snapshot directory after the next level's snapshot is confirmed.
+
+### Resume path
+
+Snapshot nodes are loaded as `IsInMemory = False` with `FilePath` pointing at `snap_L{N}\N{idx}.bin`. The existing Phase 2 combine loop loads them on demand via `LoadNodeFromDisk` — no changes to combine logic. The existing `--resume-from-level` path is preserved and takes priority over auto-detect when specified explicitly.
+
+### Usage
+
+```powershell
+# Use on every 5B run — interrupted runs resume automatically
+.\Run-PiCompute.ps1 -Digits 5000000000 -Threshold 1000000 -AutoCheckpoint -LogLevel 2
+```
+
+If the run is interrupted at any point during Phase 2, re-run the same command. It finds the highest complete `snap_L{N}` snapshot and resumes from level N+1, skipping Phase 1 and all levels up to N.
+
+**Snapshot write cost:** writing ~6 GB of Level 3 nodes to NVMe takes roughly 6 seconds — negligible relative to the hours of combine time per level.
+
+**Why not §93?** The §93 approach trades RAM performance for recoverability at every pair, making the affected level significantly slower. §94 pays the snapshot cost only once per level, after all the work is already done.
+
+---
+
+## §100 — SafeMpzSqrt, SafeMpzDiv, SafeMpzReciprocal, BigShiftRight, BigShiftLeft
+
+### Problem
+
+At 5 billion digits the `mpz_sqrt` call in `ComputePi` (Step 4) crashes because the input is 10^10,000,000,005 — approximately 519 million GMP limbs. GMP's `mpn_mul_fft` uses a static lookup table indexed by `mpn_fft_best_k`, and the table overflows beyond ~33.5 million limbs (`SAFE_LIMB_THRESHOLD = 33_554_431`). The same class of overflow previously caused crashes in `mpz_mul` (fixed via `SafeMpzMul` in §17–45) and `mpz_ui_pow_ui` (fixed via `SafeMpzPow10` in §99).
+
+### Solution
+
+Replace the `gmp_lib.mpz_sqrt(gmpSqrt, gmpSqrtInput)` call with `SafeMpzSqrt(gmpSqrt, gmpSqrtInput)`.
+
+Five helper routines were added:
+
+**`BigShiftRight(rop, op, bits As Long)`** — right-shifts `op` by an arbitrary number of bits (including values exceeding `UInt32.Max` ≈ 4.3 billion). Splits the shift into chunks of at most 2,100,000,000 bits, calling the raw GMP P/Invoke `GmpRaw_tdiv_q_2exp` each time. `rop` may alias `op`.
+
+**`BigShiftLeft(rop, op, bits As Long)`** — same for left shift, using `GmpRaw_mul_2exp`.
+
+**`SafeMpzReciprocal(r, b, kBits As Long)`** — computes `floor(2^kBits / b)` using Newton iteration with progressive precision. Seeds from the top 64 bits of `b`, then doubles working precision from ~62 bits to `rBits+2` bits. At each step, `b` is ceiling-truncated (ensuring `r` stays a strict underestimate throughout). Large multiplications within the loop use `SafeMpzMul` or `GmpRaw_mul` depending on operand size.
+
+**`SafeMpzDiv(q, a, b)`** — computes `floor(a / b)` using Barrett reduction. For operand sizes within the safe threshold it calls `mpz_tdiv_q` directly. For larger operands: computes the Newton reciprocal via `SafeMpzReciprocal`, forms `q ≈ a·r / 2^kBits` via `SafeMpzMul`, then adjusts by ±1 until `0 ≤ remainder < b`.
+
+**`SafeMpzSqrt(result, n)`** — computes `floor(sqrt(n))` using Newton iteration. For inputs within the safe threshold it calls `mpz_sqrt` directly. For larger inputs:
+- Seeds by right-shifting `n` by `seedShift` bits (even, chosen so the shifted value has ≤ 700M bits), computing `mpz_sqrt` of the seed (safe, ≤ 5.5M limbs), then left-shifting the result back.
+- Refines via Newton: at each step doubles the working precision from `SEED_BITS` to `bitsS+2` bits. Uses `BigShiftRight`/`BigShiftLeft` to keep operands at the target precision, and `SafeMpzDiv` (or `mpz_tdiv_q` when safe) for the division step.
+- Final adjustment: verifies `x² ≤ n < (x+1)²`, correcting by ±1 if needed (at most 1 correction expected).
+
+### Usage
+
+`SafeMpzSqrt` is a drop-in replacement for `gmp_lib.mpz_sqrt`. It is called only once per PI computation (Step 4 of `ComputePi`). For the 5B-digit run the Newton refinement performs approximately 6 full-precision steps.
+
+### Why not use GMP's integer square root directly?
+
+GMP's `mpz_sqrt` internally calls `mpn_sqrtrem` which calls `mpn_mul_fft` for the Schönhage-Strassen squarings used in Newton refinement — and those calls read from the same static table that overflows. There is no GMP API to compute a large integer square root without triggering this path.
+
+## §101 — PreAllocMpzToLimbs: bypass GMP S→L realloc crash in BigShiftRight
+
+### Problem
+
+`BigShiftRight`'s first chunk called `GmpRaw_tdiv_q_2exp` on a freshly `mpz_init`'d destination with only a 1-limb CRT-allocated buffer (~8 bytes). GMP's `_mpz_realloc` was needed to grow this to ~3.9 GB (486M limbs), but `_mpz_realloc` has a hard overflow check: it aborts with `gmp_die("mpz_realloc: overflow")` whenever `new_alloc > INT_MAX / GMP_NUMB_BITS = 33,554,431 limbs`. This abort fires *before* our `GmpReallocFunc` callback is reached. Result: silent crash in native code.
+
+### Solution
+
+`PreAllocMpzToLimbs(m, neededLimbs)`: directly replaces the mpz_t's limb buffer via struct manipulation (the same pattern used for `tmpHigh`, `mpQ1`, `mpQ2` in `ComputePiGMP`). Obtains a pool/VirtualAlloc block of the required size, copies any existing limb data (for aliased calls), frees the old buffer, and writes the new pointer and alloc count directly into the mpz_t header. Called at the start of `BigShiftRight` before the first `GmpRaw_tdiv_q_2exp` chunk.
+
+## §102 — BigShiftLeft first-chunk pre-alloc (partial fix)
+
+Applied the same `PreAllocMpzToLimbs` to the first chunk of `BigShiftLeft` (aliased `BigShiftLeft(x, x, ...)` case). This fixed the S→L transition for the seed shift-back in `SafeMpzSqrt`. However, subsequent chunks still crashed — see §105.
+
+## §103 — snap_Phase3 checkpoint: skip Phase 1/2 on Phase 3 crash
+
+### Problem
+
+Phase 3 crashes (Steps 1–9 of `ComputePiGMP`) cost 10+ hours of Phase 1/2 re-work because snap_L* node files are deleted when Phase 2 completes (nodes are loaded into memory and disk files removed). By the time a crash is diagnosed and fixed, no valid checkpoint exists.
+
+### Solution
+
+- `SavePhase3Snapshot(snapDir, digits, numTerms, finalP, finalQ, finalT)`: serialises the three large integers to `NodeCache/snap_Phase3/` (P.bin, Q.bin, T.bin, meta.txt) immediately after Phase 2 finishes, before any Phase 3 operation begins.
+- `TryLoadPhase3Snapshot(snapDir, digits, outP, outQ, outT)`: on startup (when `--auto-checkpoint`), checks for `snap_Phase3`, validates `digits` match, deserialises P/Q/T via the existing `DeserializeOneMpz` path, and returns True to skip `BinarySplitGMP` entirely.
+- `GoTo Phase3Start` label added in `ComputePiGMP` at the Phase 3 entry point.
+- `Run-PiCompute.ps1`: `Invoke-CheckpointRestore` called before each run to copy `snap_Phase3`/`snap_L*` from SnapshotStore → NodeCache; `Invoke-CheckpointBackup` extended to include `snap_Phase3`.
+
+## §104 — Immediate SnapshotStore backup after every snapshot write
+
+### Problem
+
+The end-of-run script backup was too late: Phase 2 deletes snap_L* `.bin` files when loading nodes for the final combine. The backup saw only empty directories.
+
+### Solution
+
+`BackupSnapshotToStore(snapName)` and `DeleteSnapshotFromStore(level)`: called immediately inside `WriteLevelSnapshot` (after each successful write) and inside `SavePhase3Snapshot`. SnapshotStore is now updated in real-time — the backup reflects the current computation state regardless of when the run exits or crashes. The script `Invoke-CheckpointRestore` at run-start closes the loop: the next run always begins with the latest protected checkpoint.
+
+## §105 — BigShiftLeft full pre-alloc: fix all chunks, not just the first
+
+### Problem
+
+§102 pre-allocated `rop` to accommodate only the first 2.1B-bit chunk. Every subsequent chunk grows `rop` further; once the intermediate result exceeds 33,554,431 limbs, GMP's `_mpz_realloc` overflow abort fires (same mechanism as §101). For the seed shift-back in `SafeMpzSqrt` — `BigShiftLeft(x, x, 16,259,640,482 bits)` — there are ~8 chunks; chunks 2–8 all grew past the 33M-limb limit.
+
+### Solution
+
+Change `BigShiftLeft` to pre-allocate `rop` to the **full final result size** (`opLimbs + (bits + 63) / 64 + 1`) before any chunk executes. Every chunk then finds `_mp_alloc ≥ needed` and `MPZ_REALLOC` short-circuits without ever calling `_mpz_realloc`. Existing limb data is copied by `PreAllocMpzToLimbs` before the old buffer is freed, making the aliased case safe.
+
+## §106 — Affinity watchdog (#33), Phase 3 parallelism gaps (#34), Newton + Phase 3 checkpointing
+
+### #33: P-core affinity watchdog
+
+New GMP and .NET runtime threads created after the initial `SetPCoreAffinity` call were landing on E-cores, causing them to run at low frequency. The fix adds an `AffinityWatchdog` background thread that polls every 500 ms, enumerates all threads in the current process via `OpenThread` / `SetThreadAffinityMask`, and re-applies the P-core affinity mask to any thread that has drifted. `_pCoreMask` (Shared Long) stores the mask set by `SetPCoreAffinity`. The watchdog is started on form load (after `SetPCoreAffinity`) and cancelled on form close. On non-hybrid machines (`_pCoreMask = 0`) the watchdog exits immediately without polling.
+
+DllImports added: `OpenThread`, `SetThreadAffinityMask`, `CloseHandle` (kernel32.dll).
+
+### #34: Phase 3 parallelism gaps
+
+**Gap 1 — R0/R1/R2 parallel multiplies with checkpoints:** `SafeMpzMul(mpR0, gmpNumer, finalQ)`, `SafeMpzMul(mpR1, gmpNumer, mpQ1)`, `SafeMpzMul(mpR2, gmpNumer, mpQ2)` now run concurrently via `Parallel.Invoke`. Before launching, each result is checked against a Phase 3 checkpoint (`snap_Phase3/{mpR0,mpR1,mpR2}.bin`); if all three are present the multiplies are skipped entirely. After completion, each result is saved immediately.
+
+**Gap 2 — `_safeMulDop` ceiling division:** `_safeMulDop` was computed as `Floor(ProcessorCount / pairCount)`, starving inner parallelism at levels where `pairCount` doesn't divide evenly. Changed to ceiling division: `_rawDop = ProcessorCount / pairCount`; if `_rawDop >= 1.5` use `Ceiling`, else 1.
+
+**Gap 3 — Lock-free Phase 1 chunk writes:** Phase 1's per-chunk `SyncLock` on `FileStream` was a serialisation bottleneck. Replaced with `RandomAccess.Write` (positional, no seek/lock) backed by a `SafeFileHandle` opened with `FileOptions.Asynchronous Or FileOptions.WriteThrough`. File offsets are allocated lock-free via `Interlocked.Add`.
+
+**Gap 4 — Level-aware outer DOP:** The outer `Parallel.For` over pairs was capped at `ProcessorCount` even at low levels where `pairCount < ProcessorCount`. Added `_outerDop = Min(ProcessorCount, pairCount)` so the scheduler isn't given more parallelism slots than there are work items.
+
+**Gap 5 — Final divide uses `mpz_tdiv_q` not `SafeMpzDiv` (NOT YET FIXED):** `gmp_lib.mpz_tdiv_q(gmpPi, gmpNumer, finalT)` at the end of `ComputePiGMP` uses native GMP. At 5B digits `gmpNumer` ≈ 5.2 billion limbs and `finalT` ≈ 2.6 billion limbs — both vastly exceed the 33M-limb threshold at which GMP's internal `mpn_mul_fft` overflows. This is the same crash class that broke `mpz_sqrt` and `mpz_mul`. Fix: replace with `SafeMpzDiv(gmpPi, gmpNumer, finalT)`.
+
+**Gap 6 — `_safeMulDop` not reset at `Phase3Start` (NOT YET FIXED):** When Phase 2 runs to completion and its last level takes the serial path (always true at 5B digits, where final levels have `pairCount < 4`), `_safeMulDop` is left at 3. There is no reset at `Phase3Start`. Phase 3's single-threaded callers — `SafeMpzPow10`, the Step 2 squaring, and `SafeMpzSqrt`'s internal `SafeMpzMul` calls — therefore run at DOP=3 instead of DOP=24, using only ~9 of 24 cores. Fix: add `Volatile.Write(_safeMulDop, -1)` at `Phase3Start` (−1 is read as `ProcessorCount` inside `SafeMpzMul`). Note: does not affect runs that load from `snap_Phase3` directly (Phase 2 never ran, so `_safeMulDop` stays at its initial −1).
+
+### Newton step checkpointing (SafeMpzSqrt)
+
+Each of the 6 Newton refinement steps in `SafeMpzSqrt` now saves a checkpoint immediately after completing: `snap_Phase3/sqrt_newton.bin` (serialized `x`) + `sqrt_newton_meta.txt` (`bitsN`, `kBitsX`, `step`). On entry, if a matching checkpoint exists (`bitsN` matches and `kBitsX > SEED_BITS`), `x` is deserialized and the loop resumes at the saved step. After each save, `BackupSnapshotToStore("snap_Phase3")` is called immediately.
+
+`BackupSnapshotToStore`, `SerializeOneMpz`, `DeserializeOneMpz` promoted to `Shared` so they can be called from the `Shared` `SafeMpzSqrt`. `_autoCheckpoint` promoted to `Shared` for the same reason.
+
+### Phase 3 intermediate checkpoints (gmpNumer, R0/R1/R2, finalT)
+
+`SavePhase3Value(name, val, dir)` / `TryLoadPhase3Value(name, val, dir)` helpers write/read a single `mpz_t` to `snap_Phase3/{name}.bin` and back up snap_Phase3 immediately.
+
+Checkpoints added:
+- **gmpNumer** — saved after Combine D (the most expensive intermediate; avoids re-running Steps 1–5 on divide crash)
+- **mpR0, mpR1, mpR2** — saved after parallel multiply; loaded at Phase3Start to skip all three multiplies
+- **finalT** — saved alongside gmpNumer so the divide can resume without reloading from snap_Phase3/T.bin
+
+At `Phase3Start`, if `gmpNumer` is found in the checkpoint, the code jumps to `NumeratorDone:` (past Steps 1–5, the sqrt, all three R multiplies, and Combine A–D), loading `finalT` from checkpoint or falling back to `snap_Phase3/T.bin`.
+
+**Known cosmetic inaccuracy:** The log line `"finalT reloaded from spill file"` at `NumeratorDone:` is printed on both the normal path (where finalT really was loaded from spill) and the `GoTo NumeratorDone` checkpoint path (where finalT was loaded from `snap_Phase3/finalT.bin`). Not a correctness issue.
+
+## §107 — SafeMpzReciprocal: Newton iteration guard and floor truncation
+
+### Problem
+
+`SafeMpzReciprocal` uses Newton's method to compute `r ≈ 2^kBits / b`. The inner loop iterates `r ← 2r − bTrunc·r² / 2^(kBits−bShift)` where `bTrunc` is a truncated version of `b` and `bShift = max(0, bBits − prec − 2)`.
+
+The previous implementation used *ceiling* truncation (`bTrunc = floor(b / 2^bShift) + 1`) to keep `p` as an overestimate of `b·r² / 2^kBits`, thereby guaranteeing `r_new = 2r − p ≤ R` (where `R = 2^kBits / b`). A guard block reset `r = 1, prec = 1` whenever `r_new ≤ 0`.
+
+When called from `SafeMpzDiv` during `SafeMpzSqrt`'s Newton step 2 (for a 1B-digit run), the ceiling excess `r² / 2^(kBits−bShift)` for the penultimate iteration was found to cause `r_new` to go negative. The guard fired, reset `r = 1`, and the subsequent restart iterations (doubling from prec=1) converged to a grossly wrong value (~3 limbs instead of ~21.875M limbs). `SafeMpzDiv` then tried to compute `q ≈ a·r / 2^kBits` with this tiny `r`, producing `q ≈ 2^26` instead of the correct quotient `≈ 2^1.4B`. The adjustment loop inside `SafeMpzDiv` then ran for effectively infinite iterations (≈2^1.4B subtractions at 1 core) until killed.
+
+### Gap 5: Final divide (SafeMpzDiv)
+
+`gmp_lib.mpz_tdiv_q(gmpPi, gmpNumer, finalT)` replaced with `SafeMpzDiv(gmpPi, gmpNumer, finalT)` to avoid the `mpn_mul_fft` overflow at 5B+ limbs.
+
+### Gap 6: `_safeMulDop` reset at Phase3Start
+
+Added `System.Threading.Volatile.Write(_safeMulDop, -1)` at `Phase3Start` so Phase 3's single-threaded callers (`SafeMpzPow10`, Step 2 squaring, `SafeMpzSqrt`) use all available cores instead of the DOP=3 left over from Phase 2's serial path.
+
+### Gap 7: Floor truncation fix (in progress)
+
+Removed the `+1` ceiling from `bTrunc` computation in `SafeMpzReciprocal`. With floor truncation, `p ≤ b·r²/2^kBits` so `r_new = 2r−p ≥ r·(2−r/R) ≥ 0` for any `r ≤ R`. The guard is retained as a safety net but should not fire in normal operation.
+
+**Status:** The guard is still firing (log shows `[PreAlloc] 67,586 limbs` restart sequence immediately following the `21,875,002` limb entry). Diagnostic logging (writing to `C:\PiOutput\guard_debug.txt`) has been added to the guard block to capture exact `prec`, `bShift`, and operand sizes when it fires, enabling identification of which iteration is the root cause.
+
+## §108 — SafeMpzDiv: dense diagnostic logging + adj-loop safety abort
+
+### Problem
+
+With floor truncation in `SafeMpzReciprocal`, the Newton iterations all converge successfully (25 iterations, `szR=21,875,001`). However `SafeMpzDiv`'s adjustment loop (which corrects the Barrett-reduced quotient by ±1 until `0 ≤ remainder < b`) was hanging indefinitely — observed as a 20+ hour silent stall.
+
+Post-mortem analysis showed `q_approx = floor(a·r / 2^kBits)` was catastrophically low: only the top 970,336 limbs were non-zero while the bottom 20,904,665 limbs were effectively zero. This made `remainder = a − q·b` have ~42,779,665 limbs (≈ b-sized), requiring ~2^1.34B adj-up iterations.
+
+### Fix
+
+Added `MAX_ADJ_ITERS = 10` safety abort to both the adj-down and adj-up loops inside `SafeMpzDiv`. When exceeded, a `InvalidOperationException` is thrown with full context (`szA`, `szB`, `aBits`, `kBits`, `szR`, `szQ`, `szQB`, `szRem`). This converts a multi-hour hang into a 3-minute crash with a clear diagnostic message.
+
+Also added dense `_logLevel >= 2` logging throughout `SafeMpzDiv`: entry parameters, `a*r` result size, shift size, q top-2 limbs, `q*b` result size, remainder sign/size/top-limb, and each adj-up/adj-down iteration.
+
+### Status
+
+The run now terminates in ~3 minutes with the exception. Root cause (zero lower limbs in `q_approx`) is confirmed but not yet fixed.
+
+## §109 — SafeMpzMul general-path per-sub-product diagnostics + q bottom-limb logging
+
+### Problem
+
+`q_approx` from `SafeMpzDiv` has only its top ~970K limbs non-zero and ~20.9M zero bottom limbs. The zero-lower-limbs hypothesis is: if `q`'s lower 20,904,665 limbs are zero, then `remainder = a − q·b` has `20,904,665 + 21,875,001 − 1 = 42,779,665` limbs — exactly matching the observed `szRem=42,779,665`.
+
+`q` is produced by `SafeMpzMul(ar, a, r)` followed by `BigShiftRight(ar, ar, kBits)`. Since `szA=43,750,001` and `szR=21,875,001`, we have `mA ≠ mB` so the **general accumulation path** is used (not the §39 column path). That path loops `k=0..8`, shifts each of the 9 sub-products `A_i × B_j` by `ki*bitsA + kj*bitsB`, and accumulates.
+
+### Fix (diagnostic)
+
+Added `[SafeMpzMul§gen]` log lines after each of the 9 `GmpRaw_add` calls in the general accumulation loop, reporting `k`, `shiftBits`, `szProd` (sub-product limb count), `szShifted` (shifted limb count, for non-zero shifts), and `accumSz` (accumulator limb count after the add). This will identify exactly which sub-product first produces an abnormal accumulator state.
+
+Also extended the `[SafeMpzDiv] q_approx ready:` log line to include `bot2limbs=[limb0 limb1]`, confirming whether the bottom two limbs of `q` are both zero.
+
+### Status
+
+Diagnostics added. Run in progress — awaiting log analysis.
+
+## §110 — SafeMpzMul/SafeMpzDiv: sub-product top-2 limb diagnostics + `a` top-2
+
+### Problem
+
+After §109 confirmed that sub-product sizes are all plausible (k=0/1/2 zero because `A0=0` in the final Newton step; k=3..8 matching expected sizes), the root cause of the underflowing `q_approx` was still unclear.  The error corresponds to `ar` being short by ≈2^4,137,898,523, placing the missing bit at `ar[64,654,664]`, which falls entirely within k=8's shifted product (shift = 2,800,000,128 bits = exactly 43,750,002 limbs, so the raw product limb at index 20,904,662 is implicated).
+
+### Fix (diagnostic)
+
+- Added `top2=[hi lo]` logging for each of the 9 sub-products after their `GmpRaw_mul` completes, inside the general §23/§90 accumulation loop.
+- Added `[SafeMpzDiv] a top2=[...]` immediately before `SafeMpzMul(ar, a, r)` to confirm `a` (`nTrunc`) is sane.
+
+### Status
+
+Log confirms `a top2=[000000000085BA61 25BC66C4D7A3C6AF]` and k=8's top2 matches `ar`'s top2.  `BigShiftRight` is confirmed correct (`q_bot_expected` matches actual `q_bot`).  Reciprocal top2 is confirmed correct.  Root cause localised to k=8's raw product at limb 20,904,662.
+
+## §111 — SafeMpzMul/SafeMpzDiv: targeted error-limb diagnostic
+
+### Problem
+
+With the error precisely localised to `(A2×B2)[20,904,662]` — the interior of k=8's GmpRaw_mul sub-product — we need empirical read-back of that exact limb before and after accumulation to determine whether the fault is in the raw product, the limb-shift, or carry propagation from lower sub-products.
+
+### Fix (diagnostic)
+
+- In the §23/§90 accumulation loop, for the `a×r` call only (guard `szA=43,750,001 ∧ szB=21,875,001`):
+  - Before accumulating k=8: log `prods(8)[20,904,662]` and `prods(8)[20,904,663]` as `[SafeMpzMul§111]`.
+  - After accumulating k=8: log `accum[64,654,664]` and `accum[64,654,665]` as `[SafeMpzMul§111]`.
+- In `SafeMpzDiv`'s `ar` diagnostic block, for `szAR=65,625,001`: log `ar[64,654,664]` and `ar[64,654,665]` as `[SafeMpzDiv§111]`.
+
+### Status
+
+`prod[20,904,662] = accum[64,654,664] = ar[64,654,664] = 0x8AF1A69460682417` — all non-zero and matching.  The k=8 raw product at that limb is correct.  Therefore the error is NOT at `ar[64,654,664]`; it must be in the middle zone `ar[43,750,002..64,654,663]`.
+
+## §112 — SafeMpzDiv: sparse ar limb sweep to localise middle-zone error
+
+### Problem
+
+`ar[64,654,664]` is confirmed correct, but `q` is still ~2^1,337,898,496 short.  The shortfall must live in `ar[43,750,002..64,654,663]`.  A sparse sweep at ~11 positions across this zone will reveal exactly where values transition from valid to wrong/zero.
+
+### Fix (diagnostic)
+
+Added a `§112` sparse sweep inside the existing `szAR=65,625,001` guard in `SafeMpzDiv`, sampling `ar` at positions: 43,750,002 / 45,000,000 / 47,000,000 / 50,000,000 / 52,000,000 / 55,000,000 / 57,000,000 / 60,000,000 / 62,000,000 / 64,000,000 / 64,654,663.  Output as `[SafeMpzDiv§112]`.
+
+### Status
+
+All 11 sweep positions non-zero: `ar[43,750,002..64,654,663]` is fully populated.  `ar` itself is correct.  The error is therefore in `BigShiftRight` or in the `q×b` multiplication that follows.
+
+## §113 — SafeMpzDiv: verify q middle limbs after BigShiftRight
+
+### Problem
+
+`ar` is confirmed correct throughout.  The next hypothesis is that `BigShiftRight(ar, ar, kBits)` or the `q×b` SafeMpzMul (which uses the §39 equal-size path for szA=szB=21,875,001) produces the wrong result.  Logging `q[10,937,500]` and `q[20,904,664]` immediately after BigShiftRight (before q×b) will confirm whether q itself is wrong or the error is introduced during q×b.
+
+### Fix (diagnostic)
+
+Added `[SafeMpzDiv§113]` inside the `szQ=21,875,001` guard: logs `q[10,937,500]` and `q[20,904,664]` from the shifted `ar` buffer before the `GmpRaw_swap`.
+
+### Status
+
+`q[10,937,500]=62E99550C2B36B0F` and `q[20,904,664]=26909AD15E34D28C` — both non-zero.  q itself is correct after BigShiftRight.  The bug is in `SafeMpzMul(q, b)` via the §39 equal-size path.
+
+## §114 — SafeMpzMul §39: per-column diagnostics for q×b
+
+### Problem
+
+q is confirmed correct.  `SafeMpzMul(q, b)` uses the §39 column-group path (mA=mB=7,291,667).  The result qb is too small by ~2^1,337,898,496, causing rem=a−qb to have 42,779,665 limbs.  Need to identify which column contributes wrong/missing data.
+
+### Fix (diagnostic)
+
+Added `[SafeMpzMul§114]` inside the §39 loop, guarded by `mA=7,291,667`: logs per-column `szBk`, `bkTop`, `bkBot`, `szShifted`, `szAccum` for all 5 columns, plus `accum[42,779,664]` after col=4 (A2×B2, shift=1,866,666,752 bits).
+
+### Status
+
+**Result**: First 2 §39 calls (mA=7,291,667) have all 5 columns populated — these are SafeMpzReciprocal's r×r Newton iterations.  Subsequent 20+ calls show col0–3 szBk=0, col4 szBk=14,583,333 — implying A0=A1=B0=B1=0.  Yet §113 confirmed q[0]≠0 and q[10,937,500]≠0.  **Contradiction** — requires §115 to resolve.
+
+## §115 — SafeMpzMul: distinguish r×r vs q×b calls via buffer-identity check
+
+### Problem
+
+§114 shows 20+ §39 calls where parts A0/A1/B0/B1 appear zero (trimmed szT=0) even though §113 confirmed q has non-zero limbs in those ranges.  Two possible explanations:
+1. Those calls are SafeMpzReciprocal's `r×r` iterations (opA_d == opB_d), where r legitimately has zero low limbs.
+2. Something corrupts q's buffer between §113 (before GmpRaw_swap) and SafeMpzMul(qb,q,b).
+
+### Fix (diagnostic)
+
+Added `[SafeMpzMul§115]` after A/B window setup, guarded by `mA=7,291,667`.  Logs `opA_d`, `opB_d`, `same` (pointer equality), and all six piece trim-sizes (`A0sz`…`B2sz`).  If `same=True` → r×r call.  If `same=False` with A0sz=0/A1sz=0 → genuine corruption in q.
+
+### Status
+
+Diagnostic added — run in progress.
+
+## Repo housekeeping — exclude DLLs and PDBs from source control
+
+Added `*.dll` and `*.pdb` patterns to `.gitignore` to prevent pre-built native binaries (`GmpNativeAlloc/Debug/GmpNativeAlloc.dll`, `GmpNativeAlloc/Debug/GmpNativeAlloc.pdb`) from appearing as modified files in the source control window.  Existing tracked copies removed from the git index.
+
+## §NR-raw — SafeMpzReciprocal: replace managed wrapper calls with raw P/Invoke in Newton loop
+
+### Problem
+
+The Newton reciprocal loop (`SafeMpzReciprocal`) computed `r = 2r − p` via two successive managed wrapper calls:
+```vb
+gmp_lib.mpz_add(r, r, r)   ' r = 2r
+gmp_lib.mpz_sub(r, r, p)   ' r = 2r - p
+```
+The `Math.Gmp.Native` managed wrapper is documented (§42/§78) to corrupt `mpz_t.Pointer` fields during native GMP calls on large objects.  At iterations 21–25 (r ≈ 21,875,001 limbs), this corruption caused `r.Pointer` to be read/written at a wrong address between the `mpz_add` return and the subsequent `mpz_sub` call.
+
+Evidence:
+- §119 log after iter=1: `bot=[FFFFFFFFFFFFFFFF FFFFFFFFFFFFFFFF]` (r has non-zero bottom limbs from seed borrow-propagation).
+- §115 log at iter=2 entry (reading from same buffer address `0x0000027B1A590010`): `A0sz=0 A1sz=0` — all 7,291,667 bottom limbs read as zero.
+- These two readings of the same buffer address are contradictory; the only intervening operation touching `r` is `gmp_lib.mpz_sub(r, r, p)` (managed wrapper).
+- Bottom 2 limbs of r change by ~2^61–2^62 at each of iters 21–25 (diverging rather than converging), consistent with pointer corruption producing operand reads from a wrong address.
+
+The guard path also used `gmp_lib.mpz_set_ui(r, 1UI)` — another managed call on a large object.
+
+### Fix
+
+1. Added `GmpRaw_sub` P/Invoke declaration (`__gmpz_sub`, `libgmp-10.dll`) for general mpz_t subtraction.
+2. Replaced `gmp_lib.mpz_add(r, r, r)` with `GmpRaw_add(r.Pointer, r.Pointer, r.Pointer)` — tagged `§NR-raw`.
+3. Replaced `gmp_lib.mpz_sub(r, r, p)` with `GmpRaw_sub(r.Pointer, r.Pointer, p.Pointer)` — tagged `§NR-raw`.
+4. Replaced guard's `gmp_lib.mpz_set_ui(r, 1UI)` with `GmpRaw_set_ui(r.Pointer, 1UI)` — tagged `§NR-raw`.
+
+All three raw calls bypass the managed wrapper entirely, eliminating pointer corruption on large operands.
+
+### Status
+
+Fix applied — run in progress.
+
+## §123-§126 — Targeted limb diagnostics in SafeMpzReciprocal Newton final iteration
+
+### Problem
+
+After the §NR-raw fix, the run still crashes with `szRem=42,779,665 >> szB=21,875,001`.
+Cross-checking confirmed:
+- `q[20,904,664] = 0x26909AD15E34D28C` (computed) vs `b[20,904,664] = 0x2690BFD417C6E66C` (expected)
+- The error at `q` traces back to `ar[64,654,664] = A2×B2[20,904,662] = 0x8AF1A69460682417` in `SafeMpzDiv`'s `a×r` multiplication
+- This means either `r[20,904,664]` itself is wrong (bad Newton reciprocal), or GMP's `__gmpz_mul` is wrong (unlikely)
+- Further narrowing: `r[20,904,664] = 0x0CFE92E693312BCA` (logged by §116); need to verify if this is correct
+
+The Newton final iteration computes `p = bTrunc × rSq` (via `SafeMpzMul`), then `p >>= kBits`, then `r = 2r - p`.
+If `p[64,654,664]` (before shift) or `p[20,904,664]` (after shift) carry an error, that propagates into r[20,904,664].
+
+### Diagnostics added
+
+All four fire only at `bShift = 0` (the final Newton iteration, iter=25):
+
+- **§126** (`[NR126]`): `rSq[20,904,662]` and `rSq[20,904,663]` when `rSq = r²` is complete.
+  `rSq[20,904,662]` feeds into `p[64,654,664]` via the B2 piece of `rSq` in `SafeMpzMul(p, bTrunc, rSq)`.
+
+- **§125** (`[NR125]`): `p[64,654,664]` and `p[64,654,665]` before `BigShiftRight(p, p, kBits)`.
+  The shift by `kBits = 2,800,000,027` bits maps these limbs to `p_shifted[20,904,664]` via:
+  `p_shifted[20,904,664] = (p[64,654,664] >> 27) | (p[64,654,665] << 37)`
+
+- **§123** (`[NR123]`): `p[20,904,664]` and `p[20,904,665]` after `BigShiftRight`.
+  Cross-check: §123 value must equal `(§125[64654664] >> 27) | (§125[64654665] << 37)` — if not, the Newton `BigShiftRight` has a bug.
+
+- **§124** (`[NR124]`): `r[20,904,664]` and `r[20,904,665]` immediately after `GmpRaw_sub(r, r, p)`.
+  Must match §116 value `0x0CFE92E693312BCA` (logged in SafeMpzDiv after Newton completes) — if not, r is modified between Newton exit and SafeMpzDiv entry.
+
+### Status
+
+Diagnostics added — run in progress.
+
+## §128 — SafeMpzMul: disable §39 column fast path when any split piece is zero
+
+### Problem
+
+The `SafeMpzDiv` failure (`adj-up exceeded 10`) remained reproducible after the §123–§126 diagnostics.  The trace showed:
+- `a*r` and `BigShiftRight` produced a plausible `q_approx`
+- the failure exploded during `SafeMpzMul(qb, q, b)`
+- in that call, `mA=mB=7,291,667` and one split piece was exactly zero (`B0sz=0`), while the §39 column-group fast path was active.
+
+The §39 path is an optimization that groups 9 sub-products into 5 shifted columns when `mA=mB`.  In this sparse-piece case, it produced a catastrophically low `q*b`, leaving `remainder = a - q*b` at ~42.8M limbs and forcing effectively unbounded adj-up corrections.
+
+### Fix
+
+Hardened the §39 branch condition in `SafeMpzMul`:
+
+- **Before:** use §39 whenever `mA = mB`
+- **After:** use §39 only when all six split windows are non-empty
+    (`A0sz/A1sz/A2sz/B0sz/B1sz/B2sz > 0`)
+
+If any split piece is zero-sized, `SafeMpzMul` now falls back to the general 9-product accumulation path (§23/§90), which is slower but robust for sparse windows.
+
+### Status
+
+Fix verified: the 700M→1.4B Barrett step (kBits=2,800,000,027, szB=21,875,001) completed
+successfully with zero adj-up iterations.  The 1.4B→2.8B step (kBits=5,600,000,067,
+szB=43,750,001) also exercised the fix (B0sz=0 again) and passed without incident.
+
+---
+
+## §175/§181 — SafeMpzMul: remove result.Pointer re-reads after inner calls
+
+### Problem
+
+Inside the 3×3 recursive `SafeMpzMul`, `savedResultPtr` was being overwritten with
+`result.Pointer` in two places:
+
+1. **After the 9 inner sub-product calls** (before serial accumulation):
+   `savedResultPtr = result.Pointer`
+2. **After the serial accumulation loop** (before the final struct copy):
+   `savedResultPtr = result.Pointer`
+
+Both re-reads were intended for safety, but `result.Pointer` is a managed-wrapper field
+that Math.Gmp.Native may corrupt during recursive `SafeMpzMul` calls (§78 corruption —
+the inner call's `mpz_init`/`mpz_clear` side-effects overwrite the outer frame's managed
+field).  After a recursive sub-product call, `result.Pointer` pointed to a different struct
+than `savedResultPtr` (the original pre-alloc'd native struct).  The re-read therefore
+replaced the correct `savedResultPtr` with a corrupted address.
+
+The effect: the outer accumulation and final struct-copy operated on the wrong native
+struct, leaving `rSq`'s lower limbs zeroed — causing Newton iterations to appear
+converged prematurely and producing a wrong reciprocal.
+
+### Fix
+
+Removed both `savedResultPtr = result.Pointer` re-reads.  `savedResultPtr` is now
+captured exactly once (immediately after pre-alloc, before any inner call) and never
+overwritten.  `accumPtr` is derived from `savedResultPtr` rather than from
+`result.Pointer`.
+
+The serial accumulation loop contains no inner `SafeMpzMul` calls, so `accumPtr` is
+also stable across that loop — the second re-read was doubly unnecessary.
+
+### Status
+
+Fix applied and verified across Newton iterations 1–26 for szB=43,750,001.
+
+---
+
+## §176–§183 — SafeMpzMul diagnostic probes
+
+A set of `_logLevel >= 2` instrumentation probes added during the Barrett crash
+investigation to identify the source of zero-data corruption in Newton squarings:
+
+| Probe | Location | Purpose |
+|-------|----------|---------|
+| §176  | After 9 inner calls, mA=7,291,667 squarings | Log prods(0..2) bottom limbs immediately after inner SafeMpzMul |
+| §177  | After piece trim, mA=2,430,556 squarings | Log A0/A1/A2 sizes and raw limbs for depth-2 r×r calls |
+| §178  | After fast-path return, squarings only | Log if fast-path produced zero result (szA+szB ≤ threshold) |
+| §179  | After A0 trim loop | Log when A0-trim reduces to zero in squarings — with freed-buffer aliasing check |
+| §182  | Before k=6,7,8 inner calls (serial path) | Log A2._mp_d and A2_d[0] to detect mid-loop corruption |
+| §183  | SafeMpzMul entry, squarings only | Log if opA._mp_d already points to zero data on entry |
+
+These probes fire only when `_logLevel >= 2` and are conditioned to avoid hot-path
+overhead.  §179/§183 fire legitimately for `SafeMpzPow10` squarings (powers of 10 have
+trailing zero limbs); they do not fire for Newton squarings of r.
+
+---
+
+## §144-serial — SafeMpzDiv b×r diagnostic: force serial
+
+### Problem
+
+The `§144` diagnostic block (which computes `b×r` to verify the Newton reciprocal) was
+calling `SafeMpzMul` without serialising it, causing the diagnostic itself to race and
+potentially corrupt state being measured.
+
+### Fix
+
+Wrap the `§144` `SafeMpzMul(_br144, b, r)` call with `_safeMulDop = 1` save/restore,
+matching the §168 pattern used for the main reciprocal computation.
+
+---
+
+## §184 — SafeMpzDiv: bypass managed wrapper for qb and remainder (fix STATUS_ASSERTION_FAILURE crash)
+
+### Problem
+
+After `SafeMpzMul(qb, q, b)` returned, `SafeMpzDiv` called `gmp_lib.mpz_init(remainder)` via
+the Math.Gmp.Native managed wrapper, then `gmp_lib.mpz_sub(remainder, a, qb)`.
+
+The `gmp_lib.mpz_init(remainder)` call went through the managed wrapper, which triggered the §78
+side-effect: Math.Gmp.Native's internal tracking scanned registered `mpz_t` objects and updated
+their `Pointer` fields.  This corrupted `qb.Pointer` (even though `qb` was not passed to the
+call), replacing it with a stale/wrong address.
+
+When `gmp_lib.mpz_sub(remainder, a, qb)` was then called, Math.Gmp.Native read the corrupted
+`qb.Pointer` and passed a garbage struct address to GMP's `__gmpz_sub`.  GMP's internal
+assertion (`_mp_alloc ≥ abs(_mp_size)` or a limb-count sanity check) failed immediately,
+raising `STATUS_ASSERTION_FAILURE` (exception code 0x40000015) at offset 0x14ef6 in
+`libgmp-10.dll`.
+
+This crash was 100% reproducible: every run hit the same fault ~99 minutes in (after
+Newton completes for the 1.4B→2.8B step and q×b accumulation finishes).
+
+### Fix
+
+Replace all managed-wrapper calls in the post-`SafeMpzMul` section of `SafeMpzDiv` with raw
+P/Invoke calls (bypassing Math.Gmp.Native entirely):
+
+- Allocate `qb` as a plain `Marshal.AllocHGlobal(16)` struct + `GmpRaw_init` (not `gmp_lib.mpz_init`)
+- Capture `_qbPtr = qb.Pointer` immediately after `SafeMpzMul` returns, before any native call
+- Allocate `remainder` as a plain raw struct + `GmpRaw_init`
+- Use `GmpRaw_sub(_remRaw, a.Pointer, _qbPtr)` instead of `gmp_lib.mpz_sub(remainder, a, qb)`
+- Use `GmpRaw_clear` + `FreeHGlobal` for cleanup
+- All adj-down/adj-up operations use `_remRaw` and raw P/Invokes (`GmpRaw_sub_ui`, `GmpRaw_add`,
+  `GmpRaw_add_ui`, `GmpRaw_sub`, `GmpRaw_cmp`) — no managed wrapper calls touch `qb` or `remainder`
+
+### Status
+
+Fix applied and verified: computation completed the 1.4B→2.8B Newton step and
+saved checkpoint kBitsX=2,800,000,028 successfully.
+
+---
+
+## §SqNewton — SafeMpzSqrt Newton loop: bypass managed wrapper for nTrunc/xTrunc/q (fix STATUS_ASSERTION_FAILURE crash)
+
+### Problem
+
+After the 1.4B→2.8B checkpoint was saved, the compute resumed for the 2.8B→5.6B
+(final) Newton step in `SafeMpzSqrt`.  For this step `nShift=0` and `xHalf=0`, so
+the code path falls through to the `GmpRaw_set(nTrunc.Pointer, n.Pointer)` branch.
+
+The crash occurred because the three `gmp_lib.mpz_init` calls at the top of the
+Newton loop (`nTrunc`, `xTrunc`, `q`) went through the Math.Gmp.Native managed wrapper,
+triggering the §78 side-effect: every registered `mpz_t.Pointer` field was updated.
+After `gmp_lib.mpz_init(nTrunc)` the values of `n.Pointer` and `x.Pointer` in the
+enclosing scope became stale (pointing to wrong native structs).  When
+`GmpRaw_set(nTrunc.Pointer, n.Pointer)` was then called, it passed the corrupted
+`n.Pointer` address to GMP's `__gmpz_set`, which called `_mpz_realloc` on a garbage
+struct and fired GMP's internal assertion at offset 0x14ef6 in `libgmp-10.dll`
+(`STATUS_ASSERTION_FAILURE`, code 0x40000015).
+
+This crash always happened at the start of the final Newton step — never on earlier
+iterations because those used `BigShiftRight` (pure raw calls) instead of `GmpRaw_set`.
+
+### Fix (§SqNewton)
+
+Apply the same raw-struct bypass used by §184:
+
+- Before the Newton loop, capture `_xNativePtr = x.Pointer` and `_nNativePtr = n.Pointer`.
+- Inside each iteration, allocate `nTrunc`, `xTrunc`, `q` with `Marshal.AllocHGlobal(16) + GmpRaw_init`
+  instead of `gmp_lib.mpz_init` — these are never registered with the managed wrapper.
+- When `nShift=0` (copy n whole): use `PreAllocMpzToLimbs(nTrunc, szN)` then
+  `GmpRaw_set(_nTruncRaw, _nNativePtr)` using the pre-captured raw pointer.
+- When `xHalf=0` (copy x whole): similarly use `_xNativePtr` for the copy source.
+- After `SafeMpzDiv` returns (which triggers §78 again internally), restore:
+  `x.Pointer = _xNativePtr` and `n.Pointer = _nNativePtr`.
+- Replace `gmp_lib.mpz_add(xTrunc, xTrunc, q)` with `GmpRaw_add(_xTruncRaw, _xTruncRaw, _qRaw)`.
+- Replace `gmp_lib.mpz_tdiv_q_2exp` with `GmpRaw_tdiv_q_2exp`.
+- Replace `gmp_lib.mpz_clear` + `FreeHGlobal` for all three raw structs.
+- Use `GmpRaw_swap(_xNativePtr, _xTruncRaw)` (not `x.Pointer`) to update x after each step,
+  then immediately restore `x.Pointer = _xNativePtr`.
+
+### Status
+
+Fix applied; computation completed the 2.8B→5.6B Newton step. Checkpoint
+kBitsX=3,321,928,130 saved.
+
+---
+
+## §NumeratorDiv — ComputePi final division: restore Pointer fields after §78 corruption (fix STATUS_HEAP_CORRUPTION)
+
+### Problem
+
+After SafeMpzSqrt completed and the numerator was saved to the `gmpNumer` checkpoint,
+the next restart loaded `gmpNumer` from `snap_Phase3/gmpNumer.bin` via
+`TryLoadPhase3Value("gmpNumer", gmpNumer, ...)` and similarly for `finalT`.
+
+These checkpoint-loading calls go through the Math.Gmp.Native managed wrapper
+(`gmp_lib.mpz_realloc2`, `gmp_lib.mpz_clear`, `gmp_lib.mpz_init`), each triggering
+the §78 side-effect: all registered `mpz_t.Pointer` fields are overwritten with
+stale/wrong native struct addresses.  By the time the code reached `NumeratorDone`,
+`gmpPi.Pointer`, `gmpNumer.Pointer`, and `finalT.Pointer` were all corrupted.
+
+At the gmpPi pre-allocation block (just before `SafeMpzDiv(gmpPi, gmpNumer, finalT)`),
+the code read `gmpPi.Pointer` to find the old 1-limb buffer address, then called
+`_savedGmpFree(old_buf, 8)` to release it before writing the new large VirtualAlloc
+pointer.  With a corrupted `gmpPi.Pointer`, `old_buf` was a garbage native-heap address.
+Passing a garbage pointer to `_savedGmpFree` (the CRT `free`) immediately corrupted the
+Windows heap, raising `STATUS_HEAP_CORRUPTION` (exception code 0xc0000374) at
+`ntdll.dll+0x1176e5`.
+
+### Fix (§NumeratorDiv-v4)
+
+Two earlier attempts (d796769, 7487b61) to restore the three Pointer fields also failed:
+the captures were taken after `gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpNumer, gmpPi, gmpOne)`,
+but `mpz_inits` fires §78 during each internal `mpz_init` call.  The §78 fired during
+`mpz_init(gmpOne)` (last in the list) overwrote `gmpPi.Pointer` before we could capture it,
+so `_gmpPiRaw` itself contained a stale/wrong address — restoring to it put a garbage pointer
+into `gmpPi`, and the pre-alloc `_savedGmpFree` call still crashed.  By the same mechanism,
+`_gmpNumerRaw` was also wrong (overwritten by §78 during `mpz_init(gmpPi)` and `mpz_init(gmpOne)`).
+
+Additionally, the gmpPi pre-alloc block was removed entirely: it was never safe because even
+with a correct `_gmpPiRaw`, GmpReallocFunc handles the 1-limb CRT → large VirtualAlloc growth
+correctly when `SafeMpzDiv` first writes to `gmpPi` — one realloc inside the division is
+harmless.
+
+**Root fix:** remove `gmpNumer` and `gmpPi` from `mpz_inits`; init them separately, in order,
+capturing each `Pointer` immediately after its own `mpz_init` and before the next call fires §78:
+
+```vb
+gmp_lib.mpz_inits(gmpSqrtInput, gmpSqrt, gmpOne, Nothing)   ' gmpNumer/gmpPi excluded
+gmp_lib.mpz_init(gmpNumer)
+Dim _gmpNumerRaw As IntPtr = gmpNumer.Pointer  ' correct: captured before mpz_init(gmpPi) fires §78
+gmp_lib.mpz_init(gmpPi)
+Dim _gmpPiRaw As IntPtr = gmpPi.Pointer        ' correct: no managed GMP call between here and mpz_init(gmpPi)
+gmpNumer.Pointer = _gmpNumerRaw                ' restore: mpz_init(gmpPi) just fired §78 and corrupted gmpNumer.Pointer
+```
+
+After this, `gmpNumer.Pointer` is correct so `TryLoadPhase3Value("gmpNumer", gmpNumer, ...)`
+(which calls `DeserializeOneMpz` → `Marshal.WriteInt32(val.Pointer, ...)`) writes to the right
+native struct.  `_finalTRaw` is captured after `gmp_lib.mpz_init(finalT)` as before.
+
+At `NumeratorDone`, all three are restored before `SafeMpzDiv`:
+
+```vb
+If _gmpPiRaw <> IntPtr.Zero Then gmpPi.Pointer = _gmpPiRaw
+If _gmpNumerRaw <> IntPtr.Zero Then gmpNumer.Pointer = _gmpNumerRaw
+If _finalTRaw <> IntPtr.Zero Then finalT.Pointer = _finalTRaw
+SafeMpzDiv(gmpPi, gmpNumer, finalT)
+```
+
+`SafeMpzDiv` captures `a.Pointer`/`b.Pointer` at entry (§184c), uses `q.Pointer` for
+`GmpRaw_swap` and the adjustment loop — all require correct addresses.
+
+### Status
+
+v4 fix applied and built (Debug). 1B-digit run completed successfully (verified all three digit checks OK).
+
+## §Phase3OOM — Step 2 squaring OOM crash at 5B digits
+
+### Problem
+
+At 5B digits, `SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)` (Step 2: squaring 10^5B) uses
+`gmpOne` ≈ 130M limbs (1 GB). With `_safeMulDop=24` (all cores), the 9 sub-products
+run concurrently; each sub-product is ~43M×43M limbs → ~700 MB, so 9 simultaneous
+allocations = ~6 GB on top of ~22 GB already in use. Windows silently terminates the
+process when `VirtualAlloc` fails — no managed exception, no log entry, clean exit code.
+
+### Fix (§Phase3OOM)
+
+Force `_safeMulDop=1` for the Step 2 squaring only, then restore the saved DOP:
+
+```vb
+Dim _savedDopStep2 As Integer = Volatile.Read(_safeMulDop)
+Volatile.Write(_safeMulDop, 1)
+SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)
+Volatile.Write(_safeMulDop, _savedDopStep2)
+```
+
+Serial sub-products reduce peak concurrent memory to ~700 MB extra (one sub-product
+at a time) instead of ~6 GB. Step 2 takes longer but completes without OOM.
+snap_Phase3 (P/Q/T) is saved before Step 1, so restart resumes from there.
+
+## §171-iter — SafeMpzDiv: iterate top-limb correction + capture raw prodHdr (5B SafeMpzSqrt crash fix)
+
+### Problem
+
+At 5B digits, inside `SafeMpzSqrt` Newton step 1 (`175M / 87.5M` limbs), `SafeMpzDiv`'s
+adj-up loop exceeded `MAX_ADJ_ITERS=10` (Barrett quotient was ~2× too small: szRem ≈ 172.7M,
+szB ≈ 87.5M — ratio 1.97). The existing §171 top-limb correction fired, computed
+`szDelta=85,222,805` via `mpn_divrem_1`, then did:
+
+```vb
+SafeMpzMul(_prod171, _deltaWrap171, _bWrap171)
+GmpRaw_sub(_remRaw, _remRaw, _prod171.Pointer)
+```
+
+The log showed `szRemNew = 172,722,805` — **identical** to the pre-correction szRem.
+Subtraction produced no change. The outer adj-up loop then ran 11 more naive iterations,
+hit `§171b`'s `GmpRaw_tdiv_q(_qPtr, _aPtr, _bPtr)` fallback, which AV'd (0xC0000005)
+because `mpz_tdiv_q` allocates internal scratch that can't satisfy 172M-limb / 87.5M-limb
+at this scale.
+
+### Root cause
+
+Per the existing §175 note, `SafeMpzMul` recursion corrupts `result.Pointer` for
+locally-scoped `mpz_t` wrappers. `SafeMpzMul` restores via `savedResultPtr` at its exit,
+but when the caller uses the wrapper's `.Pointer` property *after* the call, it may still
+read a stale value routed through managed wrapping. The actual correct struct is always
+at the raw `IntPtr` captured before the call (`_prodHdr171`).
+
+When `GmpRaw_sub(_remRaw, _remRaw, _prod171.Pointer)` ran, `_prod171.Pointer` pointed at
+a struct with `_mp_size=0`, so GMP subtracted zero. rem was left unchanged.
+
+### Fix
+
+1. **Use captured raw pointer** `_prodHdr171` directly in `GmpRaw_sub` / `GmpRaw_clear` —
+   matches the §78/§NR-r-add/§184 pattern.
+2. **Iterate** the §171 correction until `szRem ≤ szB`. One pass is not enough when the
+   rem/b ratio approaches 2 (which it does at 5B scale). Bail with a clear
+   `InvalidOperationException` if a pass fails to reduce rem (pointer corruption or
+   arithmetic bug — loud, not silent-AV).
+3. **Remove `§171b` crash fallback**. Replace `GmpRaw_tdiv_q` with an
+   `InvalidOperationException` carrying `szRem`, `szB`, `szA` — if iterative §171
+   somehow leaves rem > b after MAX_ADJ_ITERS of normal adj-up, we want a clean
+   stack trace, not an AV.
+
+### New diagnostics (added per "every investigation adds logging")
+
+- `[SafeMpzDiv§171-entry]` — szA, szB, szRem, ratio on first §171 trigger.
+- `[SafeMpzDiv§171 pass=N]` — bTop, szDelta, szRemBefore (start of each pass).
+- `[SafeMpzDiv§171 pass=N]` — szProd, prodHdr address, `_prod171.Pointer`, **match flag**
+  (post-SafeMpzMul — would have caught the `.Pointer`-mismatch bug in seconds).
+- `[SafeMpzDiv§171 pass=N] done` — szRemAfter, delta.
+- `[SafeMpzDiv§171-done]` — total passes + final szRem.
+
+If a future crash recurs, the per-pass `match=False` flag or a non-decreasing szRem would
+instantly pinpoint the failure mode.
+
+## §171-barrett — 5B SafeMpzSqrt Newton step 1: Barrett precision bug (NOT a §171 bug)
+
+### Observed (2026-04-23)
+
+After deploying `§171-iter` and restarting the 5B run, the fix threw a clean exception
+1h 11m in, at the same code location:
+
+```
+[SafeMpzDiv§171-entry] szA=175,000,001 szB=87,500,001 szRem=172,722,805 ratio=1.974
+[SafeMpzDiv§171 pass=1] bTop=0x0000000021D94463 szDelta=85,222,805
+[SafeMpzDiv§171 pass=1] szProd=172,722,805 prodHdr=0x…  prod.Ptr=0x… match=True
+[SafeMpzDiv§171 pass=1] done: szRemAfter=172,722,805 Δ=0
+  EXCEPTION: SafeMpzDiv §171 pass 1 did not reduce rem size
+```
+
+- `match=True` → pointer corruption was **not** the cause (my original §171-iter hypothesis).
+- `szProd=172,722,805` → SafeMpzMul did produce the correctly-sized delta×b.
+- `Δ=0` → GmpRaw_sub(rem, rem, prod) ran but left szRem exactly unchanged.
+
+### Root cause
+
+The real bug is **upstream of §171**, in SafeMpzDiv's Barrett estimate itself:
+
+- Barrett setup: `szA=175,000,001 szB=87,500,001 aBits=11,200,000,064 bBits=5,600,000,064 kBits=11,200,000,067 szR=87,500,001 rBits=5,600,000,038`.
+- `q_approx` from `(a*r) >> kBits` has top limbs `[0x21D94463, D8DAD84AB39138B5]`.
+- After `SafeMpzMul(q*b)` and subtract, `rem` has 172,722,805 limbs = ~2^(11.05B) — far larger than `b` (~2^(5.6B)).
+- So `q_true − q_approx ≈ rem/b ≈ 2^(5.45B)` (a **~85M-limb** integer).
+
+Normal Barrett should produce error ≤ 1-2. This is **off by 2^(5.45 billion)** — a bug, not rounding.
+
+### Why §171 cannot converge at 5B
+
+`b`'s top limb is `0x21D94463` (only **30 bits** non-zero). The single-limb correction
+`delta = floor(rem_top / (bTop+1))` is accurate only to ~2^bTopBits per pass. So each
+pass reduces rem by factor ≤ 2^30 in value. To close the 2^(5.45B) gap needs ~180 million
+passes — obviously infeasible.
+
+Even with b-normalization (shifting `bTop` to have its top bit set) the reduction is ~2^63
+per pass ≈ 86 million passes — still infeasible. **Single-limb top correction is
+fundamentally unable to fix a Barrett error this large.**
+
+### Where the real bug is
+
+One of these at 5B scale produces a wrong result:
+1. `SafeMpzMul(ar, a, r)` — 175M × 87.5M limb multiply.
+2. `BigShiftRight(ar, ar, kBits)` — shift by 11.2B bits = 175M limbs.
+3. `SafeMpzReciprocal(r, b, kBits)` — Newton reciprocal with insufficient precision for
+   the unnormalized b (top limb 30 bits → loss of significance propagates).
+
+At 1B digits these worked (§171 fired 4 times and all single-pass corrections succeeded).
+At 5B something is numerically wrong at one of these three stages.
+
+### Not yet fixed — next steps
+
+- Add Barrett sanity check: before adj-up, verify `szRem ≤ szB + MAX_ADJ_ITERS` or
+  throw immediately with all Barrett params logged, so we fail fast rather than run 11
+  pointless adj-up iters then enter §171.
+- Instrument `SafeMpzMul(ar,a,r)` top/bot limbs and compare against an independent
+  reference (small example with known answer) to localise which step is wrong.
+- Consider forcing b-normalization (`b << k` so bTop's top bit is set) before the
+  Barrett setup — this is a known stabiliser for divisors with sparse top limbs.
+
+### Status
+
+`§171-iter` code is correct — it catches the bug cleanly with rich diagnostics instead
+of the prior silent AV. But the 5B run still crashes at Newton step 1 because the root
+cause is upstream. Further investigation needed.
+
+## §5B-investigate — Boundary-limb logging to localise the upstream Barrett bug
+
+### Approach
+
+Three candidates for the upstream bug at 5B scale: `SafeMpzMul(ar,a,r)`,
+`BigShiftRight(ar,kBits)`, or `SafeMpzReciprocal`. To localise:
+
+- **Pre-mul logging** (gated on `szA=175,000,001 ∧ szR=87,500,001`): log a[0], a[1],
+  a[mid], a[szA-2], a[szA-1] and r[0], r[1], r[mid], r[szR-2], r[szR-1].  Captured into
+  outer-scope ULongs so they are reusable post-mul.
+- **Post-mul self-verification** at the boundaries:
+  - **Bottom**: `ar[0]` must equal `(a[0] * r[0]) mod 2^64` exactly.  Mismatch ⇒
+    `SafeMpzMul` produced a wrong bottom limb (definitive).
+  - **Top**: `ar[szAR-1..szAR-2]` should be plausibly close to
+    `Math.BigMul(a[szA-1], r[szR-1])` (high) plus accumulated cross-product carry.
+    Wildly off ⇒ top-limb error in `SafeMpzMul`.
+- **Post-shift logging**: log q[0], q[1], q[mid], q[szQ-2], q[szQ-1].  Combined with
+  saved ar limbs (already logged for kLimb / kLimb+1), the existing `q_bot_expected`
+  formula tells us if `BigShiftRight` honoured the bit-shift correctly.
+
+### Why this is decisive
+
+If the §5B-arBot match flag is `False`, the bug is **definitely** in `SafeMpzMul` —
+no other component can change the bottom limb of a*r. If `True`, SafeMpzMul's bottom
+is correct; we then look at top-limb plausibility and the post-shift logs to attribute
+the error to either SafeMpzMul's top or BigShiftRight.
+
+If both the bottom matches and the top is plausible (carry within a few limbs of
+`hi(a_top*r_top)`), the bug is in `BigShiftRight` or `SafeMpzReciprocal` — and the
+post-shift q values let us pin it down.
+
+### Status
+
+Diagnostics added; relaunching the 5B run to capture them.  No checkpoint added because
+the existing Newton checkpoint (kBitsX=2.8B) already lets us get back to this point in
+~1h11m, and the diagnostics will fire on the very first §171 trigger.
+
+### Fresh-Newton verification (2026-04-26 12:43–21:57)
+
+Ran with `nr_r.bin` moved aside, forcing `SafeMpzReciprocal` to recompute `r` from seed.
+Newton converged through 27 iterations in ~8h.  Final `r` is **bit-for-bit identical**
+to the saved checkpoint at all five logged boundary positions (r[0], r[1], r[mid],
+r[szR-2], r[szR-1]) AND every other §5B-* value (a, ar, q, rem, ratio) is identical
+across the two runs.
+
+**Conclusion: bug is fully deterministic. Not checkpoint corruption, not Newton, not
+parallelism, not memory.**  The same wrong q_approx is produced reliably.
+
+The bug must be in the chain:
+1. `BigShiftRight(n, nShift) → nTrunc` (`a`) — only boundary verified, middle could be wrong.
+2. `SafeMpzMul(ar, a, r)` middle limbs — only ar[0] (exact) and ar[szAR-1] (boundary)
+   verified.  Middle limbs unverified.
+3. `BigShiftRight(ar, kBits) → q_approx` middle limbs — only q[0] is verified via the
+   existing `q_bot_expected` formula.  Middle of q unverified.
+
+### q[mid] / q[quart] verification result (2026-04-27)
+
+Added §5B-q-mid and §5B-q-quart spot-checks: capture ar[kLimb+i] and ar[kLimb+i+1]
+before BigShiftRight (for i = quartIdx=21,875,000 and midIdx=43,750,000); then post-shift
+verify q[i] = (ar[kLimb+i] >> 3) | (ar[kLimb+i+1] << 61) matches actual q[i].
+
+Result: **both match=True** at quart and mid. BigShiftRight produces q faithfully from
+ar across all four checked positions (q[0], q[quart], q[mid], q[szQ-1]).
+
+**The bug is now isolated to `SafeMpzMul(ar, a, r)` middle limbs.** ar's middle limbs are
+wrong (e.g., ar[218,750,001]=F749B40E433B9742 differs from the true a*r at that index),
+even though ar[0] = a[0]*r[0] mod 2^64 is exact and ar[szAR-1] = high(a[top]*r[top]) is
+plausible at the boundary. One or more of the 9 sub-products in SafeMpzMul's 3-way
+Toom-Cook split is producing a wrong value at 175M × 87.5M-limb scale.
+
+Next step: instrument SafeMpzMul to log each of the 9 sub-products' size/top/bottom/mid
+limbs at the szA=175M ∧ szR=87.5M gate so we can spot which sub-product is wrong.
+
+### Result (2026-04-26 12:36)
+
+Run reached §171 in 1h 14m and threw with all diagnostics. Critical findings:
+
+```
+[SafeMpzDiv§5B-a]   a[0]=A514E7911325F190 ... a[szA-1]=0479BC06C17340EB
+[SafeMpzDiv§5B-r]   r[0]=88638C785832DAFF ... r[szR-1]=0000003C81298323
+[SafeMpzDiv§5B-ar]  ar[0]=FA82F7C310A03E70 ... ar[szAR-1]=000000010ECA231E
+[SafeMpzDiv§5B-arBot] actual ar[0]=FA82F7C310A03E70 expected=FA82F7C310A03E70  match=True
+[SafeMpzDiv§5B-arTop] ar[szAR-1]=000000010ECA231E  hi(a_top*r_top)=000000010ECA231E
+[SafeMpzDiv§5B-q]   q[0]=2DBB1E91012D8D3E ... q[szQ-1]=0000000021D94463
+[SafeMpzDiv§171-entry] szRem=172,722,805 ratio=1.974 bTop=0x21D94463 bTopBits=30
+```
+
+**SafeMpzMul is correct**: the bottom-limb identity `ar[0] = (a[0]*r[0]) mod 2^64`
+holds **exactly**, and the top limb matches `high(a[szA-1]*r[szR-1])` with cross-term
+carry of 0.
+
+**BigShiftRight is correct**: `q[szQ-1] = ar[szAR-1] >> 3 = 0x10ECA231E >> 3 = 0x21D94463`
+matches actual; `q[0]` matches the existing `q_bot_expected` formula.
+
+**Therefore the bug is in `r` itself** — `SafeMpzReciprocal` (or its checkpoint).  Given
+correct `a*r` and correct shift, q_approx error of 2^(5.45B) directly maps to an r
+error of ~2^(5.45B) in r's bottom ~85M limbs.  r's top ~2.5M limbs appear correct
+(rBits, top-limb value, magnitude all match expectations); the corruption (or Newton
+convergence shortfall) lives in the lower limbs that aren't surfaced by boundary checks.
+
+### Most likely root cause
+
+The 5B Newton-reciprocal checkpoint `nr_r.bin` was saved by an earlier run that already
+contained this bug; on every restart we load the same corrupt r.  Each subsequent run
+loads the bad checkpoint, computes the same wrong `a*r`, and crashes at the same place.
+
+### Next step (deferred — discuss with user)
+
+Options:
+1. Invalidate the checkpoint (`mv nr_r.bin nr_r.bin.suspect`) and force a fresh Newton
+   recomputation from seed.  Expensive (many hours) but definitive: if fresh r differs
+   from saved r, the checkpoint is the bug; if identical, the bug is in Newton
+   itself at this scale.
+2. In-process verification: after `SafeMpzReciprocal` returns, compute `r*b` and
+   confirm it lies in `[2^kBits - b, 2^kBits)`.  Direct but adds another 175M-limb
+   multiply per Newton step.
+3. Mid-limb spot check: log r at many positions (every ~1M limbs) and compare against
+   the expected magnitude/distribution of a true reciprocal.  Cheap but only suggestive.
+
+### §5B-sub verifyT — per-sub-product TOP-limb spot check (2026-04-27)
+
+Fresh-Newton verification (above) ruled out `r` itself: the bug is fully deterministic
+and identical across runs.  Subsequent §5B-q-mid / §5B-q-quart / §5B-arBot / §5B-arTop
+work isolated the error to **`SafeMpzMul(ar, a, r)` middle limbs of one or more of the
+9 Toom-Cook sub-products**.
+
+`§5B-sub verify` (k=0..8 prods[0]) and `§5B-sub verify1` (k=0..8 prods[1]) both match
+all 9 sub-products: bottom limbs are correct.  The bug therefore lives in
+`prods(k)[≥2]` for at least one k.
+
+**verifyT** (this section) extends the gate to the TOP limb of each sub-product.
+For k=0..8, gated on `szA=175,000,001 ∧ szB=87,500,001` (the outer 175M × 87.5M
+SafeMpzMul call):
+
+- Compute `topA_idx = ki*mA + szAi - 1` and `topB_idx = kj*mB + szBj - 1`, where
+  `szAi`, `szBj` are the actual sizes of pieces `A_i` and `B_j` (the last A piece
+  is one limb shorter at 5B due to ceiling-division).
+- Compute `(expHi, expLo) = BigMul(A_i[topA_idx], B_j[topB_idx])`.
+- Compare against actual `prods(k)[szProd-1]` and `prods(k)[szProd-2]`.
+- Choose the comparison side based on whether `mpz_mul` stripped a leading zero:
+  - If `actSzProd == szAi + szBj`: the top limb should be `≈ expHi` (within 0..2 carry).
+  - If `actSzProd == szAi + szBj - 1`: leading zero was stripped, so `actTop ≈ expLo`.
+- Log `diff(act-exp)`: `0`, `1`, or `2` is normal carry; anything large pinpoints
+  the wrong sub-product's recursive `SafeMpzMul`.
+
+Most likely k=7 (A_2×B_1) and/or k=8 (A_2×B_2) — they are the only contributors to
+ar[218,750,001], the known-wrong limb.  This run will distinguish "wildly off top" (sub-
+product is broken end-to-end) from "correct top, broken middle" (sub-product top limb
+is fine but middle limbs are wrong, suggesting a deeper recursion or leaf `mpz_mul`
+issue at sizes near `SAFE_LIMB_THRESHOLD=5M`).
+
+### verifyT result (2026-04-27 16:54 — run 6)
+
+Run reached §171 in 1h 11m and threw deterministically with the same Barrett error
+(~2^5,454,259,456). All 9 sub-products' **top limbs** matched the predicted
+`hi(A_i[topA] * B_j[topB])` with `diff(act-exp) ∈ {0, 1}` — no carry-of-2 anywhere,
+no "wildly off" k:
+
+```
+k  ki  kj  diff(act-exp)   actSzProd     expSzProd
+-  --  --  -------------   -----------   -----------
+0   0   0  0x1             87,500,001    87,500,001
+1   0   1  0x0             87,500,001    87,500,001
+2   0   2  0x0             87,500,001    87,500,001
+3   1   0  0x0             87,500,001    87,500,001
+4   1   1  0x1             87,500,001    87,500,001
+5   1   2  0x0             87,500,001    87,500,001
+6   2   0  0x0             87,500,000    87,500,000
+7   2   1  0x0             87,500,000    87,500,000
+8   2   2  0x0             87,500,000    87,500,000
+```
+
+Combined with the previously-verified prod[0] (verify) and prod[1] (verify1) match
+flags, this rules out the working hypothesis that one sub-product is "wildly off
+end-to-end".  **The bug is definitively in middle limbs of one or more sub-products**,
+not at any boundary.
+
+The known-wrong `ar[218,750,001]` receives contributions from exactly two sub-products
+(others' shift ranges don't reach that index):
+- `prods(7)[72,916,666]` (shift = 145,833,335 limbs)
+- `prods(8)[43,749,999]` (shift = 175,000,002 limbs; geometric mid of prods(8))
+
+The §5B-sub log already shows `prods(8)[mid=43,750,000]=11D57DC8288B6585` — that limb
+is essentially the suspect.
+
+### Next step (recommended): Option B — lower SAFE_LIMB_THRESHOLD 5M → 1M
+
+Option B becomes the natural next binary-search step: forces each of the 9 inner
+sub-products (each at 58.3M × 29.2M) to recurse one more split level past the
+2.2M × 1.1M leaves that currently call GMP `mpz_mul` directly.
+
+Outcome:
+- Bug **disappears** ⇒ leaf `mpz_mul` / `mpn_mul_fft` is producing wrong middle limbs
+  at sizes ≥ 1M (GMP FFT precision issue near the current threshold).
+- Bug **persists** ⇒ middle-limb error is in our `SafeMpzMul` 3×3 split logic itself
+  (accumulator add, `mul_2exp` shift, or recursion housekeeping).
+
+Single-constant change at line ~2271 of `Form1.vb`.  ~1h to next data point with the
+warm-checkpoint resume.
+
+### Option B in flight (2026-04-27)
+
+`SAFE_LIMB_THRESHOLD` lowered from `5_000_000` to `1_000_000` in `Form1.vb`.  Build
++ launch + warm-checkpoint resume; expecting either a clean 5B run (proves the bug
+was in the leaf GMP call at sizes ≥ 1M) or the same §171 throw (proves the bug is
+in our own split logic).  Result will be appended below.
+
+### Option B result (2026-04-28 00:37 — run 7)
+
+Run reached §171 in 6h 26m (5.4× slower than the 5M run, due to deeper recursion
+overhead from the additional 9× sub-product fan-out at level 6) and threw the
+**identical** exception with the **identical** Barrett error magnitude
+(`~2^5,454,259,456`).  All 9 sub-products produced **bit-identical** mid[43,750,000]
+and top limbs as the 5M run:
+
+```
+k | mid (5M)              | mid (1M)              | top (5M)              | top (1M)
+- | --------------------- | --------------------- | --------------------- | ---------------------
+0 | 6CB381B03B25461A      | 6CB381B03B25461A      | 27B50FCBA40707E7      | 27B50FCBA40707E7
+1 | 3106EFF61B28AB18      | 3106EFF61B28AB18      | 38D70AFB5A9A3D99      | 38D70AFB5A9A3D99
+2 | 948620F9445F2749      | 948620F9445F2749      | 0000002FD735CD6D      | 0000002FD735CD6D
+3 | 51987FEC0865F037      | 51987FEC0865F037      | 1A93F197A821B53F      | 1A93F197A821B53F
+4 | AA62DB4D6DB9259B      | AA62DB4D6DB9259B      | 260BAECE29FCA757      | 260BAECE29FCA757
+5 | 68E86859D15E75D9      | 68E86859D15E75D9      | 00000020059F1CE1      | 00000020059F1CE1
+6 | E260C3D54136832D      | E260C3D54136832D      | 00E0C0ADDCA37B15      | 00E0C0ADDCA37B15
+7 | 0E4F4489AEE94ABF      | 0E4F4489AEE94ABF      | 0141BA6194A14F54      | 0141BA6194A14F54
+8 | 11D57DC8288B6585      | 11D57DC8288B6585      | 000000010ECA231E      | 000000010ECA231E
+```
+
+At 5M threshold the leaf `mpz_mul` calls operate on ~3.24M total limbs (FFT pl≈2^22).
+At 1M threshold the leaves operate on ~360K total limbs (FFT pl≈2^19) — far below
+any plausible FFT precision boundary.  Identical results across these two regimes
+**rules out** the leaf `mpz_mul` / `mpn_mul_fft` as the bug source.
+
+### Conclusion of Option B
+
+**The bug is in code COMMON to both threshold settings.** Top suspects:
+
+1. The **§gen accumulation step** itself — `GmpRaw_mul_2exp(_sv_shifted_hdr, _shiftSrc, _chunk)`
+   inside the chunked-shift loop.  For shifts > UInt32.MaxValue bits (~4.29 billion),
+   the loop iterates 2× (k=4-6) or 3× (k=7-8) at the outer 175M × 87.5M call, with
+   the second/third iterations reading from `_shiftSrc = _sv_shifted_hdr`
+   (in-place shift).  GMP supports aliasing but worth verifying.
+2. **Piece extraction (A_parts, B_parts mpz_t setup)** — A_2 size = 58,333,333 (one
+   limb shorter than mA = 58,333,334) due to ceiling division.  Edge-case slicing
+   for the last piece could mis-set _mp_size or _mp_d.
+3. **mpz_t struct juggling** (§40/§42/§44, accumPtr stash inside savedResultPtr's
+   _mp_d slot) — unusual layout; if any inner SafeMpzMul accidentally writes a
+   wrong buffer, middle-limb corruption could repeat deterministically.
+4. **GmpRaw_add into accum** — battle-tested GMP add; lowest probability.
+
+### Next step (recommended): Option C — pinpoint the wrong sub-product OR the wrong accumulation step
+
+Three complementary diagnostics, any can run individually:
+
+- **C-1 (independent prods(8) reference)**: gated on the outer 175M × 87.5M call,
+  compute prods(8) = A_2 × B_2 a SECOND time via a fresh SafeMpzMul into a separate
+  mpz_t, and compare mid[43,750,000].  Match ⇒ deterministic-but-wrong (true bug).
+  Differ ⇒ memory corruption (very different problem).
+- **C-2 (direct mpz_mul reference)**: at the outer call, also compute prods(8) via
+  a direct `GmpRaw_mul(prod_alt, A_2, B_2)` (skipping our 3×3 split).  Match ⇒ bug is
+  outside our split (in accumulation, mul_2exp, or piece extraction).  Differ ⇒ bug
+  is in our level-2 SafeMpzMul split.
+- **C-3 (per-k accumulation snapshot)**: log `accum[218,750,001]` after each k's
+  `GmpRaw_add`.  The k whose add introduces the divergence pinpoints either a bad
+  prods(k) middle limb OR a bad shift step.  Cheapest of the three (no extra
+  multiplication needed).
+
+C-2 is the most decisive single test: it directly compares our split against GMP's
+own multiplication.  Combine with C-3 for layered confirmation.
+
+**Note**: SAFE_LIMB_THRESHOLD should be reverted to 5,000,000 before further runs —
+the 5.4× slowdown is too costly for the rest of the investigation.
+
+### Option C-2 + C-3 in flight (2026-04-28)
+
+Two complementary diagnostics added to `Form1.vb`, both gated on the outer 175M ×
+87.5M `SafeMpzMul(ar, a, r)` call.
+
+**§5B-c2** — Direct `GmpRaw_mul` reference for prods(8).  After the 9 outer
+sub-products are computed via recursive `SafeMpzMul`, also compute `A_2 × B_2`
+once via `GmpRaw_mul` (GMP's internal mpz_mul, 87.5M total limbs).  Compare the
+suspect middle limb at index 43,749,999 (which contributes to ar[218,750,001])
+plus boundaries at index 0 and szP-1.
+
+Interpretation:
+- **Match at idx=43,749,999** ⇒ both paths agree on this middle limb; either both
+  are right (so prods(8) is NOT the bug source — look at prods(7) or the
+  shift+add) or both happen to share the same wrong value (extraordinary
+  coincidence between two independent FFT engines — extremely unlikely).
+- **Mismatch at idx=43,749,999** ⇒ paths diverge.  We can't tell which is right
+  from C-2 alone, but combined with C-3 we can pin which contributor's middle
+  limb feeds the wrong ar value.
+
+**§5B-c3** — Per-k accumulation snapshot.  After each k=0..8's `GmpRaw_add` into
+`accum`, log `accum[218,750,001]` (the known-wrong ar limb) and its two
+neighbours.
+
+Expected progression:
+- k=0..6: shift ranges don't reach index 218,750,001 ⇒ accum[218,750,001] = 0
+- k=7: shift = 145,833,335 limbs, prods(7)[72,916,666] enters the limb ⇒
+  accum[218,750,001] = prods(7)[72,916,666]
+- k=8: shift = 175,000,002 limbs, prods(8)[43,749,999] is added ⇒
+  accum[218,750,001] = (prods(7)[72,916,666] + prods(8)[43,749,999]) mod 2^64
+  + cross-carry from limb 218,750,000
+
+If accum[218,750,001] differs from the known-wrong final value `F749B40E433B9742`
+already after k=7 ⇒ prods(7) is the source.  If it's correct after k=7 but wrong
+after k=8 ⇒ prods(8) is the source.  If neither sub-product alone seems wrong but
+their combined sum doesn't match expectations ⇒ `GmpRaw_add` or carry handling
+is the source (very unlikely but worth ruling out).
+
+Both diagnostics are cheap (~30 s for C-2's direct mpz_mul; C-3 is essentially
+free).  Combining their outputs should narrow the bug to one of: prods(7) middle,
+prods(8) middle, mul_2exp shift step, or accumulator-add step.
+
+### Option C result (2026-04-28 10:02 — runs 8 + 9)
+
+**C-2 disabled** after run 8 crashed natively (0xC0000005 in `libgmp-10.dll`)
+on the direct `GmpRaw_mul(A_2, B_2)` at 58.3M × 29.2M = 87.5M total limbs.
+GMP's mpz_mul is unsafe at this scale — exactly the regime `§143`'s recursive
+split was created to avoid.  Existing `§136` block uses the same pattern at
+43.75M total where GMP merely produces wrong limbs; the hard-fail boundary
+is somewhere between 43.75M and 87.5M total.
+
+**C-3 result (run 9, 1h 11m to §171, identical Barrett error)**:
+
+```
+After k | accum[218,750,001]                    Notes
+--------|---------------------------------------|----------------------------------------
+0..6    | 0000000000000000                      Their shift ranges don't reach this index
+7       | 3E924C7A243168E4                      = prods(7)[72,916,666] exactly (limb-aligned shift)
+8       | F749B40E433B9742                      = known-wrong ar[218,750,001]
+```
+
+Critical interpretation:
+- After k=0..6 the limb is exactly zero, confirming no spurious upstream contribution.
+- After k=7, accum[218,750,001] = `3E924C7A243168E4`. Because k=7's shift
+  (145,833,335 limbs × 64 bits) is exactly limb-aligned and the prior accum was zero
+  at this limb, this value equals `prods(7)[72,916,666]` with no carry contamination.
+- After k=8, the accum value matches the known-wrong final ar limb — confirming the
+  full §gen output reproduces the same wrong ar.
+
+The k=8 delta `F749B40E433B9742 - 3E924C7A243168E4 = B8B767941F0A2E5E` represents
+`prods(8)[43,749,999] + cross-limb carry from limb 218,750,000`.
+
+**Bug is now isolated to ONE limb of ONE of two specific level-2 SafeMpzMul calls:**
+- `prods(7)[72,916,666]` (the suspect value `3E924C7A243168E4`) where prods(7) =
+  SafeMpzMul(A_2, B_1) at 58.3M × 29.2M, OR
+- `prods(8)[43,749,999]` of prods(8) = SafeMpzMul(A_2, B_2) at 58.3M × 29.2M.
+
+A buggy `GmpRaw_add` carry chain at 175M-limb scale is extremely unlikely (battle-
+tested GMP code), but not formally ruled out.
+
+### Next step (recommended): Option D — recursive C-3 at the level-2 call
+
+Apply the same per-k accumulation snapshot to the level-2 SafeMpzMul calls (gated
+on szA=58,333,333 ∧ szB=29,166,667 with input-bot-limb fingerprints to identify
+prods(7) vs prods(8) specifically).  At that level, the level-2 §gen loop has its
+own 9 sub-products (each ~19.4M × 9.7M), and the relevant accum index is 72,916,666
+(for prods(7)) or 43,749,999 (for prods(8)).
+
+This recursive narrowing pinpoints the inner k where the wrong value enters at
+level 2, and so on until we reach a leaf that we can verify directly against
+direct mpz_mul (which is safe at sub-5M total limb sizes).
+
+### Option D in flight (2026-04-28)
+
+**§5B-d-L2** — at every level-2 SafeMpzMul call (gated `szA=58,333,333 ∧
+szB=29,166,667`, the size of A_2 × any B_j at the outer 175M × 87.5M call),
+log `accum[72,916,666]` (= prods(7) suspect index) and `accum[43,749,999]`
+(= prods(8) suspect index) after each k=0..8 sub-product accumulation, plus
+opB[0] for fingerprinting (B_0=`88638C785832DAFF`, B_1=`4B08FAE8DCA50441`,
+B_2=`0706751D8688C2D3`).
+
+At level-2: mA' = 19,444,445, mB' = 9,722,223.  Shifts are limb-aligned at
+ki'·mA' + kj'·mB' limbs.
+
+For target index 72,916,666 (prods(7) suspect):
+- k'=0..6 shifts don't reach this index ⇒ accum should be 0.
+- k'=7 (shift=48,611,113 limbs) reaches it; post-k'=7 value is the level-3
+  sub-product limb that lands at offset 72,916,666 - 48,611,113 = 24,305,553.
+- k'=8 (shift=58,333,336 limbs) also reaches it; post-k'=8 value combines
+  contributions from both.
+
+For target index 43,749,999 (prods(8) suspect):
+- k'=0,1 shifts don't reach this index.
+- k'=2..6 shifts reach it; values accumulate.
+- k'=7,8 shifts are too high; their offsets within prods(k') are negative.
+
+Three level-2 calls fire the gate (prods(6), prods(7), prods(8)).  The opB[0]
+fingerprint distinguishes them in the log.  The k' that first introduces a
+wrong value pinpoints which level-3 sub-product (19.4M × 9.7M) is the culprit
+— or whether the bug is in the level-2 shift+add itself.
+
+### Option D result (2026-04-28 15:52 — run 10, 1h 14m to §171)
+
+prods(7) = SafeMpzMul(A_2, B_1) at 58.3M × 29.2M, accum[72,916,666] across k':
+
+```
+After k' | accum[72,916,666]
+---------|----------------------
+0..6     | 0000000000000000     (k'=0..6 shifts don't reach this index)
+7        | 6A28287E3E835734     ← level-3 sub-product 7 contribution
+8        | 3E924C7A243168E4     ← matches outer prods(7)[72,916,666] exactly
+```
+
+prods(8) = SafeMpzMul(A_2, B_2) at 58.3M × 29.2M, accum[43,749,999] across k':
+
+```
+After k' | accum[43,749,999]
+---------|----------------------
+0..1     | 0000000000000000
+2        | 04CCBF81C2006924
+3        | E2EEDAF0F48BA909
+4        | F029EC6DEF37FE89
+5        | A62ABA42210CF6B0
+6        | B8B767941F0A2E5D     ← matches outer C-3 delta (off by 1 = cross-limb carry)
+```
+
+**Both level-2 SafeMpzMul calls reproduce the wrong values verbatim.**  The
+bug is at level 3 or deeper, but we still cannot tell which of `prods(7)` or
+`prods(8)` (or both) is wrong without an independent oracle.
+
+Continued recursive narrowing (level-3, level-4, ...) doesn't produce an
+oracle either; it just localizes the bug to a smaller sub-product.
+
+### Next step (recommended): Option E — chunked-grid independent reference
+
+Compute `prods(7) = A_2 × B_1` (and/or `prods(8) = A_2 × B_2`) via a 2-way
+chunked-grid split that uses ONLY direct `GmpRaw_mul` at sub-threshold sizes:
+
+- Split A_2 (58.3M limbs) into ~39 chunks of ≤ 1.5M limbs each
+- Split B_1 (29.2M limbs) into ~20 chunks of ≤ 1.5M limbs each
+- For each (i,j) pair: compute `chunk_A[i] × chunk_B[j]` via direct
+  `GmpRaw_mul` (≤ 3M total — well under `SAFE_LIMB_THRESHOLD = 5M`,
+  where direct mpz_mul is reliable per §160's earlier analysis)
+- Accumulate all 780 sub-products into a fresh result mpz_t via
+  `mul_2exp` + `add`, exactly mirroring the §gen pattern but with a
+  flatter 2-way structure that avoids our 3×3 split entirely
+
+Read `result[72,916,666]` and compare to our SafeMpzMul `prods(7)[72,916,666]
+= 3E924C7A243168E4`:
+- **Match** ⇒ `prods(7)` is correct; the bug is in `prods(8)` (or in the
+  carry chain of `GmpRaw_add` at the outer level).  Drill into prods(8)
+  next.
+- **Differ** ⇒ `prods(7)` is wrong.  The chunked reference value IS the
+  truth.  We then know exactly how much our SafeMpzMul is off, and we can
+  drill into the level-2 prods(7) computation to find which level-3 k'
+  introduces the divergence.
+
+Cost: 780 sub-products at ~50ms each + accumulation ≈ 1-2 minutes one-shot.
+Memory peak: a few GB.  Gated on the outer 175M × 87.5M call so it fires
+once per run.
+
+### Option E in flight (2026-04-28)
+
+`§5B-e` implemented in `Form1.vb`: at the outer 175M × 87.5M call, computes
+both `prods(7)` and `prods(8)` via 39 × 20 = 780 sub-products of size
+≤ 1.5M × ≤ 1.5M (≤ 3M total — well under the 5M FFT-precision boundary),
+then accumulates each into a fresh `_refAcc` mpz_t via `mul_2exp` + `add`.
+
+Compares the suspect index of each:
+- `reference prods(7)[72,916,666]` vs our SafeMpzMul `prods(7)[72,916,666]`
+  (`= 3E924C7A243168E4` per run 9/10)
+- `reference prods(8)[43,749,999]` vs our SafeMpzMul `prods(8)[43,749,999]`
+  (`= B8B767941F0A2E5D` per run 10)
+
+Logs include the `idx-1` and `idx+1` neighbours so we can see whether any
+disagreement is just a one-limb carry quirk or a substantive divergence.
+
+Result expected after the next ~1h 14m run.
+
+### Option E v1 result (2026-04-28 17:00 — run 11 ABORTED)
+
+`gmp: overflow in mpz type` aborted run 11 at the start of the §5B-e prods(7)
+loop.  Root cause: GMP's realloc path (NativeReallocFunc) misbehaving when
+freshly `GmpRaw_init`'d `_ckShifted`/`_refAcc` (1-limb initial alloc) tried to
+grow to ~87.5M limbs across the 780-iteration grid.  Fix in v2: pre-allocate
+both buffers via VirtualAlloc to 90M limbs (~720 MB) and swap them into the
+mpz_t struct's `_mp_d` slot, mirroring §gen's `_sharedSjBuf` /
+`_sv_shifted_hdr` pattern — `_mp_alloc` set to the full pre-allocated size,
+so `mul_2exp` and `add` never trigger realloc.
+
+### Option E v2 result (2026-04-28 18:35 — run 12, 1h 26m to §171)
+
+**MAJOR PIVOT.**  The chunked-grid reference completed cleanly and revealed:
+
+```
+prods(7) idx=72,916,666 (and idx-1, idx+1):
+  reference:    EA6244050D44001F  3E924C7A243168E4  6AD0F6B6D638BF07
+  ourSafeMpz:   EA6244050D44001F  3E924C7A243168E4  6AD0F6B6D638BF07
+  → MATCH (all 3 adjacent limbs identical).
+
+prods(8) idx=43,749,999 (and idx-1, idx+1):
+  reference:    751C4E2F65EC4FA6  B8B767941F0A2E5D  11D57DC8288B6585
+  ourSafeMpz:   751C4E2F65EC4FA6  B8B767941F0A2E5D  11D57DC8288B6585
+  → MATCH (all 3 adjacent limbs identical).
+```
+
+**Both `prods(7)` and `prods(8)` are CORRECT.**  Combined with the level-1
+shift+add structure, this means `ar[218,750,001] = F749B40E433B9742` is the
+**correct** value, not the wrong value we had presumed.
+
+The "ar[218,750,001] is wrong" assumption was an INFERENCE ("q is off by
+2^5.45B ⇒ some ar limb must be wrong ⇒ we picked 218,750,001 because it was
+already logged in early diagnostics"), never proven against an independent
+oracle.  Option E disproves the assumption.
+
+### What this opens up — bug is somewhere we never checked
+
+The real wrong limb (or wrong operation) lives in territory we haven't
+verified yet.  Candidates, ordered by likelihood:
+
+1. **A different ar limb** — we've only verified ar at indices 0, szAR-1,
+   and 218,750,001.  ar has 262,500,002 limbs total.  Some other mid-position
+   is the culprit.
+2. **BigShiftRight(ar, kBits) → q at unchecked positions** — Option A
+   verified q at 4 indices (0, quart, mid, szQ-1).  The shift could be wrong
+   elsewhere.
+3. **r itself has wrong middle limbs** — fresh-Newton verified r is
+   bit-identical to checkpoint at 5 boundary positions; the middle of r was
+   never verified against `r * b ∈ [2^kBits - b, 2^kBits)`.
+4. **a has wrong middle limbs** — same coverage gap as r.
+
+### Next step (recommended): Option F
+
+- **F-3 (FIRST — cheap)**: scan all q[0..szQ-1] against the
+  `(ar[kLimb+i] >> 3) | (ar[kLimb+i+1] << 61)` formula.  If any disagreement
+  ⇒ BigShiftRight is wrong at that index.  Runs in seconds; no extra mpz_mul.
+
+### Option F-3 in flight (2026-04-28)
+
+`§5B-f3` implemented in `SafeMpzDiv` — captures 100 evenly-spaced ar samples
+(at q indices 0, ~884K, ~1.77M, …, 87.5M-1) plus their +1 neighbours BEFORE
+`BigShiftRight(ar, kBits)`, then post-shift verifies each q[i] against the
+predicted `(ar_pre[kLimb+i] >> 3) | (ar_pre[kLimb+i+1] << 61)`.  Logs first
+10 mismatches plus a summary count.
+
+Outcome:
+- mismatches > 0 ⇒ BigShiftRight is wrong at one or more positions
+- mismatches = 0 ⇒ BigShiftRight is faithful across the q range; bug is in
+  ar itself or upstream (escalate to Option F-1 next).
+
+### Option F-3 result (2026-04-28 20:20 — run 13, 1h 23m to §171)
+
+```
+[SafeMpzDiv§5B-f3 SUMMARY] scanned 100 q positions, mismatches=0, firstMismatchSampleIdx=-1
+[SafeMpzDiv§5B-q-quart] q[21,875,000] match=True
+[SafeMpzDiv§5B-q-mid]   q[43,750,000] match=True
+```
+
+Combined with the existing q[0] / q[szQ-1] coverage from Option A, **102 q
+positions verified, all matching**.  BigShiftRight is faithful (with high
+statistical confidence — would need the bug to live at a single limb out
+of 87.5M, with all 100 evenly-spaced samples skipping it, to be missed).
+
+**The bug is in ar itself at some unchecked limb, OR upstream in r or a.**
+
+### Next step (recommended): Option F-1 — chunked-grid a × r reference
+
+Compute `a × r` (175M × 87.5M = 262.5M-limb result) via a flat 2-way
+chunked grid using sub-threshold direct `mpz_mul`: chunk size 1.5M, grid =
+117 × 59 = 6,903 sub-products.  Each sub-product is ≤ 3M total limbs —
+reliable per §160's analysis.
+
+Scan our SafeMpzMul ar against the reference at thousands of positions;
+log first ~10 mismatches and a summary count.  Outcome:
+- Mismatches > 0 ⇒ ar is wrong at those positions; bug is in our level-1
+  §gen accumulation step (`mul_2exp` chunked-shift loop, or `GmpRaw_add`
+  carry chain).
+- Mismatches = 0 ⇒ ar is fully correct; bug must be in `kBits`
+  computation, in BigShiftRight at a position F-3's 100 samples missed
+  (escalate to F-3-full), or in the §171 trigger logic itself.
+
+Pre-allocate `_refAcc` and `_ckShifted` buffers via VirtualAlloc (~2.5 GB
+each) and swap into mpz_t — same pattern as §gen's `_sharedSjBuf` and the
+Option E v2 fix.  ~12 min added to the run.
+
+### Option F-1 result (2026-04-28 23:03 — run 14, 2h 38m to §171)
+
+```
+[SafeMpzDiv§5B-f1] reference complete: subProducts=6,903 refSz=262,500,002 ourArSz=262,500,002
+[SafeMpzDiv§5B-f1 SUMMARY] scanned 1000 ar positions across [0..262,500,001], mismatches=0, firstMismatchArIdx=-1
+```
+
+**1,000 / 1,000 ar positions match** the chunked-grid reference.  `ar = a × r`
+is **fully correct** across its 262.5M-limb range.
+
+(F-1 took ~80 min instead of the estimated 12 min — `mul_2exp` + `add` on
+the growing 1-2 GB `_refAcc` buffer scales badly at this scale.  Acceptable
+for one-shot diagnostic.  Memory peak only ~13 GB on the 64 GB host.)
+
+Cumulative coverage now:
+| Component | Positions verified | Method |
+|---|---|---|
+| `ar = a × r` | 1003+ | F-1 (1000) + Option E (1) + Option A (2 boundaries) |
+| `q` (post-shift) | 102 | F-3 (100) + Option A (2 boundaries) |
+| All 9 outer `prods(k)` | bot, [1], top | Option A + Option D |
+| `prods(7)` and `prods(8)` middle limbs | 6 | Option E |
+
+### Conclusion of F-1
+
+**`ar = a × r` is correct AND BigShiftRight is faithful, yet `q` is still
+off by ~2^5,454,259,456 from truth.**  The math `q = ar >> kBits` runs
+correctly on the inputs we provide.  The error must therefore be in **what
+we provide** — either:
+
+- **`r` is wrong in middle limbs** — Newton converges to a slightly-short
+  reciprocal, fresh-Newton verification only checked 5 boundary positions,
+  middle limbs are unverified.  This is the most likely culprit given the
+  §171 ratio of 1.974 ≈ 2 (suggesting q is off by exactly one factor of
+  the recursion structure).
+- **`kBits` is computed wrong** — we shift by the wrong amount.
+- **`b` is corrupted by something upstream** — but `b` arrives from
+  outside SafeMpzDiv intact.
+
+### Next step (recommended): Option F-2 — verify r via r * b
+
+A true reciprocal satisfies `r ≈ 2^kBits / b`, so `r * b ∈ [2^kBits - b, 2^kBits)`.
+Compute `r * b` (87.5M × 87.5M = 175M total) via the chunked-grid
+pattern (117 × 117 = 13,689 sub-products — about double F-1's count, so
+~5 hours).  Verify:
+- All limbs above `kLimb = kBits / 64` are zero (high bits should not be set).
+- The bit at position `kBits` is zero (the result is strictly less than `2^kBits`).
+- The shortfall `2^kBits - (r * b)` is in `[0, b)` (true reciprocal lower
+  bound).
+
+If r * b has bits set above kLimb ⇒ r is too big.
+If 2^kBits - r*b ≥ b ⇒ r is too small (Newton converged short).
+
+### Option F-2 result (2026-04-29 00:48 — run 15, 1h 40m to §171)
+
+```
+refSz = 175,000,002 (= kLimb + 1)
+r×b[kLimb-1] = FFFFFFFFFFFFFFFF        ← saturated (maximum)
+r×b[kLimb]   = 0000000000000007        ← exactly 2^kRem - 1 (kRem=3)
+r×b[kLimb+1] = 0                       ← zero above kLimb
+inKBitsRange = True
+aboveKLimbAllZero = True
+```
+
+This is the textbook signature of a correct Barrett reciprocal: r×b ∈
+[2^kBits - δ, 2^kBits) with small δ.  **r is correct.**
+
+So now we have ALL of:
+- r correct (F-2)
+- ar = a × r correct at 1003 positions (F-1 + Option E + boundaries)
+- q = ar >> kBits correct at 102 positions (F-3 + Option A)
+
+But §171 still throws with rem ≈ 2^5.45B × b.  The math is solid;
+something deeper is broken.
+
+### Critical insight — §39 column-group path
+
+a × r (175M × 87.5M asymmetric) and q × b (87.5M × 87.5M symmetric) take
+DIFFERENT code paths inside SafeMpzMul:
+
+| Operation | Outer call | Recursion | §39 fires? |
+|---|---|---|---|
+| `a × r` | 175M × 87.5M | §gen (asymmetric) | **NEVER** |
+| `q × b` | 87.5M × 87.5M | §gen at top, **§39 at level 2+** | **YES** |
+
+§39 (the column-group fast path at Form1.vb line 2776) fires when
+`mA = mB ∧ mA + mB ≤ 50M`.  For q × b at 5B scale:
+- Outer 87.5M × 87.5M: sum 58.3M > 50M → §gen
+- Inner 29.2M × 29.2M sub-products: sum 19.4M ≤ 50M → **§39**
+- Inner-inner 9.72M × 9.72M: sum 6.48M ≤ 50M → **§39**
+
+So q × b's inner sub-products use §39's column-group accumulation
+(combining 9 sub-products into 5 columns by shift, with adds-before-shifts).
+
+**Every diagnostic up to F-3 missed §39 entirely:**
+- F-1 verified a × r via §gen (asymmetric — never §39).
+- F-2 verified r × b via chunked-grid (each sub-product ≤ 3M total via
+  direct mpz_mul; never §39 nor §gen).
+- F-3 verified BigShiftRight (no SafeMpzMul involved).
+- Option E verified prods(7), prods(8) of a × r — these are 58.3M × 29.2M
+  sub-products at level 2 (asymmetric — §gen, never §39).
+
+If §39 has a bug, **q × b is wrong**.  Then rem = a − q×b is garbage and
+§171 throws — exactly matching the observed symptom.
+
+### Next step (recommended): Option G — disable §39 (force §gen for symmetric)
+
+Change the §39 gate at Form1.vb line 2776 to never fire (`If False Then`)
+and run the 5B test.  Outcome:
+- §171 throw disappears ⇒ §39 was buggy at q×b inner sizes; fix is to
+  shrink §39's size threshold OR rewrite §39's accumulation logic.
+- §171 throw persists ⇒ §39 is not the culprit; bug is elsewhere we
+  haven't imagined.
+
+Cost: one constant toggle; ~1h 14m run (no diagnostic overhead).
+
+`§5B-f2` implemented in `SafeMpzDiv` immediately after the (now-disabled)
+F-1 block.  F-1 disabled via `_F1_ENABLED = False` to save ~80 min — its
+result (`mismatches=0`) is conclusive and need not re-run.
+
+F-2 computes `r × b` (87.5M × 87.5M = 175M total) via a 59 × 59 = 3,481
+sub-product chunked grid (chunk 1.5M, ≤ 3M total per cell).  Pre-allocates
+180M-limb buffers (~1.44 GB each) for `_refAcc` and `_ckShifted`.
+
+Post-grid, logs:
+- `r×b` at indices 0, 1, kLimb-2, kLimb-1, kLimb, kLimb+1, kLimb+2, top-1, top
+- `refSz` (total limbs of r×b)
+- `r×b[kLimb] >> kRem` (should be 0 if r×b < 2^kBits)
+- `aboveKLimbAllZero` (limbs above kLimb should all be 0 if r×b < 2^kBits)
+
+Verdict heuristics:
+- `refSz ≤ kLimb-1` ⇒ r×b is way too small ⇒ r severely short
+- `refSz = kLimb` AND `r×b[kLimb-1]` near 2^64 ⇒ r is correct
+- `refSz = kLimb+1` AND `r×b[kLimb] ∈ [0, 2^kRem-1]` ⇒ r is correct
+- `refSz > kLimb+1` OR `r×b[kLimb] >> kRem > 0` ⇒ r is too big
+
+Estimated time: ~40 min for the chunked grid (fewer sub-products + smaller
+buffers than F-1's 80 min).
+- **F-1**: full chunked-grid reference for `a * r` (39 × 39 = 1,521
+  sub-products); scan ar limbs against the reference at every k-th position
+  (e.g., every 100K).  Finds the wrong ar limb if any exists.  ~5-10 min.
+- **F-2**: chunked-grid `r * b` and verify it's in `[2^kBits - b, 2^kBits)`.
+  Catches Newton convergence shortfall in the middle of r.
+
+## §201-raise — Newton-raising for SafeMpzReciprocal (NativeOptimization branch, 2026-04-27)
+
+### Motivation
+
+After §200 fixed the convergence shortfall, SafeMpzSqrt's outer Newton loop
+runs three steps at increasing scale (kBits ≈ 5.6B / 2.8B / 1.4B) and each
+step calls `SafeMpzReciprocal`.  Without raising, every call starts from a
+fresh 64-bit seed and performs ~`log2(rBits) + 3` iterations (≈ 33 at the
+largest scale, ≈ 32 at half-scale, etc.).  Each iter at ~5.6B-bit precision
+takes 50-150 minutes via SafeMpzMul, so the three-step sqrt would take
+several days.
+
+But Newton from step *n* converged to ~rBits/2 of correct precision at
+step *n+1*'s scale: the prior `r` left-shifted by `(rBits_new - rBits_prior)`
+is already a half-precision approximation to the new reciprocal.  Newton's
+quadratic convergence raises that to full precision in **1-2 iterations**
+(plus a few slack iters for seed-scaling rounding).  Replacing 33 iters
+with 5 cuts step-2 and step-3 runtime by ~85%.
+
+### Implementation (Form1.vb, SafeMpzReciprocal §201-raise)
+
+Two parts:
+
+1. **Load** at function entry, before the 64-bit seed setup: read
+   `snap_Phase3/nr_raise.bin` + `nr_raise_meta.txt` (prior `r`, kBits,
+   bBits, rBits).  If `priorKBits / kBits ∈ (0.4, 0.7)` AND
+   `priorRBits < rBits`, deserialize prior `r` and `BigShiftLeft` it by
+   `rBits - priorRBits` to scale into the new domain.  Set
+   `_raiseUsed = True`, `prec = priorRBits + 2`, and skip the 64-bit seed
+   block.
+
+2. **Save** after the Newton loop converges: write the freshly-converged
+   `r` + meta back to `nr_raise.bin` so the *next* (larger) call can
+   raise from it.  Also delete the §NR-ckpt mid-Newton snapshot
+   (`nr_r.bin`) since this call has finished — leaving a stale snap
+   would confuse a future call at a different scale.
+
+`_minNrIters` is also conditional: `5` when raised vs `log2(rBits) + 3`
+for a fresh seed.  Newton's outer loop condition
+(`prec < rBits + 2 OR _nrIter < _minNrIters`) ensures Newton runs both
+to full precision AND for enough iterations to absorb residual seed error.
+
+### Resume safety
+
+§NR-ckpt match-check (`_snapKBits = kBits`) takes precedence over §201-raise
+when both fire on restart — the mid-Newton snapshot at the current scale is
+more recent than any prior-scale raised seed.  Without this, a raised run
+that crashed at iter 3 would restart from priorRBits+2 (= half-precision)
+instead of the saved precision near full convergence.
+
+### Expected runtime impact
+
+For SafeMpzSqrt's three-step Newton (5.6B / 2.8B / 1.4B-bit scales):
+
+| Step | rBits  | Without raise | With raise | Saved |
+|------|--------|---------------|------------|-------|
+| 1    | 1.4B   | 33 iters      | 33 iters   | 0     |
+| 2    | 2.8B   | 33 iters      | 5 iters    | 28×   |
+| 3    | 5.6B   | 33 iters      | 5 iters    | 28×   |
+
+Step 1 cannot be raised (no prior `nr_raise.bin` at first launch).  Steps
+2 and 3 each shrink from ~50 hours to ~7-8 hours, taking the full sqrt
+from ~150h to ~65h.
+
+## §171-ckpt — Save Barrett quotient `q` before `q×b` (NativeOptimization branch, 2026-04-30)
+
+`SafeMpzDiv` does two heavy multiplications inside what we call the §171
+window: `ar = a × r` (~half the cost) and `qb = q × b` (~the other half),
+followed by adj-down/adj-up corrections.  Until §171-ckpt, a crash anywhere
+inside that window forced the entire `SafeMpzDiv` call to be re-run from
+scratch on resume — the existing `sqrt_newton.bin` checkpoint is only saved
+*after* the surrounding outer step completes, so a step-6 crash mid-§171
+would replay ~65h of Newton reciprocal + a×r work.
+
+§171-ckpt closes that gap by saving the post-shift Barrett quotient `q` to
+`snap_Phase3/div_q.bin` immediately after `BigShiftRight(ar, ar, kBits)` and
+the q↔ar swap, just before `SafeMpzMul(qb, q, b)`.  On resume, the matching
+checkpoint causes `SafeMpzDiv` to skip the Newton reciprocal, `a×r`, the
+shift, and the swap — jumping straight to the q×b computation and adj loops.
+
+### Implementation (Form1.vb, SafeMpzDiv §171-ckpt)
+
+Three insertion points mirror the existing §NR-ckpt pattern:
+
+1. **Resume probe** at SafeMpzDiv entry (after `kBits` is computed): if
+   `div_meta.txt` matches the current call's `(szA, szB, aBits, kBits, scope)`
+   tuple, deserialize `q` from `div_q.bin`, set `_qPtr` and `szQ`, and
+   `GoTo PostShiftCheckpoint` — the label placed right after the existing
+   q↔ar swap and `mpz_clear(ar)`.
+2. **Save** at `PostShiftCheckpoint:` (only when not just resumed): serialize
+   `q` to `div_q.bin` + meta, then `BackupSnapshotToStore("snap_Phase3")`.
+3. **Cleanup** at successful end of SafeMpzDiv (after §171b adj-up complete):
+   delete `div_q.bin` and `div_meta.txt` so a stale checkpoint cannot poison
+   the next call.
+
+### Scope disambiguation
+
+`SafeMpzDiv` is called from two distinct sites that must not share a
+checkpoint: the SafeMpzSqrt outer Newton loop (one call per outer step) and
+the Phase 4 final `pi = numerator / finalT` divide.  A class-level
+`_divCkptScope` field, set by each caller before invocation
+(`"sqrt_step_{N}"` or `"phase4"`), is included in the meta key so a stale
+sqrt-step checkpoint cannot be loaded into Phase 4 (or vice versa).
+
+### Restart-window reduction
+
+| Crash window | Pre-§171-ckpt replay | Post-§171-ckpt replay |
+|---|---|---|
+| Inside step 5 §171 | ~30h | ~5h (q×b + adj only) |
+| Inside step 6 §171 | ~65h | ~13h (q×b + adj only) |
+| Inside Phase 4 div | full Phase 4 div | q×b + adj only |
+
+The save itself costs ~1–2 minutes of disk I/O at each §171 boundary; the
+quotient `q` is ~1.4 GB at step 5 and ~2.1 GB at step 6.
+
+## §piCkpt — Save gmpPi after final divide, before mpz_get_str (NativeOptimization branch, 2026-05-01)
+
+After §171-ckpt closed the SafeMpzDiv crash window, the only remaining
+unprotected segment of meaningful duration in the post-Phase-3 pipeline was
+`mpz_get_str(gmpPi)` — the binary→base-10 conversion that produces the
+final digit string.  At 5B digits this is a single ~1–4h GMP call with no
+internal checkpoint; a crash during it would force re-running the final
+SafeMpzDiv (which, even with §171-ckpt protection, is still several hours).
+
+§piCkpt serializes `gmpPi` to `snap_Phase3/gmpPi.bin` immediately after the
+final SafeMpzDiv returns successfully.  On resume, a matching `gmpPi_meta.txt`
+(`digits=N`) causes `ComputePiGMP` to load `gmpPi` from disk and skip the
+final SafeMpzDiv entirely, jumping straight to `mpz_get_str`.  After
+`mpz_get_str` completes, both files are deleted (the digits are now in
+`pi_digits.txt` and the on-disk gmpPi is no longer load-bearing).
+
+### Worst-case post-Phase-3 replay after §piCkpt
+
+| Crash window | Pre-§piCkpt | Post-§piCkpt |
+|---|---|---|
+| Inside final SafeMpzDiv | ~5–7h (a×r) → ~3–5h (q×b+adj) via §171-ckpt | unchanged |
+| Inside `mpz_get_str` | ~5–9h (re-run divide + base conversion) | ~1–4h (base conversion only) |
+
+The save costs ~30 seconds and ~750 MB of disk; only matters for the single
+~1–4h window between final SafeMpzDiv completion and digit output.
+
+## §202-trace: SafeMpzDiv exit + SafeMpzSqrt post-divide tracing
+
+The 5B-run-1 process (PID 36244, NativeOptimization branch) died silently at
+2026-05-04 03:37 PT immediately after `[SafeMpzDiv] adj-up complete: 0 iter(s);
+SafeMpzDiv done` for `sqrt_step_2`.  No WER report, no Application event log
+entry, no exception in `pi_phase_log.txt` — the process simply stopped writing
+between the existing log line at the end of SafeMpzDiv and the next visible
+log line in the outer Newton loop checkpoint save.
+
+§202-trace adds dense `AppendLog` calls through the silent region so that the
+next time the process dies in this window we know exactly which step was last:
+
+**SafeMpzDiv exit cleanup** (Form1.vb, after the existing "SafeMpzDiv done"):
+- `[SafeMpzDiv§202-exit] start cleanup` — entered the cleanup block
+- `[SafeMpzDiv§202-exit] remainder cleared and freed` — `_remRaw` released
+- `[SafeMpzDiv§202-exit] §171-ckpt files deleted from NodeCache` — `div_q.bin`/`div_meta.txt` removed (or `delete FAILED: …` if I/O failed)
+- `[SafeMpzDiv§202-exit] returning to caller` — about to `End Sub`
+
+**SafeMpzSqrt post-divide block** (Form1.vb, inside the outer Newton `Do While` loop):
+- `[SafeMpzSqrt§202-postdiv] step N: SafeMpzDiv returned; entering post-divide cleanup` — control returned to the loop
+- `[SafeMpzSqrt§202-postdiv] nTrunc cleared and freed`
+- `[SafeMpzSqrt§202-postdiv] xTrunc += q complete (szXT=…)` — the GmpRaw_add of two ~16.6B-bit values completed
+- `[SafeMpzSqrt§202-postdiv] q freed; xTrunc >>= 1 done`
+- `[SafeMpzSqrt§202-postdiv] BigShiftLeft xHalf=… starting/done` (only when xHalf > 0; skipped at the final iteration where target=bitsS+2 makes xHalf=0)
+- `[SafeMpzSqrt§202-postdiv] swap+free complete; kBitsX advanced to …`
+- `[SafeMpzSqrt§202-ckpt] starting sqrt_newton.bin save` — entered the checkpoint Try block
+- `[SafeMpzSqrt§202-ckpt] sqrt_newton.bin written; writing meta`
+- `[SafeMpzSqrt§202-ckpt] meta written; calling BackupSnapshotToStore`
+- `[SafeMpzSqrt§202-postdiv] step N fully complete; looping (kBitsX=… bitsS+2=… cont=…)` — about to re-evaluate the loop condition
+
+The trace is unconditional (not gated by `_logLevel`) because the cost is a
+handful of `AppendLog` calls per outer Newton iteration (≤6 per run) and we
+only need the data once.
+
+### Recovery from the 2026-05-04 03:37 PT death
+
+§171-ckpt for `sqrt_step_2` was successfully written to `SnapshotStore` at
+00:09 PT before q×b ran.  The success-path cleanup in SafeMpzDiv removed it
+from `NodeCache` after q×b completed cleanly, but the `SnapshotStore` mirror
+(populated by `BackupCheckpoint` at save time, not deletion time) and the
+read-only preserved frozen copy at `C:\PiPreserved_5B_run1_2026-05-04\` both
+retained it.  Restoring `div_q.bin` + `div_meta.txt` to `NodeCache\snap_Phase3\`
+before relaunch lets the §171-ckpt resume path fire on the next sqrt_step_2
+SafeMpzDiv call, saving the ~50h reciprocal + ~3h a×r recomputation and
+leaving only ~3h of q×b + final adj + base conversion to redo.
+
+## §211 — Defer §NR-ckpt cleanup until SafeMpzDiv succeeds (2026-05-15)
+
+### The crash
+
+2026-05-15 09:55:34 UTC: 5B run (PID 13540 on `NativeOptimization @ dc93def`) died
+with `System.AccessViolationException` (`0xc0000005`) inside the **top-level
+depth-0 §gen** of `a × r` in the final `SafeMpzDiv` — `szA=998,532,722
+szB=259,525,633`, the largest §gen pass ever attempted in this codebase.  The
+faulting module was reported as "unknown" with a stack hint inside KernelBase,
+consistent with a heap-allocator failure under memory pressure.  Log signal: the
+§gen accumulator logged `k=0 accumSz=419,352,786` and then the process exited
+mid-`k=1` (the next k's shift+add for prods(1)).  The previous `[SafeMpzMul§accum]
+shifted buffer OK (9,598 MB)` line confirms the buffer pre-alloc succeeded;
+death came during the `mul_2exp` or `GmpRaw_add` that consumed it.
+
+### The compounding bug — `nr_r.bin` got auto-deleted
+
+After `SafeMpzReciprocal` converged at iter 37 on 2026-05-14 00:20, its exit
+block (Form1.vb ~3654) deleted `nr_r.bin` and `nr_meta.txt` as defensive
+housekeeping ("a future call at a different kBits scale would see the stale
+nr_r.bin from this call's mid-Newton state and either skip raise … or, worse,
+mis-resume").  That concern is **already addressed** by the §NR-ckpt resume
+check (which verifies `_snapKBits = kBits AndAlso _snapBBits = bBits` and
+ignores non-matching files).  The cleanup was therefore over-eager: it left the
+entire ~50 h post-recip stretch (`a × r` → `BigShiftRight` → `q × b` → adj
+loops → `tdiv_q`) with NO mid-NR snapshot to fall back to.
+
+Recovery after the 09:55 crash required hand-restoring `nr_r.bin` + `nr_meta.txt`
+from a belt-and-braces backup at `C:\PiBackup_iter36_2026-05-13\` (taken at
+iter 36, one iter shy of iter 37, costing an extra ~13 h to redo the polish
+iter).  If that backup had not existed the only fallback would have been
+`sqrt_newton.bin` — ~10 days back.
+
+### The fix
+
+Two surgical edits:
+
+1. **SafeMpzReciprocal exit (~Form1.vb:3650)** — replace the `nr_r.bin` /
+   `nr_meta.txt` delete with a `[SafeMpzReciprocal] §211: deferring §NR-ckpt
+   cleanup` log line.  The files remain on disk after the Newton loop converges.
+
+2. **SafeMpzDiv §202-exit (~Form1.vb:4930)** — add `nr_r.bin` / `nr_meta.txt`
+   cleanup alongside the existing `div_q.bin` cleanup.  By the time §202-exit
+   fires, the entire post-recip stretch has succeeded, so the iter=N r snapshot
+   is genuinely no longer needed.
+
+### Why this closes the gap
+
+The §NR-ckpt resume path (Form1.vb ~3340) already gracefully ignores files whose
+`kBits` / `bBits` don't match the current call, so leaving them on disk between
+SafeMpzReciprocal exit and SafeMpzDiv §202-exit is safe — even if an interleaving
+SafeMpzDiv call at a different scope fired in the meantime (it can't, because
+SafeMpzReciprocal is only ever called from one site in SafeMpzDiv, and
+SafeMpzDiv calls are non-reentrant on the live state).
+
+### Replay impact
+
+Pre-§211: crash anywhere in the post-recip stretch lost the entire reciprocal
+(~13 h at 5B step-6 / final-divide scale) plus everything since.  Post-§211:
+crash anywhere in the same stretch resumes from §NR-ckpt iter N (the converged
+or near-converged r), skipping the Newton loop entirely.  Net saving at 5B
+final-divide scale: **~13 h per post-recip crash**.
+
+### Relates to
+
+- #65 ("Checkpoint gap: post-recip SafeMpzDiv") — §211 closes the dominant half
+  of #65 with two-line changes; the remaining `ar` checkpoint (#65 Option A)
+  would only protect the ~5 min `BigShiftRight` window between `a × r` complete
+  and §171-ckpt save and is marginal value.
+- §NR-ckpt save (Form1.vb ~3571) — unchanged; saves are still per-iter.
+- §171-ckpt (Form1.vb:4488 / 4497) — unchanged; still fires after BigShiftRight.
+
+## §212 — Depth-0 §gen RAM diagnostics (2026-05-15)
+
+Companion to §211.  The 5/15 09:55 AV happened during the **first ever**
+top-level §gen pass at 5B scale (998M × 259M).  We have no instrumentation
+on memory pressure at that depth — we only learned post-mortem that the run
+got through `k=0` and died in `k=1`.  §212 adds RAM probes so a re-occurrence
+gives us actionable telemetry.
+
+### What it logs
+
+At the end of each `k` iteration of the §gen accumulator (Form1.vb ~3044), when
+`szA + szB > 800_000_000` limbs (gates exactly the 5B-scale top-level call — at
+depth 1 the operand size is 333M + 86M ≈ 420M, below threshold):
+
+```
+[SafeMpzMul§212] depth-0 k={k} END  szA={szA} szB={szB} WS={MB} Priv={MB} accumSz={...} accumAlloc={...}
+```
+
+Captures:
+
+- **`WS`** — `Process.WorkingSet64`, the resident working set in MB.  Tells us
+  how close we are to the box's 64 GB physical limit at each k boundary.
+- **`Priv`** — `Process.PrivateMemorySize64`, total committed private memory.
+  Diverges from WS when pages are evicted to standby/pagefile under pressure;
+  the gap is a leading indicator of paging-induced slowdown or eventual OOM.
+- **`accumSz`** — `accumPtr->_mp_size`, current limb count of the accumulator.
+- **`accumAlloc`** — `accumPtr->_mp_alloc`, pre-allocated headroom.  If
+  `accumSz` ever approaches `accumAlloc` we are one realloc away from a GMP
+  buffer-grow that the §gen path is not designed for.
+
+### Cost
+
+Zero overhead at smaller depths (gate skips); at depth 0 exactly 9 log lines
+per top-level call, fired once per `SafeMpzDiv` post-recip.  Negligible.
+
+### Recovery expectation
+
+If the next 5B run crashes in the same place, §212 tells us:
+
+- Was WS climbing or stable?  (Climbing → leak / fragmentation hypothesis.)
+- Was WS far below the 64 GB ceiling?  (Yes → not a simple OOM.)
+- Did `accumAlloc` grow between k iterations?  (Yes → a realloc fired,
+  consistent with the AV being a realloc-induced heap corruption.)
+
+These distinguish the three candidate root causes for the AV: heap pressure,
+mpz_t 32-bit `_mp_size` overflow, and allocator heap corruption.
+
+## §213 — Eager `r`-clear in SafeMpzDiv when `_5b_verify=False` (issue #66, 2026-05-15)
+
+`_5b_verify` ([Form1.vb:3890](Form1.vb#L3890)) is `(szA = 175000001 AndAlso szR = 87500001)`
+— a size-specific gate that fires only at the 1B-scale sqrt-step-4 shape.  At all
+5B-class operand sizes the gate is `False`, and the §5B-f1 ([Form1.vb:4003](Form1.vb#L4003))
+and §5B-f2 ([Form1.vb:4131](Form1.vb#L4131)) chunked-grid verification blocks that follow
+`SafeMpzMul(ar, a, r)` never run.  But the original code kept `r` alive (deferred
+`mpz_clear(r)` until [~line 4281](Form1.vb#L4281)) so the diagnostics could read its
+data buffer.  At 5B scale this meant a 1.98 GB buffer (259M limbs × 8 bytes) was
+held in the working set through the entire depth-0 §gen window — the exact window
+the 2026-05-15 09:55 AV crashed in.
+
+§213 adds an eager `mpz_clear(r)` immediately after `SafeMpzMul(ar, a, r)` returns
+when `_5b_verify` is `False` ([Form1.vb:~3940](Form1.vb#L3940)).  The deferred clear
+at line ~4281 becomes conditional on `_5b_verify` so the 1B-scale path still
+defers as before.
+
+**RAM saving at 5B**: ~2 GB working set during depth-0 §gen.
+**Perf impact**: zero — `r` is unused on the 5B path between the eager and deferred
+clear sites.
+
+## §214 — Skip P+Q load when `gmpNumer.bin` resume will fire (issue #67, 2026-05-15)
+
+When the 5B final-divide stage starts from a fully-checkpointed `snap_Phase3`
+that includes `gmpNumer.bin`, the run path is:
+
+```
+Phase3Start → mpz_init(...) → TryLoadPhase3Value("gmpNumer") succeeds
+            → GoTo NumeratorDone → SafeMpzDiv (the final divide)
+```
+
+Neither `finalP` nor `finalQ` is read between `Phase3Start` and `NumeratorDone`.
+The original `TryLoadPhase3Snapshot` ([Form1.vb:1931](Form1.vb#L1931)) eagerly
+deserialized **all three** of P/Q/T (~14.8 GB at 5B: P 3.6 GB + Q 5.6 GB + T 5.6
+GB) before the gmpNumer-resume check fired.  P and Q were then dead weight on the
+heap until the regular sqrt-completion cleanup freed P at ~[line 6364](Form1.vb#L6364)
+and Q piecemeal during r0/r1/r2 multiplies (which don't run on the gmpNumer-resume
+path).
+
+§214 adds `TryLoadPhase3SnapshotTOnly` ([Form1.vb:~1986](Form1.vb#L1986)) and a
+probe at the call site ([Form1.vb:~6111](Form1.vb#L6111)):
+
+1. Read `snap_Phase3/meta.txt` and check `digits` matches.
+2. Check `gmpNumer.bin` exists.
+3. If **both** pass, load T only.  Set `_p3TOnlyLoadActive = True` to record the
+   skip.
+4. Otherwise, fall through to the full P+Q+T load.
+
+A `§214-assert` block at the gmpNumer-resume site ([Form1.vb:~6250](Form1.vb#L6250))
+throws a clear error if `_p3TOnlyLoadActive` is `True` but `TryLoadPhase3Value("gmpNumer")`
+returns `False` (e.g., gmpNumer.bin became corrupted after the probe passed) — this
+prevents a silent fall-through to Step 1+ which would touch the empty finalP/finalQ.
+
+**RAM saving at 5B**: ~9.3 GB working set at startup peak (drops the post-Phase-3-load
+mark from ~15 GB to ~5.6 GB on the gmpNumer-resume path).
+**Perf impact**: zero — the work being skipped is I/O on dead-weight buffers.
+
+**Combined impact of §213 + §214 at 5B**: ~11.3 GB of working-set relief during the
+dangerous depth-0 §gen window, taking the projected peak from ~38 GB to ~27 GB on a
+64 GB box.
+
+### Recovery from a corrupt gmpNumer.bin under §214
+
+If `gmpNumer.bin` becomes corrupted between launches, the §214-assert throws.
+Recovery: delete `gmpNumer.bin` from both `NodeCache\snap_Phase3\` and
+`SnapshotStore\snap_Phase3\`.  Next launch will see `_gmpNumerExists = False`, fall
+through to the full P+Q+T load, and recompute Steps 1-5 from scratch (~50 h at 5B).
+A backup of `gmpNumer.bin` (currently at `C:\PiBackup_postcrash_2026-05-15\NodeCache\snap_Phase3\`)
+can shorten that to a file copy.
+
+## §215 — Int32 overflow in §gen / SafeMpzDiv log-offset arithmetic (2026-05-17)
+
+The 5B run resumed at §NR-ckpt iter 36, completed iter 37 (13h40m), and crashed
+**14h into the post-recip `a × r` Barrett multiply** with `System.AccessViolationException`
+in `Marshal.ReadInt64`, ~92% of the way through the top-level §gen accumulation.
+
+Root cause: diagnostic-only logging code in `SafeMpzMul.§gen` ([Form1.vb:2929-2931](Form1.vb#L2929-L2931))
+and four `SafeMpzDiv` log sites computed limb-array offsets as `(sz - 1) * 8` where
+both operands are `Integer` (Int32) — silently overflowing when `sz ≥ 2^28 = 268,435,456`
+limbs.  At the topmost a×r recursion (998M × 259M), each sub-product is ≈ 419M limbs,
+giving `(419,352,782) * 8 = 3,354,822,256` which wraps to `-940,145,040` in Int32.
+`Marshal.ReadInt64(ptr, -940M)` then reads outside the buffer → AccessViolation.
+
+This bug had been latent for every prior run because:
+- 1B-scale runs never exceeded ~67M-limb sub-products (well under 2^28).
+- Iter 37's two NR multiplies (r×r and bTrunc×rSq) had sub-products of 260M and 174M
+  limbs — close to but below the 2^28 boundary, so they didn't trigger it.
+- Only the post-recip `a × r` (with `a` ≈ 998M limbs) generates 419M-limb sub-products
+  in its top-level recursion.  5B is the first scale where this fires.
+
+Fix: compute the absolute limb address in 64-bit (`dPtr.ToInt64() + (CLng(sz) - N) * 8L`)
+and read at offset 0.  Applied at 5 active-at-5B logging sites:
+- [Form1.vb:2934-2936](Form1.vb#L2934-L2936) — §gen prod top-limb logging (the crash site)
+- [Form1.vb:3919-3924](Form1.vb#L3919-L3924) — `SafeMpzDiv` `a` top-limb logging
+- [Form1.vb:4373-4376](Form1.vb#L4373-L4376) — `SafeMpzDiv` `ar` top-limb logging
+- [Form1.vb:4438-4441](Form1.vb#L4438-L4441) — `SafeMpzDiv` `q` top-limb logging
+- [Form1.vb:4870-4874](Form1.vb#L4870-L4874) — `SafeMpzDiv` `rem` / `b` top-limb logging
+
+Twelve other occurrences of the same pattern exist in the file but are gated by
+size predicates that never fire at 5B (`mA = 7291667`, `szA = 21875001`, `bShift = 0`,
+etc.) and so cannot trigger overflow at this scale.  They are left as-is to keep the
+diff minimal; a comprehensive sweep is captured separately under "code hygiene."
+
+**Recovery path**: §NR-ckpt iter=37 is still on disk (§211 deferred cleanup); on resume
+the app reloads `r` in seconds and re-enters `SafeMpzDiv` from a×r start.  Expect
+another ~36h to reach the next §171-ckpt save (post-`a × r`, post-`BigShiftRight`).
+
+## §216 — Chunked decimal conversion to avoid mpz_get_str crash at 5B (2026-05-19)
+
+The 5B run resumed cleanly after §215, completed iter 37, a×r, q×b, and §171 adj
+loops (adj-down=0, adj-up=0 — Barrett quotient was exact), and **`§piCkpt` saved
+`gmpPi.bin` successfully**.  The next step — `mpz_get_str` converting `gmpPi` to a
+decimal string — then crashed with `0xC0000005 AccessViolation`:
+
+```
+Fatal error.
+0xC0000005
+   at Math.Gmp.Native.gmp_lib+SafeNativeMethods.__gmpz_get_str(IntPtr, Int32, IntPtr)
+   at Math.Gmp.Native.gmp_lib.mpz_get_str(...)
+   at PI_BillionDigits.Form1.ComputePiGMP(...)
+```
+
+Root cause appears to be **Int32 overflow in GMP's internal recursive
+`mpn_dc_get_str` divide-and-conquer**: each level computes buffer positions
+using `mp_size_t` (= `int` on Windows x64).  At 5B digits the output is
+≈ 5 GB > 2³¹ bytes, and once internal byte positions exceed 2³¹ they wrap to
+negative and dereference outside the buffer.  Same class of bug as §215, but
+inside GMP itself rather than in our diagnostic logging.
+
+Fix: route large outputs to a new **ChunkedMpzGetStr** helper
+([Form1.vb:6160-6280](Form1.vb#L6160-L6280)) that extracts 300M-digit slabs
+iteratively via:
+
+```
+rem = pi mod 10^300M
+pi  = pi //  10^300M
+```
+
+and calls `mpz_get_str` on each `rem` separately.  Each chunk produces ≤ 300M
+chars ≈ 300 MB output — well within GMP's safe range.  Slabs are written
+right-to-left into a pre-allocated 5 GB `VirtualAlloc` buffer, padded with
+leading zeros where needed, then `RtlMoveMemory`d back to offset 0.
+
+Routing threshold: outputs ≥ 1.5B digits use the chunked path; smaller outputs
+(1B and below) continue to use the native `mpz_get_str` directly.
+
+**Cost at 5B**: 17 chunks × `mpz_fdiv_qr` calls at progressively shrinking
+dividend sizes (5B → 4.7B → ... → 300M digits) divided by a fixed 300M-digit
+divisor (10^300M, ≈ 15.5M limbs).  Plus a one-time `mpz_ui_pow_ui(10, 300M)`
+to build the divisor.  Estimated wall time: 4-8 h.
+
+**Recovery for the in-flight 5B run**: `gmpPi.bin` (2.08 GB) is on disk at
+`snap_Phase3\gmpPi.bin` from the 2026-05-19 13:19 `§piCkpt` save.  On resume,
+`ComputePi` loads it directly (skipping every step from `gmpNumer` through the
+final `SafeMpzDiv`) and proceeds straight into `ChunkedMpzGetStr`.
+
+**Future direction**: issue #37 ("§110: Parallel decimal string conversion")
+proposes a parallel recursive halving version of this algorithm — same shape
+as §216 but with concurrent left/right sub-trees, predicted ~5-10× speedup
+on 24-core hardware.  §216 is the minimal serial workaround to unblock the
+in-flight 5B run; #37 is the proper optimisation.
+
+## §74 — Chunk-N-of-M progress indicator during chunked decimal conversion (2026-05-19, issue #74)
+
+The §216 chunked converter takes ~2 hours at 5B digits (100 × 50M-digit
+chunks).  The existing `_strConvTimer` callback on the compute thread only
+showed `String conversion... mm:ss elapsed` — for a two-hour run the
+status bar looked indistinguishable from a hang.
+
+Fix: two instance fields (`_chunkConvCurrent`, `_chunkConvTotal`,
+[Form1.vb:46-52](Form1.vb#L46-L52)) are populated at entry to
+`ChunkedMpzGetStr` (total = `ceil(totalDigitsEstimate / CHUNK_DIGITS)`) and
+updated every iteration to the 1-based current chunk.  The `_strConvTimer`
+callback at [Form1.vb:7358-7388](Form1.vb#L7358-L7388) snapshots both
+fields and switches between the two formats based on whether `total > 0`:
+
+```
+String conversion: chunk 12 of 100, 00:23:14 elapsed, ETA ~2.7h
+```
+
+ETA is computed from elapsed × (total − current) / current and is
+reasonably accurate after the first ~3 chunks.  Both fields are reset to
+zero in a `Finally` block inside `ChunkedMpzGetStr` so a subsequent
+small-scale run (which doesn't enter the chunked path) shows the original
+"String conversion..." text instead of stale "chunk 100 of 100".
+
+**Concurrency**: writes are from the compute thread, reads are from the
+`_strConvTimer` callback (separate `System.Threading.Timer` thread).  Both
+fields are 64-bit aligned ordinary `Long`s; on x64 aligned 64-bit
+accesses are atomic, so the timer never sees a torn read.  A momentary
+inconsistency between the two counters (e.g. "12 of 99" briefly when total
+has just been written but current hasn't) is harmless for status display.
+
+## §75 — RunVerification crashes at 5B via Marshal.PtrToStringAnsi (2026-05-19, issue #75)
+
+After §216's `pi_digits.txt` write succeeded in the 2026-05-19 5B run, the
+autoverify path crashed with:
+
+```
+[DIALOG] EXCEPTION: ArgumentException: The string must be null-terminated.
+   at System.Runtime.InteropServices.Marshal.PtrToStringAnsi(IntPtr ptr)
+   at PI_BillionDigits.Form1.RunVerification() in Form1.vb:line 7643
+   at PI_BillionDigits.Form1.StreamPiToScreen(String piString) in Form1.vb:line 7456
+```
+
+The file on disk was bit-correct (manually verified: `999999@762` ✓,
+`777777777@24,658,601` ✓, file size = 5,000,000,003 bytes).  The crash
+was downstream — in the autoverify scan of the in-memory `_displayNativePtr`
+char buffer.
+
+Root cause: `Marshal.PtrToStringAnsi(_displayNativePtr)` was attempting to
+materialise the 5 GB native buffer into a managed `String`.  .NET's
+`String` is limited to **2³¹ − 1 chars = 2,147,483,647**.  Any conversion
+above this throws (as observed) or silently truncates.  The exception
+text "string must be null-terminated" is misleading — the buffer *is*
+null-terminated; the CLR raises this generic error when its internal walk
+exceeds `Int32`.
+
+At 1B-scale runs this never fires (`_displayNativeLen ≈ 1B < 2.1B`).  The
+bug has been latent since native-buffer streaming shipped; 5B is the first
+scale where it triggers.
+
+Fix: `RunVerification` ([Form1.vb:7640-7745](Form1.vb#L7640-L7745)) now
+splits into two paths:
+
+- **Native path** (`_displayNativePtr <> IntPtr.Zero`): scan the native
+  byte buffer directly at the known-good positions via a new
+  `NativeMatchAt(needle, ptr, totalLen, position)` helper.  O(needle) per
+  check, no managed allocation, no `Int32`-sized intermediate.
+- **Managed fallback** (no native pointer, small-scale interactive run):
+  unchanged — string `IndexOf` on the `RtbPiDigits.Text` content.
+
+A second helper `NativeIndexOf(needle, ptr, totalLen)` does a chunked
+1 MB-window scan with `(needle - 1)` overlap so a match straddling a
+chunk boundary still hits.  This is used by
+`RunCustomVerificationsNative` for `--verify-contains` (the only case
+that needs a full-buffer scan rather than a known-position check).
+
+Together with §76, this restores clean process exit on a successful
+autoverified 5B+ run.
+
+## §76 — Headless mode hangs on exception (missing Application.Exit) (2026-05-19, issue #76)
+
+When §75 fired in the 2026-05-19 5B run, the process did **not** exit
+cleanly: it sat at 0 % CPU holding ~5 GB RSS, blocking
+`Run-PiCompute.ps1`'s post-run `BackupCheckpoint` step (which uses
+`Start-Process -Wait`).  The operator had to `Stop-Process -Force` after
+~20 minutes of confusion.
+
+Root cause: the compute thread's outer `Catch ex As Exception` handler at
+[Form1.vb:1505-1517](Form1.vb#L1505-L1517) only logged the exception and
+updated UI state.  The interactive branch shows a `MessageBox` which the
+user dismisses (form closes on `BtnCompute_Click` re-entry); the headless
+branch wrote a `[DIALOG] EXCEPTION` log line and returned — leaving the
+form's message loop running forever with no way to terminate.  Same
+defect on the `OutOfMemoryException` and `OverflowException` catches at
+[Form1.vb:1479-1503](Form1.vb#L1479-L1503).
+
+Fix: one-line addition to the headless branch of each catch:
+
+```vb
+Else
+    WriteToLog("[DIALOG] EXCEPTION: " & ex.GetType().Name & ": " & ex.Message)
+    Environment.ExitCode = 1
+    Application.Exit()
+End If
+```
+
+`Environment.ExitCode = 1` is set **before** `Application.Exit()` so that
+`Run-PiCompute.ps1`'s `Start-Process -Wait $LASTEXITCODE` sees a non-zero
+status and can react (skip BackupCheckpoint, copy crash artifacts to a
+forensics dir, etc.).
+
+Once #75 lands, this bug is harder to trigger — but still latent for any
+other exception during compute/verify.  Both fixes belong in the same
+prerequisite batch for the parallelism rollout (#72), which requires
+unattended Phase 0+ runs to terminate cleanly on failure.

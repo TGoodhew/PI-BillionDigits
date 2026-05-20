@@ -44,13 +44,30 @@ Namespace My
             sb.AppendLine("=== END UNHANDLED EXCEPTION ===")
 
             ' Write to the log file before showing UI
+            Dim logPath As String = ""
             Try
-                System.IO.File.AppendAllText("c:\PiOutput\pi_phase_log.txt", sb.ToString())
+                Dim logDir As String = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "PI-BillionDigits")
+                System.IO.Directory.CreateDirectory(logDir)
+                logPath = System.IO.Path.Combine(logDir, "pi_phase_log.txt")
+                System.IO.File.AppendAllText(logPath, sb.ToString())
             Catch
             End Try
 
-            MessageBox.Show(sb.ToString(), "Unhandled Exception", MessageBoxButtons.OK, MessageBoxIcon.Error)
-            e.ExitApplication = True
+            ' Copy the full exception text to the clipboard so it can be pasted elsewhere.
+            Try
+                System.Windows.Forms.Clipboard.SetText(sb.ToString())
+            Catch
+            End Try
+
+            Dim logNote As String = If(logPath <> "",
+                $"{vbCrLf}{vbCrLf}Full details saved to:{vbCrLf}{logPath}{vbCrLf}(also copied to clipboard)",
+                $"{vbCrLf}{vbCrLf}(Exception text copied to clipboard)")
+
+            MessageBox.Show(sb.ToString() & logNote,
+                            "Unhandled Exception", MessageBoxButtons.OK, MessageBoxIcon.Error)
+            e.ExitApplication = False   ' keep the app alive; user can review state and close manually
         End Sub
 
     End Class
