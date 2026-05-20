@@ -1,0 +1,7 @@
+PerfView logging started at 5/19/2026 8:46:59 PM
+[EXECUTING: PerfView /AcceptEULA /NoGui /LogFile=traces\20260519_180901_cpu_1000000000d\perfview_convert.log Run -CommandLineArguments:convert traces\20260519_180901_cpu_1000000000d\trace.nettrace]
+Need Elevation, but this process is not Elevated, Relaunching process as Elevated
+PerfView logging started at 5/19/2026 8:47:01 PM
+[EXECUTING: PerfView /RestartingToElevelate:run /BufferSizeMB:256 /StackCompression /NoGui /LogFile:traces\20260519_180901_cpu_1000000000d\perfview_convert.log /NoNGenRundown Run -CommandLineArguments:convert traces\20260519_180901_cpu_1000000000d\trace.nettrace]
+[Error: Could not find command -CommandLineArguments:convert traces\20260519_180901_cpu_1000000000d\trace.nettrace on path.]
+[DONE 20:47:01 FAIL: PerfView /RestartingToElevelate:run /BufferSizeMB:256 /StackCompression /NoGui /LogFile:traces\20260519_180901_cpu_1000000000d\perfview_convert.log /NoNGenRundown Run -CommandLineArguments:convert traces\20260519_180901_cpu_1000000000d\trace.nettrace]

@@ -1,0 +1,56 @@
+=== Trace run: cpu @ 05/19/2026 20:44:22 ===
+Exe   : C:\Users\Tony\source\PI-BillionDigits\PI-BillionDigits\bin\Debug\net10.0-windows10.0.26100.0\PI-BillionDigits.exe
+Args  : --digits 100000000 --autostart --autoverify --log-level 2 --output-dir C:\PiTraceOutput_100M --threshold 200000
+
+--- dotnet-trace topN (inclusive, top 50) ---
+Top 50 Functions (Inclusive)                                                  Inclusive           Exclusive           
+1.  (Non-Activities)                                                          100%                0%                  
+2.  Threads                                                                   100%                0%                  
+3.  Thread.StartCallback()                                                    77.69%              0%                  
+4.  PortableThreadPool+WorkerThread.WorkerThreadStart()                       71.73%              0%                  
+5.  LowLevelLifoSemaphore.WaitForSignal(int32)                                37.27%              35.76%              
+6.  Task.ExecuteWithThreadLocal(class System.Threading.Tasks.Task&,class S    36.64%              0%                  
+7.  TaskReplicator+Replica.Execute()                                          36.49%              0%                  
+8.  LowLevelLifoSemaphore.Wait(int32,bool)                                    35.57%              0.09%               
+9.  ThreadPoolWorkQueue.Dispatch()                                            34.35%              0%                  
+10. ExecutionContext.RunFromThreadPoolDispatchLoop(class System.Threading.    34.35%              0%                  
+11. Int64].<ForWorker>b__1(value class System.Threading.Tasks.RangeWorker&    33.76%              0%                  
+12. Form1+_Closure$__255-2._Lambda$__5(int64)                                 28.53%              0%                  
+13. Form1.BinarySplitChunk(int64,int64,class Math.Gmp.Native.mpz_t&,class     28.53%              13.7%               
+14. ExecutionContext.RunInternal(class System.Threading.ExecutionContext,c    17.2%               0%                  
+15. Thread+StartHelper.Callback(class System.Object)                          17.09%              0%                  
+16. gmp_lib.mpz_inits(class Math.Gmp.Native.mpz_t[])                          12.31%              12.1%               
+17. Form1.SafeMpzMul(class Math.Gmp.Native.mpz_t,class Math.Gmp.Native.mpz    9.15%               9.13%               
+18. Thread.Sleep(int32)                                                       6.44%               6.44%               
+19. WaitHandle.WaitOneNoCheck(int32,bool,class System.Object,value class W    5.93%               5.93%               
+20. Form1+_Closure$__255-4._Lambda$__8(int64)                                 5.23%               0.04%               
+21. Missing Symbol                                                            5.2%                5.18%               
+22. MyApplication.Main(class System.String[])                                 5.18%               0%                  
+23. WindowsFormsApplicationBase.Run(class System.String[])                    5.18%               0%                  
+24. WindowsFormsApplicationBase.DoApplicationModel()                          5.18%               0%                  
+25. WindowsFormsApplicationBase.OnRun()                                       5.18%               0%                  
+26. SystemEvents.WindowThreadProc()                                           5.16%               0%                  
+27. Application+ThreadContext.RunMessageLoopInner(value class Microsoft.Of    5.16%               0%                  
+28. Application.Run(class System.Windows.Forms.ApplicationContext)            5.16%               0%                  
+29. Form1+_Closure$__162-0._Lambda$__0()                                      5.16%               0.01%               
+30. Application+LightThreadContext.RunMessageLoop(value class Microsoft.Of    5.15%               0%                  
+31. Application+LightThreadContext.FPushMessageLoop(value class Microsoft.    5.15%               0%                  
+32. Form1._Lambda$__231-0()                                                   5.14%               0%                  
+33. Form1.ComputePiGMP(int64,value class System.Threading.CancellationToke    5.14%               0%                  
+34. PortableThreadPool+GateThread.GateThreadStart()                           5.14%               0%                  
+35. PInvoke.WaitMessage()                                                     5.11%               5.11%               
+36. Form1+_Closure$__248-0._Lambda$__0(int32)                                 2.72%               0%                  
+37. Int32].<ForWorker>b__1(value class System.Threading.Tasks.RangeWorker&    2.72%               0%                  
+38. Form1.BinarySplitGMP(int64,class System.Collections.Generic.List`1<val    2.69%               0.02%               
+39. gmp_lib.mpz_clears(class Math.Gmp.Native.mpz_t[])                         2.56%               2.5%                
+40. Parallel.ForWorker(!!1,!!1,class System.Threading.Tasks.ParallelOption    2.4%                0%                  
+41. TaskReplicator.Run(class ReplicatableUserAction`1<!!0>,class System.Th    2.4%                0%                  
+42. Task.InternalRunSynchronously(class System.Threading.Tasks.TaskSchedul    2.38%               0%                  
+43. TaskScheduler.TryRunInline(class System.Threading.Tasks.Task,bool)        2.38%               0%                  
+44. ThreadPoolTaskScheduler.TryExecuteTaskInline(class System.Threading.Ta    1.67%               0%                  
+45. il!Interop+Kernel32.GetQueuedCompletionStatus(int,unsigned int32&,unsi    1.51%               1.51%               
+46. Form1+_Closure$__255-2._Lambda$__3()                                      1.13%               0%                  
+47. Parallel.For(int64,int64,class System.Action`1<int64>)                    1.12%               0%                  
+48. Parallel.For(int32,int32,class System.Threading.Tasks.ParallelOptions,    0.92%               0%                  
+49. TimerQueue.TimerThread()                                                  0.82%               0%                  
+50. gmp_lib.mpz_get_str(value class Math.Gmp.Native.char_ptr,int32,class M    0.81%               0.81%               

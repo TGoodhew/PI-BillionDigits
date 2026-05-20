@@ -444,6 +444,13 @@ function Invoke-TraceRun {
     $vtuneExe    = Resolve-TraceTool 'VTUNE_EXE'    'C:\Program Files (x86)\Intel\oneAPI\vtune\latest\bin64\vtune.exe'
     $uprofExe    = Resolve-TraceTool 'UPROF_EXE'    'C:\Program Files\AMD\AMDuProf\bin\AMDuProfCLI.exe'
 
+    # PerfView and WPR both require admin elevation for kernel-mode CPU/disk tracing.
+    # Detect early and skip cleanly rather than trigger silent self-elevation that
+    # spawns an orphaned elevated PerfView and leaves us with no trace.
+    $isElevated = ([Security.Principal.WindowsPrincipal] `
+        [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+
     switch ($Mode) {
         'cpu' {
             $traceFile = Join-Path $RunDir 'trace.nettrace'
@@ -503,12 +510,19 @@ function Invoke-TraceRun {
                 "SKIPPED: PerfView not installed." | Out-File -FilePath $summaryFile -Append
                 return
             }
+            if (-not $isElevated) {
+                Write-Warning "PerfView CPU stack-sampling requires admin elevation (kernel ETW). Re-run this session 'as Administrator' to capture perfview-cpu/perfview-block/wpr."
+                "SKIPPED: perfview-cpu needs an elevated PowerShell session (kernel ETW)." | Out-File -FilePath $summaryFile -Append
+                "To fix: Right-click PowerShell -> Run as administrator, then re-run." | Out-File -FilePath $summaryFile -Append
+                return
+            }
             $traceFile = Join-Path $RunDir 'trace.etl.zip'
             $perfLog   = Join-Path $RunDir 'perfview.log'
             Write-Host "--- PerfView CPU + .NET providers ---" -ForegroundColor Magenta
+            # PerfView syntax: Run takes ONE quoted "exe args" string (NOT dotnet-trace's -- convention).
             $argString = ($ExeArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
             $cmd = '"' + $ExePath + '" ' + $argString
-            & $perfViewExe /AcceptEULA /NoGui /BufferSizeMB=512 /CircularMB=8192 /DataFile=$traceFile /LogFile=$perfLog Run -- $cmd
+            & $perfViewExe /AcceptEULA /NoGui /BufferSizeMB=512 /CircularMB=8192 /DataFile=$traceFile /LogFile=$perfLog Run $cmd
             "PerfView trace: $traceFile" | Out-File -FilePath $summaryFile -Append
             "Open in PerfView (CPU Stacks → expand by process / thread). Use GroupPats `[group module entries]` for native frames (libgmp, GmpNativeAlloc)." | Out-File -FilePath $summaryFile -Append
         }
@@ -519,17 +533,27 @@ function Invoke-TraceRun {
                 "SKIPPED: PerfView not installed." | Out-File -FilePath $summaryFile -Append
                 return
             }
+            if (-not $isElevated) {
+                Write-Warning "PerfView ThreadTime tracing requires admin elevation."
+                "SKIPPED: perfview-block needs an elevated PowerShell session (kernel ETW)." | Out-File -FilePath $summaryFile -Append
+                return
+            }
             $traceFile = Join-Path $RunDir 'trace.etl.zip'
             $perfLog   = Join-Path $RunDir 'perfview.log'
             Write-Host "--- PerfView ThreadTime + lock contention ---" -ForegroundColor Magenta
             $argString = ($ExeArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
             $cmd = '"' + $ExePath + '" ' + $argString
-            & $perfViewExe /AcceptEULA /NoGui /ThreadTime /BufferSizeMB=512 /CircularMB=8192 /DataFile=$traceFile /LogFile=$perfLog Run -- $cmd
+            & $perfViewExe /AcceptEULA /NoGui /ThreadTime /BufferSizeMB=512 /CircularMB=8192 /DataFile=$traceFile /LogFile=$perfLog Run $cmd
             "PerfView ThreadTime trace: $traceFile" | Out-File -FilePath $summaryFile -Append
             "Open in PerfView → 'Thread Time Stacks' → 'CPU_TIME' vs 'BLOCKED_TIME'. Lock contention shows in 'BLOCKED_TIME on Lock'." | Out-File -FilePath $summaryFile -Append
         }
 
         'wpr' {
+            if (-not $isElevated) {
+                Write-Warning "WPR kernel tracing (-start CPU) requires admin elevation."
+                "SKIPPED: wpr needs an elevated PowerShell session." | Out-File -FilePath $summaryFile -Append
+                return
+            }
             $traceFile = Join-Path $RunDir 'trace.etl'
             Write-Host "--- WPR (Windows Performance Recorder) CPU + Disk + FileIO ---" -ForegroundColor Magenta
             # System-wide recording. -filemode writes incrementally rather than circular buffer.

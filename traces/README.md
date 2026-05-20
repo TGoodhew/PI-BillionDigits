@@ -47,3 +47,8 @@ this box.
 ## Run-log
 
 <!-- Entries below appended automatically by Invoke-TraceRun in Run-PiCompute.ps1 -->
+- [1,000,000,000 digits @ 20260519_180901](20260519_180901_cpu_1000000000d/summary.txt) — cpu @ 2026-05-19 20:43
+- [100,000,000 digits @ 20260519_204422](20260519_204422_cpu_100000000d/summary.txt) — cpu @ 2026-05-19 20:45
+- [100,000,000 digits @ 20260519_204829](20260519_204829_gc_100000000d/summary.txt) — gc @ 2026-05-19 20:50
+- [100,000,000 digits @ 20260519_205028](20260519_205028_perfview-cpu_100000000d/summary.txt) — perfview-cpu @ 2026-05-19 20:50
+- [100,000,000 digits @ 20260519_205312](20260519_205312_counters_100000000d/summary.txt) — counters @ 2026-05-19 20:54

@@ -1,0 +1,4 @@
+=== Trace run: cpu @ 05/19/2026 20:55:13 ===
+Exe   : C:\Users\Tony\source\PI-BillionDigits\PI-BillionDigits\bin\Debug\net10.0-windows10.0.26100.0\PI-BillionDigits.exe
+Args  : --digits 500000000 --autostart --autoverify --log-level 2 --output-dir C:\PiTraceOutput_500M --threshold 200000 --auto-checkpoint
+

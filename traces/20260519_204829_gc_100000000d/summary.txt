@@ -1,0 +1,39 @@
+=== Trace run: gc @ 05/19/2026 20:48:29 ===
+Exe   : C:\Users\Tony\source\PI-BillionDigits\PI-BillionDigits\bin\Debug\net10.0-windows10.0.26100.0\PI-BillionDigits.exe
+Args  : --digits 100000000 --autostart --autoverify --log-level 2 --output-dir C:\PiTraceOutput_100M --threshold 200000
+
+Trace: C:\Users\Tony\source\PI-BillionDigits\PI-BillionDigits\traces\20260519_204829_gc_100000000d\trace.nettrace
+Open in PerfView (File → Open → trace.nettrace) for GC pause histogram + alloc-by-type.
+
+--- dotnet-trace topN (inclusive, top 30) ---
+Top 30 Functions (Inclusive)                                                  Inclusive           Exclusive           
+1.  (Non-Activities)                                                          100%                0%                  
+2.  Threads                                                                   100%                0.09%               
+3.  Task.ExecuteWithThreadLocal(class System.Threading.Tasks.Task&,class S    69.67%              0%                  
+4.  TaskReplicator+Replica.Execute()                                          69.67%              0%                  
+5.  Int64].<ForWorker>b__1(value class System.Threading.Tasks.RangeWorker&    69.66%              0%                  
+6.  Thread.StartCallback()                                                    67.06%              0%                  
+7.  PortableThreadPool+WorkerThread.WorkerThreadStart()                       67.06%              0%                  
+8.  ThreadPoolWorkQueue.Dispatch()                                            67.06%              0%                  
+9.  ExecutionContext.RunFromThreadPoolDispatchLoop(class System.Threading.    67.06%              0%                  
+10. Form1.BinarySplitChunk(int64,int64,class Math.Gmp.Native.mpz_t&,class     64.26%              21.06%              
+11. Form1+_Closure$__255-2._Lambda$__5(int64)                                 64.26%              0%                  
+12. ExecutionContext.RunInternal(class System.Threading.ExecutionContext,c    22.57%              0%                  
+13. gmp_lib.mpz_inits(class Math.Gmp.Native.mpz_t[])                          21.48%              20.96%              
+14. gmp_lib.mpz_clears(class Math.Gmp.Native.mpz_t[])                         21.47%              20.72%              
+15. Thread+StartHelper.Callback(class System.Object)                          20.57%              0%                  
+16. WindowsFormsApplicationBase.OnRun()                                       11.2%               0%                  
+17. WindowsFormsApplicationBase.DoApplicationModel()                          11.2%               0%                  
+18. WindowsFormsApplicationBase.Run(class System.String[])                    11.2%               0%                  
+19. MyApplication.Main(class System.String[])                                 11.2%               0%                  
+20. Missing Symbol                                                            11.19%              0%                  
+21. Application.Run(class System.Windows.Forms.ApplicationContext)            11.19%              0%                  
+22. Application+ThreadContext.RunMessageLoopInner(value class Microsoft.Of    11.19%              0%                  
+23. NativeWindow.Callback(value class Windows.Win32.Foundation.HWND,unsign    11.16%              0%                  
+24. Application+LightThreadContext.FPushMessageLoop(value class Microsoft.    11.16%              0%                  
+25. Application+LightThreadContext.RunMessageLoop(value class Microsoft.Of    11.16%              0%                  
+26. Form1+_Closure$__162-0._Lambda$__0()                                      9.71%               0%                  
+27. Form1.ComputePiGMP(int64,value class System.Threading.CancellationToke    8.83%               0.03%               
+28. Form1._Lambda$__231-0()                                                   8.83%               0%                  
+29. String.Ctor(value class System.ReadOnlySpan`1<wchar>)                     6.32%               6.32%               
+30. Form1.Timer1_Tick(class System.Object,class System.EventArgs)             6.17%               2.63%               
