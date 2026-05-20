@@ -4445,3 +4445,119 @@ proposes a parallel recursive halving version of this algorithm — same shape
 as §216 but with concurrent left/right sub-trees, predicted ~5-10× speedup
 on 24-core hardware.  §216 is the minimal serial workaround to unblock the
 in-flight 5B run; #37 is the proper optimisation.
+
+## §74 — Chunk-N-of-M progress indicator during chunked decimal conversion (2026-05-19, issue #74)
+
+The §216 chunked converter takes ~2 hours at 5B digits (100 × 50M-digit
+chunks).  The existing `_strConvTimer` callback on the compute thread only
+showed `String conversion... mm:ss elapsed` — for a two-hour run the
+status bar looked indistinguishable from a hang.
+
+Fix: two instance fields (`_chunkConvCurrent`, `_chunkConvTotal`,
+[Form1.vb:46-52](Form1.vb#L46-L52)) are populated at entry to
+`ChunkedMpzGetStr` (total = `ceil(totalDigitsEstimate / CHUNK_DIGITS)`) and
+updated every iteration to the 1-based current chunk.  The `_strConvTimer`
+callback at [Form1.vb:7358-7388](Form1.vb#L7358-L7388) snapshots both
+fields and switches between the two formats based on whether `total > 0`:
+
+```
+String conversion: chunk 12 of 100, 00:23:14 elapsed, ETA ~2.7h
+```
+
+ETA is computed from elapsed × (total − current) / current and is
+reasonably accurate after the first ~3 chunks.  Both fields are reset to
+zero in a `Finally` block inside `ChunkedMpzGetStr` so a subsequent
+small-scale run (which doesn't enter the chunked path) shows the original
+"String conversion..." text instead of stale "chunk 100 of 100".
+
+**Concurrency**: writes are from the compute thread, reads are from the
+`_strConvTimer` callback (separate `System.Threading.Timer` thread).  Both
+fields are 64-bit aligned ordinary `Long`s; on x64 aligned 64-bit
+accesses are atomic, so the timer never sees a torn read.  A momentary
+inconsistency between the two counters (e.g. "12 of 99" briefly when total
+has just been written but current hasn't) is harmless for status display.
+
+## §75 — RunVerification crashes at 5B via Marshal.PtrToStringAnsi (2026-05-19, issue #75)
+
+After §216's `pi_digits.txt` write succeeded in the 2026-05-19 5B run, the
+autoverify path crashed with:
+
+```
+[DIALOG] EXCEPTION: ArgumentException: The string must be null-terminated.
+   at System.Runtime.InteropServices.Marshal.PtrToStringAnsi(IntPtr ptr)
+   at PI_BillionDigits.Form1.RunVerification() in Form1.vb:line 7643
+   at PI_BillionDigits.Form1.StreamPiToScreen(String piString) in Form1.vb:line 7456
+```
+
+The file on disk was bit-correct (manually verified: `999999@762` ✓,
+`777777777@24,658,601` ✓, file size = 5,000,000,003 bytes).  The crash
+was downstream — in the autoverify scan of the in-memory `_displayNativePtr`
+char buffer.
+
+Root cause: `Marshal.PtrToStringAnsi(_displayNativePtr)` was attempting to
+materialise the 5 GB native buffer into a managed `String`.  .NET's
+`String` is limited to **2³¹ − 1 chars = 2,147,483,647**.  Any conversion
+above this throws (as observed) or silently truncates.  The exception
+text "string must be null-terminated" is misleading — the buffer *is*
+null-terminated; the CLR raises this generic error when its internal walk
+exceeds `Int32`.
+
+At 1B-scale runs this never fires (`_displayNativeLen ≈ 1B < 2.1B`).  The
+bug has been latent since native-buffer streaming shipped; 5B is the first
+scale where it triggers.
+
+Fix: `RunVerification` ([Form1.vb:7640-7745](Form1.vb#L7640-L7745)) now
+splits into two paths:
+
+- **Native path** (`_displayNativePtr <> IntPtr.Zero`): scan the native
+  byte buffer directly at the known-good positions via a new
+  `NativeMatchAt(needle, ptr, totalLen, position)` helper.  O(needle) per
+  check, no managed allocation, no `Int32`-sized intermediate.
+- **Managed fallback** (no native pointer, small-scale interactive run):
+  unchanged — string `IndexOf` on the `RtbPiDigits.Text` content.
+
+A second helper `NativeIndexOf(needle, ptr, totalLen)` does a chunked
+1 MB-window scan with `(needle - 1)` overlap so a match straddling a
+chunk boundary still hits.  This is used by
+`RunCustomVerificationsNative` for `--verify-contains` (the only case
+that needs a full-buffer scan rather than a known-position check).
+
+Together with §76, this restores clean process exit on a successful
+autoverified 5B+ run.
+
+## §76 — Headless mode hangs on exception (missing Application.Exit) (2026-05-19, issue #76)
+
+When §75 fired in the 2026-05-19 5B run, the process did **not** exit
+cleanly: it sat at 0 % CPU holding ~5 GB RSS, blocking
+`Run-PiCompute.ps1`'s post-run `BackupCheckpoint` step (which uses
+`Start-Process -Wait`).  The operator had to `Stop-Process -Force` after
+~20 minutes of confusion.
+
+Root cause: the compute thread's outer `Catch ex As Exception` handler at
+[Form1.vb:1505-1517](Form1.vb#L1505-L1517) only logged the exception and
+updated UI state.  The interactive branch shows a `MessageBox` which the
+user dismisses (form closes on `BtnCompute_Click` re-entry); the headless
+branch wrote a `[DIALOG] EXCEPTION` log line and returned — leaving the
+form's message loop running forever with no way to terminate.  Same
+defect on the `OutOfMemoryException` and `OverflowException` catches at
+[Form1.vb:1479-1503](Form1.vb#L1479-L1503).
+
+Fix: one-line addition to the headless branch of each catch:
+
+```vb
+Else
+    WriteToLog("[DIALOG] EXCEPTION: " & ex.GetType().Name & ": " & ex.Message)
+    Environment.ExitCode = 1
+    Application.Exit()
+End If
+```
+
+`Environment.ExitCode = 1` is set **before** `Application.Exit()` so that
+`Run-PiCompute.ps1`'s `Start-Process -Wait $LASTEXITCODE` sees a non-zero
+status and can react (skip BackupCheckpoint, copy crash artifacts to a
+forensics dir, etc.).
+
+Once #75 lands, this bug is harder to trigger — but still latent for any
+other exception during compute/verify.  Both fixes belong in the same
+prerequisite batch for the parallelism rollout (#72), which requires
+unattended Phase 0+ runs to terminate cleanly on failure.

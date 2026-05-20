@@ -42,6 +42,13 @@ Public Class Form1
     Private _displayNativePtr As IntPtr = IntPtr.Zero
     Private _displayNativeLen As Long = 0
     Private _displayNativeBufSize As Long = 0   ' GmpAllocFunc alloc size; >= GMP_LARGE_THRESHOLD → VirtualAlloc'd
+    ' §74 (issue #74): chunked decimal converter progress.  Written by the compute thread
+    ' inside ChunkedMpzGetStr, read by the _strConvTimer status-bar callback.  64-bit
+    ' aligned ordinary longs — on x64 aligned 64-bit writes are atomic, so the timer never
+    ' observes a torn read.  Both reset to 0 in ChunkedMpzGetStr's Finally so a subsequent
+    ' run that skips the chunked path doesn't show stale "12 of 99" data.
+    Private _chunkConvCurrent As Long = 0
+    Private _chunkConvTotal As Long = 0
     ' §81 display perf: pre-allocated byte buffer reused across ticks (avoids per-tick allocation).
     Private _displayBuf() As Byte = New Byte(65535) {}   ' initial 64 KB; grown as adaptive chunk size increases
     ' §81 adaptive chunk size: starts at 4096, adjusted each tick to target ~80 ms of UI work.
@@ -1482,7 +1489,12 @@ Public Class Form1
                                   If Not _headless Then
                                       MessageBox.Show("OUT OF MEMORY!" & vbCrLf & oex.Message & vbCrLf & oex.StackTrace)
                                   Else
+                                      ' §76 (issue #76): headless must exit on exception, otherwise the
+                                      ' form's message loop keeps the process alive at 0% CPU and blocks
+                                      ' Run-PiCompute.ps1's post-run BackupCheckpoint step.
                                       WriteToLog("[DIALOG] OUT OF MEMORY: " & oex.Message)
+                                      Environment.ExitCode = 1
+                                      Application.Exit()
                                   End If
                                   LblStatus.Text = "Error: Out of memory"
                                   BtnCompute.Enabled = True
@@ -1495,7 +1507,10 @@ Public Class Form1
                                   If Not _headless Then
                                       MessageBox.Show("OVERFLOW!" & vbCrLf & ovex.Message & vbCrLf & ovex.StackTrace)
                                   Else
+                                      ' §76 (issue #76): headless must exit on exception.
                                       WriteToLog("[DIALOG] OVERFLOW: " & ovex.Message)
+                                      Environment.ExitCode = 1
+                                      Application.Exit()
                                   End If
                                   LblStatus.Text = "Error: Overflow"
                                   BtnCompute.Enabled = True
@@ -1508,7 +1523,10 @@ Public Class Form1
                                   If Not _headless Then
                                       MessageBox.Show("EXCEPTION: " & ex.GetType().Name & vbCrLf & ex.Message & vbCrLf & ex.StackTrace)
                                   Else
+                                      ' §76 (issue #76): headless must exit on exception.
                                       WriteToLog("[DIALOG] EXCEPTION: " & ex.GetType().Name & ": " & ex.Message)
+                                      Environment.ExitCode = 1
+                                      Application.Exit()
                                   End If
                                   LblStatus.Text = "Error: " & ex.Message
                                   BtnCompute.Enabled = True
@@ -6258,10 +6276,21 @@ Phase2:
 
         Dim chunkIdx As Long = 0
 
+        ' §74 (issue #74): publish total-chunk count so the _strConvTimer UI callback can
+        ' show "chunk N of M".  totalDigitsEstimate is mpz_sizeinbase(gmpPi, 10) — within
+        ' ±1 of the true digit count.  Ceiling division gives the exact chunk count the
+        ' loop below will produce.
+        Dim totalChunks As Long = (totalDigitsEstimate + CHUNK_DIGITS - 1L) \ CHUNK_DIGITS
+        _chunkConvTotal = totalChunks
+        _chunkConvCurrent = 0
+
+        Try
+
         While gmp_lib.mpz_sgn(piMutable) > 0
             Dim _chunkStart As DateTime = DateTime.Now
             Dim _piSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(piMutable.Pointer, 4)))
             AppendLog($"[§216c] iter {chunkIdx + 1L} start: piMutable_sz={_piSz:N0} → mpz_fdiv_qr...{vbCrLf}")
+            _chunkConvCurrent = chunkIdx + 1L   ' §74: 1-based "current chunk" for the UI
 
             ' §216b: de-aliased call — quot=quotTmp, num=piMutable, rem=chunkRem, den=D.
             ' Then mpz_set(piMutable, quotTmp) for next iteration (no realloc, alloc already 260M).
@@ -6320,6 +6349,14 @@ Phase2:
             Dim _chunkTotal As TimeSpan = DateTime.Now - _chunkStart
             AppendLog($"[§216] chunk {chunkIdx} done: chunkLen={chunkLen:N0} isTop={isTop} pad={zeroPadCount:N0} writeAt={writeAt:N0} (div={_divElapsed.TotalMinutes:F1}m, total={_chunkTotal.TotalMinutes:F1}m){vbCrLf}")
         End While
+
+        Finally
+            ' §74 (issue #74): clear progress fields so the next mpz_get_str call (small-scale
+            ' path that doesn't enter this function) shows the original "String conversion..."
+            ' status instead of stale "chunk 100 of 100" text.
+            _chunkConvCurrent = 0
+            _chunkConvTotal = 0
+        End Try
 
         ' Clean up GMP scratch.
         gmp_lib.mpz_clear(piMutable)
@@ -7359,8 +7396,29 @@ NumeratorDone:
             Dim _strConvTimer As New System.Threading.Timer(
                 Sub(state As Object)
                     Dim elapsed As TimeSpan = DateTime.Now - _strConvStart
+                    ' §74 (issue #74): when ChunkedMpzGetStr is running it publishes (current,total)
+                    ' so a 2-hour conversion shows visible chunk progress every ~minute instead of
+                    ' a single mm:ss timer that's indistinguishable from a hang.  Snapshot both
+                    ' fields locally to avoid a torn read across the conditional and the format.
+                    Dim total As Long = _chunkConvTotal
+                    Dim current As Long = _chunkConvCurrent
+                    Dim statusText As String
+                    If total > 0 Then
+                        Dim etaText As String = ""
+                        If current > 0 AndAlso current < total Then
+                            Dim etaMinutes As Double = elapsed.TotalMinutes * CDbl(total - current) / CDbl(current)
+                            If etaMinutes >= 60.0 Then
+                                etaText = $", ETA ~{etaMinutes / 60.0:F1}h"
+                            Else
+                                etaText = $", ETA ~{etaMinutes:F0}m"
+                            End If
+                        End If
+                        statusText = $"String conversion: chunk {current:N0} of {total:N0}, {elapsed:hh\:mm\:ss} elapsed{etaText}"
+                    Else
+                        statusText = $"String conversion... {elapsed:mm\:ss} elapsed"
+                    End If
                     Me.BeginInvoke(Sub()
-                                       LblStatus.Text = $"String conversion... {elapsed:mm\:ss} elapsed"
+                                       LblStatus.Text = statusText
                                    End Sub)
                 End Sub, Nothing, 1000, 1000)
             ' §216: GMP's mpz_get_str crashes with AccessViolation when the output exceeds
@@ -7638,17 +7696,66 @@ NumeratorDone:
     ''' completes when ChkAutoVerify is checked.
     ''' </summary>
     Private Sub RunVerification()
-        Dim piText As String
-        If _displayNativePtr <> IntPtr.Zero Then
-            piText = Runtime.InteropServices.Marshal.PtrToStringAnsi(_displayNativePtr)
-            WriteToLog("[Verify] native pi buffer searched (buffer retained for display)")
-        Else
-            piText = RtbPiDigits.Text.Replace(".", "").Replace(vbCrLf, "")
-        End If
-
-        ' ── Built-in checks ──────────────────────────────────────────────────
         Dim parts As New System.Collections.Generic.List(Of String)()
         Dim allOk As Boolean = True
+
+        If _displayNativePtr <> IntPtr.Zero Then
+            ' §75 (issue #75): at 5B+ scale we cannot route through Marshal.PtrToStringAnsi
+            ' because the resulting managed String would exceed the CLR's 2^31-1 char limit
+            ' and throw ArgumentException("string must be null-terminated").  Scan the native
+            ' byte buffer directly at the known-good positions.  O(needle) per check instead
+            ' of O(n) full-buffer materialisation, and no managed allocation.
+            Dim totalLen As Long = _displayNativeLen
+            WriteToLog($"[Verify] native pi buffer scanned at known positions (len={totalLen:N0}, buffer retained for display)")
+
+            Dim _999999 As Byte() = New Byte() {&H39, &H39, &H39, &H39, &H39, &H39}
+            If NativeMatchAt(_999999, _displayNativePtr, totalLen, 762L) Then
+                parts.Add("999999@762 OK")
+            Else
+                parts.Add("999999@762 FAIL")
+                allOk = False
+            End If
+
+            Dim _777777777 As Byte() = New Byte() {&H37, &H37, &H37, &H37, &H37, &H37, &H37, &H37, &H37}
+            If totalLen > 24658610L Then
+                If NativeMatchAt(_777777777, _displayNativePtr, totalLen, 24658601L) Then
+                    parts.Add("777777777@24,658,601 OK")
+                Else
+                    parts.Add("777777777@24,658,601 FAIL")
+                    allOk = False
+                End If
+            Else
+                parts.Add("777777777 not checked (need 24.66M+ digits)")
+            End If
+
+            ' §29: nine-9s replaces e-digits check (e-digits don't appear until 45B+ digits).
+            ' Native buffer has no '.' prefix, so digit-stream position == buffer offset:
+            ' buffer[0]='3' and buffer[n] = n-th decimal digit (1-indexed).
+            Dim _nine9s As Byte() = New Byte() {&H39, &H39, &H39, &H39, &H39, &H39, &H39, &H39, &H39}
+            If totalLen > 564665215L Then
+                If NativeMatchAt(_nine9s, _displayNativePtr, totalLen, 564665206L) Then
+                    parts.Add("nine-9s@564,665,206 OK")
+                Else
+                    parts.Add("nine-9s@564,665,206 FAIL")
+                    allOk = False
+                End If
+            Else
+                parts.Add("nine-9s not checked (need 564M+ digits)")
+            End If
+
+            Dim summary As String = If(allOk, "Verify OK: ", "Verify: ") & String.Join(" | ", parts)
+            LblStatus.Text = summary
+            WriteToLog("[Verify] " & summary)
+
+            If _verifyAt.Count > 0 OrElse _verifyContains.Count > 0 Then
+                RunCustomVerificationsNative(_displayNativePtr, totalLen)
+            End If
+            Return
+        End If
+
+        ' Small-scale interactive path: no native buffer (display-disabled fast path was not
+        ' used or buffer already released), fall back to the managed RtbPiDigits text.
+        Dim piText As String = RtbPiDigits.Text.Replace(".", "").Replace(vbCrLf, "")
 
         Dim pos1 As Integer = piText.IndexOf("999999")
         If pos1 = 762 Then
@@ -7671,11 +7778,6 @@ NumeratorDone:
             parts.Add("777777777 not found")
         End If
 
-        ' §29: nine-9s replaces e-digits check (e-digits don't appear until 45B+ digits)
-        ' piText has the '.' stripped, so piText[0]='3' and piText[n] = n-th decimal digit (1-indexed).
-        ' Nine consecutive 9s first appear at 1-indexed decimal position 564,665,206 → piText[564665206].
-        ' (Previous hardcoded value 564665205 was off by 1 — it was the file offset minus 2 rather
-        ' than the correct piText index.)
         Dim pos3 As Integer = piText.IndexOf("999999999")
         If pos3 = 564665206 Then
             parts.Add("nine-9s@564,665,206 OK")
@@ -7686,14 +7788,85 @@ NumeratorDone:
             parts.Add("nine-9s not found (need 564M+ digits)")
         End If
 
-        Dim summary As String = If(allOk, "Verify OK: ", "Verify: ") & String.Join(" | ", parts)
-        LblStatus.Text = summary
-        WriteToLog("[Verify] " & summary)
+        Dim summary2 As String = If(allOk, "Verify OK: ", "Verify: ") & String.Join(" | ", parts)
+        LblStatus.Text = summary2
+        WriteToLog("[Verify] " & summary2)
 
-        ' ── Custom --verify-at / --verify-contains checks ────────────────────
         If _verifyAt.Count > 0 OrElse _verifyContains.Count > 0 Then
             RunCustomVerifications(piText)
         End If
+    End Sub
+
+    ' §75 (issue #75): native-buffer scan helpers.  Used by RunVerification and the custom-
+    ' verify path when _displayNativePtr is alive (any run that streams from the GMP/§216
+    ' char buffer — i.e., any run large enough to matter).  Avoid Marshal.PtrToStringAnsi
+    ' which throws at >2 GB.
+
+    Private Function NativeMatchAt(needle As Byte(), nativePtr As IntPtr, totalLen As Long, position As Long) As Boolean
+        If position < 0 OrElse position + CLng(needle.Length) > totalLen Then Return False
+        Dim base64 As Long = nativePtr.ToInt64() + position
+        For i As Integer = 0 To needle.Length - 1
+            If Runtime.InteropServices.Marshal.ReadByte(New IntPtr(base64 + CLng(i)), 0) <> needle(i) Then Return False
+        Next
+        Return True
+    End Function
+
+    ' Chunked byte-buffer search.  1 MB scan window with (needle-1) overlap so a match
+    ' straddling a chunk boundary still hits.  Returns first match offset, or -1.
+    Private Function NativeIndexOf(needle As Byte(), nativePtr As IntPtr, totalLen As Long) As Long
+        If needle.Length = 0 Then Return 0
+        If CLng(needle.Length) > totalLen Then Return -1
+        Const SCAN_CHUNK As Integer = 1024 * 1024
+        Dim overlap As Integer = needle.Length - 1
+        Dim buf(SCAN_CHUNK + overlap - 1) As Byte
+        Dim firstByte As Byte = needle(0)
+        Dim pos As Long = 0
+        While pos < totalLen
+            Dim toRead As Integer = CInt(System.Math.Min(CLng(SCAN_CHUNK + overlap), totalLen - pos))
+            Runtime.InteropServices.Marshal.Copy(New IntPtr(nativePtr.ToInt64() + pos), buf, 0, toRead)
+            Dim scanEnd As Integer
+            If pos + CLng(toRead) >= totalLen Then
+                scanEnd = toRead - needle.Length + 1
+            Else
+                scanEnd = toRead - overlap
+            End If
+            For i As Integer = 0 To scanEnd - 1
+                If buf(i) = firstByte Then
+                    Dim match As Boolean = True
+                    For j As Integer = 1 To needle.Length - 1
+                        If buf(i + j) <> needle(j) Then
+                            match = False
+                            Exit For
+                        End If
+                    Next
+                    If match Then Return pos + CLng(i)
+                End If
+            Next
+            pos += CLng(SCAN_CHUNK)
+        End While
+        Return -1
+    End Function
+
+    ' §75 (issue #75): native equivalent of RunCustomVerifications.  Same semantics, byte-
+    ' range based, no managed String materialisation.
+    Private Sub RunCustomVerificationsNative(nativePtr As IntPtr, totalLen As Long)
+        For Each chk In _verifyAt
+            Dim digits As String = chk.Item1
+            Dim expectedPos As Long = chk.Item2
+            Dim needle As Byte() = System.Text.Encoding.ASCII.GetBytes(digits)
+            Dim ok As Boolean = NativeMatchAt(needle, nativePtr, totalLen, expectedPos)
+            Dim msg As String = $"[verify-at] '{digits}' at {expectedPos:N0}: {If(ok, "OK", "FAIL")}"
+            WriteToLog(msg)
+            LblStatus.Text = msg
+        Next
+
+        For Each needleText In _verifyContains
+            Dim needle As Byte() = System.Text.Encoding.ASCII.GetBytes(needleText)
+            Dim pos As Long = NativeIndexOf(needle, nativePtr, totalLen)
+            Dim msg As String = If(pos >= 0, $"[verify-contains] '{needleText}' at {pos:N0} OK", $"[verify-contains] '{needleText}' NOT FOUND")
+            WriteToLog(msg)
+            LblStatus.Text = msg
+        Next
     End Sub
 
     ''' <summary>
