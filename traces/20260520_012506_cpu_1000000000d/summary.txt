@@ -1,0 +1,109 @@
+=== Trace run: cpu @ 05/20/2026 01:25:06 ===
+Exe   : C:\Users\Tony\source\PI-BillionDigits\PI-BillionDigits\bin\Debug\net10.0-windows10.0.26100.0\PI-BillionDigits.exe
+Args  : --digits 1000000000 --autostart --autoverify --log-level 2 --output-dir C:\PiTraceOutput_1B --threshold 200000 --auto-checkpoint
+
+--- dotnet-trace topN (inclusive, top 50) ---
+Top 50 Functions (Inclusive)                                                  Inclusive           Exclusive           
+1.  (Non-Activities)                                                          100%                0%                  
+2.  Threads                                                                   100%                0%                  
+3.  Thread.StartCallback()                                                    80.57%              0%                  
+4.  PortableThreadPool+WorkerThread.WorkerThreadStart()                       80.1%               0.01%               
+5.  LowLevelLifoSemaphore.WaitForSignal(int32)                                59.67%              59.27%              
+6.  Form1.SafeMpzMul(class Math.Gmp.Native.mpz_t,class Math.Gmp.Native.mpz    33.76%              32.41%              
+7.  ExecutionContext.RunInternal(class System.Threading.ExecutionContext,c    31.86%              0%                  
+8.  Thread+StartHelper.Callback(class System.Object)                          23.24%              0%                  
+9.  Task.ExecuteWithThreadLocal(class System.Threading.Tasks.Task&,class S    21.97%              0%                  
+10. TaskReplicator+Replica.Execute()                                          21.96%              0%                  
+11. ThreadPoolWorkQueue.Dispatch()                                            21.5%               0%                  
+12. ExecutionContext.RunFromThreadPoolDispatchLoop(class System.Threading.    21.5%               0%                  
+13. Thread.Sleep(int32)                                                       17.68%              17.68%              
+14. Missing Symbol                                                            17.6%               17.57%              
+15. Form1+_Closure$__162-0._Lambda$__0()                                      17.56%              0.01%               
+16. SystemEvents.WindowThreadProc()                                           17.56%              0%                  
+17. Form1._Lambda$__231-0()                                                   17.55%              0%                  
+18. Form1.ComputePiGMP(int64,value class System.Threading.CancellationToke    17.55%              0%                  
+19. PortableThreadPool+GateThread.GateThreadStart()                           17.55%              0%                  
+20. MyApplication.Main(class System.String[])                                 17.55%              0%                  
+21. WindowsFormsApplicationBase.DoApplicationModel()                          17.55%              0%                  
+22. WindowsFormsApplicationBase.Run(class System.String[])                    17.55%              0%                  
+23. WindowsFormsApplicationBase.OnRun()                                       17.55%              0%                  
+24. Application.Run(class System.Windows.Forms.ApplicationContext)            17.55%              0%                  
+25. Application+ThreadContext.RunMessageLoopInner(value class Microsoft.Of    17.55%              0%                  
+26. Application+LightThreadContext.RunMessageLoop(value class Microsoft.Of    17.55%              0%                  
+27. Application+LightThreadContext.FPushMessageLoop(value class Microsoft.    17.55%              0%                  
+28. PInvoke.WaitMessage()                                                     17.52%              17.52%              
+29. WaitHandle.WaitOneNoCheck(int32,bool,class System.Object,value class W    17.51%              17.51%              
+30. GC.RunFinalizers()                                                        17.22%              17.12%              
+31. Int32].<ForWorker>b__1(value class System.Threading.Tasks.RangeWorker&    17.03%              0%                  
+32. Form1.SafeMpzDiv(class Math.Gmp.Native.mpz_t,class Math.Gmp.Native.mpz    16.55%              0%                  
+33. Form1+_Closure$__248-0._Lambda$__0(int32)                                 16.08%              0%                  
+34. Form1.SafeMpzReciprocal(class Math.Gmp.Native.mpz_t,class Math.Gmp.Nat    13.91%              0%                  
+35. Form1.SafeMpzSqrt(class Math.Gmp.Native.mpz_t,class Math.Gmp.Native.mp    11.53%              0%                  
+36. Parallel.ForWorker(!!1,!!1,class System.Threading.Tasks.ParallelOption    9.97%               0%                  
+37. TaskReplicator.Run(class ReplicatableUserAction`1<!!0>,class System.Th    9.97%               0%                  
+38. Parallel.For(int32,int32,class System.Threading.Tasks.ParallelOptions,    9.85%               0%                  
+39. Task.InternalRunSynchronously(class System.Threading.Tasks.TaskSchedul    9.1%                0%                  
+40. Int64].<ForWorker>b__1(value class System.Threading.Tasks.RangeWorker&    5.11%               0%                  
+41. Form1+_Closure$__255-2._Lambda$__5(int64)                                 4.37%               0%                  
+42. Form1.BinarySplitChunk(int64,int64,class Math.Gmp.Native.mpz_t&,class     4.37%               2.26%               
+43. gmp_lib.mpz_inits(class Math.Gmp.Native.mpz_t[])                          1.73%               1.73%               
+44. Task.InternalWait(int32,value class System.Threading.CancellationToken    1.29%               0%                  
+45. Task.InternalWaitCore(int32,value class System.Threading.CancellationT    1.29%               1.21%               
+46. Form1+_Closure$__235-1._Lambda$__0(int32)                                 0.95%               0%                  
+47. Form1.SerializeNodeToDisk(class Math.Gmp.Native.mpz_t,class Math.Gmp.N    0.95%               0.01%               
+48. Form1.WriteToLog(class System.String)                                     0.86%               0%                  
+49. Form1+_Closure$__255-4._Lambda$__8(int64)                                 0.74%               0%                  
+50. Form1.AppendLog(class System.String)                                      0.63%               0%                  
+
+--- Re-generated topN report after run end (graceful exit via §76) ---
+Top 50 Functions (Inclusive)                                                  Inclusive           Exclusive           
+1.  (Non-Activities)                                                          100%                0%                  
+2.  Threads                                                                   100%                0%                  
+3.  Thread.StartCallback()                                                    80.57%              0%                  
+4.  PortableThreadPool+WorkerThread.WorkerThreadStart()                       80.1%               0.01%               
+5.  LowLevelLifoSemaphore.WaitForSignal(int32)                                59.67%              59.27%              
+6.  Form1.SafeMpzMul(class Math.Gmp.Native.mpz_t,class Math.Gmp.Native.mpz    33.76%              32.41%              
+7.  ExecutionContext.RunInternal(class System.Threading.ExecutionContext,c    31.86%              0%                  
+8.  Thread+StartHelper.Callback(class System.Object)                          23.24%              0%                  
+9.  Task.ExecuteWithThreadLocal(class System.Threading.Tasks.Task&,class S    21.97%              0%                  
+10. TaskReplicator+Replica.Execute()                                          21.96%              0%                  
+11. ThreadPoolWorkQueue.Dispatch()                                            21.5%               0%                  
+12. ExecutionContext.RunFromThreadPoolDispatchLoop(class System.Threading.    21.5%               0%                  
+13. Thread.Sleep(int32)                                                       17.68%              17.68%              
+14. Missing Symbol                                                            17.6%               17.57%              
+15. Form1+_Closure$__162-0._Lambda$__0()                                      17.56%              0.01%               
+16. SystemEvents.WindowThreadProc()                                           17.56%              0%                  
+17. Form1._Lambda$__231-0()                                                   17.55%              0%                  
+18. Form1.ComputePiGMP(int64,value class System.Threading.CancellationToke    17.55%              0%                  
+19. PortableThreadPool+GateThread.GateThreadStart()                           17.55%              0%                  
+20. MyApplication.Main(class System.String[])                                 17.55%              0%                  
+21. WindowsFormsApplicationBase.DoApplicationModel()                          17.55%              0%                  
+22. WindowsFormsApplicationBase.Run(class System.String[])                    17.55%              0%                  
+23. WindowsFormsApplicationBase.OnRun()                                       17.55%              0%                  
+24. Application.Run(class System.Windows.Forms.ApplicationContext)            17.55%              0%                  
+25. Application+ThreadContext.RunMessageLoopInner(value class Microsoft.Of    17.55%              0%                  
+26. Application+LightThreadContext.RunMessageLoop(value class Microsoft.Of    17.55%              0%                  
+27. Application+LightThreadContext.FPushMessageLoop(value class Microsoft.    17.55%              0%                  
+28. PInvoke.WaitMessage()                                                     17.52%              17.52%              
+29. WaitHandle.WaitOneNoCheck(int32,bool,class System.Object,value class W    17.51%              17.51%              
+30. GC.RunFinalizers()                                                        17.22%              17.12%              
+31. Int32].<ForWorker>b__1(value class System.Threading.Tasks.RangeWorker&    17.03%              0%                  
+32. Form1.SafeMpzDiv(class Math.Gmp.Native.mpz_t,class Math.Gmp.Native.mpz    16.55%              0%                  
+33. Form1+_Closure$__248-0._Lambda$__0(int32)                                 16.08%              0%                  
+34. Form1.SafeMpzReciprocal(class Math.Gmp.Native.mpz_t,class Math.Gmp.Nat    13.91%              0%                  
+35. Form1.SafeMpzSqrt(class Math.Gmp.Native.mpz_t,class Math.Gmp.Native.mp    11.53%              0%                  
+36. Parallel.ForWorker(!!1,!!1,class System.Threading.Tasks.ParallelOption    9.97%               0%                  
+37. TaskReplicator.Run(class ReplicatableUserAction`1<!!0>,class System.Th    9.97%               0%                  
+38. Parallel.For(int32,int32,class System.Threading.Tasks.ParallelOptions,    9.85%               0%                  
+39. Task.InternalRunSynchronously(class System.Threading.Tasks.TaskSchedul    9.1%                0%                  
+40. Int64].<ForWorker>b__1(value class System.Threading.Tasks.RangeWorker&    5.11%               0%                  
+41. Form1+_Closure$__255-2._Lambda$__5(int64)                                 4.37%               0%                  
+42. Form1.BinarySplitChunk(int64,int64,class Math.Gmp.Native.mpz_t&,class     4.37%               2.26%               
+43. gmp_lib.mpz_inits(class Math.Gmp.Native.mpz_t[])                          1.73%               1.73%               
+44. Task.InternalWait(int32,value class System.Threading.CancellationToken    1.29%               0%                  
+45. Task.InternalWaitCore(int32,value class System.Threading.CancellationT    1.29%               1.21%               
+46. Form1+_Closure$__235-1._Lambda$__0(int32)                                 0.95%               0%                  
+47. Form1.SerializeNodeToDisk(class Math.Gmp.Native.mpz_t,class Math.Gmp.N    0.95%               0.01%               
+48. Form1.WriteToLog(class System.String)                                     0.86%               0%                  
+49. Form1+_Closure$__255-4._Lambda$__8(int64)                                 0.74%               0%                  
+50. Form1.AppendLog(class System.String)                                      0.63%               0%                  
