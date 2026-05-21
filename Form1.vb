@@ -743,6 +743,23 @@ Public Class Form1
     Private Shared Sub GmpRaw_mul(rop As IntPtr, op1 As IntPtr, op2 As IntPtr)
     End Sub
 
+    ' §219 (issue #79, 2026-05-21): Drain the .NET finalizer queue at known
+    ' idle break points in the compute. The Math.Gmp.Native mpz_t class has a
+    ' finalizer (no IDisposable surface) — over long single-threaded compute
+    ' stretches (sqrt-Newton, SafeMpzDiv), the finalizer queue accumulates
+    ' faster than the single finalizer thread can drain, and the finalizer
+    ' thread starts competing for CPU with the sole compute thread.
+    ' Observed at 1B: GC.RunFinalizers 17.12% exclusive (vs 0.61% at 500M)
+    ' — 28× jump for 2× run duration. Force-draining at known idle points
+    ' (between Newton iterations, between Phase 2 levels) bounds the backlog.
+    ' Cost per call: ~10-50 ms; fires ~50-100 times across a multi-hour run.
+    Private Shared Sub DrainFinalizers()
+        GC.Collect(2, GCCollectionMode.Forced, blocking:=True)
+        GC.WaitForPendingFinalizers()
+        ' Second pass: some finalizers schedule more cleanups that need a follow-up GC.
+        GC.Collect(2, GCCollectionMode.Forced, blocking:=True)
+    End Sub
+
     <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_add",
                CallingConvention:=CallingConvention.Cdecl)>
     Private Shared Sub GmpRaw_add(rop As IntPtr, op1 As IntPtr, op2 As IntPtr)
@@ -3713,6 +3730,12 @@ Public Class Form1
             ' Correct behaviour without §173: lower bits of r are "garbage" in early iterations
             ' but they do NOT pollute the upper bits (the garbage contribution to p is confined
             ' to low-order positions after the shift).  Newton converges normally.
+
+            ' §219 (issue #79): drain finalizer queue at the Newton iteration boundary.
+            ' Each iteration creates and drops many mpz_t wrappers (rSq, p, sub-products,
+            ' etc.); over a multi-hour SafeMpzReciprocal run the finalizer backlog grows
+            ' and starts stealing CPU from the single compute thread. Bounded cleanup here.
+            DrainFinalizers()
         Loop
         ' §108-diag: log top 4 limbs of r to verify value (not just size)
         If _logLevel >= 2 Then
@@ -4951,25 +4974,72 @@ PostShiftCheckpoint:
                     _bTopBits171 += 1
                     _bTopScan >>= 1
                 Loop
-                AppendLog($"[SafeMpzDiv§171-entry] szA={szA:N0} szB={szB:N0} szRem={_szRem171:N0} ratio={(CDbl(_szRem171)/szB):F3} bTop=0x{_bTop171e:X16} bTopBits={_bTopBits171} (if <48, single-limb correction will NOT converge — upstream Barrett bug suspected){vbCrLf}")
+                AppendLog($"[SafeMpzDiv§171-entry] szA={szA:N0} szB={szB:N0} szRem={_szRem171:N0} ratio={(CDbl(_szRem171)/szB):F3} bTop=0x{_bTop171e:X16} bTopBits={_bTopBits171} (if <48, normalizing per §218 below){vbCrLf}")
+
+                ' §218 (issue #78, 2026-05-21): Knuth Algorithm D-style divisor normalization.
+                ' When _bTopBits171 < 48, the previous single-limb correction
+                ' delta = floor(remTop / (bTop+1)) over-estimates by up to 2^(64-bTopBits)×
+                ' because the lower (szB-1) limbs of b contribute meaningfully to the actual
+                ' divisor value that bTop+1 ignores. The over-estimate makes delta×b > rem;
+                ' subtraction wraps to negative-magnitude same-size remainder; convergence
+                ' check fires.
+                '
+                ' Fix: shift both rem and b LEFT by shift = 64 - bTopBits so the normalized
+                ' bTop has its top bit set (bTopBits_norm = 64). The single-limb estimate
+                ' is then tight (off by at most ±1-2 limbs, matching the pre-normalization
+                ' design intent). The quotient delta is scale-invariant: (rem×2^s)/(b×2^s)
+                ' = rem/b, so q is unaffected. At the end of correction we shift rem RIGHT
+                ' by shift to restore original scale before returning to the outer adj-up loop.
+                Dim _shift218 As Integer = 0
+                Dim _bForCorr218 As IntPtr = _bPtr
+                Dim _szBForCorr218 As Integer = szB
+                Dim _bNormHdr218 As IntPtr = IntPtr.Zero
+                If _bTopBits171 < 48 Then
+                    _shift218 = 64 - _bTopBits171
+                    AppendLog($"[SafeMpzDiv§218-norm] bTopBits={_bTopBits171} < 48; shift-normalizing b and rem by {_shift218} bits{vbCrLf}")
+                    _bNormHdr218 = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                    GmpRaw_init(_bNormHdr218)
+                    ' §218 (issue #78 fix-up): mul_2exp internally calls __gmpz_realloc which
+                    ' aborts when new_alloc > INT_MAX/64 = 33.5M limbs (same class of bug as
+                    ' §216a). At 1B scale b is ~140M limbs; without PreAlloc, mul_2exp aborts
+                    ' the process with "gmp: overflow in mpz type". Wrap each raw IntPtr in
+                    ' an mpz_t struct and PreAllocMpzToLimbs to bypass GMP's check before
+                    ' calling mul_2exp.
+                    Dim _bNormWrap218 As New mpz_t()
+                    _bNormWrap218.Pointer = _bNormHdr218
+                    PreAllocMpzToLimbs(_bNormWrap218, CLng(szB) + 2L)
+                    AppendLog($"[SafeMpzDiv§218-norm] _bNorm PreAlloc'd to {(CLng(szB) + 2L):N0} limbs{vbCrLf}")
+                    GmpRaw_mul_2exp(_bNormHdr218, _bPtr, CUInt(_shift218))
+
+                    Dim _remWrap218 As New mpz_t()
+                    _remWrap218.Pointer = _remRaw
+                    PreAllocMpzToLimbs(_remWrap218, CLng(_szRem171) + 2L)
+                    AppendLog($"[SafeMpzDiv§218-norm] _rem PreAlloc'd to {(CLng(_szRem171) + 2L):N0} limbs{vbCrLf}")
+                    GmpRaw_mul_2exp(_remRaw, _remRaw, CUInt(_shift218))
+
+                    _bForCorr218 = _bNormHdr218
+                    _szBForCorr218 = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_bNormHdr218, 4))
+                    _szRem171 = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
+                    AppendLog($"[SafeMpzDiv§218-norm] after normalization: szB_norm={_szBForCorr218:N0} szRem_norm={_szRem171:N0}{vbCrLf}")
+                End If
 
                 Dim _171Pass As Integer = 0
-                Do While _szRem171 > szB
+                Do While _szRem171 > _szBForCorr218
                     _171Pass += 1
                     If _171Pass > 64 Then
-                        Throw New InvalidOperationException($"SafeMpzDiv §171 failed to converge in 64 passes (szRem={_szRem171}, szB={szB}, szA={szA})")
+                        Throw New InvalidOperationException($"SafeMpzDiv §171 failed to converge in 64 passes (szRem={_szRem171}, szB={_szBForCorr218}, szA={szA}, shift218={_shift218})")
                     End If
                     Dim _szRemBefore171 As Integer = _szRem171
                     Dim _remData171 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_remRaw, 8))
-                    Dim _bData171 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_bPtr, 8))
-                    Dim _bTop171 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_bData171, CInt(CLng(szB - 1) * 8L)))
-                    Dim _topSliceLen171 As Integer = _szRem171 - szB + 1
+                    Dim _bData171 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_bForCorr218, 8))
+                    Dim _bTop171 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_bData171, CInt(CLng(_szBForCorr218 - 1) * 8L)))
+                    Dim _topSliceLen171 As Integer = _szRem171 - _szBForCorr218 + 1
                     Dim _deltaBytes171 As Long = CLng(_topSliceLen171) * 8L
                     Dim _deltaBuf171 As IntPtr = GmpNativeAlloc_PoolGet(_deltaBytes171)
                     If _deltaBuf171 = IntPtr.Zero Then
                         Throw New InvalidOperationException($"SafeMpzDiv §171 pool alloc failed on pass {_171Pass}: requested {_deltaBytes171:N0} bytes")
                     End If
-                    Dim _remTopPtr171 As IntPtr = New IntPtr(_remData171.ToInt64() + CLng(szB - 1) * 8L)
+                    Dim _remTopPtr171 As IntPtr = New IntPtr(_remData171.ToInt64() + CLng(_szBForCorr218 - 1) * 8L)
                     GmpRaw_mpn_divrem_1(_deltaBuf171, 0, _remTopPtr171, _topSliceLen171, _bTop171 + 1UL)
                     Dim _deltaSz171 As Integer = _topSliceLen171
                     Do While _deltaSz171 > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(_deltaBuf171, CInt(CLng(_deltaSz171 - 1) * 8L)) = 0L
@@ -4978,7 +5048,7 @@ PostShiftCheckpoint:
                     AppendLog($"[SafeMpzDiv§171 pass={_171Pass}] bTop=0x{_bTop171:X16} szDelta={_deltaSz171:N0} szRemBefore={_szRemBefore171:N0}{vbCrLf}")
                     If _deltaSz171 = 0 Then
                         GmpNativeAlloc_FreeRaw(_deltaBuf171, _deltaBytes171)
-                        Throw New InvalidOperationException($"SafeMpzDiv §171 delta=0 on pass {_171Pass}: top-limb ratio too small. szRem={_szRem171}, szB={szB}, bTop=0x{_bTop171:X16}")
+                        Throw New InvalidOperationException($"SafeMpzDiv §171 delta=0 on pass {_171Pass}: top-limb ratio too small. szRem={_szRem171}, szB={_szBForCorr218}, bTop=0x{_bTop171:X16}, shift218={_shift218}")
                     End If
                     Dim _deltaHdr171 As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
                     Runtime.InteropServices.Marshal.WriteInt32(_deltaHdr171, 0, _topSliceLen171)
@@ -4990,7 +5060,7 @@ PostShiftCheckpoint:
                     Dim _prod171 As New mpz_t()
                     _prod171.Pointer = _prodHdr171
                     Dim _bWrap171 As New mpz_t()
-                    _bWrap171.Pointer = _bPtr
+                    _bWrap171.Pointer = _bForCorr218
                     Dim _deltaWrap171 As New mpz_t()
                     _deltaWrap171.Pointer = _deltaHdr171
                     SafeMpzMul(_prod171, _deltaWrap171, _bWrap171)
@@ -5007,10 +5077,22 @@ PostShiftCheckpoint:
                     _szRem171 = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
                     AppendLog($"[SafeMpzDiv§171 pass={_171Pass}] done: szRemAfter={_szRem171:N0} Δ={_szRemBefore171 - _szRem171:N0}{vbCrLf}")
                     If _szRem171 >= _szRemBefore171 Then
-                        Throw New InvalidOperationException($"SafeMpzDiv §171 pass {_171Pass} did not reduce rem SIZE: before={_szRemBefore171}, after={_szRem171}, szB={szB}, szProd={_szProd171}, ptrMatch={_ptrMatch171}, bTopBits={_bTopBits171}. ROOT CAUSE: Barrett estimate was off by ~2^{(CLng(_szRemBefore171 - szB) * 64L):N0} (far more than the usual ±1-2). Single-limb top-limb correction cannot converge when bTopBits<{48} and rem/b value-ratio is ~2^({(CLng(_szRemBefore171 - szB) * 64L):N0}). Investigate upstream: SafeMpzMul(ar,a,r), BigShiftRight(ar,kBits), SafeMpzReciprocal precision at 5B scale.")
+                        Throw New InvalidOperationException($"SafeMpzDiv §171 pass {_171Pass} did not reduce rem SIZE: before={_szRemBefore171}, after={_szRem171}, szB={_szBForCorr218}, szProd={_szProd171}, ptrMatch={_ptrMatch171}, bTopBits_orig={_bTopBits171}, shift218={_shift218}. After §218 normalization this should not occur — investigate further.")
                     End If
                 Loop
-                AppendLog($"[SafeMpzDiv§171-done] {_171Pass} pass(es); szRem={_szRem171:N0} ≤ szB={szB:N0}{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§171-done] {_171Pass} pass(es); szRem={_szRem171:N0} ≤ szB={_szBForCorr218:N0}{vbCrLf}")
+
+                ' §218 (issue #78): denormalize rem back to original scale, then free the
+                ' normalized b copy. The outer adj-up loop and any downstream code references
+                ' _remRaw at the original (unshifted) scale.
+                If _shift218 > 0 Then
+                    GmpRaw_tdiv_q_2exp(_remRaw, _remRaw, CUInt(_shift218))
+                    _szRem171 = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
+                    AppendLog($"[SafeMpzDiv§218-norm] denormalized rem; szRem after rshift={_szRem171:N0}{vbCrLf}")
+                    GmpRaw_clear(_bNormHdr218)
+                    Runtime.InteropServices.Marshal.FreeHGlobal(_bNormHdr218)
+                End If
+
                 _adjUp = 0
                 Continue Do
             End If
@@ -5359,6 +5441,14 @@ PostShiftCheckpoint:
                 End Try
             End If
             AppendLog($"[SafeMpzSqrt§202-postdiv] step {_newtonStep} fully complete; looping (kBitsX={kBitsX:N0} bitsS+2={bitsS + 2L:N0} cont={kBitsX < bitsS + 2L}){vbCrLf}")
+
+            ' §219 (issue #79): drain finalizer queue at SafeMpzSqrt Newton step boundary.
+            ' Each sqrt-Newton step runs a full SafeMpzDiv internally (which itself runs
+            ' SafeMpzReciprocal Newton loop), creating thousands of mpz_t wrappers.
+            ' Sqrt-Newton at 1B+ scale has 4 steps each ~2.5 hours single-threaded; the
+            ' finalizer backlog accumulated during a step is best drained at the step
+            ' boundary while we're momentarily in cleanup before the next step's SafeMpzMul.
+            DrainFinalizers()
         Loop
 
         If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] Newton done; final adjustment{vbCrLf}")

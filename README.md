@@ -4618,3 +4618,89 @@ you are going to do something that might impact the cache then you MUST
 back the cache up. ... Finally I want you to review the code and ensure
 that no checkpoint is deleted prior to the completion of a successful
 run."*
+
+## §218 — SafeMpzDiv §171 normalization at 1B+ precision (2026-05-21, issue #78)
+
+The 2026-05-20 1B trace run (issue #50 Phase 0 work) crashed in
+`SafeMpzDiv §171` at 14h 21m wall with:
+
+```
+EXCEPTION: SafeMpzDiv §171 pass 1 did not reduce rem SIZE:
+   before=192030933, after=192030933, szB=140125808,
+   ptrMatch=True, bTopBits=34.
+```
+
+Root cause: the §171 single-limb top-bits correction loop assumed
+`bTopBits >= 48` (top limb of the divisor has at least 48 significant
+bits) so that the estimate `delta = floor(remTop / (bTop+1))` is tight
+within ±1-2.  At 1B precision the Barrett reciprocal output's
+`bTopBits = 34` — the top limb has only 34 significant bits, with 30
+leading zeros.  The "+1" trick to make `delta` an under-estimate over-
+corrects by `2^(64 - bTopBits) ≈ 2^30 ≈ 10^9×`; the resulting `delta`
+is so under-sized that `delta × b` ≈ `rem` value-wise but the size
+arithmetic wraps and `rem` doesn't shrink.  Convergence check fires.
+
+Fix: Knuth Algorithm D-style **normalization** before the correction
+loop.  When `bTopBits < 48`:
+
+1. Compute `shift = 64 - bTopBits` (1 ≤ shift ≤ 63).
+2. Shift both `b` and `rem` LEFT by `shift` bits via
+   `GmpRaw_mul_2exp` (using `PreAllocMpzToLimbs` first to bypass GMP's
+   33.5M-limb realloc abort — same class of issue as §216a).
+3. Now `bTop_norm` has its top bit set (`bTopBits_norm = 64`) and the
+   single-limb estimate is tight again.
+4. Run the existing §171 correction passes on the normalized values.
+   Quotient deltas are scale-invariant: `floor(rem × 2^s / (b × 2^s))
+   = floor(rem / b)`, so `q` is unaffected.
+5. After convergence, shift `rem` RIGHT by `shift` via
+   `GmpRaw_tdiv_q_2exp` to restore original scale before returning to
+   the outer adj-up loop.
+
+Implementation at [Form1.vb:4960-5024](Form1.vb#L4960-L5024) inside the
+existing §171 block — gated on the same `_bTopBits171 < 48` predicate
+that the original diagnostic already detected and reported.
+
+This is a **prerequisite for #72 5B-scale parallelism testing**: without
+it, any fresh 5B run would hit the same Barrett-correction failure
+before reaching the parallel `SafeMpzDiv` paths that #44 + #55 would
+introduce.  The 2026-05-19 verified 5B run avoided this because it
+resumed from `§NR-ckpt iter=36` — entering the regime AFTER the precision
+that triggers `bTopBits < 48`.
+
+## §219 — Drain finalizer queue at idle break points (2026-05-21, issue #79)
+
+The 2026-05-20 1B cpu trace (issue #50) showed
+**`GC.RunFinalizers: 17.12% exclusive`** at 1B vs **0.61% at 500M** — a
+28× jump for 2× run duration.
+
+Root cause: `Math.Gmp.Native.mpz_t` is a managed reference type with a
+finalizer (no `IDisposable` surface).  Every `gmp_lib.mpz_init` /
+`mpz_inits` call allocates a wrapper instance; when the wrapper becomes
+unreachable, GC marks it and the finalizer thread runs `Finalize`.
+Over a multi-hour single-threaded compute stretch (post-sqrt-Newton at
+5B is the worst case), the finalizer queue accumulates faster than the
+single finalizer thread can drain.  Once the finalizer thread is
+saturated, it competes for CPU with the sole compute thread.
+
+Projected at 5B: ~25-30% of wall in `GC.RunFinalizers` ≈ 30-40 hours of
+recoverable wall time, independent of any parallelism work.
+
+Fix: a `DrainFinalizers()` helper at [Form1.vb:746-762](Form1.vb#L746-L762)
+that calls `GC.Collect(2, Forced, blocking:=True)` +
+`WaitForPendingFinalizers()` + a second `GC.Collect`.  Invoked at two
+known idle break points:
+
+- **`SafeMpzReciprocal` Newton loop end** ([Form1.vb:~3716](Form1.vb#L3716))
+  — once per Newton iteration (typically 4-8 per `SafeMpzDiv` call).
+- **`SafeMpzSqrt` Newton step end** ([Form1.vb:~5428](Form1.vb#L5428))
+  — once per sqrt-Newton step (4 per 1B sqrt, 5 per 5B sqrt).
+
+Each call is ~10-50 ms; fires ~50-100 times across a multi-hour run.
+Total instrumentation cost: ≤ 5 seconds; recovered cost at 1B: ≈ 17% of
+the post-Newton stretch wall (projected from the 100M / 500M / 1B
+duration-scaling pattern in the pre-§219 traces).
+
+Exercised in-line with the §218 1B validation run; the post-run topN
+will report the new `GC.RunFinalizers` excl% for direct comparison
+against the pre-§219 1B baseline (`traces/20260520_012506_cpu_1000000000d/`
+in local-only `traces/` per the gitignore).

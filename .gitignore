@@ -41,22 +41,19 @@ pi_trace_*
 launch_stdout.txt
 launch_stderr.txt
 
-# Issue #50 traces/ — keep .md summaries + README, ignore everything binary.
-# VTune writes a per-collection directory (r000hs, r001ue, ...) — gitignore them too.
-traces/**/*.nettrace
-traces/**/*.etl
-traces/**/*.etl.zip
-traces/**/*.etlx
-traces/**/*.speedscope.json
-traces/**/*.csv
-traces/**/r*hs/
-traces/**/r*ue/
-traces/**/r*th/
-traces/**/*.caperf/
+# Issue #50 traces/ — local-only after 2026-05-21 (user directive).
+# All trace runs, summaries, sampler logs, and analysis docs are kept on the
+# host machine and in C:\PiPreserved_*_2026-*\ backups; not in version control.
+traces/
 
 # Run-PiCompute.ps1 redirected stdout/stderr per-run logs
 run_5B_*.log
 run_5B_*.log.err
+
+# All log files (run logs, trace tool logs, sampler logs, etc.) are local-only.
+# Case-insensitive — explicit patterns for systems with core.ignorecase=false.
+*.log
+*.LOG
 
 # Claude-session workflow scratch scripts (underscore-prefix convention)
 _*.ps1
