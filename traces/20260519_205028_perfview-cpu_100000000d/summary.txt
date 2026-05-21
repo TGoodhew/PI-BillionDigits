@@ -1,6 +1,0 @@
-=== Trace run: perfview-cpu @ 05/19/2026 20:50:28 ===
-Exe   : C:\Users\Tony\source\PI-BillionDigits\PI-BillionDigits\bin\Debug\net10.0-windows10.0.26100.0\PI-BillionDigits.exe
-Args  : --digits 100000000 --autostart --autoverify --log-level 2 --output-dir C:\PiTraceOutput_100M --threshold 200000
-
-PerfView trace: C:\Users\Tony\source\PI-BillionDigits\PI-BillionDigits\traces\20260519_205028_perfview-cpu_100000000d\trace.etl.zip
-Open in PerfView (CPU Stacks → expand by process / thread). Use GroupPats [group module entries] for native frames (libgmp, GmpNativeAlloc).

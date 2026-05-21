@@ -1,6 +1,0 @@
-=== Trace run: counters @ 05/19/2026 20:53:12 ===
-Exe   : C:\Users\Tony\source\PI-BillionDigits\PI-BillionDigits\bin\Debug\net10.0-windows10.0.26100.0\PI-BillionDigits.exe
-Args  : --digits 100000000 --autostart --autoverify --log-level 2 --output-dir C:\PiTraceOutput_100M --threshold 200000
-
-Counters CSV: C:\Users\Tony\source\PI-BillionDigits\PI-BillionDigits\traces\20260519_205312_counters_100000000d\counters.csv
-Open in Excel; rows are per-counter, columns are 5-second samples.
