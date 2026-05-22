@@ -2569,16 +2569,22 @@ Public Class Form1
         ' or ComputePiGMP, _safeMulDop=ProcessorCount to use all cores.
         Dim _smmDop As Integer = System.Threading.Volatile.Read(_safeMulDop)  ' §27: cross-thread read
         If _smmDop <= 0 Then _smmDop = Environment.ProcessorCount
-        ' §138: Force serial sub-product computation for q×b (szA=szB=21875001, opA_d≠opB_d).
-        ' Parallel.For with GmpNativeAlloc.dll gave catastrophically wrong prods(8) for q×b —
-        ' suspected GMP internal allocator thread-safety issue under concurrent mpz_mul reallocs.
-        ' r×r has opA_d=opB_d (same=True) and continues to use the parallel path safely.
-        ' §165: Extended to also cover a×r (szA=43750001, szB=21875001, opA_d≠opB_d).
-        ' Newton's non-squaring mults peak at ~21875000×10937500 (half the size of a×r) so
-        ' they were never affected; a×r is the first 43750001×21875001 non-squaring call.
-        Dim _forceSerialQxB As Boolean = ((szA = 21875001 OrElse szA = 43750001) AndAlso szB = 21875001 AndAlso _pre_opA_d <> _opB_d)
-        If _smmDop <= 1 OrElse _forceSerialQxB Then
-            If _logLevel >= 2 AndAlso _forceSerialQxB Then AppendLog($"[SafeMpzMul§138] forcing serial sub-products for {If(szA = 43750001, "a×r", "q×b")} (opA_d={_pre_opA_d:X16} opB_d={_opB_d:X16}){vbCrLf}")
+        ' §138/§165 LIFTED by §221 (issue #44, 2026-05-22): the size-gate that forced
+        ' serial 9-sub-product computation for q×b (szA=szB=21875001) and a×r
+        ' (szA=43750001, szB=21875001) when opA_d≠opB_d. The original "wrong prods(8)"
+        ' symptom was the SAME upstream Newton-convergence bug §200/§201 fixed and the
+        ' SAME issue §220 (issue #55) just lifted at SafeMpzDiv. With §200/§201 in place
+        ' the parallel SafeMpzMul path produces correct prods regardless of opA_d/opB_d
+        ' identity. The 9 sub-products inside this Parallel.For are independent results
+        ' written to distinct prods(k) slots; concurrent GMP mpz_mul on distinct mpz_t
+        ' destinations has no shared mutable state outside the GmpNativeAlloc pool
+        ' (which is per-thread-safe by design).
+        ' Original gate preserved as comment for easy revert (grep §221):
+        '   Dim _forceSerialQxB As Boolean = ((szA = 21875001 OrElse szA = 43750001) AndAlso szB = 21875001 AndAlso _pre_opA_d <> _opB_d)
+        '   If _smmDop <= 1 OrElse _forceSerialQxB Then
+        '       If _logLevel >= 2 AndAlso _forceSerialQxB Then AppendLog($"[SafeMpzMul§138] forcing serial sub-products...")
+        ' The §144/§170/§169 in-loop verifiers stay enabled and would catch any regression.
+        If _smmDop <= 1 Then
             ' Serial path: no thread pool involvement, no park/unpark overhead.
             For k As Integer = 0 To 8
                 ' §182: Before each inner call involving A2 (k=6,7,8), log A2._mp_d and its raw[0].
