@@ -728,6 +728,201 @@ Public Class Form1
         freeFn As IntPtr)
     End Sub
 
+    ' §224 (issue #41, 2026-05-22): P/E core detection + thread-affinity helpers.
+    ' Win32 surface: GetLogicalProcessorInformationEx(RelationProcessorCore=0) returns a
+    ' variable-length buffer of SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX entries. Each
+    ' processor-core entry has an EfficiencyClass byte (0 = E-core, 1+ = P-core on hybrid;
+    ' uniform on symmetric CPUs). Re-uses the existing GetLogicalProcessorInformationEx +
+    ' SetThreadAffinityMask P/Invokes at Form1.vb:327-345 (originally added for the simpler
+    ' process-wide SetPCoreAffinity helper at line 364); this §224 module adds richer
+    ' per-thread pinning + mask-splitting helpers for the pipelined Phase 2 work (#43/#42).
+
+    <DllImport("kernel32.dll")>
+    Private Shared Function GetCurrentThread() As IntPtr
+    End Function
+
+    ' Detected at startup. Defaults are safe-degradation for symmetric CPUs: both lists
+    ' contain all logicals, IsHybrid=False, masks cover the full process affinity.
+    Private Shared _topoInit As Integer = 0   ' 0=not yet, 1=done
+    Private Shared _topoPCoreIds As Integer() = Nothing
+    Private Shared _topoECoreIds As Integer() = Nothing
+    Private Shared _topoIsHybrid As Boolean = False
+    Private Shared _topoPCoreMask As ULong = 0UL
+    Private Shared _topoECoreMask As ULong = 0UL
+    Private Shared _topoTotalLogicals As Integer = 0
+
+    Private Shared Sub EnsureCpuTopologyInitialized()
+        If System.Threading.Interlocked.CompareExchange(_topoInit, 1, 0) <> 0 Then Return
+        Try
+            Dim _retLen As UInteger = 0UI
+            ' First call: NULL buffer → returns required size in retLen, error 122 (insufficient buffer).
+            GetLogicalProcessorInformationEx(RelationProcessorCore, IntPtr.Zero, _retLen)
+            If _retLen = 0UI Then
+                AppendLog($"[CpuTopology§224] GetLogicalProcessorInformationEx size-probe returned 0 — falling back to symmetric defaults{vbCrLf}")
+                ApplyTopologyDefault()
+                Return
+            End If
+            Dim _buf As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(CInt(_retLen))
+            Try
+                If Not GetLogicalProcessorInformationEx(RelationProcessorCore, _buf, _retLen) Then
+                    AppendLog($"[CpuTopology§224] GetLogicalProcessorInformationEx fill failed — falling back to symmetric defaults{vbCrLf}")
+                    ApplyTopologyDefault()
+                    Return
+                End If
+                ' Walk entries. Each: DWORD Relationship + DWORD Size + variant body.
+                ' Variant for ProcessorCore: BYTE Flags + BYTE EfficiencyClass + 20 BYTE Reserved +
+                ' WORD GroupCount + GROUP_AFFINITY[GroupCount].
+                ' GROUP_AFFINITY: ULONG_PTR Mask (8 B on x64) + WORD Group + WORD Reserved[3] (6 B) = 16 B.
+                Dim _pHi As New Dictionary(Of Byte, List(Of Integer))()  ' efficiencyClass → logical IDs
+                Dim _pos As Long = 0L
+                Dim _bufEnd As Long = CLng(_retLen)
+                While _pos + 8L <= _bufEnd
+                    Dim _entry As IntPtr = New IntPtr(_buf.ToInt64() + _pos)
+                    Dim _rel As Integer = Runtime.InteropServices.Marshal.ReadInt32(_entry, 0)
+                    Dim _sz As Integer = Runtime.InteropServices.Marshal.ReadInt32(_entry, 4)
+                    If _sz <= 0 OrElse _pos + CLng(_sz) > _bufEnd Then Exit While
+                    If _rel = RelationProcessorCore Then
+                        Dim _effClass As Byte = Runtime.InteropServices.Marshal.ReadByte(_entry, 9)  ' offset 8 + 1
+                        Dim _grpCount As Short = Runtime.InteropServices.Marshal.ReadInt16(_entry, 30)  ' 8 + 22
+                        For _g As Integer = 0 To CInt(_grpCount) - 1
+                            Dim _gaOff As Integer = 32 + _g * 16
+                            Dim _mask As Long = Runtime.InteropServices.Marshal.ReadInt64(_entry, _gaOff)
+                            ' Decode mask bits → logical IDs (we only handle group 0 — single-group machines).
+                            Dim _grp As Short = Runtime.InteropServices.Marshal.ReadInt16(_entry, _gaOff + 8)
+                            If _grp = 0 Then
+                                If Not _pHi.ContainsKey(_effClass) Then _pHi(_effClass) = New List(Of Integer)()
+                                Dim _u As ULong = CULng(_mask)
+                                For _b As Integer = 0 To 63
+                                    If (_u And (1UL << _b)) <> 0UL Then _pHi(_effClass).Add(_b)
+                                Next
+                            End If
+                        Next
+                    End If
+                    _pos += CLng(_sz)
+                End While
+                ' Classify: highest EfficiencyClass = P-cores, lowest = E-cores.
+                If _pHi.Count = 0 Then
+                    AppendLog($"[CpuTopology§224] no ProcessorCore entries found — falling back to symmetric defaults{vbCrLf}")
+                    ApplyTopologyDefault()
+                    Return
+                End If
+                Dim _maxClass As Byte = 0
+                Dim _minClass As Byte = 255
+                For Each _kvp In _pHi
+                    If _kvp.Key > _maxClass Then _maxClass = _kvp.Key
+                    If _kvp.Key < _minClass Then _minClass = _kvp.Key
+                Next
+                _topoIsHybrid = (_maxClass <> _minClass)
+                If _topoIsHybrid Then
+                    _topoPCoreIds = _pHi(_maxClass).ToArray()
+                    _topoECoreIds = _pHi(_minClass).ToArray()
+                Else
+                    ' Symmetric: all logicals are equivalent; populate both lists with the full set.
+                    Dim _all As New List(Of Integer)()
+                    For Each _kvp In _pHi : _all.AddRange(_kvp.Value) : Next
+                    _topoPCoreIds = _all.ToArray()
+                    _topoECoreIds = _all.ToArray()
+                End If
+                _topoPCoreMask = 0UL
+                For Each _id In _topoPCoreIds : _topoPCoreMask = _topoPCoreMask Or (1UL << _id) : Next
+                _topoECoreMask = 0UL
+                For Each _id In _topoECoreIds : _topoECoreMask = _topoECoreMask Or (1UL << _id) : Next
+                _topoTotalLogicals = Environment.ProcessorCount
+                AppendLog($"[CpuTopology§224] hybrid={_topoIsHybrid} P-cores={_topoPCoreIds.Length} logicals (mask=0x{_topoPCoreMask:X16}) E-cores={_topoECoreIds.Length} logicals (mask=0x{_topoECoreMask:X16}) total={_topoTotalLogicals}{vbCrLf}")
+            Finally
+                Runtime.InteropServices.Marshal.FreeHGlobal(_buf)
+            End Try
+        Catch ex As Exception
+            AppendLog($"[CpuTopology§224] detection failed: {ex.Message} — falling back to symmetric defaults{vbCrLf}")
+            ApplyTopologyDefault()
+        End Try
+    End Sub
+
+    Private Shared Sub ApplyTopologyDefault()
+        _topoTotalLogicals = Environment.ProcessorCount
+        Dim _all(_topoTotalLogicals - 1) As Integer
+        For _i As Integer = 0 To _topoTotalLogicals - 1 : _all(_i) = _i : Next
+        _topoPCoreIds = _all
+        _topoECoreIds = _all
+        _topoIsHybrid = False
+        _topoPCoreMask = If(_topoTotalLogicals >= 64, ULong.MaxValue, (1UL << _topoTotalLogicals) - 1UL)
+        _topoECoreMask = _topoPCoreMask
+    End Sub
+
+    Public Shared ReadOnly Property CpuTopologyIsHybrid As Boolean
+        Get
+            EnsureCpuTopologyInitialized() : Return _topoIsHybrid
+        End Get
+    End Property
+
+    Public Shared ReadOnly Property CpuTopologyPCoreIds As Integer()
+        Get
+            EnsureCpuTopologyInitialized() : Return _topoPCoreIds
+        End Get
+    End Property
+
+    Public Shared ReadOnly Property CpuTopologyECoreIds As Integer()
+        Get
+            EnsureCpuTopologyInitialized() : Return _topoECoreIds
+        End Get
+    End Property
+
+    Public Shared ReadOnly Property CpuTopologyPCoreMask As ULong
+        Get
+            EnsureCpuTopologyInitialized() : Return _topoPCoreMask
+        End Get
+    End Property
+
+    Public Shared ReadOnly Property CpuTopologyECoreMask As ULong
+        Get
+            EnsureCpuTopologyInitialized() : Return _topoECoreMask
+        End Get
+    End Property
+
+    ''' <summary>
+    ''' Pin the calling thread to the given affinity mask. Returns the prior mask (caller
+    ''' must save and restore via PinCurrentThreadTo(prior) if it wants to undo).
+    ''' Uses the existing IntPtr-typed SetThreadAffinityMask P/Invoke.
+    ''' </summary>
+    Public Shared Function PinCurrentThreadTo(mask As ULong) As ULong
+        EnsureCpuTopologyInitialized()
+        Dim _prior As IntPtr = SetThreadAffinityMask(GetCurrentThread(), New IntPtr(CLng(mask)))
+        Return CULng(_prior.ToInt64())
+    End Function
+
+    Public Shared Function PinCurrentThreadToPCores() As ULong
+        Return PinCurrentThreadTo(CpuTopologyPCoreMask)
+    End Function
+
+    Public Shared Function PinCurrentThreadToECores() As ULong
+        Return PinCurrentThreadTo(CpuTopologyECoreMask)
+    End Function
+
+    ''' <summary>
+    ''' Restore the affinity mask previously returned by PinCurrentThreadTo.
+    ''' Pass 0 to clear the affinity restriction entirely (effectively pinned to process mask).
+    ''' </summary>
+    Public Shared Sub RestoreCurrentThreadAffinity(priorMask As ULong)
+        SetThreadAffinityMask(GetCurrentThread(), New IntPtr(CLng(priorMask)))
+    End Sub
+
+    ''' <summary>
+    ''' Build two disjoint halves of the P-core mask, for use by pipelined stages
+    ''' that should not share memory bandwidth. On symmetric CPUs both halves are
+    ''' subsets of the full mask; on hybrid CPUs they're disjoint subsets of P-cores.
+    ''' Returns (firstHalfMask, secondHalfMask).
+    ''' </summary>
+    Public Shared Function SplitPCoreMaskInHalf() As Tuple(Of ULong, ULong)
+        EnsureCpuTopologyInitialized()
+        Dim _ids As Integer() = _topoPCoreIds
+        Dim _half As Integer = _ids.Length \ 2
+        Dim _maskA As ULong = 0UL, _maskB As ULong = 0UL
+        For _i As Integer = 0 To _ids.Length - 1
+            If _i < _half Then _maskA = _maskA Or (1UL << _ids(_i)) Else _maskB = _maskB Or (1UL << _ids(_i))
+        Next
+        Return Tuple.Create(_maskA, _maskB)
+    End Function
+
     ' §42: Raw P/Invoke to libgmp-10.dll — bypass mpz_t wrapper entirely for accumulation.
     ' Math.Gmp.Native corrupts mpz_t.Pointer for locally-scoped mpz_t objects during
     ' recursive SafeMpzMul calls, even for objects not passed to inner calls.  Using plain
@@ -6564,6 +6759,10 @@ Phase2:
     ' ════════════════════════════════════════════════════════════════════════
 
     Private Function ComputePiGMP(digits As Long, token As CancellationToken) As String
+
+        ' §224 (issue #41): trigger CpuTopology detection + logging on first run.
+        ' Idempotent: subsequent ComputePiGMP calls reuse cached topology.
+        EnsureCpuTopologyInitialized()
 
         Dim gmpSqrtInput As New mpz_t()
         Dim gmpSqrt As New mpz_t()
