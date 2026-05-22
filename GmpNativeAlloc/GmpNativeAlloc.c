@@ -109,8 +109,40 @@ static volatile LONG g_gmpLoaded = 0;  /* 1 after successful LoadGmp */
 #define POOL_MAX_BLOCK   (16LL * 1024 * 1024)  /* 16 MB — max pooled block size */
 #define GMP_BLOCK_PREFIX sizeof(SLIST_ENTRY)   /* 16 bytes on x64               */
 
-__declspec(align(16)) static SLIST_HEADER g_pool_heads[POOL_BUCKETS];
-static volatile LONG g_pool_counts[POOL_BUCKETS];
+/* §223 (issue #47, 2026-05-22): per-CPU pool heads.
+ *
+ * Original layout: one global g_pool_heads[bucket] array. All 24 worker threads
+ * competing on the same SLIST head causes the L3 cache line containing the head
+ * pointer to bounce between cores on every push/pop — ~30-50 ns per atomic when
+ * contended. At Phase 1 (BinarySplitChunk × 137K chunks at DOP=24) and during
+ * post-§220 parallel SafeMpzMul recursion, the hot buckets (4 KB / 16 KB) saturate.
+ *
+ * New layout: pool_slot_t per [bucket][cpu_index], cache-line aligned (64 bytes).
+ * Each thread tries its own CPU's local slot first; on miss it steals from a
+ * neighbouring CPU's slot before falling back to VirtualAlloc.
+ *
+ * MAX_CPUS=32 covers the i9-12900K (24 threads) plus headroom. CPUs beyond
+ * MAX_CPUS modulo down to a slot — degrades to cache-line contention with
+ * another CPU but never corrupts.
+ */
+#define MAX_CPUS         32
+typedef struct {
+    SLIST_HEADER head;
+    volatile LONG count;
+    char pad[64 - sizeof(SLIST_HEADER) - sizeof(LONG)];
+} pool_slot_t;
+__declspec(align(64)) static pool_slot_t g_pool_slots[POOL_BUCKETS][MAX_CPUS];
+
+/* Per-CPU local-vs-stolen hit stats (aggregated; not per-cpu) for diagnostics */
+static volatile LONGLONG g_stat_hits_local  = 0;
+static volatile LONGLONG g_stat_hits_steal  = 0;
+
+/* Cache the CPU index, with modulo into MAX_CPUS. Inlinable, no Win32 thunk
+ * overhead beyond GetCurrentProcessorNumber's ~ns cost. */
+static __forceinline DWORD GetCpuSlot(void) {
+    DWORD cpu = GetCurrentProcessorNumber();
+    return cpu & (MAX_CPUS - 1);  /* MAX_CPUS=32 → mod via mask */
+}
 
 /* Aggregate stats (written via Interlocked; read at Flush for logging) */
 static volatile LONGLONG g_stat_hits      = 0;
@@ -137,14 +169,32 @@ static void* __cdecl NativeAllocFunc(size_t sz) {
     LONGLONG lsz = (LONGLONG)(ULONGLONG)sz;
     if (lsz > 0 && lsz <= POOL_MAX_BLOCK) {
         int b = PoolBucket(lsz);
-        PSLIST_ENTRY ent = InterlockedPopEntrySList(&g_pool_heads[b]);
+        DWORD cpu = GetCpuSlot();
+        /* §223: try local CPU's slot first (uncontended in steady state) */
+        PSLIST_ENTRY ent = InterlockedPopEntrySList(&g_pool_slots[b][cpu].head);
         if (ent) {
-            InterlockedDecrement(&g_pool_counts[b]);
+            InterlockedDecrement(&g_pool_slots[b][cpu].count);
             InterlockedIncrement64(&g_stat_hits);
+            InterlockedIncrement64(&g_stat_hits_local);
             if ((int)g_logLevel >= LOG_POOL)
-                NativeLog(LOG_POOL, "[NativePool] alloc HIT  b=%d sz=%lld gmp=%p\n",
-                          b, lsz, (char*)ent + GMP_BLOCK_PREFIX);
+                NativeLog(LOG_POOL, "[NativePool] alloc HIT  b=%d cpu=%lu sz=%lld gmp=%p (local)\n",
+                          b, cpu, lsz, (char*)ent + GMP_BLOCK_PREFIX);
             return (char*)ent + GMP_BLOCK_PREFIX;
+        }
+        /* §223: local pool empty — steal from neighbours before falling to VirtualAlloc.
+         * Walk MAX_CPUS-1 victim slots; first success returns. */
+        for (DWORD i = 1; i < MAX_CPUS; i++) {
+            DWORD victim = (cpu + i) & (MAX_CPUS - 1);
+            ent = InterlockedPopEntrySList(&g_pool_slots[b][victim].head);
+            if (ent) {
+                InterlockedDecrement(&g_pool_slots[b][victim].count);
+                InterlockedIncrement64(&g_stat_hits);
+                InterlockedIncrement64(&g_stat_hits_steal);
+                if ((int)g_logLevel >= LOG_POOL)
+                    NativeLog(LOG_POOL, "[NativePool] alloc HIT  b=%d cpu=%lu sz=%lld gmp=%p (stole from cpu=%lu)\n",
+                              b, cpu, lsz, (char*)ent + GMP_BLOCK_PREFIX, victim);
+                return (char*)ent + GMP_BLOCK_PREFIX;
+            }
         }
         InterlockedIncrement64(&g_stat_misses);
         LONGLONG bucketSz = (1LL << b);
@@ -184,15 +234,19 @@ static void __cdecl NativeFreeFunc(void* ptr, size_t sz) {
     LONGLONG lsz = (LONGLONG)(ULONGLONG)sz;
     if (lsz > 0 && lsz <= POOL_MAX_BLOCK) {
         int b = PoolBucket(lsz);
-        if (InterlockedIncrement(&g_pool_counts[b]) <= POOL_CAP) {
-            InterlockedPushEntrySList(&g_pool_heads[b], (PSLIST_ENTRY)raw);
+        DWORD cpu = GetCpuSlot();
+        /* §223: push to local CPU's slot. POOL_CAP applies per-slot, so total
+         * pooled capacity grows MAX_CPUS× — that's the design intent (each CPU
+         * gets its own working set). */
+        if (InterlockedIncrement(&g_pool_slots[b][cpu].count) <= POOL_CAP) {
+            InterlockedPushEntrySList(&g_pool_slots[b][cpu].head, (PSLIST_ENTRY)raw);
             if ((int)g_logLevel >= LOG_POOL)
-                NativeLog(LOG_POOL, "[NativePool] free RETURN b=%d sz=%lld ptr=%p\n",
-                          b, lsz, ptr);
+                NativeLog(LOG_POOL, "[NativePool] free RETURN b=%d cpu=%lu sz=%lld ptr=%p\n",
+                          b, cpu, lsz, ptr);
             return;
         }
-        /* Pool full — roll back counter and fall through to VirtualFree */
-        InterlockedDecrement(&g_pool_counts[b]);
+        /* Local slot full — roll back counter and fall through to VirtualFree */
+        InterlockedDecrement(&g_pool_slots[b][cpu].count);
         InterlockedIncrement64(&g_stat_evictions);
     }
     /* Oversized, pool full, or zero: release immediately */
@@ -246,15 +300,18 @@ __declspec(dllexport) BOOL WINAPI GmpNativeAlloc_LoadGmp(int logLevel, const cha
 
     NativeLog(LOG_INIT, "[GmpNativeAlloc] LoadGmp START: logLevel=%d logPath='%s'\n",
               logLevel, g_logPath[0] ? g_logPath : "(none)");
-    NativeLog(LOG_INIT, "[GmpNativeAlloc] GMP_BLOCK_PREFIX=%zu  POOL_BUCKETS=%d  POOL_CAP=%d  POOL_MAX_BLOCK=%lldMB\n",
-              GMP_BLOCK_PREFIX, POOL_BUCKETS, POOL_CAP, POOL_MAX_BLOCK / (1024*1024));
+    NativeLog(LOG_INIT, "[GmpNativeAlloc] GMP_BLOCK_PREFIX=%zu  POOL_BUCKETS=%d  POOL_CAP=%d  POOL_MAX_BLOCK=%lldMB  MAX_CPUS=%d (§223 per-CPU)\n",
+              GMP_BLOCK_PREFIX, POOL_BUCKETS, POOL_CAP, POOL_MAX_BLOCK / (1024*1024), MAX_CPUS);
 
-    /* Initialise SLIST pool headers */
+    /* §223: Initialise per-CPU SLIST pool headers (POOL_BUCKETS × MAX_CPUS) */
     for (int b = 0; b < POOL_BUCKETS; b++) {
-        InitializeSListHead(&g_pool_heads[b]);
-        InterlockedExchange(&g_pool_counts[b], 0);
+        for (int c = 0; c < MAX_CPUS; c++) {
+            InitializeSListHead(&g_pool_slots[b][c].head);
+            InterlockedExchange(&g_pool_slots[b][c].count, 0);
+        }
     }
     g_stat_hits = g_stat_misses = g_stat_evictions = g_stat_large = g_stat_alloc_fail = 0;
+    g_stat_hits_local = g_stat_hits_steal = 0;
 
     /* Locate libgmp-10.dll (already loaded by Math.Gmp.Native) */
     HMODULE hGmp = GetModuleHandleA("libgmp-10.dll");
@@ -320,22 +377,28 @@ __declspec(dllexport) void WINAPI GmpNativeAlloc_Install(void) {
 /* Flush all pooled blocks back to OS.  Call between Phase 2 levels and after
  * the full computation.  Does NOT affect blocks currently held by live GMP objects. */
 __declspec(dllexport) void WINAPI GmpNativeAlloc_Flush(void) {
+    /* §223: include per-CPU local-vs-steal hit ratio so we can see whether
+     * work-stealing is firing frequently (high steal % → work imbalance). */
     NativeLog(LOG_INIT,
-              "[GmpNativeAlloc] Flush: stats hits=%lld misses=%lld evictions=%lld large=%lld alloc_fail=%lld\n",
-              g_stat_hits, g_stat_misses, g_stat_evictions, g_stat_large, g_stat_alloc_fail);
+              "[GmpNativeAlloc] Flush: stats hits=%lld (local=%lld steal=%lld) misses=%lld evictions=%lld large=%lld alloc_fail=%lld\n",
+              g_stat_hits, g_stat_hits_local, g_stat_hits_steal,
+              g_stat_misses, g_stat_evictions, g_stat_large, g_stat_alloc_fail);
 
     LONGLONG total = 0;
+    /* §223: walk all [bucket][cpu] slots */
     for (int b = 0; b < POOL_BUCKETS; b++) {
-        PSLIST_ENTRY ent;
         int cnt = 0;
-        while ((ent = InterlockedPopEntrySList(&g_pool_heads[b])) != NULL) {
-            InterlockedDecrement(&g_pool_counts[b]);
-            VirtualFree(ent, 0, MEM_RELEASE);
-            cnt++;
-            total++;
+        for (int c = 0; c < MAX_CPUS; c++) {
+            PSLIST_ENTRY ent;
+            while ((ent = InterlockedPopEntrySList(&g_pool_slots[b][c].head)) != NULL) {
+                InterlockedDecrement(&g_pool_slots[b][c].count);
+                VirtualFree(ent, 0, MEM_RELEASE);
+                cnt++;
+                total++;
+            }
         }
         if (cnt > 0 && (int)g_logLevel >= LOG_POOL)
-            NativeLog(LOG_POOL, "[GmpNativeAlloc] Flush bucket %d: freed %d blocks\n", b, cnt);
+            NativeLog(LOG_POOL, "[GmpNativeAlloc] Flush bucket %d: freed %d blocks (all CPUs)\n", b, cnt);
     }
     NativeLog(LOG_INIT, "[GmpNativeAlloc] Flush complete: %lld pool blocks freed\n", total);
 }
