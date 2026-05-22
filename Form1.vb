@@ -3872,15 +3872,20 @@ Public Class Form1
 
         Dim r As New mpz_t()
         gmp_lib.mpz_init(r)
-        ' §168: Force all-serial for SafeMpzReciprocal — bTrunc×rSq inside iter=25
-        ' (szA=21875001, szB≈34603008) bypasses §138 (szB≠21875001) and runs in parallel,
-        ' corrupting r. §166/§167 proved a×r and q×b are computed correctly FROM wrong r.
-        ' Making the entire Newton reciprocal serial ensures bTrunc×rSq produces correct p.
-        Dim _saved168Dop As Integer = System.Threading.Volatile.Read(_safeMulDop)
-        System.Threading.Volatile.Write(_safeMulDop, 1)
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§168] forcing all-serial for SafeMpzReciprocal (savedDop={_saved168Dop}){vbCrLf}")
+        ' §220 (issue #55, 2026-05-22): §168 force-serial LIFTED.
+        ' Original §168 forced _safeMulDop=1 for SafeMpzReciprocal because bTrunc×rSq
+        ' inside iter=25 produced wrong r under parallel execution. Root cause turned
+        ' out to be the Newton premature-convergence bug fixed by §200 (_minNrIters =
+        ' log2(rBits)+3) + §201-raise. With those fixes in place, a wrong reciprocal
+        ' can no longer be produced regardless of DOP. The §144/§170/§169 in-loop
+        ' verifiers stay enabled and would catch any regression early.
+        ' Original lines preserved as comments for easy revert (grep §220):
+        '   Dim _saved168Dop As Integer = System.Threading.Volatile.Read(_safeMulDop)
+        '   System.Threading.Volatile.Write(_safeMulDop, 1)
+        '   ...AppendLog($"[SafeMpzDiv§168] forcing all-serial...
+        '   System.Threading.Volatile.Write(_safeMulDop, _saved168Dop)
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§220] §168 lifted — SafeMpzReciprocal runs at caller DOP={System.Threading.Volatile.Read(_safeMulDop)}{vbCrLf}")
         SafeMpzReciprocal(r, b, kBits)
-        System.Threading.Volatile.Write(_safeMulDop, _saved168Dop)
         Dim szR As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] reciprocal done: szR={szR:N0}{vbCrLf}")
 
@@ -4027,16 +4032,16 @@ Public Class Form1
             AppendLog($"[SafeMpzDiv§5B-r] r[0]={_5b_rBot:X16} r[1]={_5b_rBot2:X16} r[mid={szR \ 2:N0}]={_5b_rMid:X16} r[szR-2]={_5b_rTop2:X16} r[szR-1]={_5b_rTop:X16}{vbCrLf}")
         End If
 
-        ' §166: Force ALL recursive levels of a×r fully serial — GMP allocator is not
-        ' thread-safe under concurrent mpz_mul reallocs with distinct opA_d/opB_d buffers.
-        ' §138/§165 only forced the outer Parallel.For; inner recursive SafeMpzMul calls
-        ' still used Parallel.For (szA=14583333 ≠ 21875001 bypassed §138 gate).
-        ' Setting _safeMulDop=1 propagates into every recursive level of SafeMpzMul.
-        Dim _saved166Dop As Integer = System.Threading.Volatile.Read(_safeMulDop)
-        System.Threading.Volatile.Write(_safeMulDop, 1)
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§166] forcing all-serial for a×r (savedDop={_saved166Dop}){vbCrLf}")
+        ' §220 (issue #55, 2026-05-22): §166 force-serial LIFTED.
+        ' Original §166 forced _safeMulDop=1 for a×r because §138/§165 only forced the
+        ' outer Parallel.For while inner recursive SafeMpzMul calls bypassed the gate
+        ' and ran parallel, producing wrong a×r values. Like §168, the root cause was
+        ' Newton premature-convergence (now fixed by §200/§201) producing a wrong r;
+        ' a×r was correctly computing (wrong_r × a). With §200/§201 in place, r is
+        ' always correct so a×r is always correct regardless of DOP.
+        ' Original lines preserved as comments for easy revert (grep §220).
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§220] §166 lifted — a×r runs at caller DOP={System.Threading.Volatile.Read(_safeMulDop)}{vbCrLf}")
         SafeMpzMul(ar, a, r)
-        System.Threading.Volatile.Write(_safeMulDop, _saved166Dop)
         ' §5B-f1: r's data buffer is needed by the §5B-f1 chunked-grid reference (below).
         ' Defer mpz_clear(r) until AFTER §5B-f1 completes to keep r alive.  Before §5B-f1
         ' was added the clear lived here directly; now it's at the end of the §5B-f1 block.
@@ -4701,12 +4706,13 @@ PostShiftCheckpoint:
         Dim qb As New mpz_t()
         qb.Pointer = _qbRaw
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] computing q*b (szQ={szQ:N0} szB={szB:N0})...{vbCrLf}")
-        ' §167: Same all-levels serial fix for q×b.
-        Dim _saved167Dop As Integer = System.Threading.Volatile.Read(_safeMulDop)
-        System.Threading.Volatile.Write(_safeMulDop, 1)
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§167] forcing all-serial for q×b (savedDop={_saved167Dop}){vbCrLf}")
+        ' §220 (issue #55, 2026-05-22): §167 force-serial LIFTED.
+        ' Same rationale as §166 (above): the original wrong-q×b was caused by upstream
+        ' wrong-r from premature Newton convergence, fixed by §200/§201. q×b parallel
+        ' execution is safe with current SafeMpzReciprocal.
+        ' Original lines preserved as comments for easy revert (grep §220).
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§220] §167 lifted — q×b runs at caller DOP={System.Threading.Volatile.Read(_safeMulDop)}{vbCrLf}")
         SafeMpzMul(qb, q, b)
-        System.Threading.Volatile.Write(_safeMulDop, _saved167Dop)
         ' Capture qb's raw pointer immediately — before any native call that could corrupt qb.Pointer.
         Dim _qbPtr As IntPtr = qb.Pointer   ' = savedResultPtr set by SafeMpzMul
         Dim szQB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4))
