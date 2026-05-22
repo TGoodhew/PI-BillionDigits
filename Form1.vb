@@ -2964,7 +2964,68 @@ Public Class Form1
                 prods(_bk).Pointer = IntPtr.Zero : Runtime.InteropServices.Marshal.FreeHGlobal(_sv_bk)
             Next _col
         Else
+            ' §222 (issue #60, 2026-05-22): parallel shift pre-pass for asymmetric §gen path.
+            '
+            ' The original loop did serial: for each k, shift prods(k) by ki·bitsA+kj·bitsB
+            ' into a single shared _sv_shifted_hdr buffer, then add to accumPtr. The shifts
+            ' (mpz_mul_2exp) are O(N) memmoves and don't overlap across k's because they
+            ' all write into the same shared buffer.
+            '
+            ' Phase 2 win: allocate 9 separate shifted buffers and compute all shifts in
+            ' parallel. The serial reduction below (k=0..8 add into accumPtr) is preserved
+            ' EXACTLY — same diagnostics, same accumPtr update order — only the shift work
+            ' is parallelized. Memory cost: 9 buffers × max-shifted-size ≈ 5.4 GB at 5B,
+            ' ~1.1 GB at 1B (well within 64 GB budget).
+            '
+            ' Gated on _smmDop > 1: if caller is at DOP=1 (Phase 2 inner) the parallel
+            ' pre-pass would just be 9 serial shifts via Parallel.For overhead — skip and
+            ' fall through to the original inline-shift path.
+            Dim _useS222 As Boolean = (_smmDop > 1) AndAlso (CLng(szA) + CLng(szB) > 1_000_000L)
+            Dim _shifted222 As IntPtr() = Nothing
+            If _useS222 Then
+                _shifted222 = New IntPtr(8) {}
+                ' Worst-case shifted size for each k: prods(k) is at most szA+szB+1 limbs;
+                ' shift = (ki·bitsA + kj·bitsB) bits = (ki·mA + kj·mB) limbs. So shifted_k
+                ' has at most szA+szB+1 + ki·mA + kj·mB limbs. PreAlloc each one to bypass
+                ' GMP's 33.5M-limb realloc abort (same §216a-class issue as §218).
+                For _k222 As Integer = 0 To 8
+                    _shifted222(_k222) = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                    GmpRaw_init(_shifted222(_k222))
+                Next
+                Dim _gen222_opts As New System.Threading.Tasks.ParallelOptions() With {.MaxDegreeOfParallelism = System.Math.Min(9, _smmDop)}
+                System.Threading.Tasks.Parallel.For(0, 9, _gen222_opts, Sub(k As Integer)
+                    Dim ki As Integer = k \ 3
+                    Dim kj As Integer = k Mod 3
+                    Dim shiftBits As ULong = CULng(ki) * bitsA + CULng(kj) * bitsB
+                    If shiftBits = 0UL Then
+                        ' k=0: no shift; copy prods(0) value into shifted222(0) so the
+                        ' serial reduction below has a uniform API (read from shifted222(k)).
+                        Dim _szP0 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prods(0).Pointer, 4))
+                        Dim _p0Wrap As New mpz_t() With {.Pointer = _shifted222(0)}
+                        PreAllocMpzToLimbs(_p0Wrap, CLng(_szP0) + 2L)
+                        GmpRaw_set(_shifted222(0), prods(0).Pointer)
+                    Else
+                        ' Pre-alloc to (prods(k) size + shift_limbs + 2) limbs.
+                        Dim _szPk As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prods(k).Pointer, 4))
+                        Dim _shiftLimbs As Long = CLng(shiftBits \ 64UL) + 1L
+                        Dim _shWrap As New mpz_t() With {.Pointer = _shifted222(k)}
+                        PreAllocMpzToLimbs(_shWrap, CLng(_szPk) + _shiftLimbs + 2L)
+                        Dim _shiftSrc As IntPtr = prods(k).Pointer
+                        Dim _shiftRem As ULong = shiftBits
+                        While _shiftRem > 0UL
+                            Dim _chunk As UInteger = CUInt(System.Math.Min(_shiftRem, CULng(UInt32.MaxValue)))
+                            GmpRaw_mul_2exp(_shifted222(k), _shiftSrc, _chunk)
+                            _shiftSrc = _shifted222(k)
+                            _shiftRem -= CULng(_chunk)
+                        End While
+                    End If
+                End Sub)
+                If _logLevel >= 2 Then AppendLog($"[SafeMpzMul§222] parallel shift pre-pass complete (DOP={_gen222_opts.MaxDegreeOfParallelism}){vbCrLf}")
+            End If
+
             ' §23/§90: Original per-product accumulation for asymmetric case (mA ≠ mB).
+            ' When §222 is active, the inline shift is REPLACED by a read from _shifted222(k);
+            ' the serial add + all diagnostics are preserved unchanged.
             For k As Integer = 0 To 8
                 Dim ki As Integer = k \ 3
                 Dim kj As Integer = k Mod 3
@@ -3056,22 +3117,36 @@ Public Class Form1
                         AppendLog($"[SafeMpzMul§5B-sub k={k} verifyT] A_{ki}[{_szAi - 1UL:N0}]={_ai5_top:X16} B_{kj}[{_szBj - 1UL:N0}]={_bj5_top2:X16} expHi={_expTopHi:X16} expLo={_expTopLo:X16} expSzProd={_expSzProd:N0} actSzProd={_logPre:N0} actTop={_sp5Top:X16} actTop-1={_sp5Top2:X16} cmpExp={_expTopForCmp:X16} diff(act-exp)={_topDiff:X16}{vbCrLf}")
                     End If
                 End If
+                ' §222 (issue #60): use the parallel-pre-shifted buffer when available.
+                Dim _shiftedForK222 As IntPtr = If(_useS222, _shifted222(k), _sv_shifted_hdr)
                 If shiftBits = 0UL Then
-                    GmpRaw_add(accumPtr, accumPtr, _sv_prod)
+                    ' k=0 has shift=0. When §222 is active, _shifted222(0) holds a COPY of
+                    ' prods(0) (we used GmpRaw_set in the pre-pass); adding it is equivalent
+                    ' to adding _sv_prod directly. When §222 is OFF, fall through to the
+                    ' original direct-add of _sv_prod.
+                    If _useS222 Then
+                        GmpRaw_add(accumPtr, accumPtr, _shifted222(0))
+                    Else
+                        GmpRaw_add(accumPtr, accumPtr, _sv_prod)
+                    End If
                     If _logLevel >= 2 Then
                         Dim _accumSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
                         AppendLog($"[SafeMpzMul§gen] k={k} shift=0 szProd={_logPre:N0} accumSz={_accumSz:N0}{vbCrLf}")
                     End If
                 Else
-                    Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 4, 0)
-                    Dim _shiftSrc As IntPtr = _sv_prod
-                    Dim _shiftRem As ULong = shiftBits
-                    While _shiftRem > 0UL
-                        Dim _chunk As UInteger = CUInt(System.Math.Min(_shiftRem, CULng(UInt32.MaxValue)))
-                        GmpRaw_mul_2exp(_sv_shifted_hdr, _shiftSrc, _chunk)
-                        _shiftSrc = _sv_shifted_hdr
-                        _shiftRem -= CULng(_chunk)
-                    End While
+                    If Not _useS222 Then
+                        ' Original inline shift path — runs when §222 pre-pass was skipped
+                        ' (caller DOP=1 or operand too small to amortise the parallel cost).
+                        Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 4, 0)
+                        Dim _shiftSrc As IntPtr = _sv_prod
+                        Dim _shiftRem As ULong = shiftBits
+                        While _shiftRem > 0UL
+                            Dim _chunk As UInteger = CUInt(System.Math.Min(_shiftRem, CULng(UInt32.MaxValue)))
+                            GmpRaw_mul_2exp(_sv_shifted_hdr, _shiftSrc, _chunk)
+                            _shiftSrc = _sv_shifted_hdr
+                            _shiftRem -= CULng(_chunk)
+                        End While
+                    End If
                     ' §150: q*b pre-add check — verify accum[42779664]=0 before adding k=8.
                     ' Only k=8 (shift=29166668 limbs) can reach position 42779664; no k<8 does.
                     ' A nonzero pre-k8 value would reveal an unexpected earlier sub-product bug.
@@ -3081,9 +3156,9 @@ Public Class Form1
                         Dim _pre150v As Long = If(42779664L < CLng(_pre150sz), Runtime.InteropServices.Marshal.ReadInt64(_pre150DPtr, CInt(42779664L * 8L)), 0L)
                         AppendLog($"[SafeMpzMul§150] pre-k8-add accum[42779664]={_pre150v:X16} (expect 0000000000000000){vbCrLf}")
                     End If
-                    GmpRaw_add(accumPtr, accumPtr, _sv_shifted_hdr)
+                    GmpRaw_add(accumPtr, accumPtr, _shiftedForK222)
                     If _logLevel >= 2 Then
-                        Dim _shiftedSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted_hdr, 4))
+                        Dim _shiftedSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_shiftedForK222, 4))
                         Dim _accumSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
                         AppendLog($"[SafeMpzMul§gen] k={k} shift={shiftBits:N0} szProd={_logPre:N0} szShifted={_shiftedSz:N0} accumSz={_accumSz:N0}{vbCrLf}")
                         ' §111: For the final a*r call only, log accum at the known error position.
@@ -3165,6 +3240,14 @@ Public Class Form1
                 End If
                 GmpRaw_clear(prods(k).Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(prods(k).Pointer)
             Next k
+
+            ' §222 (issue #60): free the 9 parallel-shifted buffers, if used.
+            If _useS222 Then
+                For _k222free As Integer = 0 To 8
+                    GmpRaw_clear(_shifted222(_k222free))
+                    Runtime.InteropServices.Marshal.FreeHGlobal(_shifted222(_k222free))
+                Next
+            End If
         End If
         ' §23: Free the shared buffer once, then re-init shifted with a fresh 1-limb stub
         ' so the final GmpRaw_clear below frees it cleanly without double-freeing _sharedSjBuf.
