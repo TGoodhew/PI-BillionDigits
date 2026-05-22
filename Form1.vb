@@ -2977,10 +2977,16 @@ Public Class Form1
             ' is parallelized. Memory cost: 9 buffers × max-shifted-size ≈ 5.4 GB at 5B,
             ' ~1.1 GB at 1B (well within 64 GB budget).
             '
-            ' Gated on _smmDop > 1: if caller is at DOP=1 (Phase 2 inner) the parallel
-            ' pre-pass would just be 9 serial shifts via Parallel.For overhead — skip and
-            ' fall through to the original inline-shift path.
-            Dim _useS222 As Boolean = (_smmDop > 1) AndAlso (CLng(szA) + CLng(szB) > 1_000_000L)
+            ' Gated on _smmDop > 1 AND szA+szB > 500M limbs: at 1B operand scale
+            ' (szA+szB ~192M for q×b) the per-call overhead of pre-allocating 9 buffers +
+            ' Parallel.For startup × 800+ §gen invocations OUTWEIGHS the parallel-shift gain.
+            ' Measured 2026-05-22: §222 ON at 1M-limb threshold made 1B q×b ~5% slower
+            ' (8m 57s vs 8m 32s baseline). At 5B-scale operands (szA+szB ~500M+) the shift
+            ' cost grows as O(N) while the overhead stays fixed, so the gain dominates per
+            ' the #60 issue body's 5-10% projection. The 500M threshold ensures §222 fires
+            ' only at the top-level a×r / q×b calls in a 5B run (where it pays off) and
+            ' stays inactive at 1B (where it doesn't).
+            Dim _useS222 As Boolean = (_smmDop > 1) AndAlso (CLng(szA) + CLng(szB) > 500_000_000L)
             Dim _shifted222 As IntPtr() = Nothing
             If _useS222 Then
                 _shifted222 = New IntPtr(8) {}
