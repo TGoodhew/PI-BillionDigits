@@ -18,6 +18,7 @@ Imports System.Collections.Concurrent
 Imports System.Runtime.InteropServices
 Imports Math.Gmp.Native
 Imports System.Diagnostics
+Imports System.Security.Cryptography
 
 Public Class Form1
 
@@ -3745,6 +3746,29 @@ Public Class Form1
         Runtime.InteropServices.Marshal.WriteInt32(rop.Pointer, 4, If(opSign < 0, -CInt(newSize), CInt(newSize)))
     End Sub
 
+    ' §230 (issue #81, 2026-05-23): SHA-256 hash of an mpz_t's limb data, used to verify
+    ' divisor identity for the §201-raise exact-scale fast-path.  Streams in 16 MB chunks
+    ' via Marshal.Copy + IncrementalHash so the buffer can exceed Int32 size.  Returns a
+    ' lower-case hex string; signs are not included (only magnitude matters for matching).
+    Private Shared Function ComputeMpzSig(m As mpz_t) As String
+        Dim szLimbs As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(m.Pointer, 4))
+        Dim totalBytes As Long = CLng(szLimbs) * 8L
+        If totalBytes <= 0L Then Return "0000000000000000000000000000000000000000000000000000000000000000"
+        Dim dataPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(m.Pointer, 8))
+        Const CHUNK_BYTES As Integer = 16 * 1024 * 1024   ' 16 MB Marshal.Copy chunks
+        Dim buf(CHUNK_BYTES - 1) As Byte
+        Using inc As IncrementalHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256)
+            Dim offset As Long = 0L
+            Do While offset < totalBytes
+                Dim chunkSize As Integer = CInt(System.Math.Min(CLng(CHUNK_BYTES), totalBytes - offset))
+                Runtime.InteropServices.Marshal.Copy(New IntPtr(dataPtr.ToInt64() + offset), buf, 0, chunkSize)
+                inc.AppendData(buf, 0, chunkSize)
+                offset += CLng(chunkSize)
+            Loop
+            Return Convert.ToHexString(inc.GetHashAndReset()).ToLowerInvariant()
+        End Using
+    End Function
+
     ' Compute r = floor(2^kBits / b) for b > 0, kBits > sizeinbase(b,2).
     ' Newton iteration with progressive precision; r is always an underestimate.
     ' All large multiplications use SafeMpzMul — no direct mpn_mul_fft calls.
@@ -3769,6 +3793,7 @@ Public Class Form1
         ' seed for the new Newton. With prior_rBits worth of correct precision, only ~3-5
         ' iters are needed (vs ~37 from a 1-bit seed via prec doubling).
         Dim _raiseUsed As Boolean = False
+        Dim _exactReuse As Boolean = False   ' §230 (issue #81): set when saved r is bit-identical to the new call's r
         Dim _raisePriorRBits As Long = 0L
         Dim _nrSnapDirRaise As String = System.IO.Path.Combine(DISK_CACHE_DIR, "snap_Phase3")
         Dim _nrRaiseBin As String = System.IO.Path.Combine(_nrSnapDirRaise, "nr_raise.bin")
@@ -3785,6 +3810,43 @@ Public Class Form1
                 If _rmDict.ContainsKey("kBits") AndAlso Long.TryParse(_rmDict("kBits"), _priorKBits) AndAlso
                    _rmDict.ContainsKey("bBits") AndAlso Long.TryParse(_rmDict("bBits"), _priorBBits) AndAlso
                    _rmDict.ContainsKey("rBits") AndAlso Long.TryParse(_rmDict("rBits"), _priorRBits) Then
+                    ' §230 (issue #81, 2026-05-23): exact-scale fast-path.  When the saved r is at
+                    ' the IDENTICAL (kBits, bBits, rBits) AND the divisor b is bit-identical
+                    ' (verified via SHA-256 bSig stored in meta), the saved r is already the
+                    ' correct reciprocal — load it and skip Newton entirely.  Without this
+                    ' fast-path, the pre-§230 ratio check (0.4..0.7) rejects ratio=1.000 and
+                    ' Newton runs from scratch (~30 min at 1B for the post-§225 deterministic
+                    ' Phase 4 reciprocal).  bSig guards against the unlikely case where a
+                    ' different divisor shares the same bit-length: without it, blindly using
+                    ' the saved r would silently produce a wrong reciprocal.
+                    Dim _priorScopeForExact As String = If(_rmDict.ContainsKey("scope"), _rmDict("scope"), "")
+                    Dim _curScopeForExact As String = If(_divCkptScope IsNot Nothing, _divCkptScope, "")
+                    Dim _scopeOkForExact As Boolean = (_priorScopeForExact.StartsWith("sqrt_step_") AndAlso _curScopeForExact.StartsWith("sqrt_step_")) OrElse
+                                                       (_priorScopeForExact.Length > 0 AndAlso _priorScopeForExact = _curScopeForExact)
+                    If _scopeOkForExact AndAlso _priorKBits = kBits AndAlso _priorBBits = bBits AndAlso _priorRBits = rBits AndAlso _rmDict.ContainsKey("bSig") Then
+                        Dim _priorBSig As String = _rmDict("bSig").Trim().ToLowerInvariant()
+                        AppendLog($"[SafeMpzReciprocal§230] exact-scale match candidate (scope={_priorScopeForExact} kBits={kBits:N0} bBits={bBits:N0} rBits={rBits:N0}); verifying bSig{vbCrLf}")
+                        Dim _t230Start As Long = System.Diagnostics.Stopwatch.GetTimestamp()
+                        Dim _curBSig As String = ComputeMpzSig(b)
+                        Dim _t230SigSec As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _t230Start) / System.Diagnostics.Stopwatch.Frequency
+                        If _curBSig = _priorBSig Then
+                            ' bSig confirms saved r is for THIS exact b — load r and signal the
+                            ' downstream §NR-ckpt + Newton gates to short-circuit (no Newton work).
+                            Dim _staging230(4194303) As Byte
+                            Using _fs230 As New FileStream(_nrRaiseBin, FileMode.Open, FileAccess.Read)
+                                Using _br230 As New BinaryReader(_fs230)
+                                    DeserializeOneMpz(r, _br230, _staging230)
+                                End Using
+                            End Using
+                            _raiseUsed = True
+                            _exactReuse = True
+                            _raisePriorRBits = _priorRBits
+                            AppendLog($"[SafeMpzReciprocal§230] EXACT-REUSE: bSig verified in {_t230SigSec:F2}s; loaded saved r directly — Newton skipped{vbCrLf}")
+                        Else
+                            AppendLog($"[SafeMpzReciprocal§230] bSig mismatch after {_t230SigSec:F2}s (cur={_curBSig.Substring(0, 16)}... prior={_priorBSig.Substring(0, System.Math.Min(16, _priorBSig.Length))}...) — falling through to existing §201-raise logic{vbCrLf}")
+                        End If
+                    End If
+
                     ' §225 (issue #80, 2026-05-22): scope-compatibility gate.
                     ' Pre-§225 the kBits ratio check alone was used, on the assumption that
                     ' the saved r came from a structurally similar divisor. That assumption
@@ -3881,7 +3943,9 @@ Public Class Form1
         Dim _resumedIter As Long = 0L  ' §200: iter count from a resumed §NR-ckpt; 0 if no resume
         ' §NR-ckpt match check (_snapKBits=kBits) takes precedence over §201-raise when both
         ' apply: a matching mid-Newton snapshot is more recent than any prior-scale raise.
-        If _autoCheckpoint AndAlso System.IO.File.Exists(_nrBin) AndAlso System.IO.File.Exists(_nrMeta) Then
+        ' §230: an exact-reuse load above already gives r at full precision — skip §NR-ckpt
+        ' resume entirely (it would overwrite the loaded r with a mid-Newton snapshot).
+        If Not _exactReuse AndAlso _autoCheckpoint AndAlso System.IO.File.Exists(_nrBin) AndAlso System.IO.File.Exists(_nrMeta) Then
             Try
                 Dim _metaLines As String() = System.IO.File.ReadAllLines(_nrMeta)
                 Dim _meta As New Dictionary(Of String, String)()
@@ -3940,7 +4004,8 @@ Public Class Form1
         ' headroom (covers seed scaling rounding + convergence slack).  Without raising,
         ' the seed has only 1 bit of precision, so log2(rBits)+3 iters are required.
         Dim _minNrIters As Integer = If(_raiseUsed, 5, CInt(System.Math.Ceiling(System.Math.Log(System.Math.Max(2L, rBits), 2))) + 3)
-        Do While prec < rBits + 2L OrElse _nrIter < _minNrIters
+        ' §230: exact-reuse loaded r at full precision — skip the Newton loop body entirely.
+        Do While Not _exactReuse AndAlso (prec < rBits + 2L OrElse _nrIter < _minNrIters)
             _nrIter += 1
             prec = System.Math.Min(prec * 2L + 4L, rBits + 2L)
 
@@ -4191,11 +4256,18 @@ Public Class Form1
                 ' §225 (issue #80): write _divCkptScope so the next call can verify the
                 ' saved r is for a compatible divisor family (sqrt_step_* across consecutive
                 ' steps; same scope otherwise).
+                ' §230 (issue #81): also write SHA-256 bSig of b's limbs so the next call's
+                ' exact-scale fast-path can verify the saved r is for the IDENTICAL divisor
+                ' before bypassing Newton.  Old meta files without bSig: §230 fast-path
+                ' won't fire (safe — falls through to existing §201-raise logic).
                 Dim _saveScope As String = If(_divCkptScope IsNot Nothing, _divCkptScope, "")
+                Dim _t230SigStart As Long = System.Diagnostics.Stopwatch.GetTimestamp()
+                Dim _saveBSig As String = ComputeMpzSig(b)
+                Dim _t230SigSaveSec As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _t230SigStart) / System.Diagnostics.Stopwatch.Frequency
                 System.IO.File.WriteAllText(_nrRaiseMeta,
-                    $"kBits={kBits}{vbLf}bBits={bBits}{vbLf}rBits={rBits}{vbLf}scope={_saveScope}{vbLf}")
+                    $"kBits={kBits}{vbLf}bBits={bBits}{vbLf}rBits={rBits}{vbLf}scope={_saveScope}{vbLf}bSig={_saveBSig}{vbLf}")
                 BackupSnapshotToStore("snap_Phase3")
-                AppendLog($"[SafeMpzReciprocal] §201-raise: saved converged r (scope={_saveScope} kBits={kBits:N0} bBits={bBits:N0} rBits={rBits:N0}) for future raise{vbCrLf}")
+                AppendLog($"[SafeMpzReciprocal] §201-raise: saved converged r (scope={_saveScope} kBits={kBits:N0} bBits={bBits:N0} rBits={rBits:N0} bSig={_saveBSig.Substring(0, 16)}... computed in {_t230SigSaveSec:F2}s) for future raise{vbCrLf}")
             Catch _ex As Exception
                 AppendLog($"[SafeMpzReciprocal] §201-raise save failed: {_ex.Message}{vbCrLf}")
             End Try

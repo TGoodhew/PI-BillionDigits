@@ -5151,3 +5151,76 @@ CPU samples spanning the run:
 absolute terms but on the Phase 3 critical path between SafeMpzSqrt
 completion and the dominant Newton-recip phase.
 
+## §230 — §201-raise exact-scale reuse (2026-05-23, issue #81)
+
+§201-raise (SafeMpzReciprocal seed via saved prior r + scale-up shift)
+rejected `ratio = priorKBits / newKBits == 1.000` because the code
+was designed for scale-up only.  Discovered during §229 validation:
+when a 1 B re-run targets the IDENTICAL divisor as the prior saved
+state (gmpDenom is deterministic from digit count), the prior r is
+already exactly correct — no Newton iterations needed.  Pre-§230 the
+ratio check rejected and Newton ran from scratch (~25-30 min wasted).
+
+### Fix
+
+Add a fast-path at the top of the §201-raise load block: when
+`(priorKBits, priorBBits, priorRBits) == (kBits, bBits, rBits)` AND
+the divisor signature matches, load r directly from `nr_raise.bin`
+and bypass the entire Newton loop + §NR-ckpt resume path.
+
+A SHA-256 hash of the divisor's limb data (`bSig`) is now written to
+`nr_raise_meta.txt` at every §201-raise save, and verified on load.
+Without bSig (old meta files), the fast-path doesn't fire — old
+saves stay safe under the existing scale-up logic.
+
+```vb
+' New helper (Form1.vb:~3637-3660)
+Function ComputeMpzSig(m As mpz_t) As String
+    ' SHA-256 of m's limb data via IncrementalHash + Marshal.Copy in 16 MB chunks
+End Function
+
+' Load-side fast-path (Form1.vb:~3795-3825)
+If _scopeOk AndAlso priorKBits = kBits AndAlso priorBBits = bBits AndAlso _
+   priorRBits = rBits AndAlso meta.ContainsKey("bSig") Then
+    If ComputeMpzSig(b) = meta("bSig") Then
+        LoadR; _raiseUsed = True; _exactReuse = True
+        ' §NR-ckpt resume + Newton loop body gated on Not _exactReuse below
+    End If
+End If
+
+' Save-side meta update (Form1.vb:~4265)
+WriteAllText(nrRaiseMeta,
+    $"kBits={kBits}{LF}bBits={bBits}{LF}rBits={rBits}{LF}scope={scope}{LF}bSig={ComputeMpzSig(b)}{LF}")
+```
+
+### bSig cost
+
+`ComputeMpzSig` streams the divisor's limbs through SHA-256 in 16 MB
+Marshal.Copy chunks: ~1 GB throughput on Debug build → ~1 s at 1 B
+(140 M-limb b ≈ 1.1 GB), ~5 s at 5 B (~500 M-limb b ≈ 4 GB).
+Negligible vs the 25-30 min Newton it replaces when the fast-path
+fires; one-time cost on the slow path.
+
+### Gates on `_exactReuse`
+
+- §NR-ckpt resume block guarded with `If Not _exactReuse Then ...`:
+  prevents the resume from overwriting the loaded full-precision r
+  with a mid-Newton snapshot.
+- Newton loop condition: `Do While Not _exactReuse AndAlso (prec <
+  rBits + 2 OrElse _nrIter < _minNrIters)` — loop is skipped
+  entirely when exact-reuse fires.
+- bTrunc/rSq/p init + mpz_clears stay outside the gates (cheap, and
+  required for symmetric cleanup in either path).
+- Save block at the bottom still runs (idempotent overwrite with
+  identical content + same bSig).
+
+### Expected impact
+
+For validation re-runs that re-use a deterministic-divisor saved r
+(the common case for #72 Phase 4 testing): ~25-30 min saved at 1 B,
+proportionally more at 5 B (~3-6 h saved when re-validating a 5 B
+post-recip change).  Doesn't affect fresh first runs (no saved r
+yet) or scale-up §201-raise (still uses the existing 0.4 < ratio <
+0.7 path).
+
+
