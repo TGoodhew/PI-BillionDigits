@@ -6784,6 +6784,176 @@ Phase2:
     End Sub
 
     ' ════════════════════════════════════════════════════════════════════════
+    '  §226: Parallel recursive-halving decimal conversion (issue #37)
+    ' ════════════════════════════════════════════════════════════════════════
+    ' Replaces the strictly-sequential §216 chunked converter (and GMP's serial
+    ' internal mpz_get_str) with a parallel binary-tree halving:
+    '
+    '   ParallelBase10(n, digits, outBuf, offset):
+    '     if digits <= LEAF: outBuf[offset..] = mpz_get_str(n), left-padded with '0'
+    '     else:
+    '       D = 10^(digits/2)         ' from pre-built power table
+    '       (hi, lo) = mpz_fdiv_qr(n, D)
+    '       Parallel.Invoke(
+    '         HalveBase10(hi, hiDigits, outBuf, offset),
+    '         HalveBase10(lo, halfDigits, outBuf, offset + hiDigits))
+    '
+    ' Key design points:
+    '   * Power-of-10 table pre-built sequentially before any recursion fires.
+    '     Sizes determined by walking the recursion tree (≤ log2(digits/LEAF)
+    '     distinct powers).
+    '   * Critical path = one fdiv_qr per level, sizes halving each level.
+    '     Wall ≈ 2 × top-level-fdiv_qr (geometric series).
+    '   * Each non-leaf node allocates its own hi/lo mpz_t — no shared mutable
+    '     state during parallel recursion.  Power table is read-only.
+    '   * PreAllocMpzToLimbs on hi/lo bypasses GMP's 33.5M-limb realloc abort
+    '     for large operands (same hazard as §216a / §218 / §225).
+    '   * outBuf is written left-to-right; each leaf knows its absolute offset.
+    '     No final memmove needed (unlike §216's right-to-left strategy).
+    '   * Verification: byte-identical output to GMP's mpz_get_str / §216
+    '     chunked path.  Validated at 1B against the 2026-05-22 post-§225
+    '     verified pi_digits.txt.
+    Private Sub ParallelMpzGetStr(pi As mpz_t, totalDigitsEstimate As Long)
+        Const LEAF_THRESHOLD As Long = 50_000_000L
+
+        Dim _t0 As DateTime = DateTime.Now
+        AppendLog($"[§226] Parallel decimal conversion start: totalDigitsEstimate={totalDigitsEstimate:N0} leaf={LEAF_THRESHOLD:N0}{vbCrLf}")
+
+        ' Allocate output buffer (totalDigits + 16 slack; null terminator at end).
+        Dim bufSize As Long = totalDigitsEstimate + 16L
+        Dim outBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(bufSize)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
+        If outBuf = IntPtr.Zero Then
+            Throw New OutOfMemoryException($"§226: VirtualAlloc {bufSize:N0} bytes failed")
+        End If
+        AppendLog($"[§226] Output buffer: {bufSize:N0} bytes at 0x{outBuf.ToInt64():X16}{vbCrLf}")
+
+        ' Actual digit count (mpz_sizeinbase over-estimates by 1 at most).
+        Dim actualDigits As Long = CLng(gmp_lib.mpz_sizeinbase(pi, 10UI))
+
+        ' Walk the recursion tree to collect the unique D-sizes (10^halfDigits at each
+        ' non-leaf node).  Worklist holds digit counts still to explore.
+        Dim neededD As New System.Collections.Generic.HashSet(Of Long)()
+        Dim seen As New System.Collections.Generic.HashSet(Of Long)()
+        Dim work As New System.Collections.Generic.Queue(Of Long)()
+        seen.Add(actualDigits)
+        work.Enqueue(actualDigits)
+        While work.Count > 0
+            Dim d As Long = work.Dequeue()
+            If d <= LEAF_THRESHOLD Then Continue While
+            Dim halfD As Long = d \ 2
+            Dim hiD As Long = d - halfD
+            neededD.Add(halfD)
+            If seen.Add(halfD) Then work.Enqueue(halfD)
+            If seen.Add(hiD) Then work.Enqueue(hiD)
+        End While
+        Dim _ordered As List(Of Long) = neededD.OrderBy(Function(x) x).ToList()
+        AppendLog($"[§226] Powers-of-10 needed: {_ordered.Count} sizes ({String.Join(", ", _ordered)}){vbCrLf}")
+
+        ' Compute each 10^k sequentially (mpz_ui_pow_ui's internal squaring already
+        ' competes with itself for FFT scratch).  Cost dominated by the largest power.
+        Dim powTable As New System.Collections.Generic.Dictionary(Of Long, IntPtr)()
+        For Each k As Long In _ordered
+            Dim _kt As DateTime = DateTime.Now
+            Dim m As New mpz_t()
+            gmp_lib.mpz_init(m)
+            gmp_lib.mpz_ui_pow_ui(m, 10UI, CUInt(k))
+            powTable(k) = m.Pointer
+            AppendLog($"[§226] 10^{k:N0} computed in {(DateTime.Now - _kt).TotalSeconds:F1}s{vbCrLf}")
+        Next
+        Dim _powElapsed As Double = (DateTime.Now - _t0).TotalSeconds
+        AppendLog($"[§226] Power table done in {_powElapsed:F1}s total{vbCrLf}")
+
+        ' Working copy of pi so we can free the caller's buffer pre-conversion.
+        ' §216a/d pattern: PreAlloc + mpz_set, then free pi + reinit to stub.
+        Dim piCopy As New mpz_t()
+        gmp_lib.mpz_init(piCopy)
+        Dim _piSrcSize As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(pi.Pointer, 4)))
+        PreAllocMpzToLimbs(piCopy, _piSrcSize + 2L)
+        gmp_lib.mpz_set(piCopy, pi)
+        gmp_lib.mpz_clear(pi)
+        gmp_lib.mpz_init(pi)
+        AppendLog($"[§226] piCopy made ({(_piSrcSize * 8L / 1048576L):N0} MB); caller pi freed{vbCrLf}")
+
+        ' Recursive halving — writes exactly actualDigits chars at outBuf[0..actualDigits].
+        Dim _convStart As DateTime = DateTime.Now
+        HalveBase10(piCopy, actualDigits, outBuf, 0L, powTable, LEAF_THRESHOLD)
+        Dim _convElapsed As Double = (DateTime.Now - _convStart).TotalSeconds
+        AppendLog($"[§226] Recursive halving done in {_convElapsed:F1}s{vbCrLf}")
+
+        ' Null terminator at end of digits.
+        Runtime.InteropServices.Marshal.WriteByte(New IntPtr(outBuf.ToInt64() + actualDigits), CByte(0))
+
+        ' Clean up power table + piCopy.
+        For Each kv As KeyValuePair(Of Long, IntPtr) In powTable
+            Dim mTmp As New mpz_t()
+            mTmp.Pointer = kv.Value
+            gmp_lib.mpz_clear(mTmp)
+        Next
+        gmp_lib.mpz_clear(piCopy)
+
+        ' Display state for downstream code (WritePiDigitsToFile, autoVerify).
+        _displayNativePtr = outBuf
+        _displayNativeLen = actualDigits + 1L
+        _displayNativeBufSize = bufSize
+
+        Dim _totalElapsed As Double = (DateTime.Now - _t0).TotalSeconds
+        AppendLog($"[§226] Parallel decimal conversion complete: {actualDigits:N0} digits in {_totalElapsed:F2}s (powTable={_powElapsed:F1}s + convert={_convElapsed:F1}s){vbCrLf}")
+    End Sub
+
+    ' §226 helper: recursive halving.  Writes exactly `digits` chars to outBuf[offset..],
+    ' zero-padding if n's actual decimal length is < digits (low-half slots of parents).
+    ' Thread-safe re-entrant: each call has its own hi/lo; powTable is read-only.
+    Private Shared Sub HalveBase10(n As mpz_t, digits As Long, outBuf As IntPtr, offset As Long, powTable As System.Collections.Generic.Dictionary(Of Long, IntPtr), leafThreshold As Long)
+        If digits <= leafThreshold Then
+            ' Leaf: serial mpz_get_str + write with leading-zero padding.
+            Dim charPtr As char_ptr = gmp_lib.mpz_get_str(char_ptr.Zero, 10, n)
+            Dim chunkLen As Long = CLng(strlen(charPtr.Pointer).ToUInt64())
+            Dim zeroPad As Long = digits - chunkLen
+            If zeroPad < 0L Then
+                Throw New InvalidOperationException($"§226 leaf: chunkLen={chunkLen} > digits={digits} at offset={offset:N0} — power-of-10 split inconsistency")
+            End If
+            If zeroPad > 0L Then
+                Dim _padDest As Long = outBuf.ToInt64() + offset
+                For i As Long = 0L To zeroPad - 1L
+                    Runtime.InteropServices.Marshal.WriteByte(New IntPtr(_padDest + i), CByte(48))   ' '0' = 0x30
+                Next
+            End If
+            CopyMemory(New IntPtr(outBuf.ToInt64() + offset + zeroPad), charPtr.Pointer, New UIntPtr(CULng(chunkLen)))
+            GmpNativeAlloc_FreeRaw(charPtr.Pointer, chunkLen + 1L)
+            Return
+        End If
+
+        ' Non-leaf: split via D = 10^halfDigits.  hi gets the top `hiDigits` chars (offset),
+        ' lo gets the bottom `halfDigits` chars (offset + hiDigits).
+        Dim halfDigits As Long = digits \ 2
+        Dim hiDigits As Long = digits - halfDigits
+        Dim dPtr As IntPtr = powTable(halfDigits)
+
+        Dim hi As New mpz_t()
+        Dim lo As New mpz_t()
+        gmp_lib.mpz_init(hi)
+        gmp_lib.mpz_init(lo)
+
+        ' PreAlloc to bypass GMP's 33.5M-limb realloc abort (§216a/§218 hazard).
+        Dim _nSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(n.Pointer, 4)))
+        PreAllocMpzToLimbs(hi, _nSz + 2L)
+        Dim _dSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(dPtr, 4)))
+        PreAllocMpzToLimbs(lo, _dSz + 2L)
+
+        Dim _dWrap As New mpz_t()
+        _dWrap.Pointer = dPtr
+        gmp_lib.mpz_fdiv_qr(hi, lo, n, _dWrap)
+
+        ' Parallel.Invoke is synchronous — both sub-calls finish before we hit mpz_clear.
+        System.Threading.Tasks.Parallel.Invoke(
+            Sub() HalveBase10(hi, hiDigits, outBuf, offset, powTable, leafThreshold),
+            Sub() HalveBase10(lo, halfDigits, outBuf, offset + hiDigits, powTable, leafThreshold))
+
+        gmp_lib.mpz_clear(hi)
+        gmp_lib.mpz_clear(lo)
+    End Sub
+
+    ' ════════════════════════════════════════════════════════════════════════
     '  Main computation entry point
     ' ════════════════════════════════════════════════════════════════════════
 
@@ -7832,10 +8002,19 @@ NumeratorDone:
             Dim _strConvSw As New Diagnostics.Stopwatch()
             _strConvSw.Start()
             Try
+                ' §226 (issue #37, 2026-05-22): route to parallel recursive-halving
+                ' converter for digits >= 100M (≈ minimum size where the recursion
+                ' tree has enough depth to amortize the power-of-10 precompute
+                ' against parallel fan-out gains).  Above 1.5B, §216 chunked path
+                ' remains as conservative fallback until §226 is 5B-validated.
                 If _piDigitsEstimate >= 1_500_000_000L Then
                     WriteToLog($"[ComputePi§216] Routing to chunked decimal converter (digits~={_piDigitsEstimate:N0} >= 1.5B threshold){vbCrLf}")
                     ChunkedMpzGetStr(gmpPi, _piDigitsEstimate)   ' sets _displayNativePtr, _displayNativeLen, _displayNativeBufSize
                     _usedChunkedPath = True
+                ElseIf _piDigitsEstimate >= 100_000_000L Then
+                    WriteToLog($"[ComputePi§226] Routing to parallel decimal converter (digits~={_piDigitsEstimate:N0} >= 100M threshold){vbCrLf}")
+                    ParallelMpzGetStr(gmpPi, _piDigitsEstimate)   ' sets _displayNativePtr, _displayNativeLen, _displayNativeBufSize
+                    _usedChunkedPath = True   ' reuse same downstream flag (display state already set)
                 Else
                     piCharPtr = gmp_lib.mpz_get_str(char_ptr.Zero, 10, gmpPi)
                 End If

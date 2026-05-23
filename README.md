@@ -4777,3 +4777,70 @@ Forensic state preserved at
 post-failure `OutputDir`, ~16 GB).  The §171-ckpt'd `div_q.bin` from
 the failed run is deleted on restart so phase4 re-runs the reciprocal
 under the fixed gate.
+
+## §226 — Parallel recursive-halving decimal converter (2026-05-22, issue #37)
+
+Replaces GMP's serial `mpz_get_str` (and §216's strictly-sequential
+chunked workaround) with a parallel binary-tree halving:
+
+```
+HalveBase10(n, digits, outBuf, offset):
+    if digits <= LEAF: outBuf[offset..] = mpz_get_str(n), left-padded
+    else:
+        D = 10^(digits/2)                    ' from pre-built power table
+        (hi, lo) = mpz_fdiv_qr(n, D)
+        Parallel.Invoke(
+            HalveBase10(hi, hiDigits, outBuf, offset),
+            HalveBase10(lo, halfDigits, outBuf, offset + hiDigits))
+```
+
+Per-call structure:
+- Power-of-10 cache pre-built sequentially before recursion fires.
+  Sizes determined by walking the recursion tree; for 1B with
+  `LEAF=50M` that's `{500M, 250M, 125M, 62M, 31M}` (5 powers,
+  total precompute 8.0 s — `mpz_ui_pow_ui` is much faster than the
+  pessimistic FFT-scaling estimate suggested).
+- Critical path = one `mpz_fdiv_qr` per recursion level, sizes
+  halving each level.  Wall ≈ sum over levels = ~ 2 × top-level
+  `fdiv_qr` time.
+- Each non-leaf allocates its own `hi`/`lo`; power table is read-only
+  during parallel execution.  No cross-thread synchronization needed.
+- `PreAllocMpzToLimbs` on `hi`/`lo` bypasses GMP's 33.5 M-limb realloc
+  abort (same hazard pattern as §216a / §218 / §225).
+- `outBuf` is written left-to-right; each leaf knows its absolute
+  offset from the recursion path.  Eliminates §216's final memmove.
+
+Implementation at [Form1.vb:6787-6900](Form1.vb#L6787-L6900) plus
+the recursive helper at [Form1.vb:6902-6957](Form1.vb#L6902-L6957).
+Routing at [Form1.vb:~7840-7860](Form1.vb#L7840-L7860): digits ≥ 100 M
+goes to §226, digits ≥ 1.5 B falls through to §216 as a conservative
+fallback until §226 is 5B-validated.
+
+### Validation (2026-05-22 ~21:07)
+
+- Resumed from §piCkpt'd `gmpPi.bin` (post-§225 verified 1 B-digit
+  state) — converter ran in isolation, no other compute.
+- Output: `pi_digits.txt`, 1,000,000,003 bytes, **SHA-256 identical** to
+  the §216 / GMP-`mpz_get_str` 2026-05-22 20:28 verified file
+  (`b153e8d5…6d9b`).
+- All three known-position markers PASS: `999999@762`,
+  `777777777@24,658,601`, `999999999@564,665,206`.
+
+### Measurement
+
+| Phase | Time |
+|---|---|
+| Power table (5 powers, 31M → 500M) | 8.0 s |
+| Recursive halving (5 levels, ~16 leaf conversions in parallel) | 68.6 s |
+| **§226 total** | **76.75 s** |
+| GMP serial baseline (same input via `mpz_get_str`) | 223.8 s |
+| **Speedup at 1B** | **2.92×** |
+
+### 5B projection
+
+Power table at 5B scales near-linearly with digit count: ~40 s.
+Recursive halving critical path scales ~N log N: 5× input → ~7-8×
+wall ≈ 8-10 min.  Total §226 at 5B ≈ 10 min vs. §216 serial
+~2-4 h ≈ **15-25× speedup**.  Validates with the same `gmpPi.bin`
+pattern (any §piCkpt'd 5B run gives a one-shot ~10-min validation
+cycle).
