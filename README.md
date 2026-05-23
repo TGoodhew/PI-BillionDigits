@@ -4704,3 +4704,76 @@ Exercised in-line with the §218 1B validation run; the post-run topN
 will report the new `GC.RunFinalizers` excl% for direct comparison
 against the pre-§219 1B baseline (`traces/20260520_012506_cpu_1000000000d/`
 in local-only `traces/` per the gitignore).
+
+## §225 — §201-raise scope-compatibility gate (2026-05-22, issue #80)
+
+The 2026-05-22 fresh-1B cumulative-validation run on ParaPerf hit a
+latent bug in `§201-raise` exposed for the first time at the
+`sqrt-Newton → phase4` transition.  Phase 4's final pi division
+(`SafeMpzDiv(gmpPi, gmpNumer, finalT)`, scope `"phase4"`) calls
+`SafeMpzReciprocal` with a divisor `finalT = T·√N` that is structurally
+unrelated to the sqrt-Newton divisor `xTrunc`.  §201-raise saw a saved
+`nr_raise.bin` from the previous sqrt step (kBits = 6.64 B, ratio
+6.64 / 12.29 ≈ 0.54 → inside the existing `(0.4, 0.7)` gate), loaded it
+as a seed, and exited Newton at iter 5 per the `_minNrIters = 5`
+shortcut.  The 5 iters were nowhere near enough to converge from a
+wrong-divisor seed.
+
+Failure cascade:
+
+1. `SafeMpzReciprocal` returns a wrong r.
+2. `a × r` and the post-shift quotient `q` are correspondingly wrong.
+3. `adj-up` exceeds `MAX_ADJ_ITERS = 10` and enters the §218 + §171
+   correction path.
+4. §218 normalization shifts both rem and b by 30 bits correctly.
+5. §171 single-limb correction (post-normalization) reduces `szRem` by
+   **exactly 1 limb per pass** because the single-limb estimate `delta =
+   floor(remTop / (bTop+1))` is tight on the high limb but the underlying
+   reciprocal is so wrong that the product `delta × b` is barely smaller
+   than `rem`.  At a 52 M-limb gap this would need 52 M passes — the
+   `_171Pass > 64` hard cap would have thrown
+   `SafeMpzDiv §171 failed to converge in 64 passes` ~30 min in.
+
+Root cause: the §201-raise gate at [Form1.vb:3677](Form1.vb#L3677)
+checked only the `kBits` ratio.  It assumed the saved r came from a
+structurally similar divisor — true between consecutive sqrt-Newton
+steps (where `xTrunc` only changes in its low-precision bits, so
+1/xTrunc is close to the prior 1/xTrunc), false across the
+`sqrt → phase4` transition.
+
+Fix: **scope-compatibility gate**.  `nr_raise_meta.txt` now also stores
+`_divCkptScope` (the same scope label used by §171-ckpt).  §201-raise
+accepts the saved seed only if scopes are compatible:
+
+- Both saved and current scope match the family `sqrt_step_*` — the
+  legitimate warm-seed inheritance across sqrt-Newton steps.
+- Otherwise scopes must be exactly equal.
+
+A mismatch logs `[SafeMpzReciprocal§225] scope mismatch …` and
+deletes the stale `nr_raise.bin` + `nr_raise_meta.txt` so future calls
+don't repeat the check.  Save and load implementation at
+[Form1.vb:3676-3713](Form1.vb#L3676-L3713) and
+[Form1.vb:4080-4087](Form1.vb#L4080-L4087).
+
+Why this is the right place to gate: `§201-raise` was designed
+specifically for the sqrt-Newton outer loop, where each step's
+converged r is provably close to the next step's true reciprocal.
+Outside that context the design contract is violated — `phase4`'s
+divisor is unrelated to any sqrt step's divisor, and the same applies
+to any future `SafeMpzDiv` caller that doesn't inherit a smoothly
+evolving divisor.
+
+Cost of the fix when it kicks in: phase4's reciprocal runs the full
+§200 min-iter count (`ceil(log2(rBits))+3 ≈ 35` iters) from a fresh
+64-bit seed instead of 5 iters from a wrong seed.  At kBits = 12.29 B
+this is ~30 extra early-iter passes that double prec from 1 bit up to
+~2 B bits — all cheap; the expensive iters at full precision happen
+either way.  Net: ~5-10 min added to phase4 reciprocal vs. the
+fraudulently-fast 5-iter §201-raise path, but the result is **correct**
+instead of corrupt.
+
+Forensic state preserved at
+`C:\PiPreserved_1B_freshtest_201raise_bug_2026-05-22\` (full
+post-failure `OutputDir`, ~16 GB).  The §171-ckpt'd `div_q.bin` from
+the failed run is deleted on restart so phase4 re-runs the reciprocal
+under the fixed gate.

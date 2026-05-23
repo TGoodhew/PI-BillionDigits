@@ -3673,8 +3673,23 @@ Public Class Form1
                 If _rmDict.ContainsKey("kBits") AndAlso Long.TryParse(_rmDict("kBits"), _priorKBits) AndAlso
                    _rmDict.ContainsKey("bBits") AndAlso Long.TryParse(_rmDict("bBits"), _priorBBits) AndAlso
                    _rmDict.ContainsKey("rBits") AndAlso Long.TryParse(_rmDict("rBits"), _priorRBits) Then
+                    ' §225 (issue #80, 2026-05-22): scope-compatibility gate.
+                    ' Pre-§225 the kBits ratio check alone was used, on the assumption that
+                    ' the saved r came from a structurally similar divisor. That assumption
+                    ' holds between consecutive sqrt-Newton steps (xTrunc only changes in
+                    ' low-precision bits across step transitions), but FAILS across the
+                    ' sqrt-Newton → phase4 transition: phase4's finalT = T·sqrt(N) is
+                    ' structurally unrelated to xTrunc, so the loaded r is garbage as a
+                    ' seed and the §201-raise _minNrIters=5 override (vs §200's ~35) leaves
+                    ' Newton far short of converged. Empirical: 1B run 2026-05-22 produced
+                    ' a wrong r at phase4 → adj-up hit MAX_ADJ_ITERS → §218+§171 entered →
+                    ' §171 grind at Δ=1 limb/pass would have throw at 64-pass hard cap.
+                    Dim _priorScope As String = If(_rmDict.ContainsKey("scope"), _rmDict("scope"), "")
+                    Dim _curScope As String = If(_divCkptScope IsNot Nothing, _divCkptScope, "")
+                    Dim _scopeOk As Boolean = (_priorScope.StartsWith("sqrt_step_") AndAlso _curScope.StartsWith("sqrt_step_")) OrElse
+                                              (_priorScope.Length > 0 AndAlso _priorScope = _curScope)
                     Dim _ratio As Double = If(kBits > 0L, CDbl(_priorKBits) / CDbl(kBits), 0.0)
-                    If _ratio > 0.4 AndAlso _ratio < 0.7 AndAlso _priorRBits > 0L AndAlso _priorRBits < rBits Then
+                    If _scopeOk AndAlso _ratio > 0.4 AndAlso _ratio < 0.7 AndAlso _priorRBits > 0L AndAlso _priorRBits < rBits Then
                         Dim _staging(4194303) As Byte
                         Using _fs As New FileStream(_nrRaiseBin, FileMode.Open, FileAccess.Read)
                             Using _br As New BinaryReader(_fs)
@@ -3685,11 +3700,21 @@ Public Class Form1
                         If _scaleShift > 0L Then
                             BigShiftLeft(r, r, _scaleShift)
                         End If
-                        AppendLog($"[SafeMpzReciprocal] §201-raise: loaded prior r (priorKBits={_priorKBits:N0} priorRBits={_priorRBits:N0}), scaled by 2^{_scaleShift:N0} → seed for Newton (kBits={kBits:N0} rBits={rBits:N0}){vbCrLf}")
+                        AppendLog($"[SafeMpzReciprocal] §201-raise: loaded prior r (priorScope={_priorScope} priorKBits={_priorKBits:N0} priorRBits={_priorRBits:N0}), scaled by 2^{_scaleShift:N0} → seed for Newton (curScope={_curScope} kBits={kBits:N0} rBits={rBits:N0}){vbCrLf}")
                         _raiseUsed = True
                         _raisePriorRBits = _priorRBits
+                    ElseIf Not _scopeOk Then
+                        ' §225: scope mismatch — saved r is for a different divisor family.
+                        ' Discard the stale file so future calls don't trip the same check.
+                        AppendLog($"[SafeMpzReciprocal§225] scope mismatch — skipping §201-raise and deleting stale nr_raise.bin (priorScope='{_priorScope}' curScope='{_curScope}' priorKBits={_priorKBits:N0} newKBits={kBits:N0}){vbCrLf}")
+                        Try
+                            System.IO.File.Delete(_nrRaiseBin)
+                            System.IO.File.Delete(_nrRaiseMeta)
+                        Catch _exDel As Exception
+                            AppendLog($"[SafeMpzReciprocal§225] stale-file delete failed ({_exDel.Message}) — will retry on next call{vbCrLf}")
+                        End Try
                     Else
-                        AppendLog($"[SafeMpzReciprocal] §201-raise: prior found but ratio={_ratio:F3} or rBits mismatch — skipping raise (priorKBits={_priorKBits:N0} priorRBits={_priorRBits:N0} newKBits={kBits:N0} newRBits={rBits:N0}){vbCrLf}")
+                        AppendLog($"[SafeMpzReciprocal] §201-raise: prior found but ratio={_ratio:F3} or rBits mismatch — skipping raise (priorScope={_priorScope} priorKBits={_priorKBits:N0} priorRBits={_priorRBits:N0} newKBits={kBits:N0} newRBits={rBits:N0}){vbCrLf}")
                     End If
                 End If
             Catch _ex As Exception
@@ -4051,10 +4076,14 @@ Public Class Form1
                         SerializeOneMpz(r, _bw, _raiseSaveStaging)
                     End Using
                 End Using
+                ' §225 (issue #80): write _divCkptScope so the next call can verify the
+                ' saved r is for a compatible divisor family (sqrt_step_* across consecutive
+                ' steps; same scope otherwise).
+                Dim _saveScope As String = If(_divCkptScope IsNot Nothing, _divCkptScope, "")
                 System.IO.File.WriteAllText(_nrRaiseMeta,
-                    $"kBits={kBits}{vbLf}bBits={bBits}{vbLf}rBits={rBits}{vbLf}")
+                    $"kBits={kBits}{vbLf}bBits={bBits}{vbLf}rBits={rBits}{vbLf}scope={_saveScope}{vbLf}")
                 BackupSnapshotToStore("snap_Phase3")
-                AppendLog($"[SafeMpzReciprocal] §201-raise: saved converged r (kBits={kBits:N0} bBits={bBits:N0} rBits={rBits:N0}) for future raise{vbCrLf}")
+                AppendLog($"[SafeMpzReciprocal] §201-raise: saved converged r (scope={_saveScope} kBits={kBits:N0} bBits={bBits:N0} rBits={rBits:N0}) for future raise{vbCrLf}")
             Catch _ex As Exception
                 AppendLog($"[SafeMpzReciprocal] §201-raise save failed: {_ex.Message}{vbCrLf}")
             End Try
