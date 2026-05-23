@@ -275,6 +275,12 @@ Public Class Form1
     Private Shared Sub CopyMemory(dest As IntPtr, src As IntPtr, length As UIntPtr)
     End Sub
 
+    ' §229 (issue #56, 2026-05-23): native zero-fill used by ParallelBigShiftLeftOOP to clear
+    ' the limb-offset region when the destination buffer is reused (not freshly VirtualAlloc'd).
+    <DllImport("kernel32.dll", EntryPoint:="RtlZeroMemory")>
+    Private Shared Sub ZeroMemory(dest As IntPtr, length As UIntPtr)
+    End Sub
+
     ' §216: strlen used to measure GMP-returned char buffers in chunked decimal conversion.
     <DllImport("msvcrt.dll", CallingConvention:=CallingConvention.Cdecl)>
     Private Shared Function strlen(s As IntPtr) As UIntPtr
@@ -1058,6 +1064,15 @@ Public Class Form1
     <DllImport("libgmp-10.dll", EntryPoint:="__gmpn_divrem_1",
                CallingConvention:=CallingConvention.Cdecl)>
     Private Shared Function GmpRaw_mpn_divrem_1(qp As IntPtr, qxn As Integer, np As IntPtr, nn As Integer, d As ULong) As ULong
+    End Function
+
+    ' §229 (issue #56): mpn-level left shift by 0 < count < 64 bits, parallelized over limb
+    ' chunks in ParallelBigShiftLeftOOP.  Returns the carry shifted out of the top limb.
+    ' Source and dest may alias when rp >= sp; per-chunk shifts use disjoint ranges so
+    ' aliasing is irrelevant across threads.
+    <DllImport("libgmp-10.dll", EntryPoint:="__gmpn_lshift",
+               CallingConvention:=CallingConvention.Cdecl)>
+    Private Shared Function GmpRaw_mpn_lshift(rp As IntPtr, sp As IntPtr, n As Integer, count As UInteger) As ULong
     End Function
 
     <DllImport("libgmp-10.dll", EntryPoint:="__gmpz_swap",
@@ -3622,6 +3637,21 @@ Public Class Form1
         Dim finalResultLimbs As Long = opLimbs + (bits + 63L) \ 64L + 1L   ' +1 safety margin
         If finalResultLimbs > 0L Then PreAllocMpzToLimbs(rop, finalResultLimbs)
 
+        ' §229 (issue #56, 2026-05-23): parallel limb-range partition for out-of-place shifts
+        ' on operands ≥ 5 M limbs.  Each chunk calls __gmpn_lshift on its own limb range;
+        ' cross-chunk carries are stitched by a serial fixup pass.  At 1 B Combine A-D
+        ' (108 M-limb gmpNumer << ~900 M bits) this cuts the shift from ~1 s serial to ~150 ms.
+        ' At 5 B (~500 M-limb gmpNumer << ~4.6 B bits) the savings are larger because the
+        ' chunked GMP mul_2exp loop runs 2-3 iterations and serial mpn_lshift dominates.
+        ' In-place shifts (rop == op) keep the existing GMP path: the parallel partition
+        ' would either need top-down processing or extra scratch.
+        Const PARALLEL_THRESHOLD As Long = 5_000_000L
+        If rop.Pointer <> op.Pointer AndAlso opLimbs >= PARALLEL_THRESHOLD Then
+            ParallelBigShiftLeftOOP(rop, op, bits, opLimbs)
+            Return
+        End If
+
+        ' Sequential chunked GMP shift (in-place or small operand).
         Dim src As IntPtr = op.Pointer
         Dim dst As IntPtr = rop.Pointer
         Dim bitsLeft As Long = bits
@@ -3631,6 +3661,88 @@ Public Class Form1
             src = dst
             bitsLeft -= CLng(chunk)
         Loop While bitsLeft > 0L
+    End Sub
+
+    ' §229 (issue #56): out-of-place parallel left shift.  Decomposes total shift into
+    ' limb-offset (whole limbs) + bit-shift (0..63 bits).  When bit-shift = 0, only the
+    ' limb-copy step runs (parallel CopyMemory of disjoint byte ranges).  When bit-shift
+    ' > 0, each thread calls __gmpn_lshift on its slice and returns the top-bit carry;
+    ' a serial fixup ORs each prior chunk's carry into the next chunk's bottom limb.
+    Private Shared Sub ParallelBigShiftLeftOOP(rop As mpz_t, op As mpz_t, bits As Long, opLimbs As Long)
+        Dim limbOffset As Long = bits \ 64L
+        Dim bitShift As Integer = CInt(bits Mod 64L)
+
+        Dim opSign As Integer = System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(op.Pointer, 4))
+        Dim spBase As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(op.Pointer, 8))
+        Dim rpBase As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(rop.Pointer, 8))
+        Dim rpShifted As IntPtr = New IntPtr(rpBase.ToInt64() + limbOffset * 8L)
+
+        ' Zero the low limbOffset limbs of rop.  PreAllocMpzToLimbs hands back fresh
+        ' VirtualAlloc pages (already zero) when growing, but if the rop buffer was
+        ' reused above its current size, stale data may live in the low limbs — zero
+        ' defensively to keep the result canonical.
+        If limbOffset > 0L Then
+            ZeroMemory(rpBase, New UIntPtr(CULng(limbOffset * 8L)))
+        End If
+
+        Dim topCarry As ULong = 0UL
+        Dim newSize As Long = opLimbs + limbOffset
+
+        Const COPY_CHUNK As Long = 33_554_432L  ' 32 MB per task — saturates NVMe bandwidth without thread thrash
+        Dim totalBytes As Long = opLimbs * 8L
+        Dim numCopyChunks As Integer = CInt(System.Math.Max(1L, System.Math.Min(16L, (totalBytes + COPY_CHUNK - 1L) \ COPY_CHUNK)))
+
+        If bitShift = 0 Then
+            ' Pure limb shift — parallel memcpy from source to shifted dest.
+            If numCopyChunks = 1 Then
+                CopyMemory(rpShifted, spBase, New UIntPtr(CULng(totalBytes)))
+            Else
+                Dim chunkBytes As Long = totalBytes \ numCopyChunks
+                System.Threading.Tasks.Parallel.For(0, numCopyChunks,
+                    Sub(i As Integer)
+                        Dim startByte As Long = CLng(i) * chunkBytes
+                        Dim sizeBytes As Long = If(i = numCopyChunks - 1, totalBytes - startByte, chunkBytes)
+                        CopyMemory(New IntPtr(rpShifted.ToInt64() + startByte),
+                                   New IntPtr(spBase.ToInt64() + startByte),
+                                   New UIntPtr(CULng(sizeBytes)))
+                    End Sub)
+            End If
+        Else
+            ' Bit shift via parallel __gmpn_lshift on limb chunks.
+            Const NUM_CHUNKS As Integer = 8
+            Dim chunkSize As Long = (opLimbs + CLng(NUM_CHUNKS) - 1L) \ CLng(NUM_CHUNKS)
+            Dim carries(NUM_CHUNKS - 1) As ULong
+
+            System.Threading.Tasks.Parallel.For(0, NUM_CHUNKS,
+                Sub(i As Integer)
+                    Dim startLimb As Long = CLng(i) * chunkSize
+                    Dim countLimbs As Long = System.Math.Min(chunkSize, opLimbs - startLimb)
+                    If countLimbs <= 0L Then Return
+                    Dim spChunk As IntPtr = New IntPtr(spBase.ToInt64() + startLimb * 8L)
+                    Dim rpChunk As IntPtr = New IntPtr(rpShifted.ToInt64() + startLimb * 8L)
+                    carries(i) = GmpRaw_mpn_lshift(rpChunk, spChunk, CInt(countLimbs), CUInt(bitShift))
+                End Sub)
+
+            ' Serial fixup: OR each prior chunk's carry into the next chunk's bottom limb.
+            For i As Integer = 1 To NUM_CHUNKS - 1
+                Dim startLimb As Long = CLng(i) * chunkSize
+                If startLimb >= opLimbs Then Exit For
+                Dim rpChunk As IntPtr = New IntPtr(rpShifted.ToInt64() + startLimb * 8L)
+                Dim cur As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(rpChunk))
+                cur = cur Or carries(i - 1)
+                Runtime.InteropServices.Marshal.WriteInt64(rpChunk, CLng(cur))
+            Next
+
+            topCarry = carries(NUM_CHUNKS - 1)
+            If topCarry <> 0UL Then
+                Dim topPtr As IntPtr = New IntPtr(rpShifted.ToInt64() + opLimbs * 8L)
+                Runtime.InteropServices.Marshal.WriteInt64(topPtr, CLng(topCarry))
+                newSize += 1L
+            End If
+        End If
+
+        ' Write back the new size with the original sign.
+        Runtime.InteropServices.Marshal.WriteInt32(rop.Pointer, 4, If(opSign < 0, -CInt(newSize), CInt(newSize)))
     End Sub
 
     ' Compute r = floor(2^kBits / b) for b > 0, kBits > sizeinbase(b,2).

@@ -5018,3 +5018,100 @@ parallel pair takes ~16 GB scratch but stays inside the 64 GB
 budget.  Projected wall: **~10–20 h** for the parallel pair vs the
 §207 baseline of ~20–40 h for the serial pair.  Savings ≈ 10–20 h
 on the §72 Phase 4 critical path.
+
+## §229 — Parallel out-of-place BigShiftLeft (2026-05-23, issue #56)
+
+`BigShiftLeft` is a widely-used helper that wraps GMP's
+`__gmpz_mul_2exp`.  Before §229 it ran a sequential chunked loop:
+
+```vb
+Do
+    chunk = Min(bitsLeft, 2_100_000_000)   ' fit in UInt32
+    GmpRaw_mul_2exp(dst, src, chunk)
+    src = dst
+    bitsLeft -= chunk
+Loop While bitsLeft > 0
+```
+
+Each `mul_2exp` invocation is a single serial native call doing
+`memmove(limbs by limbOffset) + mpn_lshift(remaining bits)`.  At the
+Combine A-D scale (~108 M-limb gmpNumer at 1 B, ~500 M-limb at 5 B)
+this is a measurable fraction of Phase 3 critical-path wall time.
+
+### Fix
+
+Split the shift into a limb-offset (whole-limb) move + a sub-limb
+mpn_lshift.  Parallelize both, taking advantage of the fact that
+non-aliased limb-range chunks are independent:
+
+- **Pure limb shifts** (`bits % 64 == 0`): partition the source into
+  ≤ 16 byte ranges and parallel `RtlMoveMemory` from each chunk.
+- **Bit shifts** (general case): partition the source limbs into
+  8 chunks; each thread calls `__gmpn_lshift` on its slice and
+  returns the top-bit carry; a serial fixup pass ORs each prior
+  chunk's carry into the next chunk's bottom limb.  Final top
+  carry, if non-zero, becomes the new top limb of the result.
+
+```vb
+' New DllImport
+<DllImport("libgmp-10.dll", EntryPoint:="__gmpn_lshift", ...)>
+Private Shared Function GmpRaw_mpn_lshift(rp, sp, n, count) As ULong
+
+' New helper
+Sub ParallelBigShiftLeftOOP(rop, op, bits, opLimbs)
+    limbOffset = bits \ 64
+    bitShift   = bits Mod 64
+
+    If limbOffset > 0 Then ZeroMemory(rpBase, limbOffset * 8)
+
+    If bitShift = 0 Then
+        Parallel.For(0, numCopyChunks, ...    ' parallel CopyMemory
+    Else
+        Parallel.For(0, 8, Sub(i) carries(i) =
+            GmpRaw_mpn_lshift(rpChunk_i, spChunk_i, count_i, bitShift))
+        For i = 1 To 7: rpChunk_i[0] |= carries(i-1) Next
+        If topCarry > 0 Then write top + size += 1
+    End If
+End Sub
+```
+
+Implementation at
+[Form1.vb:~3612-3759](Form1.vb#L3612-L3759).  Threshold:
+`PARALLEL_THRESHOLD = 5_000_000 limbs` (operands below stay on the
+existing GMP path — overhead-dominated below 40 MB).
+
+### Aliasing
+
+The parallel partition is safe only when `rop != op` because each
+thread reads and writes adjacent limb regions concurrently; an
+in-place shift would race between threads on the boundary limbs.
+In-place callers (Newton-iteration `r <<= scaleShift`, sqrt-Newton
+`xTrunc <<= xHalf`) fall through to the existing GMP sequential
+path, which is already well-optimized at the C layer for in-place.
+
+### Beneficiaries
+
+Out-of-place `BigShiftLeft` callers (all eligible for §229 at ≥ 5 M
+limbs):
+
+- Combine A-D: `BigShiftLeft(mpShiftA, gmpNumer, thirdBits)`,
+  `BigShiftLeft(mpShiftC, gmpNumer, thirdBits)` — the issue's
+  primary target.
+- §227 Q-split: `BigShiftLeft(_scratchMpz, tmpHigh, thirdBits)`,
+  `BigShiftLeft(_scratchMpz2, mpQ2, thirdBits)`.
+
+In-place callers (unchanged, still serial):
+
+- `BigShiftLeft(r, r, _scaleShift)` inside SafeMpzReciprocal Newton.
+- `BigShiftLeft(rSeed, rSeed, seedScale)` for §201-raise.
+- `BigShiftLeft(x, x, seedShift >> 1)` for sqrt seed scale-up.
+- `BigShiftLeft(xTrunc, xTrunc, xHalf)` for sqrt Newton iter.
+
+### Expected impact
+
+At 1 B the four out-of-place shifts run ~0.6-1 s each serial;
+parallel ~150-200 ms each → ~3-4 s total saved.  At 5 B (~500 M-limb
+gmpNumer shifted ~4.6 B bits), the chunked GMP loop runs 2-3
+iterations; parallel cuts each shift from ~30-60 s to ~5-10 s →
+~5-10 min total saved across the four §229-eligible call sites.
+
