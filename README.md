@@ -5223,4 +5223,33 @@ post-recip change).  Doesn't affect fresh first runs (no saved r
 yet) or scale-up §201-raise (still uses the existing 0.4 < ratio <
 0.7 path).
 
+### Validation (2026-05-23, 1 B-digit Debug, C:\PiOutput_229test)
+
+Two-pass validation:
+
+**Run 1** (with old nr_raise.bin lacking bSig): §230 fast-path doesn't
+fire — meta has no bSig key, falls through to existing §201-raise
+which rejects `ratio=1.000`.  Newton runs from scratch.  Save block
+writes nr_raise.bin WITH bSig (`fe92cc115ea861c20bb450859935c4083ff740b5e347882c485899bf27dd685b`,
+computed in 1.22 s).
+
+**Run 2** (after deleting gmpPi/nr_r/div_q, keeping bSig-equipped nr_raise.bin):
+§230 fast-path fires.  bSig verified in 0.55 s; saved r loaded directly;
+Newton entirely skipped.
+
+| Metric | Run 1 (fresh Newton) | Run 2 (§230 fast-path) | Δ |
+|---|---|---|---|
+| §230 EXACT-REUSE | not applicable (no bSig in meta) | **fires** | — |
+| bSig verify wall | n/a | 0.55 s | — |
+| Newton iterations | ~35 from scratch | **0 (skipped)** | — |
+| Wall to Division complete | 1 h 19 m 15 s | **10 m 48 s** | **−68 min** |
+| Total run wall | 1 h 20 m 31 s | **12 m 04 s** | **−68 min** |
+| §226 decimal conversion | 76.32 s | 75.52 s | (noise) |
+| pi_digits.txt SHA-256 | `b153e8d5…56d9b` | `b153e8d5…56d9b` | identical |
+| Autoverify markers | PASS | PASS | identical |
+
+**Wall-time saving: 68 min** per validation cycle — every Phase 4
+follow-up that touches Phase 3 / post-recip code can now reuse the
+bSig-equipped nr_raise.bin to skip Newton.
+
 
