@@ -5115,3 +5115,39 @@ gmpNumer shifted ~4.6 B bits), the chunked GMP loop runs 2-3
 iterations; parallel cuts each shift from ~30-60 s to ~5-10 s →
 ~5-10 min total saved across the four §229-eligible call sites.
 
+### Validation (2026-05-23, 1 B-digit Debug, C:\PiOutput_229test)
+
+Cloned `C:\PiPreserved_1B_freshtest_post225_VERIFIED_2026-05-22`,
+deleted `gmpNumer.bin`, `mpR0/R1/R2.bin`, `gmpPi.bin`/`_meta`,
+`nr_r.bin`/`_meta`, `div_q.bin`/`_meta` from both `NodeCache` and
+`SnapshotStore` (per the SnapshotStore-mirror rule), kept
+`gmpSqrt.bin`, `gmpSqrtInput.bin`, `nr_raise.bin` to skip
+`SafeMpzSqrt` and accelerate Newton via §201-raise (which actually
+rejected at `ratio=1.000` — a missed optimization for separate
+filing; full Newton ran instead).
+
+| Metric | Value |
+|---|---|
+| §227 parallel Q extraction (uses §229 twice) | **0.84 s** (vs 1.19 s pre-§229 baseline = 29% faster) |
+| Combine A-D total | ~1.15 s (vs ~2 s baseline; two §229 shifts inside) |
+| Total run wall | 1 h 41 m 26 s |
+| §226 decimal conversion | 77.41 s (matches baseline) |
+| pi_digits.txt size | 1,000,000,003 bytes |
+| pi_digits.txt SHA-256 | `b153e8d58b045fc65e8665d633ca54406d1bfbf1a2fdd38f1c3b325abc156d9b` — **identical to §225 baseline** |
+| Autoverify markers | `999999@762` ✓ `777777777@24,658,601` ✓ `nine-9s@564,665,206` ✓ |
+
+CPU samples spanning the run:
+
+| T+ | Phase | Cores | RAM |
+|---|---|---|---|
+| 0:03 | §210 serial R0 multiply | 0.99 | 6.12 GB |
+| 0:15 | §210 serial R2 multiply | 1.00 | 8.44 GB |
+| 0:22 | Newton recip warm-up | 2.53 | 11.43 GB |
+| 0:32 | Newton recip iter 25 (prec 2.2 B bits) | 13.74 | 20.46 GB |
+| 0:45 | Newton recip iter 28+ (max prec) | 15.20 | 27.41 GB |
+| 0:58 | Newton recip tail | 15.83 | 33.43 GB |
+
+§229 shifts themselves dominate ~1 s combined at 1 B — small in
+absolute terms but on the Phase 3 critical path between SafeMpzSqrt
+completion and the dominant Newton-recip phase.
+
