@@ -6483,7 +6483,28 @@ Phase2:
                 ' × ~320 MB each = ~26 GB just for intermediates, exhausting VirtualAlloc.
                 ' DOP=3 gives 3^3=27 concurrent leaf tasks — saturates 24 cores while
                 ' bounding peak intermediate memory to ~9 GB (vs ~26 GB at DOP=24).
-                System.Threading.Volatile.Write(_safeMulDop, 3)  ' §95
+                '
+                ' §231 (issue #58, 2026-05-23): scale-aware DOP — §95's cap of 3 is too
+                ' conservative at smaller digit counts.  Phase-2 top-level operand sizes
+                ' scale ~linearly with numTerms; per-leaf-task accum buffer is roughly
+                ' (topLimbs / 3) limbs ≈ (numTerms × 2 / 3) limbs at top level.  Total
+                ' leaf-task RAM = DOP^3 × bufPerLeaf.  Aim for ≤ ~40 GB (leaves 24 GB
+                ' headroom on the 64 GB box) by stepping DOP based on numTerms:
+                '   numTerms <  100 M (~ < 1.4 B digits): DOP=6 → 216 × 50 MB ≈ 10 GB
+                '   numTerms <  250 M (1.4-3.5 B digits): DOP=4 → 64 × 200 MB ≈ 13 GB
+                '   numTerms >= 250 M (>= 3.5 B digits) : DOP=3 → 27 × 500 MB ≈ 13 GB
+                ' Bumps 1B Phase-2 top levels (levels 12, 13) from DOP=3 to DOP=6
+                ' (~30-50 % faster); keeps original §95 behaviour at 5B+ scale.
+                Dim _chosenDop231 As Integer
+                If numTerms < 100_000_000L Then
+                    _chosenDop231 = 6
+                ElseIf numTerms < 250_000_000L Then
+                    _chosenDop231 = 4
+                Else
+                    _chosenDop231 = 3
+                End If
+                System.Threading.Volatile.Write(_safeMulDop, _chosenDop231)  ' §231 (was hardcoded 3 in §95)
+                AppendLog($"[BinarySplit§231] serial-path DOP at level={level}: numTerms={numTerms:N0}, pairCount={pairCount}, chosen DOP={_chosenDop231}{vbCrLf}")
                 Dim nodeIdx As Long = 0
                 While nodeIdx < diskNodes.Count - 1
 

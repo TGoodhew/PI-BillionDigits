@@ -5252,4 +5252,62 @@ Newton entirely skipped.
 follow-up that touches Phase 3 / post-recip code can now reuse the
 bSig-equipped nr_raise.bin to skip Newton.
 
+## §231 — Scale-aware DOP for serial-path Phase 2 (2026-05-23, issue #58)
+
+§95 hardcoded `_safeMulDop = 3` for the serial-path branch of
+`BinarySplitGMP`'s level loop (the top 2-3 Phase-2 levels where
+`pairCount < 4`).  The cap was set after a 5B-run-6 crash where
+DOP=24 produced 24³ = 13 824 concurrent depth-3 leaf tasks × ~320 MB
+each, exhausting VirtualAlloc.  DOP=3 caps the leaf-task count at
+3³ = 27 and keeps intermediate memory ≤ 9 GB at 5 B.
+
+But DOP=3 is over-conservative at smaller digit counts: at 1 B the
+per-leaf-task accum buffer is ~50 MB (vs ~500 MB at 5 B), so 216
+leaf tasks at DOP=6 fits in ~10 GB on the 64 GB box.
+
+### Fix
+
+`_safeMulDop` is now selected from `numTerms` (a deterministic proxy
+for top-level operand scale) inside the serial-path branch:
+
+```vb
+If numTerms < 100_000_000 Then        ' < 1.4 B digits
+    _safeMulDop = 6                   ' 216 × ~50 MB ≈ 10 GB
+ElseIf numTerms < 250_000_000 Then    ' 1.4-3.5 B digits
+    _safeMulDop = 4                   ' 64 × ~200 MB ≈ 13 GB
+Else                                  ' ≥ 3.5 B digits
+    _safeMulDop = 3                   ' 27 × ~500 MB ≈ 13 GB (== §95)
+End If
+```
+
+Implementation at [Form1.vb:~6475-6505](Form1.vb#L6475-L6505).  Logs
+the chosen DOP per level so the policy decision is auditable.
+
+### Behaviour by scale
+
+| Scale | numTerms | DOP | Leaf tasks | Per-task buffer | Total leaf RAM |
+|---|---|---|---|---|---|
+| 1 B (this run) | 70.5 M | **6** | 216 | ~50 MB | ~10 GB |
+| 2 B | ~140 M | 4 | 64 | ~100 MB | ~6 GB |
+| 3 B | ~210 M | 4 | 64 | ~160 MB | ~10 GB |
+| 5 B (= §95 baseline) | ~350 M | 3 | 27 | ~500 MB | ~13 GB |
+
+### Expected impact
+
+At 1 B Phase-2 top levels (levels 12 + 13, the only serial-path
+levels) DOP=6 doubles inner SafeMpzMul fan-out vs DOP=3.  Each top
+level is ~1-2 min serial → ~30-60 s with DOP=6, projected savings
+~2-3 min.  At 2-3 B (DOP=4) similar relative speed-up.  At 5 B+ the
+old DOP=3 cap is preserved — no regression.
+
+### Risk
+
+Crash mode is identical to §95's original (24³-task OOM).  DOP=6
+total tasks = 216, which at 1 B fits comfortably; the size-stepped
+policy ensures 5 B+ stays at DOP=3.  Validation at 1 B against
+bit-identity baseline `b153e8d5…56d9b` covers correctness;
+performance impact too small to be the headline measurement (the
+~50 % speedup on 2 minutes of work = ~1 min saved at 1 B).
+
+
 
