@@ -7385,35 +7385,11 @@ BeforeStep4:
             Else
                 WriteToLog($"[3PM-DBG] tmpHigh pre-alloc skipped ({_tHNeeded:N0} limbs, {_tHBytes:N0} B < GMP threshold; init2 buffer sufficient)")
             End If
-            WriteToLog($"[3PM-DBG] tmpHigh _mp_alloc={Runtime.InteropServices.Marshal.ReadInt32(tmpHigh.Pointer, 0):N0}  about to BigShiftRight(tmpHigh, finalQ, thirdBits={thirdBits:N0})")
-            BigShiftRight(tmpHigh, finalQ, thirdBits)  ' §209: tmpHigh = finalQ >> thirdBits = Q2*2^k + Q1
-            WriteToLog($"[3PM-DBG] BigShiftRight done: tmpHigh._mp_size={Runtime.InteropServices.Marshal.ReadInt32(tmpHigh.Pointer, 4):N0}  computing finalQ = Q0 = finalQ - (tmpHigh << thirdBits)")
-            ' §209b: finalQ = Q0 = finalQ - (tmpHigh << thirdBits) using raw struct +
-            ' GmpRaw_sub.  9th relaunch (2026-05-05 17:23 PT) died silently inside
-            ' gmp_lib.mpz_sub on two ~739M-limb operands; the managed wrapper's §78
-            ' side-effect (corrupts mpz_t.Pointer of all registered objects) is the
-            ' suspected cause.  Use Marshal.AllocHGlobal(16) + GmpRaw_init for the
-            ' scratch struct so it's never registered with Math.Gmp.Native; pre-alloc
-            ' finalQ to _finalQSz+2 limbs so __gmpz_sub never needs to realloc.
-            Dim _scratchRaw As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
-            GmpRaw_init(_scratchRaw)
-            Dim _scratchMpz As New mpz_t()
-            _scratchMpz.Pointer = _scratchRaw
-            PreAllocMpzToLimbs(_scratchMpz, _finalQSz + 4L)
-            BigShiftLeft(_scratchMpz, tmpHigh, thirdBits)
-            WriteToLog($"[3PM-DBG§209b] _scratchMpz (tmpHigh<<thirdBits) size={Runtime.InteropServices.Marshal.ReadInt32(_scratchRaw, 4):N0}; pre-allocing finalQ for safe in-place sub")
-            PreAllocMpzToLimbs(finalQ, _finalQSz + 2L)
-            Dim _finalQPtr209b As IntPtr = finalQ.Pointer  ' capture after pre-alloc
-            WriteToLog($"[3PM-DBG§209b] calling GmpRaw_sub(finalQ, finalQ, _scratchMpz)")
-            GmpRaw_sub(_finalQPtr209b, _finalQPtr209b, _scratchRaw)
-            WriteToLog($"[3PM-DBG§209b] GmpRaw_sub done: finalQ._mp_size={Runtime.InteropServices.Marshal.ReadInt32(_finalQPtr209b, 4):N0} (= Q0)")
-            GmpRaw_clear(_scratchRaw)
-            Runtime.InteropServices.Marshal.FreeHGlobal(_scratchRaw)
-            _scratchMpz.Pointer = IntPtr.Zero
-            finalQ.Pointer = _finalQPtr209b  ' restore in case §78 corrupted
-
-            ' Extract Q1 and Q2 from tmpHigh with another k1-sized shift.
-            ' Both results are ≤ k1/64 limbs ≈ 373 MB — pre-alloc both for the same reason.
+            ' §227 (issue #61, 2026-05-22): pre-allocate mpQ1 + mpQ2 BEFORE the
+            ' BigShiftRight + parallel-extraction block so both threads can use them.
+            ' These k1-sized init+pre-alloc steps were previously between the Q0 and
+            ' Q1/Q2 extractions; the move is mechanical (no semantic change to the
+            ' pre-alloc sizing).
             Dim mpQ1 As New mpz_t()
             gmp_lib.mpz_init2(mpQ1, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
             Dim _q1Needed As Long = _k1Limbs + 2L
@@ -7450,34 +7426,67 @@ BeforeStep4:
             Else
                 WriteToLog($"[3PM-DBG] mpQ2 pre-alloc skipped ({_q2Needed:N0} limbs, {_q2Bytes:N0} B < GMP threshold; init2 buffer sufficient)")
             End If
-            WriteToLog($"[3PM-DBG] about to extract Q1/Q2 from tmpHigh via BigShiftRight (thirdBits={thirdBits:N0})")
-            ' §209: mpQ2 = tmpHigh >> thirdBits.  BigShiftRight chunks via ≤2.1B-bit
-            ' GmpRaw_tdiv_q_2exp calls and pre-allocs result, so this is safe at 5B scale.
-            BigShiftRight(mpQ2, tmpHigh, thirdBits)
-            WriteToLog($"[3PM-DBG] mpQ2._mp_size={Runtime.InteropServices.Marshal.ReadInt32(mpQ2.Pointer, 4):N0}  computing mpQ1 = tmpHigh - (mpQ2 << thirdBits) via raw struct + GmpRaw_sub")
-            ' §209b: mpQ1 = Q1 = tmpHigh - (mpQ2 << thirdBits) using raw struct.  Same
-            ' rationale as the finalQ sub above — bypass the §78-firing managed wrapper.
-            Dim _scratchRaw2 As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
-            GmpRaw_init(_scratchRaw2)
-            Dim _scratchMpz2 As New mpz_t()
-            _scratchMpz2.Pointer = _scratchRaw2
-            Dim _tmpHighSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(tmpHigh.Pointer, 4)))
-            PreAllocMpzToLimbs(_scratchMpz2, _tmpHighSz + 4L)
-            BigShiftLeft(_scratchMpz2, mpQ2, thirdBits)
-            WriteToLog($"[3PM-DBG§209b] _scratchMpz2 (mpQ2<<thirdBits) size={Runtime.InteropServices.Marshal.ReadInt32(_scratchRaw2, 4):N0}; pre-allocing mpQ1 for safe sub")
-            ' Pre-alloc mpQ1 to result size = max(tmpHigh.size, _scratchMpz2.size)+1 limbs.
-            PreAllocMpzToLimbs(mpQ1, _tmpHighSz + 2L)
-            Dim _mpQ1Ptr209b As IntPtr = mpQ1.Pointer
-            Dim _tmpHighPtr209b As IntPtr = tmpHigh.Pointer
-            WriteToLog($"[3PM-DBG§209b] calling GmpRaw_sub(mpQ1, tmpHigh, _scratchMpz2)")
-            GmpRaw_sub(_mpQ1Ptr209b, _tmpHighPtr209b, _scratchRaw2)
-            WriteToLog($"[3PM-DBG§209b] GmpRaw_sub done: mpQ1._mp_size={Runtime.InteropServices.Marshal.ReadInt32(_mpQ1Ptr209b, 4):N0}")
-            GmpRaw_clear(_scratchRaw2)
-            Runtime.InteropServices.Marshal.FreeHGlobal(_scratchRaw2)
-            _scratchMpz2.Pointer = IntPtr.Zero
-            mpQ1.Pointer = _mpQ1Ptr209b
-            tmpHigh.Pointer = _tmpHighPtr209b
-            WriteToLog($"[3PM-DBG] mpQ1._mp_size={Runtime.InteropServices.Marshal.ReadInt32(mpQ1.Pointer, 4):N0}  clearing tmpHigh")
+
+            WriteToLog($"[3PM-DBG] tmpHigh _mp_alloc={Runtime.InteropServices.Marshal.ReadInt32(tmpHigh.Pointer, 0):N0}  about to BigShiftRight(tmpHigh, finalQ, thirdBits={thirdBits:N0})")
+            BigShiftRight(tmpHigh, finalQ, thirdBits)  ' §209: tmpHigh = finalQ >> thirdBits = Q2*2^k + Q1
+            WriteToLog($"[3PM-DBG§227] BigShiftRight done: tmpHigh._mp_size={Runtime.InteropServices.Marshal.ReadInt32(tmpHigh.Pointer, 4):N0}; entering parallel Q0 || Q1+Q2 extraction")
+
+            ' §227 (issue #61, 2026-05-22): parallel Q0 extraction || Q1+Q2 extraction.
+            ' Two independent paths after tmpHigh is computed:
+            '   Q0 path: reads tmpHigh, mutates finalQ in-place via _scratchRaw.
+            '   Q1Q2 path: reads tmpHigh, writes mpQ2 + mpQ1 via _scratchRaw2.
+            ' Shared input tmpHigh is treated as read-only; outputs are disjoint
+            ' (finalQ vs mpQ1+mpQ2).  Each path uses its own Marshal.AllocHGlobal
+            ' scratch struct so the §78 raw-pointer pattern stays per-thread.
+            ' BigShiftLeft / BigShiftRight / GmpRaw_sub on disjoint mpz_t's are
+            ' safe under GMP's "no shared mpz_t across threads" rule.
+            Dim _t227 As DateTime = DateTime.Now
+            System.Threading.Tasks.Parallel.Invoke(
+                Sub()
+                    ' Q0 = finalQ - (tmpHigh << thirdBits).
+                    ' Uses the §209b raw-IntPtr scratch dance to bypass the managed
+                    ' wrapper's §78 side-effect that corrupts registered mpz_t.Pointer.
+                    Dim _scratchRaw As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                    GmpRaw_init(_scratchRaw)
+                    Dim _scratchMpz As New mpz_t()
+                    _scratchMpz.Pointer = _scratchRaw
+                    PreAllocMpzToLimbs(_scratchMpz, _finalQSz + 4L)
+                    BigShiftLeft(_scratchMpz, tmpHigh, thirdBits)
+                    WriteToLog($"[3PM-DBG§227-Q0] _scratchMpz (tmpHigh<<thirdBits) size={Runtime.InteropServices.Marshal.ReadInt32(_scratchRaw, 4):N0}; pre-allocing finalQ for safe in-place sub")
+                    PreAllocMpzToLimbs(finalQ, _finalQSz + 2L)
+                    Dim _finalQPtr209b As IntPtr = finalQ.Pointer
+                    GmpRaw_sub(_finalQPtr209b, _finalQPtr209b, _scratchRaw)
+                    WriteToLog($"[3PM-DBG§227-Q0] GmpRaw_sub done: finalQ._mp_size={Runtime.InteropServices.Marshal.ReadInt32(_finalQPtr209b, 4):N0} (= Q0)")
+                    GmpRaw_clear(_scratchRaw)
+                    Runtime.InteropServices.Marshal.FreeHGlobal(_scratchRaw)
+                    _scratchMpz.Pointer = IntPtr.Zero
+                    finalQ.Pointer = _finalQPtr209b
+                End Sub,
+                Sub()
+                    ' (mpQ2, mpQ1) from tmpHigh:
+                    '   mpQ2 = tmpHigh >> thirdBits     (Q2 = high third)
+                    '   mpQ1 = tmpHigh - (mpQ2 << thirdBits)   (Q1 = middle third)
+                    BigShiftRight(mpQ2, tmpHigh, thirdBits)
+                    WriteToLog($"[3PM-DBG§227-Q1Q2] BigShiftRight(mpQ2) done: mpQ2._mp_size={Runtime.InteropServices.Marshal.ReadInt32(mpQ2.Pointer, 4):N0}")
+                    Dim _scratchRaw2 As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                    GmpRaw_init(_scratchRaw2)
+                    Dim _scratchMpz2 As New mpz_t()
+                    _scratchMpz2.Pointer = _scratchRaw2
+                    Dim _tmpHighSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(tmpHigh.Pointer, 4)))
+                    PreAllocMpzToLimbs(_scratchMpz2, _tmpHighSz + 4L)
+                    BigShiftLeft(_scratchMpz2, mpQ2, thirdBits)
+                    PreAllocMpzToLimbs(mpQ1, _tmpHighSz + 2L)
+                    Dim _mpQ1Ptr209b As IntPtr = mpQ1.Pointer
+                    Dim _tmpHighPtr209b As IntPtr = tmpHigh.Pointer
+                    GmpRaw_sub(_mpQ1Ptr209b, _tmpHighPtr209b, _scratchRaw2)
+                    WriteToLog($"[3PM-DBG§227-Q1Q2] GmpRaw_sub done: mpQ1._mp_size={Runtime.InteropServices.Marshal.ReadInt32(_mpQ1Ptr209b, 4):N0}")
+                    GmpRaw_clear(_scratchRaw2)
+                    Runtime.InteropServices.Marshal.FreeHGlobal(_scratchRaw2)
+                    _scratchMpz2.Pointer = IntPtr.Zero
+                    mpQ1.Pointer = _mpQ1Ptr209b
+                    tmpHigh.Pointer = _tmpHighPtr209b
+                End Sub)
+            WriteToLog($"[3PM-DBG§227] parallel Q extraction complete in {(DateTime.Now - _t227).TotalSeconds:F2}s; clearing tmpHigh")
             gmp_lib.mpz_clear(tmpHigh)
             WriteToLog($"[3PM-DBG] Q split complete")
 

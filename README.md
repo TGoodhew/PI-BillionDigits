@@ -4844,3 +4844,66 @@ wall ≈ 8-10 min.  Total §226 at 5B ≈ 10 min vs. §216 serial
 ~2-4 h ≈ **15-25× speedup**.  Validates with the same `gmpPi.bin`
 pattern (any §piCkpt'd 5B run gives a one-shot ~10-min validation
 cycle).
+
+## §227 — Parallel Q-split (2026-05-22, issue #61)
+
+Phase 3's 3-piece-multiply (3PM) split is `finalQ = Q2·2^(2k) + Q1·2^k + Q0`
+where each Q-piece is ~k1/64 limbs.  The original code extracted Q0,
+Q1, Q2 sequentially after computing `tmpHigh = finalQ >> k`:
+
+1. Step A: `tmpHigh = finalQ >> k` (BigShiftRight).
+2. Step B (Q0 path): `_scratch = tmpHigh << k`, `finalQ = finalQ - _scratch`.
+3. Step C (Q1/Q2 path): `mpQ2 = tmpHigh >> k`, `_scratch2 = mpQ2 << k`,
+   `mpQ1 = tmpHigh - _scratch2`.
+
+Steps B and C touch *disjoint outputs* — B mutates `finalQ` in place,
+C writes new `mpQ1`/`mpQ2` — and share only the read-only `tmpHigh`.
+Both already use the §209b raw-`IntPtr` scratch dance with per-call
+`Marshal.AllocHGlobal`, so the §78 "managed-wrapper corrupts
+registered mpz_t.Pointer" hazard stays per-thread.
+
+Fix: hoist the `mpQ1`/`mpQ2` init + pre-alloc above Step A (mechanical
+reorder, no semantic change), then wrap Steps B and C in
+`Parallel.Invoke`.  Step A remains sequential (Q0 and Q1/Q2 both read
+its result).  Implementation at
+[Form1.vb:~7388-7480](Form1.vb#L7388-L7480) — `§227-Q0` and
+`§227-Q1Q2` log markers identify the two parallel branches.
+
+### Validation (2026-05-22 ~22:09)
+
+Forced full Phase 3 by deleting `gmpNumer.bin` + `mpR0/R1/R2.bin` from
+both `NodeCache` and `SnapshotStore` (per the SnapshotStore-mirror
+lesson learned during §225 validation), kept `snap_Phase3`'s P/Q/T.
+Phase 3 re-ran Q extraction (§227) + the three N×Q_i multiplies +
+Combine A-D.
+
+SHA-256 of all 4 regenerated checkpoints **identical** to the
+2026-05-22 post-§225 verified copies in
+`C:\PiPreserved_1B_freshtest_post225_VERIFIED_2026-05-22\`:
+
+| File | SHA-256 |
+|---|---|
+| `gmpNumer.bin` | `1827efe0…05e3f` |
+| `mpR0.bin` | `d232f8a9…61355` |
+| `mpR1.bin` | `f839113d…950f2` |
+| `mpR2.bin` | `0f6247de…4a786` |
+
+Autoverify markers PASS at run completion (`999999@762`,
+`777777777@24,658,601`, `999999999@564,665,206`).
+
+### Measurement
+
+- Q extraction (Step A + parallel B/C): **1.19 s**.
+  - Step A (BigShiftRight): 0.26 s.
+  - Parallel B/C: 0.93 s wall (each path ~0.9 s of work).
+
+The two parallel paths each take ~1 s sequentially at 1B; the
+wall-clock saving for the extraction step alone is ~0.7 s — small in
+absolute terms but on the Phase 3 critical path between the costly
+r_i multiplies and downstream sqrt-Newton.
+
+### 5B projection
+
+Per the issue body Q-piece sizes at 5B are ~246 M limbs each.
+Sequential extraction cost ~3-7 min; parallel B/C ~half that.
+Saving ~2-4 min at 5B.
