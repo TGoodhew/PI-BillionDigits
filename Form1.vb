@@ -5778,67 +5778,79 @@ PostShiftCheckpoint:
 
         If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] Newton done; final adjustment{vbCrLf}")
 
-        ' Final adjustment: ensure result = floor(sqrt(n)) exactly (off by at most 1)
-        ' §207: force serial DOP for the entire final-adj SafeMpzMul region.  5B-run-6
-        ' (2026-05-04 20:59 PT) crashed in __gmpz_mul deep in 2-level parallel SafeMpzMul
-        ' recursion (stack: GmpRaw_mul ← SafeMpzMul ← Parallel.For ← SafeMpzMul ← Parallel.For).
-        ' AV in native code, no managed exception captured.  Forcing serial mirrors the §168
-        ' pattern used for SafeMpzReciprocal and eliminates parallel allocator pressure on the
-        ' two ~519M-limb (4 GB) results.  Restored to prior DOP after the SqRoot Sub returns.
-        Dim _saved207Dop As Integer = System.Threading.Volatile.Read(_safeMulDop)
-        System.Threading.Volatile.Write(_safeMulDop, 1)
-        AppendLog($"[SafeMpzSqrt§207] forcing all-serial for final-adj SafeMpzMul (savedDop={_saved207Dop}){vbCrLf}")
+        ' Final adjustment: ensure result = floor(sqrt(n)) exactly (off by at most 1).
+        '
+        ' §228 (issue #54, 2026-05-23): parallelize the two initial squarings (xSq = x²,
+        ' x1Sq = (x+1)²) via Parallel.Invoke.  Both have disjoint inputs and result buffers;
+        ' the original §207 force-serial-DOP guard was for a 5B-run-6 crash inside SafeMpzMul's
+        ' own recursive Parallel.For — that crash mode was removed by §220 (#55, force-serial
+        ' caps lifted) and §221 (#44, size-gate lifted) so the recursion can now safely run at
+        ' the caller's _safeMulDop.  Adj-down and adj-up loops remain serial (one squaring at
+        ' a time, 0-1 iter typical) and use the inherited DOP — no extra outer parallelism.
+        '
+        ' Expected impact: ~halves final-adj wall time (~10-20 h saved at 5B).  §206 pre-alloc
+        ' guards retained: x1 and x1Sq must be pre-sized before mpz_add_ui / SafeMpzMul to
+        ' avoid silent realloc inside Parallel.Invoke tasks.
+        Dim _szX228 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(x.Pointer, 4))
+        AppendLog($"[SafeMpzSqrt§228] entering parallel final-adj: szX={_szX228:N0} limbs (currentDop={System.Threading.Volatile.Read(_safeMulDop)}){vbCrLf}")
+
+        ' Pre-compute x1 = x+1 before launching the parallel pair (cannot do this inside the
+        ' Parallel.Invoke task without races on x).
+        Dim x1 As New mpz_t()
+        gmp_lib.mpz_init(x1)
+        PreAllocMpzToLimbs(x1, CLng(_szX228) + 2L)  ' §206: avoid silent realloc inside __gmpz_add_ui
+        gmp_lib.mpz_add_ui(x1, x, 1UI)
+        AppendLog($"[SafeMpzSqrt§228] x1 = x+1 computed (size={Runtime.InteropServices.Marshal.ReadInt32(x1.Pointer, 4):N0}){vbCrLf}")
+
+        ' Pre-alloc both result buffers up front so Parallel.Invoke tasks don't race on realloc.
         Dim xSq As New mpz_t()
         gmp_lib.mpz_init(xSq)
-        ' §207: pre-alloc xSq to avoid silent realloc on first SafeMpzMul completion.
-        PreAllocMpzToLimbs(xSq, 2L * CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(x.Pointer, 4))) + 4L)
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] final adj: computing x² to check x²≤n{vbCrLf}")
-        SafeMpzMul(xSq, x, x)
+        PreAllocMpzToLimbs(xSq, 2L * CLng(_szX228) + 4L)  ' §206/§207: pre-size to 2·szX+4
+        Dim x1Sq As New mpz_t()
+        gmp_lib.mpz_init(x1Sq)
+        PreAllocMpzToLimbs(x1Sq, 2L * CLng(_szX228) + 4L)
+        AppendLog($"[SafeMpzSqrt§228] xSq and x1Sq pre-alloc'd ({(2L * CLng(_szX228) + 4L):N0} limbs each, ~{((2L * CLng(_szX228) + 4L) * 8L) \ (1024L * 1024L):N0} MB){vbCrLf}")
+
+        ' §228: launch the two squarings concurrently.  Inner SafeMpzMul fans out per §220/§221.
+        AppendLog($"[SafeMpzSqrt§228] Parallel.Invoke(xSq=x*x, x1Sq=x1*x1) starting{vbCrLf}")
+        Dim _t228Ticks As Long = System.Diagnostics.Stopwatch.GetTimestamp()
+        System.Threading.Tasks.Parallel.Invoke(
+            Sub() SafeMpzMul(xSq, x, x),
+            Sub() SafeMpzMul(x1Sq, x1, x1))
+        Dim _t228Elapsed As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _t228Ticks) / System.Diagnostics.Stopwatch.Frequency
+        AppendLog($"[SafeMpzSqrt§228] Parallel.Invoke done; elapsed={_t228Elapsed:F2}s (szXSq={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(xSq.Pointer, 4)):N0} szX1Sq={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(x1Sq.Pointer, 4)):N0}){vbCrLf}")
+
+        ' adj-down: x²>n means Newton overshot; rare (0-1 iter typical from Newton convergence).
+        ' Keep x1 in sync so the post-adj x1Sq matches the new (x+1).
         Dim _adjDownSqrt As Integer = 0
         Do While GmpRaw_cmp(xSq.Pointer, n.Pointer) > 0   ' §35: x² > n → x too large
             _adjDownSqrt += 1
-            If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] adj-down iter={_adjDownSqrt} (x²>n){vbCrLf}")
+            If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt§228] adj-down iter={_adjDownSqrt} (x²>n){vbCrLf}")
             gmp_lib.mpz_sub_ui(x, x, 1UI)
+            gmp_lib.mpz_sub_ui(x1, x1, 1UI)
             SafeMpzMul(xSq, x, x)
         Loop
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] adj-down done: {_adjDownSqrt} iter(s){vbCrLf}")
-        ' §206-trace: 5B-run-5 died silently between "adj-down done" and "final adj: computing (x+1)²"
-        ' on 2026-05-04 19:14 PT.  The likely cause is mpz_add_ui needing a silent 2 GB realloc
-        ' for x1 (same class of failure as §205).  Trace each step + pre-allocate x1 and x1Sq.
-        AppendLog($"[SafeMpzSqrt§206] freeing xSq (alloc={Runtime.InteropServices.Marshal.ReadInt32(xSq.Pointer, 0):N0} limbs){vbCrLf}")
+        If _adjDownSqrt > 0 Then
+            AppendLog($"[SafeMpzSqrt§228] adj-down ran {_adjDownSqrt} iter(s); recomputing x1Sq for new x1{vbCrLf}")
+            SafeMpzMul(x1Sq, x1, x1)
+        Else
+            If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt§228] adj-down done: 0 iter(s); x1Sq from parallel pair still valid{vbCrLf}")
+        End If
         gmp_lib.mpz_clear(xSq)
-        AppendLog($"[SafeMpzSqrt§206] xSq cleared{vbCrLf}")
 
-        Dim _szX206 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(x.Pointer, 4))
-        Dim x1 As New mpz_t()
-        gmp_lib.mpz_init(x1)
-        AppendLog($"[SafeMpzSqrt§206] x1 init done; pre-alloc to {_szX206 + 2:N0} limbs to avoid mpz_add_ui realloc{vbCrLf}")
-        PreAllocMpzToLimbs(x1, CLng(_szX206) + 2L)  ' §206: avoid silent 2 GB realloc inside __gmpz_add_ui
-        AppendLog($"[SafeMpzSqrt§206] x1 pre-alloc done; calling mpz_add_ui(x1, x, 1){vbCrLf}")
-        gmp_lib.mpz_add_ui(x1, x, 1UI)
-        AppendLog($"[SafeMpzSqrt§206] x1 = x+1 done (size={Runtime.InteropServices.Marshal.ReadInt32(x1.Pointer, 4):N0}){vbCrLf}")
-        Dim x1Sq As New mpz_t()
-        gmp_lib.mpz_init(x1Sq)
-        AppendLog($"[SafeMpzSqrt§206] x1Sq init done; pre-alloc to {2 * _szX206 + 4:N0} limbs to avoid SafeMpzMul realloc{vbCrLf}")
-        PreAllocMpzToLimbs(x1Sq, 2L * CLng(_szX206) + 4L)  ' §206: pre-alloc result buffer (~4 GB) up front
-        AppendLog($"[SafeMpzSqrt§206] x1Sq pre-alloc done{vbCrLf}")
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] final adj: computing (x+1)² to check (x+1)²>n{vbCrLf}")
-        SafeMpzMul(x1Sq, x1, x1)
+        ' adj-up: (x+1)² ≤ n means Newton undershot; rare.
         Dim _adjUpSqrt As Integer = 0
         Do While GmpRaw_cmp(x1Sq.Pointer, n.Pointer) <= 0   ' §35: (x+1)² ≤ n → x too small
             _adjUpSqrt += 1
-            If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] adj-up iter={_adjUpSqrt} ((x+1)²≤n){vbCrLf}")
+            If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt§228] adj-up iter={_adjUpSqrt} ((x+1)²≤n){vbCrLf}")
             GmpRaw_swap(x.Pointer, x1.Pointer)  ' §35
             gmp_lib.mpz_add_ui(x1, x, 1UI)
             SafeMpzMul(x1Sq, x1, x1)
         Loop
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt] adj-up done: {_adjUpSqrt} iter(s); SafeMpzSqrt done{vbCrLf}")
+        AppendLog($"[SafeMpzSqrt§228] adj-up done: {_adjUpSqrt} iter(s); SafeMpzSqrt complete{vbCrLf}")
         gmp_lib.mpz_clear(x1)
         gmp_lib.mpz_clear(x1Sq)
 
-        ' §207: restore SafeMpzMul DOP after the final-adj region.
-        System.Threading.Volatile.Write(_safeMulDop, _saved207Dop)
-        AppendLog($"[SafeMpzSqrt§207] DOP restored to {_saved207Dop}{vbCrLf}")
         GmpRaw_swap(result.Pointer, x.Pointer)  ' §35
         gmp_lib.mpz_clear(x)
     End Sub

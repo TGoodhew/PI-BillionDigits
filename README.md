@@ -4907,3 +4907,74 @@ r_i multiplies and downstream sqrt-Newton.
 Per the issue body Q-piece sizes at 5B are ~246 M limbs each.
 Sequential extraction cost ~3-7 min; parallel B/C ~half that.
 Saving ~2-4 min at 5B.
+
+## §228 — Parallel xSq / x1Sq squarings in SafeMpzSqrt final-adj (2026-05-23, issue #54)
+
+`SafeMpzSqrt`'s final-adjustment region computes two large squarings to
+verify Newton's output is within ±1 of `floor(sqrt(n))`:
+
+1. `xSq = x*x` — check `x² ≤ n` (adj-down if not).
+2. `x1Sq = (x+1)*(x+1)` — check `(x+1)² > n` (adj-up if not).
+
+At 5B-digit scale each squaring is a ~519 M-limb × ~519 M-limb
+multiply taking ~10-20 hours serial → ~20-40 hours total for the
+final-adj region.  The previous §207 guard forced
+`_safeMulDop = 1` across the entire region after the 5B-run-6 crash
+(2026-05-04) inside `SafeMpzMul`'s own recursive `Parallel.For`.
+
+§220 (#55, lift §166/§167/§168 force-serial caps) and §221 (#44, lift
+§138/§165 size-gates) on this branch removed the recursive-parallel
+crash mode that §207 originally guarded against.  The two squarings
+themselves are independent — disjoint operands (`x` vs `x+1`),
+disjoint result buffers (`xSq` vs `x1Sq`), no shared mutable state.
+
+### Fix
+
+Replace the §207 force-serial bracket with a `Parallel.Invoke` over
+the two squarings:
+
+```
+PreAllocMpzToLimbs(x1, szX + 2)         ' pre-size before mpz_add_ui (§206)
+mpz_add_ui(x1, x, 1)
+PreAllocMpzToLimbs(xSq,  2·szX + 4)     ' pre-size before SafeMpzMul tasks
+PreAllocMpzToLimbs(x1Sq, 2·szX + 4)
+
+Parallel.Invoke(
+    Sub() SafeMpzMul(xSq,  x,  x),
+    Sub() SafeMpzMul(x1Sq, x1, x1))
+
+' adj-down: if xSq > n, x--, x1--, recompute xSq; then recompute x1Sq.
+' adj-up:   if x1Sq ≤ n, swap x↔x1, x1 = x+1, recompute x1Sq.
+```
+
+Implementation at
+[Form1.vb:~5779-5853](Form1.vb#L5779-L5853).  The §206 pre-alloc
+guards (avoid silent realloc inside the parallel tasks) are retained.
+
+### Why it's now safe
+
+The §220 / §221 commits removed the recursive `Parallel.For` ×
+`Parallel.For` pattern from `SafeMpzMul`'s post-`§169` body; each
+inner SafeMpzMul fans out at the caller's `_safeMulDop` (no extra
+nesting).  Total concurrency: 2 outer × _safeMulDop inner — bounded
+and well below the 24-core machine's headroom at any operand size.
+
+Adj-down / adj-up loops remain serial (0-1 iter typical, single
+SafeMpzMul each); when adj-down triggers, `x1` is kept in sync so
+the parallel-pair's `x1Sq` is rebuilt for the new operand.
+
+### Expected impact
+
+- **At 5B**: cuts final-adj from ~20-40 h to ~10-20 h (halving).  The
+  P1 win in #72's Phase 4 list.
+- **At 1B**: cuts final-adj from a few minutes to under half — small
+  absolute saving, but a bit-identity gate before promoting to 5B.
+
+### Validation plan
+
+Resume from `C:\PiPreserved_1B_freshtest_post225_VERIFIED_2026-05-22`
+with `gmpSqrt.bin` deleted (forces `SafeMpzSqrt` to re-run final-adj
+on the resumed Newton state), `gmpPi.bin` deleted (forces post-sqrt
+recompute), and verify the regenerated `pi_digits.txt` SHA-256
+matches the baseline `b153e8d5…56d9b`.  Markers must pass:
+`999999@762`, `777777777@24,658,601`, `999999999@564,665,206`.
