@@ -4970,11 +4970,51 @@ the parallel-pair's `x1Sq` is rebuilt for the new operand.
 - **At 1B**: cuts final-adj from a few minutes to under half — small
   absolute saving, but a bit-identity gate before promoting to 5B.
 
-### Validation plan
+### Validation (2026-05-23, 1 B-digit Debug, C:\PiOutput_228test)
 
-Resume from `C:\PiPreserved_1B_freshtest_post225_VERIFIED_2026-05-22`
-with `gmpSqrt.bin` deleted (forces `SafeMpzSqrt` to re-run final-adj
-on the resumed Newton state), `gmpPi.bin` deleted (forces post-sqrt
-recompute), and verify the regenerated `pi_digits.txt` SHA-256
-matches the baseline `b153e8d5…56d9b`.  Markers must pass:
-`999999@762`, `777777777@24,658,601`, `999999999@564,665,206`.
+Cloned `C:\PiPreserved_1B_freshtest_post225_VERIFIED_2026-05-22`
+(28 GB) → `C:\PiOutput_228test`; deleted `gmpSqrt.bin`,
+`gmpNumer.bin`, `mpR0/R1/R2.bin`, `gmpPi.bin`/`_meta`, `nr_r.bin`/
+`_meta`, `div_q.bin`/`_meta`, `nr_raise.bin`/`_meta` from both
+`NodeCache/snap_Phase3` and `SnapshotStore/snap_Phase3` per the
+SnapshotStore-mirror lesson.  Kept `gmpSqrtInput.bin` +
+`sqrt_newton.bin` so SafeMpzSqrt resumes Newton at step 4 (already
+converged) and enters §228 final-adj directly.
+
+| Metric | Value |
+|---|---|
+| §228 Parallel.Invoke wall | **102.26 s** |
+| adj-down / adj-up iters | **0 / 0** (Newton converged on the nose) |
+| SafeMpzSqrt total wall | 1 min 50 s (load + parallel pair + save) |
+| Total run wall | 1 h 45 m 35 s |
+| §226 decimal conversion | 77.18 s (same as §225-baseline) |
+| pi_digits.txt size | 1,000,000,003 bytes |
+| pi_digits.txt SHA-256 | `b153e8d58b045fc65e8665d633ca54406d1bfbf1a2fdd38f1c3b325abc156d9b` — **identical to §225 baseline** |
+| Autoverify markers | `999999@762` ✓ `777777777@24,658,601` ✓ `nine-9s@564,665,206` ✓ |
+
+CPU samples (60 s windows, 24-core box):
+
+| T+ | Phase | Cores | RAM |
+|---|---|---|---|
+| 0:01 | §228 Parallel.Invoke (xSq‖x1Sq) | 6.35 | 8.17 GB |
+| 0:10 | §210 serial R0 | 0.99 | 7.99 GB |
+| 0:20 | §210 serial R2 finishing | 0.77 | 13.95 GB |
+| 0:30 | Reciprocal Newton iter 24 (prec 1.1 B bits) | 15.79 | 32.97 GB |
+| 0:40 | Reciprocal Newton iter 26+ (max prec) | 15.71 | 31.31 GB |
+| 0:50 | Reciprocal Newton tail | 15.40 | 29.65 GB |
+| 1:00 | Reciprocal Newton tail | 15.84 | 43.57 GB |
+| 1:10 | Reciprocal Newton tail (iter 33) | 15.80 | 47.52 GB |
+| 1:20 | SafeMpzDiv post-NR | 15.03 | 3.87 GB |
+| 1:30 | §226 power table | 4.94 | 15.10 GB |
+
+### 5B projection
+
+At 1 B each squaring is ~52 M limbs; the parallel pair fits in
+~792 MB of buffer (well under the 64 GB box's headroom) and runs in
+102 s vs an estimated ~120–240 s for the §207 serial pair.
+
+At 5 B each squaring is ~260 M limbs (~5× the 1 B operand size); the
+parallel pair takes ~16 GB scratch but stays inside the 64 GB
+budget.  Projected wall: **~10–20 h** for the parallel pair vs the
+§207 baseline of ~20–40 h for the serial pair.  Savings ≈ 10–20 h
+on the §72 Phase 4 critical path.
