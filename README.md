@@ -5309,5 +5309,32 @@ bit-identity baseline `b153e8d5…56d9b` covers correctness;
 performance impact too small to be the headline measurement (the
 ~50 % speedup on 2 minutes of work = ~1 min saved at 1 B).
 
+### Validation (2026-05-23, 1 B-digit Debug, C:\PiOutput_231test from scratch)
+
+Full from-scratch 1 B run on an empty output directory to exercise
+the §231 path (resume from snap_Phase3 skips Phase 2 entirely):
+
+| Metric | Value |
+|---|---|
+| §231 fired at | L12, L13, L14 (the 3 serial-path levels at 1 B with 10,001 starting chunks) |
+| Chosen DOP at each level | **6** (numTerms=70,521,872 < 100 M threshold) |
+| L12 wall (DOP=6, pairCount=2) | 2 m 33 s |
+| L13 wall (DOP=6, pairCount=1) | 3 m 27 s |
+| L14 wall (DOP=6, pairCount=1, final combine) | 7 m 22 s |
+| Phase 2 total wall | 17 m 25 s |
+| Total run wall (from scratch) | 3 h 34 m 29 s |
+| §226 decimal conversion | 79.22 s |
+| pi_digits.txt SHA-256 | `b153e8d58b045fc65e8665d633ca54406d1bfbf1a2fdd38f1c3b325abc156d9b` — **identical to §225 baseline** |
+| Autoverify markers | `999999@762` ✓ `777777777@24,658,601` ✓ `nine-9s@564,665,206` ✓ |
+
+The §231 log entry for each serial-path level confirms the policy
+decision:
+
+```
+[BinarySplit§231] serial-path DOP at level=12: numTerms=70,521,872, pairCount=2, chosen DOP=6
+[BinarySplit§231] serial-path DOP at level=13: numTerms=70,521,872, pairCount=1, chosen DOP=6
+[BinarySplit§231] serial-path DOP at level=14: numTerms=70,521,872, pairCount=1, chosen DOP=6
+```
+
 
 
