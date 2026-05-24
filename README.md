@@ -5552,8 +5552,9 @@ cores are idle waiting on the slow tail.
 
 ### Fix
 
-Detect tail mode in the outer `Parallel.For` (chunk index `i ≥ numChunks - 24`)
-and route those chunks through `BinarySplitChunkParallelTop` instead of
+Detect tail mode in the outer `Parallel.For` via the queue-depth proxy
+`Interlocked.Read(completedChunks) >= numChunks - 24` and route those
+chunks through `BinarySplitChunkParallelTop` instead of
 `BinarySplitChunk`.  The parallel-top variant splits `[a, b)` at the
 midpoint, runs the two halves concurrently via `Parallel.Invoke`
 (each half recurses serially through the standard
@@ -5563,7 +5564,9 @@ same combine GMP-batch as the inner DFS's combine).
 ```vb
 ' Outer loop (Form1.vb:~6299-6325)
 Parallel.For(0L, numChunks, Sub(i)
-    Dim _tailMode234 As Boolean = (i >= numChunks - 24L) AndAlso (chunkEnd - chunkStart >= 512L)
+    Dim _tailMode234 As Boolean = _
+        (Interlocked.Read(completedChunks) >= numChunks - 24L) AndAlso _
+        (chunkEnd - chunkStart >= 512L)
     If _tailMode234 Then
         BinarySplitChunkParallelTop(chunkStart, chunkEnd, tempP, tempQ, tempT)
     Else
@@ -5585,16 +5588,33 @@ End Sub
 
 Implementation at [Form1.vb:~1925-1975 (helper) and ~6299-6325 (caller)](Form1.vb#L1925).
 
+### Initial bug (chunk-index trigger) — fixed 2026-05-24
+
+The first §234 implementation used `i >= numChunks - 24L` (chunk **index**)
+as the tail trigger.  `Parallel.For` partitions the iteration range
+across workers, so high-index chunks can execute while many other
+chunks are still in flight on other cores.  The inner `Parallel.Invoke`
+then oversubscribed the 24 cores instead of filling idle ones:
+
+| Build | Phase 1 wall (1 B, 10,001 chunks) |
+|---|---|
+| §231 baseline (no §234) | 59.4 s |
+| §234 index-trigger (original) | **62.4 s (+3 s regression)** |
+
+Replaced trigger with `Interlocked.Read(completedChunks) >= numChunks - 24`
+per issue #59's spec, so `ParallelTop` only fires once the queue is
+near-empty across all workers.
+
 ### Why this is safe
 
-- The outer `Parallel.For` dispatches in roughly chunk-index order
-  (default range partitioner).  By the time chunks with `i ≥ numChunks - 24`
-  start, the early chunks have completed and the cores are mostly
-  idle waiting on the slow tail — no oversubscription risk.
-- `BinarySplitChunkParallelTop` spawns exactly 2 inner tasks; total
-  concurrent compute at tail = up to 24 outer × 2 inner = 48 tasks,
-  but inner tasks are mostly waiting on memory bandwidth and the
-  Thread Pool elastic scheduler handles oversubscription.
+- The trigger `completedChunks >= numChunks - 24` fires only once ≤24
+  chunks remain in flight + queued across all workers.  With 24 cores
+  and ≤24 remaining work items, some cores are idle by construction —
+  inner `Parallel.Invoke` fills them rather than oversubscribing.
+- `BinarySplitChunkParallelTop` spawns exactly 2 inner tasks per
+  triggered chunk; total concurrent compute at tail = ≤24 outer × 2
+  inner = ≤48 tasks, but most outer slots are idle by the time the
+  trigger fires.
 - The combine step uses the same `GmpBatch_CombineNodes` as the
   serial DFS's combine — bit-identical output.
 - Non-tail chunks stay on the serial path (no behaviour change for

@@ -6351,18 +6351,22 @@ PostShiftCheckpoint:
                 Dim tempP As mpz_t = Nothing
                 Dim tempQ As mpz_t = Nothing
                 Dim tempT As mpz_t = Nothing
-                ' §234 (issue #59, 2026-05-23): tail-mode parallel top-split.
-                ' Late chunks (high index) have linearly-larger terms — per-term
-                ' cost grows with a — so the last ~24 chunks dominate end-of-
-                ' Phase-1 wall time even though the outer Parallel.For queue depth
-                ' has dropped below the 24-core DOP.  Detect tail (i >= numChunks-24)
-                ' and split the chunk's top via Parallel.Invoke; the two halves
-                ' recurse via the standard serial BinarySplitChunk.  Threshold
-                ' chunkSize >= 512 ensures the split has enough work to amortize
-                ' scheduling overhead.  Non-tail chunks stay on the existing serial
-                ' DFS — outer Parallel.For already saturates cores, and adding
-                ' inner parallelism oversubscribes.
-                Dim _tailMode234 As Boolean = (i >= numChunks - 24L) AndAlso (chunkEnd - chunkStart >= 512L)
+                ' §234 (issue #59, 2026-05-23; fix 2026-05-24): tail-mode parallel
+                ' top-split.  Late chunks dominate end-of-Phase-1 wall time once
+                ' outer Parallel.For queue depth drops below 24 cores.
+                '
+                ' Initial §234 used chunk *index* (i >= numChunks-24) as the
+                ' trigger.  Parallel.For partitions the range across workers, so
+                ' high-index chunks can execute while many other chunks are still
+                ' in flight — the inner Parallel.Invoke then oversubscribes,
+                ' costing wall time (62.4 s vs 59.4 s baseline at 1 B).
+                '
+                ' Fixed to use queue-depth proxy per issue #59 spec: trigger only
+                ' when completedChunks >= numChunks-24, i.e. ≤24 chunks remain
+                ' across all workers, so the inner Parallel.Invoke fills idle
+                ' cores instead of oversubscribing.  Threshold chunkSize >= 512
+                ' ensures the split has enough work to amortize scheduling.
+                Dim _tailMode234 As Boolean = (Interlocked.Read(completedChunks) >= numChunks - 24L) AndAlso (chunkEnd - chunkStart >= 512L)
                 If _tailMode234 Then
                     BinarySplitChunkParallelTop(chunkStart, chunkEnd, tempP, tempQ, tempT)
                 Else
