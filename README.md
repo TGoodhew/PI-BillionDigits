@@ -5418,15 +5418,36 @@ completing synchronously.
   Catch logs a warning and the chain continues — one bad backup
   doesn't break the next.
 
-### Validation plan
+### Validation (2026-05-23, 1 B-digit Debug, C:\PiOutput_229test)
 
-Run 1 B with full Newton from scratch (or from `gmpNumer.bin` resume
-without `nr_raise.bin`) so each Newton iter triggers
-`BackupSnapshotToStoreAsync("snap_Phase3")`.  Look for the
-absence of synchronous backup pauses between iters
-(`§NR-ckpt saved: iter=N` log lines should be back-to-back in time)
-and the `WaitForPendingBackups: drained in {s}` line at end.
-SHA-256 of `pi_digits.txt` must match baseline `b153e8d5…56d9b`.
+Cloned `C:\PiPreserved_1B_freshtest_post225_VERIFIED_2026-05-22`,
+deleted `gmpPi/nr_r/div_q/nr_raise` from both NodeCache and
+SnapshotStore (so §230 fast-path doesn't shortcut Newton + §NR-ckpt
+fires per iter triggering `BackupSnapshotToStoreAsync`).
+
+| Metric | Value |
+|---|---|
+| §NR-ckpt iter saves | 35 (iter 1 → iter 35) |
+| Async backups completed | **38** (35 §NR-ckpt + §201-raise + §piCkpt + finalT snap) |
+| §201-raise save with bSig | 5.42 s (bSig matches prior runs' fe92cc115ea861c2…) |
+| Division complete | T+1:20:36 |
+| §226 conversion | 80.94 s |
+| FormClosing | clean (ApplicationExitCall — no drain timeout) |
+| Total run wall | 1 h 21 m 59 s |
+| pi_digits.txt SHA-256 | `b153e8d58b045fc65e8665d633ca54406d1bfbf1a2fdd38f1c3b325abc156d9b` — **identical to baseline** |
+| Autoverify markers | `999999@762` ✓ `777777777@24,658,601` ✓ `nine-9s@564,665,206` ✓ |
+
+vs §230 Run 1 baseline (synchronous backup, same workload):
+1 h 20 m 31 s.  **Δ at 1 B = +1m 28s (within ~2 % run-to-run noise).**
+At 1 B the per-iter backup is small enough (~1 s) that hiding it
+doesn't move the needle.  At 5 B (backup ~5-15 s × 35 iters), §232
+projects 3-9 min saved (each backup overlaps with the next Newton
+iter's 60-90 s of compute instead of blocking it).
+
+FormClosing fires clean (no `WaitForPendingBackups: drained in {s}`
+log line — the drain helper only logs when the tail Task isn't
+already complete, which means all 38 async backups had landed before
+exit).
 
 
 
