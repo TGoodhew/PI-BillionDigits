@@ -1922,6 +1922,53 @@ Public Class Form1
         If _logLevel >= 4 Then WriteToLog($"[BinarySplitChunk] Exit   a={a:N0}  b={b:N0}  stackPeak={maxDepth}")
     End Sub
 
+    ' §234 (issue #59, 2026-05-23): tail-mode parallel top-split for
+    ' BinarySplitChunk.  Splits the term range [a, b) in half and computes the
+    ' two halves concurrently via Parallel.Invoke; each half recurses serially
+    ' through the standard BinarySplitChunk path, then the top combine uses
+    ' GmpBatch_CombineNodes (same as the serial DFS's combine).
+    '
+    ' Used only by Phase 1's outer Parallel.For when the chunk index falls in
+    ' the last ~24 chunks AND the chunk has ≥ 512 terms (enough to amortize
+    ' Parallel.Invoke scheduling).  The outer queue depth has dropped below the
+    ' 24-core DOP at that point, so the inner Parallel.Invoke fills idle cores
+    ' without oversubscribing.
+    Private Sub BinarySplitChunkParallelTop(a As Long, b As Long,
+                                            ByRef Pab As mpz_t,
+                                            ByRef Qab As mpz_t,
+                                            ByRef Tab As mpz_t)
+        If _logLevel >= 4 Then WriteToLog($"[BinarySplitChunkParallelTop§234] Enter  a={a:N0}  b={b:N0}  terms={b - a:N0}")
+        Dim mid As Long = (a + b) \ 2
+
+        Dim Pl As mpz_t = Nothing, Ql As mpz_t = Nothing, Tl As mpz_t = Nothing
+        Dim Pr As mpz_t = Nothing, Qr As mpz_t = Nothing, Tr As mpz_t = Nothing
+
+        System.Threading.Tasks.Parallel.Invoke(
+            Sub() BinarySplitChunk(a, mid, Pl, Ql, Tl),
+            Sub() BinarySplitChunk(mid, b, Pr, Qr, Tr))
+
+        ' Combine the two halves using the same GMP batch routine as the inner
+        ' DFS's combine step (line ~1860).
+        Pab = New mpz_t()
+        Qab = New mpz_t()
+        Tab = New mpz_t()
+        Dim tempA As New mpz_t()
+        Dim tempB As New mpz_t()
+        gmp_lib.mpz_inits(Pab, Qab, Tab, tempA, tempB, Nothing)
+
+        GmpBatch_CombineNodes(
+            Pab.Pointer, Qab.Pointer, Tab.Pointer,
+            Pl.Pointer, Ql.Pointer, Tl.Pointer,
+            Pr.Pointer, Qr.Pointer, Tr.Pointer,
+            tempA.Pointer, tempB.Pointer)
+
+        gmp_lib.mpz_clears(Pl, Ql, Tl, Nothing)
+        gmp_lib.mpz_clears(Pr, Qr, Tr, Nothing)
+        gmp_lib.mpz_clears(tempA, tempB, Nothing)
+
+        If _logLevel >= 4 Then WriteToLog($"[BinarySplitChunkParallelTop§234] Exit   a={a:N0}  b={b:N0}")
+    End Sub
+
     ' ════════════════════════════════════════════════════════════════════════
     '  Disk serialization / deserialization
     ' ════════════════════════════════════════════════════════════════════════
@@ -6304,7 +6351,23 @@ PostShiftCheckpoint:
                 Dim tempP As mpz_t = Nothing
                 Dim tempQ As mpz_t = Nothing
                 Dim tempT As mpz_t = Nothing
-                BinarySplitChunk(chunkStart, chunkEnd, tempP, tempQ, tempT)
+                ' §234 (issue #59, 2026-05-23): tail-mode parallel top-split.
+                ' Late chunks (high index) have linearly-larger terms — per-term
+                ' cost grows with a — so the last ~24 chunks dominate end-of-
+                ' Phase-1 wall time even though the outer Parallel.For queue depth
+                ' has dropped below the 24-core DOP.  Detect tail (i >= numChunks-24)
+                ' and split the chunk's top via Parallel.Invoke; the two halves
+                ' recurse via the standard serial BinarySplitChunk.  Threshold
+                ' chunkSize >= 512 ensures the split has enough work to amortize
+                ' scheduling overhead.  Non-tail chunks stay on the existing serial
+                ' DFS — outer Parallel.For already saturates cores, and adding
+                ' inner parallelism oversubscribes.
+                Dim _tailMode234 As Boolean = (i >= numChunks - 24L) AndAlso (chunkEnd - chunkStart >= 512L)
+                If _tailMode234 Then
+                    BinarySplitChunkParallelTop(chunkStart, chunkEnd, tempP, tempQ, tempT)
+                Else
+                    BinarySplitChunk(chunkStart, chunkEnd, tempP, tempQ, tempT)
+                End If
 
                 Dim node As DiskNode
                 node.FilePath = Nothing

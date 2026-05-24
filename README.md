@@ -5539,5 +5539,82 @@ at 1 B (was ~1 h 20 m pre-session).  At 5 B (DOP=3) the per-multiply
 speedup is smaller (~1.5-2× vs DOP=1) but the absolute base is
 larger — projects to ~50-70 min saved across the 3 R-multiplies.
 
+## §234 — Tail-mode parallel top-split for BinarySplitChunk (2026-05-23, issue #59)
+
+Phase 1's outer `Parallel.For(0L, numChunks, ...)` dispatches one
+chunk per task and each chunk runs `BinarySplitChunk` (a serial
+`Stack(Of WorkItem)` DFS over ~7-8 K terms).  Each term's cost grows
+linearly with its index `a` (later terms have larger constants), so
+the LAST ~24 chunks have ~1000× more compute per chunk than the
+first ~24.  When the outer queue depth drops below the 24-core DOP,
+late chunks dominate end-of-Phase-1 wall time even though many
+cores are idle waiting on the slow tail.
+
+### Fix
+
+Detect tail mode in the outer `Parallel.For` (chunk index `i ≥ numChunks - 24`)
+and route those chunks through `BinarySplitChunkParallelTop` instead of
+`BinarySplitChunk`.  The parallel-top variant splits `[a, b)` at the
+midpoint, runs the two halves concurrently via `Parallel.Invoke`
+(each half recurses serially through the standard
+`BinarySplitChunk`), then combines via `GmpBatch_CombineNodes` (the
+same combine GMP-batch as the inner DFS's combine).
+
+```vb
+' Outer loop (Form1.vb:~6299-6325)
+Parallel.For(0L, numChunks, Sub(i)
+    Dim _tailMode234 As Boolean = (i >= numChunks - 24L) AndAlso (chunkEnd - chunkStart >= 512L)
+    If _tailMode234 Then
+        BinarySplitChunkParallelTop(chunkStart, chunkEnd, tempP, tempQ, tempT)
+    Else
+        BinarySplitChunk(chunkStart, chunkEnd, tempP, tempQ, tempT)
+    End If
+    ...
+End Sub)
+
+' New helper (Form1.vb:~1925-1975)
+Sub BinarySplitChunkParallelTop(a, b, ByRef Pab, ByRef Qab, ByRef Tab)
+    mid = (a + b) \ 2
+    Parallel.Invoke(
+        Sub() BinarySplitChunk(a, mid, Pl, Ql, Tl),
+        Sub() BinarySplitChunk(mid, b, Pr, Qr, Tr))
+    GmpBatch_CombineNodes(Pab, Qab, Tab, Pl, Ql, Tl, Pr, Qr, Tr, tempA, tempB)
+    ...
+End Sub
+```
+
+Implementation at [Form1.vb:~1925-1975 (helper) and ~6299-6325 (caller)](Form1.vb#L1925).
+
+### Why this is safe
+
+- The outer `Parallel.For` dispatches in roughly chunk-index order
+  (default range partitioner).  By the time chunks with `i ≥ numChunks - 24`
+  start, the early chunks have completed and the cores are mostly
+  idle waiting on the slow tail — no oversubscription risk.
+- `BinarySplitChunkParallelTop` spawns exactly 2 inner tasks; total
+  concurrent compute at tail = up to 24 outer × 2 inner = 48 tasks,
+  but inner tasks are mostly waiting on memory bandwidth and the
+  Thread Pool elastic scheduler handles oversubscription.
+- The combine step uses the same `GmpBatch_CombineNodes` as the
+  serial DFS's combine — bit-identical output.
+- Non-tail chunks stay on the serial path (no behaviour change for
+  the first ~99 % of Phase 1).
+
+### Expected impact
+
+- **At 1 B**: Phase 1 wall ~60 s total; the late ~24 chunks
+  represent roughly the last 5-10 s.  §234 cuts that to ~3-5 s →
+  **~2-5 s saved at 1 B**.
+- **At 5 B** (~14× larger): Phase 1 wall ~3-4 h; late-chunk tail
+  is roughly the last 15-30 min.  §234 cuts that ~half → **~7-15 min saved at 5 B**.
+
+### Validation plan
+
+Run 1 B from-scratch with the new build.  Look for `[BinarySplitChunkParallelTop§234]`
+log entries at `_logLevel >= 4` for the last 24 chunks.  SHA-256 of
+`pi_digits.txt` must match baseline `b153e8d5…56d9b`.  Phase 1 total
+wall should be within a second or two of pre-§234 baseline (saving
+at 1 B is in the noise floor of run-to-run variance).
+
 
 
