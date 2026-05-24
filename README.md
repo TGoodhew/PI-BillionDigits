@@ -5510,13 +5510,34 @@ floor.)
   ~5 GB at 5 B).  At normal compute pace (1-5 min per r_i) backup
   has plenty of time to drain.
 
-### Validation plan
+### Validation (2026-05-23, 1 B-digit Debug, C:\PiOutput_229test)
 
-Run a clean 1 B with `mpR0/R1/R2.bin` deleted from `snap_Phase3`
-(forces §210/§233 to fire on all three).  Look for
-`[ComputePi§233] r_i done in {s}` wall times under ~3 min each (vs
-~6 min pre-§233).  SHA-256 of `pi_digits.txt` must match baseline
-`b153e8d5…56d9b`.
+Cloned the §232-equipped working dir, deleted `gmpNumer/mpR_i/gmpPi/nr_r/div_q`
+from both `NodeCache` and `SnapshotStore` (kept `gmpSqrt` + `nr_raise`
+so SafeMpzSqrt is skipped and §230 fast-path fires for the pi-divide
+Newton).
+
+| Metric | Pre-§233 (§232 baseline) | §233 (DOP=6) | Δ |
+|---|---|---|---|
+| R0 wall | 4 min 13 s | **30.6 s** | **8.3× faster** |
+| R1 wall | ~7 min | **53.3 s** | ~7.9× faster |
+| R2 wall | ~7 min | **53.1 s** | ~7.9× faster |
+| R0+R1+R2 total | ~18 min | **2 min 17 s** | **~16 min saved** |
+| Division complete | T+1:20:36 | **T+13:20** | (§230 + §233 combined) |
+| Total run wall | 1 h 21 m 59 s | **14 min 36 s** | **~67 min saved** |
+| pi_digits.txt SHA-256 | identical | identical | — |
+
+The 8× per-multiply speedup is much larger than the 3× projected.
+At DOP=6 the inner SafeMpzMul recurses 6³ = 216 leaf tasks; on a
+24-core box that's enough work to saturate all cores even when some
+tasks stall on memory bandwidth.  At DOP=1 the recursion was strictly
+single-core; the leap to multi-core fanout dominates the throughput
+gain.
+
+§233 + §230 together: total Phase-3-from-gmpSqrt cycle is now 14 min
+at 1 B (was ~1 h 20 m pre-session).  At 5 B (DOP=3) the per-multiply
+speedup is smaller (~1.5-2× vs DOP=1) but the absolute base is
+larger — projects to ~50-70 min saved across the 3 R-multiplies.
 
 
 
