@@ -57,3 +57,6 @@ run_5B_*.log.err
 
 # Claude-session workflow scratch scripts (underscore-prefix convention)
 _*.ps1
+
+# Local Claude Code session metadata
+sessions/
