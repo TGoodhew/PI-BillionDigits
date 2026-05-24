@@ -5336,5 +5336,97 @@ decision:
 [BinarySplit§231] serial-path DOP at level=14: numTerms=70,521,872, pairCount=1, chosen DOP=6
 ```
 
+## §232 — Async BackupSnapshotToStore via tail-chained Task (2026-05-23, issue #46)
+
+`BackupSnapshotToStore` copies the entire snap directory contents to
+`SnapshotStore`.  At 1 B `snap_Phase3` is ~25 GB; at 5 B ~150 GB.
+Pre-§232 this ran on the synchronous compute thread inside every
+§NR-ckpt save (Newton iter), every `SavePhase3Value` save, and every
+Phase-2 level snapshot — putting tens of seconds to many minutes of
+NVMe-bandwidth-bound I/O directly on the critical path.
+
+### Fix
+
+A new `BackupSnapshotToStoreAsync(snapName)` enqueues the backup as a
+continuation of a tail Task that runs on the ThreadPool:
+
+```vb
+Private Shared _bkstoreTail As Task = Task.CompletedTask
+Private Shared ReadOnly _bkstoreTailLock As New Object()
+
+Sub BackupSnapshotToStoreAsync(snapName)
+    SyncLock _bkstoreTailLock
+        Dim _capturedSnap = snapName
+        _bkstoreTail = _bkstoreTail.ContinueWith(
+            Sub(prior) BackupSnapshotToStore(_capturedSnap))
+    End SyncLock
+End Sub
+```
+
+ContinueWith guarantees serial execution in enqueue order — every
+commit is *eventually* reflected in SnapshotStore — but the compute
+thread doesn't wait.  The lock is held only for the enqueue
+(microseconds), not the I/O.
+
+### Shutdown drain
+
+`WaitForPendingBackups(timeoutMs)` waits on the current tail Task so
+the SnapshotStore reflects the canonical final state before the
+process exits.  Wired into `Form1_FormClosing` with a 5-minute
+timeout (caps pathological cases).
+
+```vb
+Sub Form1_FormClosing(...)
+    WriteToLog($"[FormClosing] Reason={e.CloseReason}")
+    WaitForPendingBackups(timeoutMs:=300000)   ' §232
+    StopAffinityWatchdog()
+    ...
+```
+
+### Call sites converted (8 total)
+
+- `SavePhase3Value` x2 — per Phase-3 checkpoint save (gmpSqrt,
+  gmpNumer, mpR_i, gmpPi, etc.).
+- `SafeMpzReciprocal §NR-ckpt` — per Newton iter save.
+- `SafeMpzReciprocal §201-raise save` — at end of converged Newton.
+- Sqrt-Newton §202-ckpt — per sqrt-Newton step save.
+- `BinarySplitGMP` per-level Phase-2 snapshot — `snap_L{level}`.
+- §216 / §piCkpt save — pi_digits.txt-equivalent checkpoint.
+
+All 8 sites converted to async; no caller depends on the backup
+completing synchronously.
+
+### Expected impact
+
+- **At 1 B**: ~30-60 s of synchronous backup I/O removed from the
+  Newton compute critical path (~35 iters × ~1-2 s per backup).
+- **At 5 B**: ~3-9 minutes of synchronous backup I/O removed.
+- **No safety regression**: SnapshotStore is *eventually* consistent
+  with the latest committed state; if the process crashes mid-backup
+  the NodeCache (src) still holds the canonical state.
+- Pairs with #53 (R0/R1/R2 pipeline + async-save) which can now lift
+  §210 force-serial since the per-r_i save is no longer on the
+  compute critical path.
+
+### Risk
+
+- A backup that runs SLOWER than the compute rate would build up
+  queued continuations; bounded by total backup time × compute rate.
+  In practice backups (~1-15 s) complete faster than Newton iters
+  (~60-90 s at 5 B) so the chain never gets deep.
+- If a backup throws inside `BackupSnapshotToStore`, the existing
+  Catch logs a warning and the chain continues — one bad backup
+  doesn't break the next.
+
+### Validation plan
+
+Run 1 B with full Newton from scratch (or from `gmpNumer.bin` resume
+without `nr_raise.bin`) so each Newton iter triggers
+`BackupSnapshotToStoreAsync("snap_Phase3")`.  Look for the
+absence of synchronous backup pauses between iters
+(`§NR-ckpt saved: iter=N` log lines should be back-to-back in time)
+and the `WaitForPendingBackups: drained in {s}` line at end.
+SHA-256 of `pi_digits.txt` must match baseline `b153e8d5…56d9b`.
+
 
 

@@ -1558,6 +1558,10 @@ Public Class Form1
             WriteToLog($"[FormClosing] Reason={e.CloseReason}")
         Catch
         End Try
+        ' §232: drain pending async backup tail before exit so SnapshotStore
+        ' reflects the canonical final state (rather than ending mid-copy).
+        ' 5-minute timeout caps the wait in pathological cases.
+        WaitForPendingBackups(timeoutMs:=300000)
         StopAffinityWatchdog()   ' §106
 
         ' Headless runs exit unattended; autoverify path uses ApplicationExitCall.
@@ -2078,6 +2082,56 @@ Public Class Form1
         End Try
     End Sub
 
+    ' §232 (issue #46, 2026-05-23): async tail-chained BackupSnapshotToStore.
+    '
+    ' Synchronous BackupSnapshotToStore copies the entire snap directory contents
+    ' to SnapshotStore — at 1 B snap_Phase3 is ~25 GB, at 5 B ~150 GB.  Per Newton
+    ' iter (called inside §NR-ckpt save) this was on the synchronous compute
+    ' critical path: ~1-2 s per iter × ~35 iters = 30-60 s blocked compute at 1 B
+    ' (~5-15 s × 35 iters = 3-9 min at 5 B).
+    '
+    ' Design: maintain a "tail" Task that represents the latest enqueued backup.
+    ' Each call to BackupSnapshotToStoreAsync chains a continuation that runs
+    ' AFTER the prior tail completes — serial execution + every commit eventually
+    ' reflected in SnapshotStore.  Compute thread doesn't wait.
+    '
+    ' Per-call cost: enqueue + lock = microseconds.  Compute resumes immediately;
+    ' the disk I/O happens on a background ThreadPool thread, overlapping with
+    ' the next Newton iter (typically 60-90 s of compute at 5 B).
+    '
+    ' Shutdown: WaitForPendingBackups drains the chain at FormClosing so the
+    ' SnapshotStore has the canonical final state before the process exits.
+    Private Shared _bkstoreTail As Task = Task.CompletedTask
+    Private Shared ReadOnly _bkstoreTailLock As New Object()
+
+    Private Shared Sub BackupSnapshotToStoreAsync(snapName As String)
+        SyncLock _bkstoreTailLock
+            Dim _capturedSnap As String = snapName  ' explicit capture to avoid closure surprises
+            _bkstoreTail = _bkstoreTail.ContinueWith(
+                Sub(prior)
+                    BackupSnapshotToStore(_capturedSnap)
+                End Sub,
+                TaskContinuationOptions.None)
+        End SyncLock
+    End Sub
+
+    Private Shared Sub WaitForPendingBackups(timeoutMs As Integer)
+        Dim _t As Task
+        SyncLock _bkstoreTailLock
+            _t = _bkstoreTail
+        End SyncLock
+        If _t Is Nothing OrElse _t.IsCompleted Then Return
+        Try
+            AppendLog($"[Snapshot§232] WaitForPendingBackups: draining pending backup tail (timeout={timeoutMs}ms){vbCrLf}")
+            Dim _startTicks As Long = System.Diagnostics.Stopwatch.GetTimestamp()
+            Dim _ok As Boolean = _t.Wait(timeoutMs)
+            Dim _elapsedSec As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _startTicks) / System.Diagnostics.Stopwatch.Frequency
+            AppendLog($"[Snapshot§232] WaitForPendingBackups: {(If(_ok, "drained", "TIMED OUT"))} in {_elapsedSec:F2}s{vbCrLf}")
+        Catch ex As Exception
+            AppendLog($"[Snapshot§232] WaitForPendingBackups exception: {ex.Message}{vbCrLf}")
+        End Try
+    End Sub
+
     ' §104: Remove a superseded snapshot from SnapshotStore.
     Private Sub DeleteSnapshotFromStore(level As Integer)
         Try
@@ -2109,7 +2163,7 @@ Public Class Form1
                     SerializeOneMpz(val, bw, staging)
                 End Using
             End Using
-            BackupSnapshotToStore("snap_Phase3")
+            BackupSnapshotToStoreAsync("snap_Phase3")  ' §232: async backup off compute critical path
             LogPhase($"[ComputePi] Checkpoint: {name} saved (~{CLng(gmp_lib.mpz_sizeinbase(val, 10)):N0} digits)")
         Catch ex As Exception
             LogPhase($"[ComputePi] Checkpoint: {name} save failed: {ex.Message}")
@@ -2177,7 +2231,7 @@ Public Class Form1
                      $" Q~{CLng(gmp_lib.mpz_sizeinbase(finalQ, 10)):N0}" &
                      $" T~{CLng(gmp_lib.mpz_sizeinbase(finalT, 10)):N0} digits)")
             ' §104: Back up snap_Phase3 immediately — don't wait for end-of-run script backup.
-            BackupSnapshotToStore("snap_Phase3")
+            BackupSnapshotToStoreAsync("snap_Phase3")  ' §232: async backup off compute critical path
         Catch ex As Exception
             LogPhase($"[ComputePi] snap_Phase3 save FAILED: {ex.Message} — continuing without checkpoint")
         End Try
@@ -4193,7 +4247,7 @@ Public Class Form1
                     End Using
                     System.IO.File.WriteAllText(_nrMeta,
                         $"kBits={kBits}{vbLf}bBits={bBits}{vbLf}prec={prec}{vbLf}iter={_nrIter}{vbLf}")
-                    BackupSnapshotToStore("snap_Phase3")
+                    BackupSnapshotToStoreAsync("snap_Phase3")  ' §232: async backup off compute critical path
                     AppendLog($"[SafeMpzReciprocal] §NR-ckpt saved: iter={_nrIter} prec={prec:N0}{vbCrLf}")
                 Catch _ex As Exception
                     AppendLog($"[SafeMpzReciprocal] §NR-ckpt save failed: {_ex.Message}{vbCrLf}")
@@ -4266,7 +4320,7 @@ Public Class Form1
                 Dim _t230SigSaveSec As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _t230SigStart) / System.Diagnostics.Stopwatch.Frequency
                 System.IO.File.WriteAllText(_nrRaiseMeta,
                     $"kBits={kBits}{vbLf}bBits={bBits}{vbLf}rBits={rBits}{vbLf}scope={_saveScope}{vbLf}bSig={_saveBSig}{vbLf}")
-                BackupSnapshotToStore("snap_Phase3")
+                BackupSnapshotToStoreAsync("snap_Phase3")  ' §232: async backup off compute critical path
                 AppendLog($"[SafeMpzReciprocal] §201-raise: saved converged r (scope={_saveScope} kBits={kBits:N0} bBits={bBits:N0} rBits={rBits:N0} bSig={_saveBSig.Substring(0, 16)}... computed in {_t230SigSaveSec:F2}s) for future raise{vbCrLf}")
             Catch _ex As Exception
                 AppendLog($"[SafeMpzReciprocal] §201-raise save failed: {_ex.Message}{vbCrLf}")
@@ -5159,7 +5213,7 @@ PostShiftCheckpoint:
                 End Using
                 System.IO.File.WriteAllText(_divCkptMeta,
                     $"szA={szA}{vbLf}szB={szB}{vbLf}aBits={aBits}{vbLf}kBits={kBits}{vbLf}scope={_divCkptScope}{vbLf}")
-                BackupSnapshotToStore("snap_Phase3")
+                BackupSnapshotToStoreAsync("snap_Phase3")  ' §232: async backup off compute critical path
                 AppendLog($"[SafeMpzDiv§171-ckpt] saved div_q.bin (szQ={szQ:N0} scope={_divCkptScope}){vbCrLf}")
             Catch _ex As Exception
                 AppendLog($"[SafeMpzDiv§171-ckpt] save failed: {_ex.Message}{vbCrLf}")
@@ -5943,7 +5997,7 @@ PostShiftCheckpoint:
                     System.IO.File.WriteAllText(sqrtCheckMeta,
                         $"bitsN={bitsN}{vbLf}kBitsX={kBitsX}{vbLf}step={_newtonStep}{vbLf}")
                     AppendLog($"[SafeMpzSqrt§202-ckpt] meta written; calling BackupSnapshotToStore{vbCrLf}")
-                    BackupSnapshotToStore("snap_Phase3")
+                    BackupSnapshotToStoreAsync("snap_Phase3")  ' §232: async backup off compute critical path
                     AppendLog($"[SafeMpzSqrt] Newton step {_newtonStep} checkpoint saved (kBitsX={kBitsX:N0}){vbCrLf}")
                 Catch ex As Exception
                     AppendLog($"[SafeMpzSqrt] Newton checkpoint save failed: {ex.Message}{vbCrLf}")
@@ -6707,7 +6761,7 @@ Phase2:
             ' After confirming the new snapshot, delete the previous level's snapshot.
             If _autoCheckpoint AndAlso Not isLastLevel Then
                 If WriteLevelSnapshot(level, diskNodes, numTerms, numChunks) Then  ' §96
-                    BackupSnapshotToStore($"snap_L{level}")   ' §104: immediate SnapshotStore backup
+                    BackupSnapshotToStoreAsync($"snap_L{level}")   ' §104 + §232: async SnapshotStore backup
                     DeleteSnapshotFromStore(level - 1)        ' §104: remove superseded backup
                     DeleteSnapshotDir(level - 1)              ' remove superseded NodeCache entry
                 End If
@@ -8175,7 +8229,7 @@ NumeratorDone:
                             End Using
                         End Using
                         System.IO.File.WriteAllText(_piCkptMeta, $"digits={digits}{vbLf}")
-                        BackupSnapshotToStore("snap_Phase3")
+                        BackupSnapshotToStoreAsync("snap_Phase3")  ' §232: async backup off compute critical path
                         WriteToLog($"[ComputePi§piCkpt] saved gmpPi.bin (digits={digits:N0})")
                     Catch _ex As Exception
                         WriteToLog($"[ComputePi§piCkpt] save failed: {_ex.Message}")
