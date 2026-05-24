@@ -7868,38 +7868,71 @@ BeforeStep4:
                 ' budget on the 10th relaunch (2026-05-05 17:33 PT) — OOM at a 47 MB
                 ' inner accum buffer.  Save each immediately on completion so a crash
                 ' during r1 or r2 keeps the previously-computed r_i values.
+                '
+                ' §233 (issue #53, 2026-05-23): lift §210's force-to-1.  Pre-§233 §210
+                ' kept _safeMulDop=1 for safety at 5B, but at smaller scales DOP=1 wastes
+                ' ~24× of available parallelism.  §232 made the SavePhase3Value backup
+                ' async, so the only remaining serialization concern is COMPUTE memory.
+                '
+                ' Solution: keep the sequential structure (one compute in flight at a time
+                ' to bound RAM) but lift the inner DOP via the same scale-aware policy as
+                ' §231.  Per-multiply peak ≈ DOP^3 × per-task-buffer + result + intermediate.
+                ' Memory budget (40 GB target on 64 GB box) and per-task-buffer scale
+                ' linearly with gmpNumer.size, so the same thresholds work:
+                '   numTerms <  100 M (~ < 1.4 B digits): DOP=6 → ~15 GB peak / multiply
+                '   numTerms <  250 M (1.4-3.5 B)       : DOP=4 → ~20 GB peak
+                '   numTerms >= 250 M (>= 3.5 B)        : DOP=3 → ~25 GB peak  (= §210 safety target)
+                '
+                ' Per-multiply wall: ~6 min serial at 1B → ~2 min at DOP=6 (3-4× speedup).
+                ' Three multiplies: ~18 min → ~6 min at 1B (~12 min saved).  At 5B with
+                ' DOP=3 the savings are smaller (~30% per multiply) but on a larger absolute
+                ' base (~50 min/multiply → ~35 min/multiply = 45 min saved across the 3).
                 Dim _saved210Dop As Integer = System.Threading.Volatile.Read(_safeMulDop)
-                System.Threading.Volatile.Write(_safeMulDop, 1)
-                WriteToLog($"[ComputePi§210] forcing serial DOP for sequential r0/r1/r2 multiplies (savedDop={_saved210Dop})")
+                Dim _chosenDop233 As Integer
+                If numTerms < 100_000_000L Then
+                    _chosenDop233 = 6
+                ElseIf numTerms < 250_000_000L Then
+                    _chosenDop233 = 4
+                Else
+                    _chosenDop233 = 3
+                End If
+                System.Threading.Volatile.Write(_safeMulDop, _chosenDop233)
+                WriteToLog($"[ComputePi§233] R0/R1/R2 pipeline: numTerms={numTerms:N0}, chosen DOP={_chosenDop233} (was hardcoded 1 in §210; SavePhase3Value backup is async via §232)")
                 If Not _r0Done Then
-                    WriteToLog("[ComputePi§210] computing r0 = gmpNumer * Q0 (finalQ)...")
+                    WriteToLog("[ComputePi§233] computing r0 = gmpNumer * Q0 (finalQ) at DOP=" & _chosenDop233 & "...")
+                    Dim _t233R0 As Long = System.Diagnostics.Stopwatch.GetTimestamp()
                     SafeMpzMul(mpR0, gmpNumer, finalQ)
-                    WriteToLog($"[ComputePi§210] r0 done; saving mpR0 (size={Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer, 4):N0})")
+                    Dim _t233R0Sec As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _t233R0) / System.Diagnostics.Stopwatch.Frequency
+                    WriteToLog($"[ComputePi§233] r0 done in {_t233R0Sec:F1}s; saving mpR0 (size={Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer, 4):N0})")
                     SavePhase3Value("mpR0", mpR0, p3SnapDir)
                 Else
-                    WriteToLog("[ComputePi§210] r0 already loaded; skipping")
+                    WriteToLog("[ComputePi§233] r0 already loaded; skipping")
                 End If
                 gmp_lib.mpz_clear(finalQ)
                 If Not _r1Done Then
-                    WriteToLog("[ComputePi§210] computing r1 = gmpNumer * Q1 (mpQ1)...")
+                    WriteToLog("[ComputePi§233] computing r1 = gmpNumer * Q1 (mpQ1) at DOP=" & _chosenDop233 & "...")
+                    Dim _t233R1 As Long = System.Diagnostics.Stopwatch.GetTimestamp()
                     SafeMpzMul(mpR1, gmpNumer, mpQ1)
-                    WriteToLog($"[ComputePi§210] r1 done; saving mpR1 (size={Runtime.InteropServices.Marshal.ReadInt32(mpR1.Pointer, 4):N0})")
+                    Dim _t233R1Sec As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _t233R1) / System.Diagnostics.Stopwatch.Frequency
+                    WriteToLog($"[ComputePi§233] r1 done in {_t233R1Sec:F1}s; saving mpR1 (size={Runtime.InteropServices.Marshal.ReadInt32(mpR1.Pointer, 4):N0})")
                     SavePhase3Value("mpR1", mpR1, p3SnapDir)
                 Else
-                    WriteToLog("[ComputePi§210] r1 already loaded; skipping")
+                    WriteToLog("[ComputePi§233] r1 already loaded; skipping")
                 End If
                 gmp_lib.mpz_clear(mpQ1)
                 If Not _r2Done Then
-                    WriteToLog("[ComputePi§210] computing r2 = gmpNumer * Q2 (mpQ2)...")
+                    WriteToLog("[ComputePi§233] computing r2 = gmpNumer * Q2 (mpQ2) at DOP=" & _chosenDop233 & "...")
+                    Dim _t233R2 As Long = System.Diagnostics.Stopwatch.GetTimestamp()
                     SafeMpzMul(mpR2, gmpNumer, mpQ2)
-                    WriteToLog($"[ComputePi§210] r2 done; saving mpR2 (size={Runtime.InteropServices.Marshal.ReadInt32(mpR2.Pointer, 4):N0})")
+                    Dim _t233R2Sec As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _t233R2) / System.Diagnostics.Stopwatch.Frequency
+                    WriteToLog($"[ComputePi§233] r2 done in {_t233R2Sec:F1}s; saving mpR2 (size={Runtime.InteropServices.Marshal.ReadInt32(mpR2.Pointer, 4):N0})")
                     SavePhase3Value("mpR2", mpR2, p3SnapDir)
                 Else
-                    WriteToLog("[ComputePi§210] r2 already loaded; skipping")
+                    WriteToLog("[ComputePi§233] r2 already loaded; skipping")
                 End If
                 gmp_lib.mpz_clear(mpQ2)
                 System.Threading.Volatile.Write(_safeMulDop, _saved210Dop)
-                WriteToLog($"[ComputePi§210] DOP restored to {_saved210Dop}; all r0/r1/r2 done")
+                WriteToLog($"[ComputePi§233] DOP restored to {_saved210Dop}; all r0/r1/r2 done")
             End If
             ' Swap r2 into gmpNumer (same pattern as the old serial Pass 2 end).
             ' The old gmpNumer buffer (~208 MB, the 426880*sqrt value) is freed by the swap.

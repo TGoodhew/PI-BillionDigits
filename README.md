@@ -5449,5 +5449,74 @@ log line — the drain helper only logs when the tail Task isn't
 already complete, which means all 38 async backups had landed before
 exit).
 
+## §233 — Lift §210 force-serial for R0/R1/R2 multiplies (2026-05-23, issue #53)
+
+§210 force-set `_safeMulDop = 1` for the three Phase-3 R-multiplies
+(`mpR_i = gmpNumer × Q_i`) after a 5B-run-10 OOM (2026-05-05) when
+`Parallel.Invoke` ran all three concurrently — peak 3 × ~10-12 GB
+compute = ~30-36 GB exceeded budget at 47 MB inner accum buffer.
+DOP=1 caps each multiply at single-core throughput, costing ~18 min
+at 1 B (~6 min × 3) and ~150 min at 5 B (~50 min × 3).
+
+§232 (#46) made the `SavePhase3Value` backup async, so the only
+remaining serialization concern at §210 is COMPUTE memory.
+
+### Fix
+
+Keep the sequential structure (one compute in flight at a time to
+bound RAM) but lift the inner DOP via the same scale-aware policy as
+§231.  Per-multiply peak ≈ `DOP³ × per-task-buffer + result + intermediate`;
+the per-task-buffer scales linearly with `gmpNumer.size`, so the
+§231 thresholds apply:
+
+```vb
+If numTerms < 100_000_000 Then        ' < 1.4 B digits
+    _safeMulDop = 6                   ' ~15 GB peak / multiply
+ElseIf numTerms < 250_000_000 Then    ' 1.4-3.5 B digits
+    _safeMulDop = 4                   ' ~20 GB peak / multiply
+Else                                  ' ≥ 3.5 B digits
+    _safeMulDop = 3                   ' ~25 GB peak / multiply (= §210 safety target)
+End If
+```
+
+Implementation at [Form1.vb:~7865-7920](Form1.vb#L7865-L7920).
+Per-r_i wall-time log shows the §233 speedup:
+
+```
+[ComputePi§233] R0/R1/R2 pipeline: numTerms=70,521,872, chosen DOP=6 (was hardcoded 1 in §210; SavePhase3Value backup is async via §232)
+[ComputePi§233] computing r0 = gmpNumer * Q0 (finalQ) at DOP=6...
+[ComputePi§233] r0 done in 117.4s; saving mpR0 (size=1,899,884,191)
+```
+
+### Expected impact
+
+| Scale | Pre-§233 wall (DOP=1 × 3) | §233 wall | Savings |
+|---|---|---|---|
+| 1 B (DOP=6) | ~18 min serial | ~6 min | **~12 min** |
+| 2-3 B (DOP=4) | ~40-60 min | ~15-20 min | ~25-40 min |
+| 5 B (DOP=3) | ~150 min | ~80-100 min | ~50-70 min |
+
+(5 B numbers are projections; §210's per-multiply at DOP=1 was
+~50 min, scaled inversely with DOP^3 / 24 leaf-core saturation
+floor.)
+
+### Risk
+
+- One in-flight compute keeps peak RAM bounded as before; the
+  §210 OOM mode (3 concurrent computes) is not re-introduced.
+- §232 async backup means `SavePhase3Value` no longer blocks; if
+  consecutive r_i computes saturate backup throughput the chain
+  builds up (bounded by per-r_i serialized size: ~800 MB at 1 B,
+  ~5 GB at 5 B).  At normal compute pace (1-5 min per r_i) backup
+  has plenty of time to drain.
+
+### Validation plan
+
+Run a clean 1 B with `mpR0/R1/R2.bin` deleted from `snap_Phase3`
+(forces §210/§233 to fire on all three).  Look for
+`[ComputePi§233] r_i done in {s}` wall times under ~3 min each (vs
+~6 min pre-§233).  SHA-256 of `pi_digits.txt` must match baseline
+`b153e8d5…56d9b`.
+
 
 
