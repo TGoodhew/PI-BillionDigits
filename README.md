@@ -5636,5 +5636,34 @@ log entries at `_logLevel >= 4` for the last 24 chunks.  SHA-256 of
 wall should be within a second or two of pre-§234 baseline (saving
 at 1 B is in the noise floor of run-to-run variance).
 
+### Validation result (2026-05-24, queue-depth-proxy fix)
+
+`C:\PiOutput_234test_v2\` — 1 B run from scratch (LogLevel 2,
+`-AutoCheckpoint -BackupCheckpoint -Threshold 200000`):
+
+| Phase | §231 baseline | §234 v1 (index-trigger) | **§234 v2 (queue-proxy)** |
+|---|---|---|---|
+| Phase 1 wall (10,001 chunks) | 59.4 s | 62.4 s (+3 s) | **61.3 s (+1.9 s)** |
+
+- SHA-256 of `pi_digits.txt` = `B153E8D58B045FC65E8665D633CA54406D1BFBF1A2FDD38F1C3B325ABC156D9B` ✓ bit-identical to baseline.
+- All three autoverify markers PASS (999999@762 / 777777777@24,658,601 / nine-9s@564,665,206).
+- End-to-end wall: 3 h 08 m 04 s (full Newton, no §230 reuse on first run).
+- CPU sampling: 7.1 cores during Phase 2 combine, 15.5 cores during
+  Phase 3 Newton/Sqrt (peak RAM 19.7 GB) — healthy parallel
+  utilization downstream of Phase 1.
+
+The fix eliminates the +3 s regression but the queue-depth window
+at 1 B Phase 1 (~60 s total over 10,001 chunks across 24 P-cores) is
+genuinely tiny — `Parallel.For`'s static range partitioner means the
+"tail" where `completedChunks >= numChunks - 24` lasts <1 s.  The
+~2 s residual delta at 1 B is within run-to-run variance.
+
+**Projected 5 B impact**: at 5 B (~14× larger), Phase 1 wall stretches
+to ~3-4 h with the last ~24 chunks weighing 15-30 min.  The
+queue-depth window will be proportionally longer (multiple seconds
+to minutes) — `BinarySplitChunkParallelTop` should genuinely fill
+idle cores during that window.  Empirical 5 B validation pending the
+next from-scratch 5 B run.
+
 
 
