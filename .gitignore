@@ -60,3 +60,4 @@ _*.ps1
 
 # Local Claude Code session metadata
 sessions/
+PERF_SESSION_*.md
