@@ -5665,5 +5665,113 @@ to minutes) — `BinarySplitChunkParallelTop` should genuinely fill
 idle cores during that window.  Empirical 5 B validation pending the
 next from-scratch 5 B run.
 
+## §235 — Performance trace pass (2026-05-26, issue #50)
+
+The `-TraceMode` harness in [Run-PiCompute.ps1](Run-PiCompute.ps1) was
+landed earlier (pre-ParaPerf) but the resulting trace bundles had
+either (a) been killed mid-run with corrupted output (the only prior
+1 B `cpu` trace) or (b) been collected before the §228-§234 wins
+landed.  §235 captures the first end-to-end clean post-Phase-4 trace
+and pins the empirical hot-path baseline for the next round of
+parallelism work.
+
+The trace bundles themselves stay local — `traces/` is gitignored per
+2026-05-21 user directive ([.gitignore](.gitignore)) — but a local
+`traces/README.md` index and per-bundle `summary.txt` files are
+maintained by the harness and serve as the analyst-facing record.
+This README section is the **tracked artefact** for #50 so the
+findings persist in git.
+
+### Run shape (2026-05-26 1 B trace)
+
+`C:\PiTrace_cpu_2026-05-26\` — mirrored from `C:\PiOutput_234test`
+(snap_Phase3 + `sqrt_newton.bin` step 3 intact, the kill state of
+the original §234 v1 validation run).  Resumed under `dotnet-trace
+cpu-sampling` with `dotnet-counters` attached concurrently.
+
+| Phase | Wall (sub-stage) |
+|---|---|
+| `snap_Phase3` load + gmpSqrtInput restore | ~1.4 s |
+| SafeMpzSqrt step 4 (Newton from scratch — §201-raise rejected on `ratio=0.843`) | ~26 min |
+| `finalT` spill + `mpR0`/`mpR1`/`mpR2` saves | ~2 min |
+| SafeMpzDiv (final big divide) | **1 h 16 m** |
+| §226 parallel decimal conversion | 78 s (powTable 8.3 s + convert 69.9 s) |
+| Autoverify | <1 s |
+| **Total** | **1 h 46 m wall, SHA-identical to baseline** |
+
+### Hot path comparison: 1 B pre-§228 vs post-§234
+
+Pre-baseline (`traces/20260522_223453_cpu_1000000000d/summary.txt`):
+1 B from-scratch run on 2026-05-22 just after §225 landed, **before**
+any Phase-4 issue closed.
+
+Post-baseline (`traces/20260526_182015_cpu_1000000000d/summary.txt`):
+1 B Newton-tail resume on 2026-05-26 with **all eight Phase-4 wins
+landed** (§228 + §229 + §230 + §231 + §232 + §233 + §234 + §81).
+
+| Function | 2026-05-22 pre-§228 | 2026-05-26 post-§234 | Δ |
+|---|---|---|---|
+| `Form1.SafeMpzMul` inclusive | 52.60 % | **56.77 %** | +4.2 pp |
+| `Form1.SafeMpzMul` exclusive | 58.62 % | 52.19 % | −6.4 pp |
+| **`LowLevelLifoSemaphore.WaitForSignal`** (worker idle) | **63.37 %** | **39.51 %** | **−23.9 pp** |
+| `Parallel.For` worker | 39.27 % | 37.72 % | ~equal |
+| `Form1.SafeMpzDiv` inclusive | 0.41 % | 0.58 % | ~equal |
+| `Form1.SafeMpzReciprocal` inclusive | 0.36 % | 0.49 % | ~equal |
+| `gmp_lib.mpz_inits` / `mpz_clears` | not in top 50 | not in top 50 | (negligible at 1 B+) |
+
+**Headline finding:** worker idle time dropped **from 63 % → 40 %**.
+The eight Phase-4 wins shifted ~24 percentage points of total CPU
+from "thread waiting for work" to "thread doing work."  Direct
+evidence the parallelization changes are translating into useful
+work, not just rearranging the call graph.
+
+Caveat: the two traces have different shapes — 2026-05-22 includes
+Phase 1+2 (BinarySplitChunk hot); 2026-05-26 starts at Phase 3.  The
+**worker-idle delta is the most directly comparable signal** because
+it's a thread-pool measurement independent of phase.  The
+`SafeMpzMul` percentage shifts are partly attributable to the resume
+skipping Phase 1.
+
+### dotnet-counters concurrent attach (full 1 h 46 m, 10 s samples)
+
+| Counter | Peak | Mean / typical | Interpretation |
+|---|---|---|---|
+| `dotnet.process.memory.working_set` | **46.7 GB** | 12-25 GB | SafeMpzDiv stage drives peak RAM, **not** Newton — at 5 B this scales to ~230 GB |
+| `dotnet.thread_pool.queue.length` | 123 | 0-20 | Moderate backpressure during peak parallel work |
+| `dotnet.monitor.lock_contentions` /10 s | 34 | <5 | **Low** — #47's per-CPU GmpNativeAlloc pool heads work as designed |
+| `dotnet.gc.pause.time` /10 s | 0.61 s (one sample) | 3-5 ms | GC is **not a bottleneck**; total pause budget <1 % of wall |
+| `dotnet.gc.collections [gen2]` /10 s | 6 (one burst) | 0-2 | Gen2 spikes correlate with R0/R1/R2 checkpoint saves at 18:50 |
+
+### Implications for #72 follow-on prioritization
+
+**Validated by the data:**
+- ✅ **#47 (per-CPU pool heads) is paying off** — lock contention is negligible.  No further allocator changes needed for now.
+- ✅ **GC is not a bottleneck** — no point pursuing memory recycling optimizations.
+- ✅ **Worker idle keeps dropping with each Phase-4 win** — the ParaPerf playbook is working; further parallelism still has room (40 % idle left).
+
+**Still hot, candidates for the next round:**
+- 🔥 **SafeMpzMul exclusive 52 %** dominates wall time.  Inner `§gen` /
+  `§accum` are already parallelized (#44, #60); the next excludable
+  hot spot inside `SafeMpzMul` is **#45 (§39 column-group: parallelize
+  column add-chains and shifts)** — currently OPEN, labelled
+  P3 / nice-to-have.
+- 🔥 **SafeMpzDiv RAM peak 46.7 GB at 1 B** → projects to ~230 GB at
+  5 B, **exceeding the 64 GB box**.  **#42 (SafeMpzDiv pipeline)**
+  and/or **#69 (GmpNativeAlloc trim API)** become hard requirements
+  for fresh 5 B runs, not just wall-time wins.
+
+### Modes still outstanding (deferred)
+
+- ⏸ `perfview-cpu` 1 B — native libgmp call stacks (informs whether
+  `SafeMpzMul` time is .NET interop overhead vs `__gmpn_mul_n` itself).
+  **Needs admin shell.**
+- ⏸ `perfview-block` 1 B Phase 3 slice — lock contention with caller
+  stacks (validates #47 conclusion above with direct evidence).
+  **Needs admin shell.**
+- ⏸ `vtune-hotspots` 1 B — P-core vs E-core attribution on the
+  12900K hybrid (informs #41 follow-on if/when we revisit affinity
+  tuning).  **Needs VTune install (multi-GB).**
+- ⏸ `wpr` system-wide ETW slice — disk / AV / paging confounder
+  check.  **Needs admin shell.**
 
 
