@@ -5804,4 +5804,77 @@ unit-tested against a temp dir — missing-log no-op, empty-log no-op, non-empty
 archived under its last-write timestamp with the original removed, and retention
 trimming 24 → 20.  The live 5 B run #3 was unaffected.
 
+## §237 — 64-bit safe pointer arithmetic for residual NR diagnostic reads (2026-05-27, issue #86)
+
+5 B run #3 crashed at 23:42 on 2026-05-27, ~9 h into Phase 3, with
+`System.AccessViolationException` inside `SafeMpzReciprocal`'s NR
+diagnostic logging:
+
+```
+Fatal error.
+System.AccessViolationException: Attempted to read or write protected memory.
+   at System.Runtime.InteropServices.Marshal.ReadInt64(IntPtr, Int32)
+   at PI_BillionDigits.Form1.SafeMpzReciprocal(...)
+   at PI_BillionDigits.Form1.SafeMpzDiv(...)
+   at PI_BillionDigits.Form1.SafeMpzSqrt(...)
+```
+
+The phase log right before the AV showed accumulator sizes of
+350,000,004 limbs — well above the 2^28 = 268,435,456 limb Int32-overflow
+boundary identified in #71.  This is precisely the residual category #71's
+body flagged as *"twelve other latent sites that don't fire at 5 B"*.
+
+### Root cause
+
+Twelve `Marshal.ReadInt64` calls still used the unsafe Int32 offset pattern:
+
+```vb
+Marshal.ReadInt64(_dPtr, (_sz - 1) * 8)   ' overflows Int32 when _sz > 2^28
+```
+
+At 5 B, `_sz ≈ 350 M` → `(_sz - 1) * 8 = 2,799,999,992` overflows Int32
+(max 2,147,483,647) → wraps negative → AV in `Marshal.ReadInt64`.  All 12
+were diagnostic reads gated by `If _logLevel >= 2`; the compute itself had
+already completed, which is why every Phase-3 checkpoint on disk
+(`gmpSqrtInput.bin`, `sqrt_newton.bin`, `nr_r.bin`, `nr_raise.bin`,
+`div_q.bin`) survived intact.
+
+### Sites fixed
+
+- **10 in `SafeMpzReciprocal`** — fired this run:
+  §121 ([Form1.vb:4177-4178](Form1.vb#L4177-L4178)), §122
+  ([Form1.vb:4205-4206](Form1.vb#L4205-L4206)), §120
+  ([Form1.vb:4235-4236](Form1.vb#L4235-L4236)), §119
+  ([Form1.vb:4277-4278](Form1.vb#L4277-L4278)), §108-diag final
+  ([Form1.vb:4339-4340](Form1.vb#L4339-L4340)).
+- **2 in `SafeMpzMul`** — latent (gates won't fire at 5 B but pattern is
+  identical): §134-probe ([Form1.vb:3097](Form1.vb#L3097), gated by
+  `szA = 21875001`), §114bk ([Form1.vb:3265](Form1.vb#L3265), gated by
+  `mA = 7291667UL`).
+
+### Fix
+
+Apply the c7a0c76 pattern (compute the absolute limb address in Int64,
+read at offset 0):
+
+```vb
+' OLD:
+Marshal.ReadInt64(_dPtr, (sz - 1) * 8)
+' NEW:
+Marshal.ReadInt64(New IntPtr(_dPtr.ToInt64() + (CLng(sz) - 1L) * 8L), 0)
+```
+
+Same shape with `- 2L` for the second-from-top reads.  Pure correctness;
+semantically identical when `sz ≤ 2^28`, no longer crashes when
+`sz > 2^28`.  Closes the entire #71 residual category.
+
+### Verification
+
+Checkpoints preserved at `C:\PiPreserved_5B_run3_nrR_2026-05-27` (full
+38 GB NodeCache + 38 GB SnapshotStore mirror, plus a labelled copy of the
+crash phase log).  Relaunch from `nr_r.bin` (23:30) lands back at the
+same diagnostic block within minutes — immediate signal whether the fix
+holds.  SHA equivalence against the 5 B oracle
+(`2218EE06…E08983A`) is the acceptance gate at run completion.
+
 

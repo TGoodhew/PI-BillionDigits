@@ -3093,7 +3093,8 @@ Public Class Form1
             Dim _p8D134 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_p8Ptr134, 8))
             Dim _p8Bot134 As Long = If(_p8Sz134 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_p8D134, 0), 0L)
             Dim _p8Bot1134 As Long = If(_p8Sz134 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_p8D134, 8), 0L)
-            Dim _p8Top134 As Long = If(_p8Sz134 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_p8D134, (_p8Sz134 - 1) * 8), 0L)
+            ' §237 (issue #86): 64-bit safe pointer arithmetic — latent at 5 B since this block is gated by szA=21875001 (1 B-tuned).
+            Dim _p8Top134 As Long = If(_p8Sz134 >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_p8D134.ToInt64() + (CLng(_p8Sz134) - 1L) * 8L), 0), 0L)
             Const _IDX134 As Long = 13612996L
             Dim _p8Mid134 As Long = If(_IDX134 < CLng(_p8Sz134), Runtime.InteropServices.Marshal.ReadInt64(_p8D134, CInt(_IDX134 * 8L)), 0L)
             ' Also log A2[0] and B2[0] to verify piece contents
@@ -3261,7 +3262,8 @@ Public Class Form1
                     Dim _114shSz As Integer = If(_colShift = 0UL, _114bkSz, System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted_hdr, 4)))
                     Dim _114aSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
                     Dim _114bkDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_bk, 8))
-                    Dim _114bkTop As Long = If(_114bkSz >= 1, Runtime.InteropServices.Marshal.ReadInt64(_114bkDPtr, (_114bkSz - 1) * 8), 0L)
+                    ' §237 (issue #86): 64-bit safe pointer arithmetic — latent at 5 B since this block is gated by mA=7291667 (1 B-tuned).
+                    Dim _114bkTop As Long = If(_114bkSz >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_114bkDPtr.ToInt64() + (CLng(_114bkSz) - 1L) * 8L), 0), 0L)
                     Dim _114bkBot As Long = If(_114bkSz >= 1, Runtime.InteropServices.Marshal.ReadInt64(_114bkDPtr, 0), 0L)
                     AppendLog($"[SafeMpzMul§114] §39 col={_col} shift={_colShift:N0} szBk={_114bkSz:N0} bkTop={_114bkTop:X16} bkBot={_114bkBot:X16} szShifted={_114shSz:N0} szAccum={_114aSz:N0}{vbCrLf}")
                     ' For col=4 (A2*B2): log accum at the position driving the rem error.
@@ -4172,8 +4174,10 @@ Public Class Form1
                 Dim _rSq121DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(rSq.Pointer, 8))
                 Dim _rSq121B0 As Long = If(_sz121 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_rSq121DPtr, 0), 0L)
                 Dim _rSq121B1 As Long = If(_sz121 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_rSq121DPtr, 8), 0L)
-                Dim _rSq121T1 As Long = If(_sz121 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_rSq121DPtr, (_sz121 - 1) * 8), 0L)
-                Dim _rSq121T0 As Long = If(_sz121 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_rSq121DPtr, (_sz121 - 2) * 8), 0L)
+                ' §237 (issue #86): compute the absolute limb address in Int64.  Old `(sz - 1) * 8`
+                ' overflowed Int32 at 5 B when sz > 2^28 (~268 M limbs) → AV in Marshal.ReadInt64.
+                Dim _rSq121T1 As Long = If(_sz121 >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_rSq121DPtr.ToInt64() + (CLng(_sz121) - 1L) * 8L), 0), 0L)
+                Dim _rSq121T0 As Long = If(_sz121 >= 2, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_rSq121DPtr.ToInt64() + (CLng(_sz121) - 2L) * 8L), 0), 0L)
                 AppendLog($"[NR121] iter={_nrIter} rSq sz={_sz121:N0} bot=[{_rSq121B0:X16} {_rSq121B1:X16}] top=[{_rSq121T0:X16} {_rSq121T1:X16}]{vbCrLf}")
             End If
             ' §126: log rSq[20,904,662..663] at final iter — B2[6,321,328] of rSq feeds into p[64,654,664]
@@ -4200,8 +4204,9 @@ Public Class Form1
                 Dim _p122DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(p.Pointer, 8))
                 Dim _p122B0 As Long = If(_sz122 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_p122DPtr, 0), 0L)
                 Dim _p122B1 As Long = If(_sz122 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_p122DPtr, 8), 0L)
-                Dim _p122T1 As Long = If(_sz122 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_p122DPtr, (_sz122 - 1) * 8), 0L)
-                Dim _p122T0 As Long = If(_sz122 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_p122DPtr, (_sz122 - 2) * 8), 0L)
+                ' §237 (issue #86): 64-bit safe pointer arithmetic — see comment at §121 site above.
+                Dim _p122T1 As Long = If(_sz122 >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_p122DPtr.ToInt64() + (CLng(_sz122) - 1L) * 8L), 0), 0L)
+                Dim _p122T0 As Long = If(_sz122 >= 2, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_p122DPtr.ToInt64() + (CLng(_sz122) - 2L) * 8L), 0), 0L)
                 AppendLog($"[NR122] iter={_nrIter} p_before_shift sz={_sz122:N0} bot=[{_p122B0:X16} {_p122B1:X16}] top=[{_p122T0:X16} {_p122T1:X16}]{vbCrLf}")
             End If
             ' §125: log p[64,654,663..665] before BigShiftRight
@@ -4230,8 +4235,9 @@ Public Class Form1
                 Dim _p120DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(p.Pointer, 8))
                 Dim _p120B0 As Long = If(_sz120 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_p120DPtr, 0), 0L)
                 Dim _p120B1 As Long = If(_sz120 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_p120DPtr, 8), 0L)
-                Dim _p120T1 As Long = If(_sz120 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_p120DPtr, (_sz120 - 1) * 8), 0L)
-                Dim _p120T0 As Long = If(_sz120 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_p120DPtr, (_sz120 - 2) * 8), 0L)
+                ' §237 (issue #86): 64-bit safe pointer arithmetic — see comment at §121 site above.
+                Dim _p120T1 As Long = If(_sz120 >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_p120DPtr.ToInt64() + (CLng(_sz120) - 1L) * 8L), 0), 0L)
+                Dim _p120T0 As Long = If(_sz120 >= 2, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_p120DPtr.ToInt64() + (CLng(_sz120) - 2L) * 8L), 0), 0L)
                 AppendLog($"[NR120] iter={_nrIter} p_after_shift: sz={_sz120:N0} bot=[{_p120B0:X16} {_p120B1:X16}] top=[{_p120T0:X16} {_p120T1:X16}]{vbCrLf}")
             End If
             ' §123: log p[20,904,662..665] after BigShiftRight — §147: add 20904662..663 for cross-check with §125
@@ -4272,8 +4278,9 @@ Public Class Form1
                 Dim _r119DPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
                 Dim _r119B0 As Long = If(_sz119 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_r119DPtr, 0), 0L)
                 Dim _r119B1 As Long = If(_sz119 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_r119DPtr, 8), 0L)
-                Dim _r119T1 As Long = If(_sz119 >= 1, Runtime.InteropServices.Marshal.ReadInt64(_r119DPtr, (_sz119 - 1) * 8), 0L)
-                Dim _r119T0 As Long = If(_sz119 >= 2, Runtime.InteropServices.Marshal.ReadInt64(_r119DPtr, (_sz119 - 2) * 8), 0L)
+                ' §237 (issue #86): 64-bit safe pointer arithmetic — see comment at §121 site above.
+                Dim _r119T1 As Long = If(_sz119 >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_r119DPtr.ToInt64() + (CLng(_sz119) - 1L) * 8L), 0), 0L)
+                Dim _r119T0 As Long = If(_sz119 >= 2, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_r119DPtr.ToInt64() + (CLng(_sz119) - 2L) * 8L), 0), 0L)
                 AppendLog($"[NR§119] iter={_nrIter} szR={_sz119:N0} bot=[{_r119B0:X16} {_r119B1:X16}] top=[{_r119T0:X16} {_r119T1:X16}]{vbCrLf}")
                 AppendLog($"[NR] iter={_nrIter} prec={prec:N0} bShift={bShift:N0} kBitsMinusBShift={kBits - bShift:N0} szP={_szP:N0} szR_after={_szR_after:N0}{vbCrLf}")
             End If
@@ -4334,8 +4341,9 @@ Public Class Form1
         If _logLevel >= 2 Then
             Dim _szRFinal As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
             Dim _rDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8))
-            Dim _rLimb2 As Long = If(_szRFinal >= 1, Runtime.InteropServices.Marshal.ReadInt64(_rDPtr, (_szRFinal - 1) * 8), 0L)
-            Dim _rLimb1 As Long = If(_szRFinal >= 2, Runtime.InteropServices.Marshal.ReadInt64(_rDPtr, (_szRFinal - 2) * 8), 0L)
+            ' §237 (issue #86): 64-bit safe pointer arithmetic — see comment at §121 site above.
+            Dim _rLimb2 As Long = If(_szRFinal >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_rDPtr.ToInt64() + (CLng(_szRFinal) - 1L) * 8L), 0), 0L)
+            Dim _rLimb1 As Long = If(_szRFinal >= 2, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_rDPtr.ToInt64() + (CLng(_szRFinal) - 2L) * 8L), 0), 0L)
             AppendLog($"[SafeMpzReciprocal] done: szR={_szRFinal:N0} top2limbs=[{_rLimb2:X16} {_rLimb1:X16}] kBits={kBits:N0} rBits={rBits:N0}{vbCrLf}")
         End If
 
