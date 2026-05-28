@@ -658,6 +658,36 @@ function Invoke-CheckpointRestore {
     }
 }
 
+function Invoke-PhaseLogArchive {
+    # Issue #84: the exe opens pi_phase_log.txt in truncate mode on startup, so a
+    # crash-resume would otherwise overwrite (and permanently lose) the log of the
+    # session that just died.  Before launching, move any existing log into a
+    # logs\ subdir, stamped with its OWN last-write time (when that session ended,
+    # not now), and keep only the newest $Keep archives.
+    param([string]$LogPath, [int]$Keep = 20)
+    if (-not (Test-Path $LogPath)) { return }
+    $info = Get-Item $LogPath
+    if ($info.Length -eq 0) { return }   # nothing worth keeping
+    $logsDir = Join-Path (Split-Path $LogPath -Parent) 'logs'
+    if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir | Out-Null }
+    $stamp = $info.LastWriteTime.ToString('yyyyMMdd_HHmmss')
+    $dest  = Join-Path $logsDir "pi_phase_log_$stamp.txt"
+    # Guard against two sessions sharing a second-resolution timestamp.
+    if (Test-Path $dest) {
+        $dest = Join-Path $logsDir "pi_phase_log_${stamp}_$([System.IO.Path]::GetRandomFileName().Substring(0,4)).txt"
+    }
+    Move-Item -LiteralPath $LogPath -Destination $dest -Force
+    $sizeMB = [math]::Round($info.Length / 1MB, 1)
+    Write-Host "PhaseLogArchive: preserved prior log ($sizeMB MB) -> $dest" -ForegroundColor Green
+    # Retention: keep the newest $Keep archives, delete the rest.
+    $old = @(Get-ChildItem $logsDir -Filter 'pi_phase_log_*.txt' -ErrorAction SilentlyContinue |
+             Sort-Object LastWriteTime -Descending | Select-Object -Skip $Keep)
+    foreach ($f in $old) { Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue }
+    if ($old.Count -gt 0) {
+        Write-Host "PhaseLogArchive: trimmed $($old.Count) old archive(s), keeping newest $Keep" -ForegroundColor DarkGray
+    }
+}
+
 # ── 3. Restore checkpoints from SnapshotStore before running ─────────────────
 # Ensures that snap_Phase3 / snap_L* saved from a previous run (or backed up
 # after a crash) are present in NodeCache before the app starts.  Safe to call
@@ -668,6 +698,11 @@ if ($BackupCheckpoint) {
     Invoke-CheckpointRestore -NodeCacheDir (Join-Path $OutputDir 'NodeCache') `
                              -StoreDir     (Join-Path $OutputDir 'SnapshotStore')
 }
+
+# ── 3b. Preserve the prior phase log before the exe truncates it (issue #84) ──
+# Runs unconditionally (every launch truncates pi_phase_log.txt, not just backup
+# runs).  No-ops on a fresh run where the log does not yet exist.
+Invoke-PhaseLogArchive -LogPath $logFile
 
 # ── 4. Run (with or without trace) ───────────────────────────────────────────
 Write-Host ""

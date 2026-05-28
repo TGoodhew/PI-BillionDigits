@@ -5774,4 +5774,34 @@ skipping Phase 1.
 - ⏸ `wpr` system-wide ETW slice — disk / AV / paging confounder
   check.  **Needs admin shell.**
 
+## §236 — Preserve pi_phase_log.txt across relaunches (2026-05-27, issue #84)
+
+The exe opens `pi_phase_log.txt` in truncate mode on startup, so every relaunch —
+including a crash-resume — overwrote the prior session's log.  On 2026-05-27 a power
+outage (`[FormClosing] Reason=WindowsShutDown`) killed 5 B run #3; the 18:11 resume
+then overwrote the 132 MB crash log before its timings/final state could be analysed.
+
+### Change
+
+`Run-PiCompute.ps1` gains an `Invoke-PhaseLogArchive` helper, called once just before
+the exe launches (after checkpoint restore, before the run dispatch — so it covers
+both the main and `-TraceMode` paths).  It:
+
+- moves any existing **non-empty** `pi_phase_log.txt` into
+  `<OutputDir>\logs\pi_phase_log_<yyyyMMdd_HHmmss>.txt`, stamped with the file's **own
+  last-write time** (when that session ended, not the relaunch time);
+- no-ops on a fresh run (log missing) or an empty log;
+- de-duplicates same-second stamps with a short random suffix;
+- retains the newest 20 archives, deleting older ones.
+
+Tooling-only: no app code change, no recompile.  Safe to apply mid-run — it touches
+only future launches, never the running exe.
+
+### Verification
+
+`Run-PiCompute.ps1` parses clean; the extracted `Invoke-PhaseLogArchive` was
+unit-tested against a temp dir — missing-log no-op, empty-log no-op, non-empty log
+archived under its last-write timestamp with the original removed, and retention
+trimming 24 → 20.  The live 5 B run #3 was unaffected.
+
 
