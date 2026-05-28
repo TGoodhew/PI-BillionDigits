@@ -5877,4 +5877,98 @@ same diagnostic block within minutes — immediate signal whether the fix
 holds.  SHA equivalence against the 5 B oracle
 (`2218EE06…E08983A`) is the acceptance gate at run completion.
 
+## §238 — Thread-local nesting cap for SafeMpzMul recursive Parallel.For (2026-05-28, issue #87)
+
+The §237 relaunch ran ~3 h cleanly past the AV (no Marshal.ReadInt64
+regressions), advanced through `sqrt_step_5` (NR iter 5 done,
+`div_q.bin` and `sqrt_newton.bin` saved), then crashed at ~03:09 in
+`sqrt_step_6` with `Fatal error. 0xC0000005` in the **native**
+`__gmpn_mul`:
+
+```
+Fatal error.
+0xC0000005
+   at PI_BillionDigits.Form1.GmpRaw_mul(IntPtr, IntPtr, IntPtr)
+   at PI_BillionDigits.Form1.SafeMpzMul(...)
+   at System.Threading.Tasks.Parallel+...ForWorker...
+   at PI_BillionDigits.Form1.SafeMpzMul(...)         ← nested
+   at System.Threading.Tasks.Parallel+...ForWorker... ← nested
+   at PI_BillionDigits.Form1.SafeMpzMul(...)
+   at GmpRaw_mul(...)
+```
+
+CPU monitor's RSS climbed to **51.4 GB at 02:50** on a 64 GB box, then
+the process died.  Classic silent `VirtualAlloc` failure inside native
+code → SEH access violation, no managed exception.
+
+### Root cause
+
+`sqrt_step_6` operands are ~520 M / 260 M limbs, well past the
+§143 RECURSE threshold.  The outer `SafeMpzMul` spawns 9 parallel
+sub-products via `Parallel.For(0, 9, ...)`; each recursive
+`SafeMpzMul` inside the lambda *also* spawns 9 parallel sub-products.
+Two levels of nesting → up to 81 concurrent ~1–2 GB working buffers,
+on top of ~15 GB of resident Phase-3 checkpoints.
+
+The protection that prevented this **was deliberately lifted by §220**
+(#55).  Our own code-comments at [Form1.vb:4648](Form1.vb#L4648) had
+already named the failure mode:
+
+> "§166 forced `_safeMulDop=1` for a×r because §138/§165 only forced
+> the outer `Parallel.For` while inner recursive `SafeMpzMul` calls
+> bypassed the gate"
+
+At smaller scale, §220 was a net win.  At 5 B `sqrt_step_6` the
+assumption that the memory budget could afford a 9 × 9 explosion is
+false.
+
+### Fix
+
+A thread-local `<ThreadStatic>` flag `_smm_innerForceSerial` records
+whether the current thread is running inside a parent `SafeMpzMul`'s
+sub-product lambda.  At entry to `SafeMpzMul`, the flag forces
+`_smmDop = 1` when set:
+
+```vb
+<System.ThreadStatic> Private Shared _smm_innerForceSerial As Boolean
+
+Dim _smmDop As Integer
+If _smm_innerForceSerial Then
+    _smmDop = 1                                                ' §238: nested → serial
+Else
+    _smmDop = System.Threading.Volatile.Read(_safeMulDop)
+End If
+```
+
+The Parallel.For body at [Form1.vb:2915](Form1.vb#L2915) sets the flag
+before its recursive `SafeMpzMul`, and a `Try/Finally` restores it
+for ThreadPool thread reuse (worker threads host unrelated work later).
+
+The §222 shift pre-pass at [Form1.vb:3316](Form1.vb#L3316) does **not**
+recurse into `SafeMpzMul` (it only does `GmpRaw_mul_2exp` shifts), so
+its `Parallel.For` doesn't need the flag.
+
+### Memory budget
+
+| Scenario                | Concurrent buffers       | Extra RAM     |
+|-------------------------|--------------------------|---------------|
+| Before §238 (5 B step 6)| 9 outer × 9 inner = 81   | ~80–160 GB    |
+| After  §238 (5 B step 6)| 9 outer × 1 inner =  9   | ~9–18 GB      |
+
+Comfortably back inside 64 GB.  Smaller-scale calls (no recursion) see
+the flag stay False and behave exactly as today — §220's nested-perf
+gains there are preserved.
+
+### Verification
+
+`sqrt_newton.bin` (step 5 complete, written 02:43) preserved in
+`C:\PiPreserved_5B_run3_OOM_2026-05-28` (full 39 GB NodeCache +
+39 GB SnapshotStore mirror, plus the 59 MB crash phase log and the
+12 KB AV stack trace).  Relaunch loads step 5, enters `sqrt_step_6`
+NR seeded by §201-raise from `nr_raise.bin`, hits the exact same
+recursive `r × r` and `bTrunc × rSq` multiplies within minutes —
+crash-or-survive signal lands well before the previous 64 GB pressure
+point.  SHA equivalence against the 5 B oracle
+(`2218EE06…E08983A`) is the acceptance gate at run completion.
+
 

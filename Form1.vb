@@ -104,6 +104,14 @@ Public Class Form1
     ' those single-pair operations still use all cores.
     Private Shared _safeMulDop As Integer = -1   ' -1 = not yet set; reads as ProcessorCount
 
+    ' §238 (issue #87, 2026-05-28): thread-local nesting cap.  Set True inside the
+    ' Parallel.For sub-product lambda in SafeMpzMul; any recursive SafeMpzMul that
+    ' runs on the same thread sees True and forces _smmDop=1.  Caps the nested-
+    ' Parallel.For memory explosion that crashed sqrt_step_6 at 5 B (§220 had
+    ' lifted §168/§166's force-serial protection; this restores the design intent
+    ' in one central place instead of policing it at every call site).
+    <System.ThreadStatic> Private Shared _smm_innerForceSerial As Boolean
+
     ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
     ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
     ' thread-safe.  Only the File.AppendAllText log writes need serialisation so
@@ -2879,7 +2887,15 @@ Public Class Form1
         ' Parallel.For (outer DOP=24), _safeMulDop=1 so sub-products run serially — eliminates
         ' the thread-pool park/unpark overhead. When called from the serial Phase 2 top levels
         ' or ComputePiGMP, _safeMulDop=ProcessorCount to use all cores.
-        Dim _smmDop As Integer = System.Threading.Volatile.Read(_safeMulDop)  ' §27: cross-thread read
+        ' §238 (issue #87): if this thread is already running inside a parent SafeMpzMul's
+        ' Parallel.For sub-product lambda, force serial sub-products here — caps the nested
+        ' parallel memory blow-up that crashed 5B sqrt_step_6.  See _smm_innerForceSerial decl.
+        Dim _smmDop As Integer
+        If _smm_innerForceSerial Then
+            _smmDop = 1
+        Else
+            _smmDop = System.Threading.Volatile.Read(_safeMulDop)  ' §27: cross-thread read
+        End If
         If _smmDop <= 0 Then _smmDop = Environment.ProcessorCount
         ' §138/§165 LIFTED by §221 (issue #44, 2026-05-22): the size-gate that forced
         ' serial 9-sub-product computation for q×b (szA=szB=21875001) and a×r
@@ -2913,7 +2929,16 @@ Public Class Form1
                 .MaxDegreeOfParallelism = _smmDop
             }
             Parallel.For(0, 9, _smm_opts, Sub(k As Integer)
-                SafeMpzMul(prods(k), A_parts(k \ 3), B_parts(k Mod 3))
+                ' §238 (issue #87): mark this worker thread as "inside parallel sub-product"
+                ' so recursive SafeMpzMul below sees the flag and forces _smmDop=1.  Save/restore
+                ' for ThreadPool thread reuse — the worker may host unrelated work later.
+                Dim _was238 As Boolean = _smm_innerForceSerial
+                _smm_innerForceSerial = True
+                Try
+                    SafeMpzMul(prods(k), A_parts(k \ 3), B_parts(k Mod 3))
+                Finally
+                    _smm_innerForceSerial = _was238
+                End Try
             End Sub)
         End If
 
