@@ -6038,3 +6038,52 @@ protects all downstream work — a later crash resumes from `div_q`, skipping th
 instantly; no Newton replay). Empirical a×r wall: **~5 h15 m** (00:35 → 05:50,
 serial-nested under §238) — direct baseline for #42. SHA equivalence vs the 5 B
 oracle (`2218EE06…E08983A`) is the acceptance gate at completion.
+
+## §240 — Enable §226 parallel decimal conversion at 5 B+ (2026-05-31, issue #89)
+
+5 B run-3 completed and **SHA-verified bit-identical to the oracle**
+(`2218ee06…e08983a`), confirming the full ParaPerf pipeline at 5 B. The final
+decimal conversion, however, still ran on the **serial** §216 `ChunkedMpzGetStr`
+path — **46:49 on ~1 core** (100 chunks × ~1-2 min, each a full-size `mpz_fdiv_qr`
+by 10^50M). The parallel §226 `ParallelMpzGetStr` (issue #37, recursive halving +
+`Parallel.Invoke`, validated byte-identical at 1 B) existed but was **gated to
+< 1.5 B** at [Form1.vb:8428](Form1.vb#L8428) as a conservative measure pending 5 B
+validation.
+
+### Change
+
+Lift the `>= 1.5B` serial gate so §226 handles **all** outputs `>= 100M`,
+including 5 B+:
+
+```vb
+' OLD:  >= 1.5B → §216 ChunkedMpzGetStr (serial) ; 100M..1.5B → §226 ParallelMpzGetStr
+' NEW (§240):  >= 100M → §226 ParallelMpzGetStr ; < 100M → GMP mpz_get_str
+```
+
+§216 `ChunkedMpzGetStr` is retained as a grep-revertable fallback (original
+routing preserved as comments at the call site, grep `§240`).
+
+### Why it's safe at 5 B
+
+- §226's leaf threshold is `LEAF_THRESHOLD = 50_000_000` — the **same** chunk size
+  §216 used and proved at 5 B; each leaf is a serial GMP `mpz_get_str` on ≤ 50 M
+  digits (well under the ~2 GB output ceiling that crashes `mpz_get_str`).
+- Memory footprint at 5 B is modest (~15 GB: 5 GB output buffer + ~2 GB `piCopy`
+  + ~2 GB power table + recursion-tree hi/lo) — far below the q×b peak; conversion
+  is the low-memory phase. `PreAllocMpzToLimbs` on hi/lo bypasses the 33.5 M-limb
+  realloc abort (§216a/§218 hazard).
+- `Parallel.Invoke` recursion (~7 levels, ~100 leaves at 5 B) is TPL-throttled to
+  core count; conversion is not where the §238 nested-`Parallel.For` OOM lived.
+
+### Expected win
+
+Serial **46:49 (1 core)** → **~15-30 min** parallel across 24 cores.
+
+### Verification
+
+Resume from the preserved `gmpPi.bin`
+(`C:\PiPreserved_5B_run3_VERIFIED_2026-05-31`) so the divide is skipped, route the
+5 B output through §226, and compare its SHA-256 against the oracle
+(`2218ee06…e08983a`). Acceptance = byte-identical. The §216-produced
+`pi_digits.txt` is preserved (renamed) during the validation run so the verified
+oracle is never overwritten.

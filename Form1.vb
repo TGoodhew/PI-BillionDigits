@@ -8425,12 +8425,18 @@ NumeratorDone:
                 ' tree has enough depth to amortize the power-of-10 precompute
                 ' against parallel fan-out gains).  Above 1.5B, §216 chunked path
                 ' remains as conservative fallback until §226 is 5B-validated.
-                If _piDigitsEstimate >= 1_500_000_000L Then
-                    WriteToLog($"[ComputePi§216] Routing to chunked decimal converter (digits~={_piDigitsEstimate:N0} >= 1.5B threshold){vbCrLf}")
-                    ChunkedMpzGetStr(gmpPi, _piDigitsEstimate)   ' sets _displayNativePtr, _displayNativeLen, _displayNativeBufSize
-                    _usedChunkedPath = True
-                ElseIf _piDigitsEstimate >= 100_000_000L Then
-                    WriteToLog($"[ComputePi§226] Routing to parallel decimal converter (digits~={_piDigitsEstimate:N0} >= 100M threshold){vbCrLf}")
+                ' §240 (issue #89, 2026-05-31): lift the >= 1.5B serial gate — §226
+                ' ParallelMpzGetStr now handles ALL outputs >= 100M, including 5B+.
+                ' Previously §226 was gated to 100M..1.5B and >= 1.5B fell back to the
+                ' strictly-serial §216 ChunkedMpzGetStr (~1 core; 46:49 at 5B on the
+                ' 2026-05-31 run #3).  §226 was validated byte-identical at 1B; this
+                ' change routes 5B through it too.  §216 ChunkedMpzGetStr is retained as
+                ' a grep-revertable fallback (lines preserved below for easy revert):
+                '   If _piDigitsEstimate >= 1_500_000_000L Then
+                '       ChunkedMpzGetStr(gmpPi, _piDigitsEstimate) : _usedChunkedPath = True
+                '   ElseIf _piDigitsEstimate >= 100_000_000L Then ... (now the >= 100M branch)
+                If _piDigitsEstimate >= 100_000_000L Then
+                    WriteToLog($"[ComputePi§240] Routing to §226 parallel decimal converter (digits~={_piDigitsEstimate:N0} >= 100M; §216 serial >=1.5B gate lifted per #89){vbCrLf}")
                     ParallelMpzGetStr(gmpPi, _piDigitsEstimate)   ' sets _displayNativePtr, _displayNativeLen, _displayNativeBufSize
                     _usedChunkedPath = True   ' reuse same downstream flag (display state already set)
                 Else
