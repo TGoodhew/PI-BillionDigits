@@ -403,6 +403,63 @@ __declspec(dllexport) void WINAPI GmpNativeAlloc_Flush(void) {
     NativeLog(LOG_INIT, "[GmpNativeAlloc] Flush complete: %lld pool blocks freed\n", total);
 }
 
+/* §241 (issue #69): census of currently-pooled memory.
+ * Sums count × bucketSize across all [bucket][cpu] slots.  The pool only ever holds
+ * blocks <= POOL_MAX_BLOCK (16 MB), so the total is bounded by the small/medium
+ * buckets that GMP churns (FFT temporaries etc.), NOT the multi-GB buffers (those
+ * take the oversized path and are VirtualFree'd immediately, never pooled).
+ * Uses the per-slot count fields (cheap, no SLIST walk); accurate at quiescent
+ * phase boundaries.  Logs a per-bucket breakdown at LOG_INIT. */
+__declspec(dllexport) void WINAPI GmpNativeAlloc_PoolCensus(ULONGLONG* outBytes, ULONG* outBlocks) {
+    ULONGLONG bytes = 0;
+    ULONG blocks = 0;
+    for (int b = 0; b < POOL_BUCKETS; b++) {
+        LONGLONG cnt = 0;
+        for (int c = 0; c < MAX_CPUS; c++) cnt += g_pool_slots[b][c].count;
+        if (cnt > 0) {
+            ULONGLONG bb = (ULONGLONG)cnt * (1ULL << b);
+            bytes += bb;
+            blocks += (ULONG)cnt;
+            if ((int)g_logLevel >= LOG_INIT)
+                NativeLog(LOG_INIT, "[PoolCensus]   bucket %d (%lluB ea): %lld blocks, %.1f MB\n",
+                          b, (1ULL << b), cnt, bb / (1024.0 * 1024.0));
+        }
+    }
+    if (outBytes)  *outBytes  = bytes;
+    if (outBlocks) *outBlocks = blocks;
+    NativeLog(LOG_INIT, "[PoolCensus] TOTAL pooled: %u blocks, %.3f GB\n",
+              blocks, bytes / (1024.0 * 1024.0 * 1024.0));
+}
+
+/* §241 (issue #69): release pooled blocks whose bucket size >= minBucketBytes back
+ * to the OS via VirtualFree, returning the count and bytes freed.  Buckets smaller
+ * than minBucketBytes are preserved (small buckets have high reuse; trimming them is
+ * counter-productive).  NOTE: the pool only holds blocks <= POOL_MAX_BLOCK (16 MB),
+ * so minBucketBytes > 16 MB is a no-op — pass <= 16 MB (e.g. 1 MB) to free anything. */
+__declspec(dllexport) void WINAPI GmpNativeAlloc_Trim(
+    ULONGLONG minBucketBytes, ULONG* outBuffersFreed, ULONGLONG* outBytesFreed) {
+    LONGLONG freedBlocks = 0;
+    ULONGLONG freedBytes = 0;
+    for (int b = 0; b < POOL_BUCKETS; b++) {
+        ULONGLONG bucketSz = (1ULL << b);
+        if (bucketSz < minBucketBytes) continue;   /* keep small high-reuse buckets */
+        for (int c = 0; c < MAX_CPUS; c++) {
+            PSLIST_ENTRY ent;
+            while ((ent = InterlockedPopEntrySList(&g_pool_slots[b][c].head)) != NULL) {
+                InterlockedDecrement(&g_pool_slots[b][c].count);
+                VirtualFree(ent, 0, MEM_RELEASE);
+                freedBlocks++;
+                freedBytes += bucketSz;
+            }
+        }
+    }
+    if (outBuffersFreed) *outBuffersFreed = (ULONG)freedBlocks;
+    if (outBytesFreed)   *outBytesFreed   = freedBytes;
+    NativeLog(LOG_INIT, "[GmpNativeAlloc_Trim] minBucket=%lluB (%.1f MB): freed %lld blocks, %.3f GB to OS\n",
+              minBucketBytes, minBucketBytes / (1024.0 * 1024.0),
+              freedBlocks, freedBytes / (1024.0 * 1024.0 * 1024.0));
+}
+
 /* Free a GMP limb block that was allocated by the native pool.
  * ptr is the GMP data pointer (raw = ptr - GMP_BLOCK_PREFIX).
  * Called from managed code for blocks that SafeMpzMul evicts directly. */

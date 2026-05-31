@@ -6038,3 +6038,45 @@ protects all downstream work — a later crash resumes from `div_q`, skipping th
 instantly; no Newton replay). Empirical a×r wall: **~5 h15 m** (00:35 → 05:50,
 serial-nested under §238) — direct baseline for #42. SHA equivalence vs the 5 B
 oracle (`2218EE06…E08983A`) is the acceptance gate at completion.
+
+## §241 — GmpNativeAlloc pool census + phase-boundary trim (2026-05-31, issue #69)
+
+Adds the ability to **release pooled buffers back to the OS** between phases, plus a
+**census** to measure how much the pool actually retains (the value/tuning question).
+
+### Allocator reality that shapes this
+
+`GmpNativeAlloc` pools blocks **only up to `POOL_MAX_BLOCK` = 16 MB**
+([GmpNativeAlloc.c:109](GmpNativeAlloc/GmpNativeAlloc.c#L109)). Larger blocks (the
+multi-GB a×r/q×b accumulation/shifted buffers) take the **oversized path** — direct
+`VirtualAlloc`, immediate `VirtualFree` on free — and are **never pooled**. So:
+- #69's original premise (*"pool retains 4-8 GB blocks"*) is **incorrect** — those big
+  buffers bypass the pool entirely.
+- A trim can only release **≤16 MB pooled granules** (GMP's churned FFT temporaries),
+  bounded by `POOL_CAP (256) × MAX_CPUS (32)` per bucket.
+- The proposed `minBucketBytes` thresholds of **64 MB–1 GB would free nothing** (no
+  bucket exceeds 16 MB). Hooks use **1 MB** so they actually release the 1–16 MB
+  buckets while keeping tiny high-reuse ones.
+- **Trim does NOT reduce the divide's live peak** (a + b + q + qb + accumulators are
+  *live* working set during a×r/q×b — not pool); it lowers the **between-phase
+  baseline**. The live peak is an algorithmic-footprint problem, separate from #69.
+
+### Added
+
+- `GmpNativeAlloc_PoolCensus(outBytes, outBlocks)` — sums `count × bucketSize` over all
+  `[bucket][cpu]` slots; logs per-bucket breakdown. The census-before number is the
+  measurement that tells us whether the pool holds GB (trim worthwhile) or MB.
+- `GmpNativeAlloc_Trim(minBucketBytes, outBuffersFreed, outBytesFreed)` — `VirtualFree`s
+  every pooled block whose bucket ≥ `minBucketBytes`; returns count + bytes freed.
+- VB `TrimPoolAtBoundary(ctx, minBytes)` — logs census-before → trims → logs freed +
+  working-set delta, as `[Trim§241 ctx=…]`.
+- Hooks: **post-a×r** and **post-q×b** in `SafeMpzDiv`, and **pre-conversion** in
+  `ComputePiGMP` (all `minBytes = 1 MB`).
+
+### Validation
+
+Run with the new census logging; read `[PoolCensus] TOTAL pooled` + `[Trim§241]` lines
+to quantify retention and freed bytes at each boundary, and confirm correctness
+(SHA-identical output). If retention is large, keep/extend the hooks; if it's MB-scale,
+#69 is low-value and the threshold/hook set can be trimmed back. Bit-identity is the
+acceptance gate (trim only frees *unreferenced* pool blocks — must not change output).

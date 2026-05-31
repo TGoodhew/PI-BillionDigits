@@ -1134,6 +1134,38 @@ Public Class Form1
     Private Shared Sub GmpNativeAlloc_PoolReturn(ptr As IntPtr, sz As Long)
     End Sub
 
+    ' §241 (issue #69): pool census + phase-boundary trim.
+    <DllImport("GmpNativeAlloc.dll", EntryPoint:="GmpNativeAlloc_PoolCensus",
+               CallingConvention:=CallingConvention.Winapi)>
+    Private Shared Sub GmpNativeAlloc_PoolCensus(ByRef outBytes As ULong, ByRef outBlocks As UInteger)
+    End Sub
+
+    <DllImport("GmpNativeAlloc.dll", EntryPoint:="GmpNativeAlloc_Trim",
+               CallingConvention:=CallingConvention.Winapi)>
+    Private Shared Sub GmpNativeAlloc_Trim(minBucketBytes As ULong, ByRef outBuffersFreed As UInteger, ByRef outBytesFreed As ULong)
+    End Sub
+
+    ' §241 (issue #69): census the native pool, trim buckets >= minBytes, log retention,
+    ' freed amount, and working-set delta.  Called at phase boundaries.  The census-before
+    ' value is the measurement that tells us whether the pool retains GB (trim worthwhile)
+    ' or MB (low-value / tune threshold).  minBytes must be <= POOL_MAX_BLOCK (16 MB) to
+    ' free anything — the pool never holds larger blocks.
+    Private Shared Sub TrimPoolAtBoundary(ctx As String, minBytes As ULong)
+        Try
+            Dim wsBefore As Long = Process.GetCurrentProcess().WorkingSet64
+            Dim pooledBefore As ULong = 0UL
+            Dim blocksBefore As UInteger = 0UI
+            GmpNativeAlloc_PoolCensus(pooledBefore, blocksBefore)
+            Dim freedBuffers As UInteger = 0UI
+            Dim freedBytes As ULong = 0UL
+            GmpNativeAlloc_Trim(minBytes, freedBuffers, freedBytes)
+            Dim wsAfter As Long = Process.GetCurrentProcess().WorkingSet64
+            AppendLog($"[Trim§241 ctx={ctx}] pooled-before={pooledBefore / 1048576.0:N0} MB ({blocksBefore:N0} blks) | freed {freedBuffers:N0} blks {freedBytes / 1073741824.0:N3} GB (minBucket={minBytes / 1048576.0:N0} MB) | WS {wsBefore \ 1048576L:N0} -> {wsAfter \ 1048576L:N0} MB{vbCrLf}")
+        Catch _ex As Exception
+            AppendLog($"[Trim§241 ctx={ctx}] FAILED: {_ex.Message}{vbCrLf}")
+        End Try
+    End Sub
+
     ' §32B: Batch GMP operations — single managed→native crossing per term/combine.
     <DllImport("GmpNativeAlloc.dll", EntryPoint:="GmpBatch_ComputeTerm",
                CallingConvention:=CallingConvention.Winapi)>
@@ -4695,6 +4727,10 @@ Public Class Form1
             If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§213] r cleared eagerly (_5b_verify=False, ~{CLng(szR) * 8L \ 1048576L:N0} MB freed){vbCrLf}")
         End If
 
+        ' §241 (issue #69): trim pooled FFT temporaries left over from a×r before q×b
+        ' allocates fresh. Measures pool retention at this boundary (census-before).
+        TrimPoolAtBoundary("post-axr", 1048576UL)
+
         ' §5B-investigate (post-mul): verify ar boundary limbs against pre-mul a, r values.
         ' Bottom: ar[0] = (a[0]*r[0]) mod 2^64 — EXACT relation, mismatch ⇒ SafeMpzMul bug.
         ' Top: ar[szAR-1] should be ≈ high(a[szA-1]*r[szR-1]) plus accumulated carry from cross
@@ -5359,6 +5395,10 @@ PostShiftCheckpoint:
         Dim _qbPtr As IntPtr = qb.Pointer   ' = savedResultPtr set by SafeMpzMul
         Dim szQB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4))
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§184] qb raw: alloc={Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 0):N0} size={Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4):N0} _mp_d={Runtime.InteropServices.Marshal.ReadInt64(_qbPtr, 8):X16}{vbCrLf}")
+
+        ' §241 (issue #69): trim pooled temporaries left over from q×b. Census-before
+        ' here captures the post-q×b retention (the highest-RAM point in the divide).
+        TrimPoolAtBoundary("post-qxb", 1048576UL)
 
         ' §5B-f4: Cheap qb sanity checks (post-SafeMpzMul(qb, q, b), pre-subtract).
         ' Mathematically q ≈ q_true (within ±1 by Barrett), so q × b ≈ a (within b).
@@ -8376,6 +8416,11 @@ NumeratorDone:
             End If
             gmp_lib.mpz_clears(gmpNumer, finalT, Nothing)
             LogPhase("Division complete")
+
+            ' §241 (issue #69): trim pooled temporaries accumulated across the whole
+            ' final divide before the decimal conversion allocates its big output buffer.
+            ' Census-before here is the post-divide pool watermark.
+            TrimPoolAtBoundary("pre-conversion", 1048576UL)
 
             If token.IsCancellationRequested Then Return ""
 
