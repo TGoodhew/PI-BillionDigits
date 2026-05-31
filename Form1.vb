@@ -5068,8 +5068,13 @@ Public Class Form1
             ' Boundary limbs: at index kBits\64 and kBits\64+1. q_bot = (bnd0 >> kBits%64) | (bnd1 << (64 - kBits%64))
             Dim _kLimb As Long = kBits \ 64L
             Dim _kRem As Integer = CInt(kBits Mod 64L)
-            Dim _arBnd0 As Long = If(_kLimb >= 0L AndAlso _kLimb < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt(_kLimb * 8L)), 0L)
-            Dim _arBnd1 As Long = If(_kLimb + 1L < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, CInt((_kLimb + 1L) * 8L)), 0L)
+            ' §239 (2026-05-31, issue #71 residual): 64-bit-safe absolute-address read.
+            ' szAR ≈ 1.26B at 5B, so _kLimb (= kBits\64 ≈ 998M) × 8 = 7.99 GB overflows
+            ' Int32; with overflow checks off CInt wraps to a NEGATIVE offset → Marshal
+            ' reads ~601 MB before the buffer → AccessViolation. The §215 fix at line 5066
+            ' fixed _arTop but missed these two boundary reads. Same pattern as §237/c7a0c76.
+            Dim _arBnd0 As Long = If(_kLimb >= 0L AndAlso _kLimb < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_arDPtr.ToInt64() + _kLimb * 8L), 0), 0L)
+            Dim _arBnd1 As Long = If(_kLimb + 1L < CLng(szAR), Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_arDPtr.ToInt64() + (_kLimb + 1L) * 8L), 0), 0L)
             Dim _arBot As Long = If(szAR >= 1, Runtime.InteropServices.Marshal.ReadInt64(_arDPtr, 0), 0L)
             Dim _qBotExpected As Long = CLng(CULng(_arBnd0) >> _kRem) Or CLng(CULng(_arBnd1) << (64 - _kRem))
             AppendLog($"[SafeMpzDiv] ar pre-shift: szAR={szAR:N0} top2=[{_arTop:X16} {_arTop2:X16}] bot=[{_arBot:X16}] bnd=[{_arBnd0:X16} {_arBnd1:X16}] q_bot_expected={_qBotExpected:X16}{vbCrLf}")
@@ -5610,7 +5615,7 @@ PostShiftCheckpoint:
                 ' §171-entry: log bTop's bit width to quickly spot unnormalized divisors —
                 ' these can't converge via single-limb top correction at 5B+ scale.
                 Dim _bData171e As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_bPtr, 8))
-                Dim _bTop171e As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_bData171e, CInt(CLng(szB - 1) * 8L)))
+                Dim _bTop171e As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_bData171e.ToInt64() + CLng(szB - 1) * 8L), 0))  ' §239: 64-bit-safe (szB ≈ 739M at 5B → CInt overflow)
                 Dim _bTopBits171 As Integer = 0
                 Dim _bTopScan As ULong = _bTop171e
                 Do While _bTopScan <> 0UL
@@ -5675,7 +5680,7 @@ PostShiftCheckpoint:
                     Dim _szRemBefore171 As Integer = _szRem171
                     Dim _remData171 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_remRaw, 8))
                     Dim _bData171 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_bForCorr218, 8))
-                    Dim _bTop171 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_bData171, CInt(CLng(_szBForCorr218 - 1) * 8L)))
+                    Dim _bTop171 As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_bData171.ToInt64() + CLng(_szBForCorr218 - 1) * 8L), 0))  ' §239: 64-bit-safe (szB ≈ 739M at 5B → CInt overflow)
                     Dim _topSliceLen171 As Integer = _szRem171 - _szBForCorr218 + 1
                     Dim _deltaBytes171 As Long = CLng(_topSliceLen171) * 8L
                     Dim _deltaBuf171 As IntPtr = GmpNativeAlloc_PoolGet(_deltaBytes171)
@@ -5685,7 +5690,7 @@ PostShiftCheckpoint:
                     Dim _remTopPtr171 As IntPtr = New IntPtr(_remData171.ToInt64() + CLng(_szBForCorr218 - 1) * 8L)
                     GmpRaw_mpn_divrem_1(_deltaBuf171, 0, _remTopPtr171, _topSliceLen171, _bTop171 + 1UL)
                     Dim _deltaSz171 As Integer = _topSliceLen171
-                    Do While _deltaSz171 > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(_deltaBuf171, CInt(CLng(_deltaSz171 - 1) * 8L)) = 0L
+                    Do While _deltaSz171 > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_deltaBuf171.ToInt64() + CLng(_deltaSz171 - 1) * 8L), 0) = 0L  ' §239: 64-bit-safe
                         _deltaSz171 -= 1
                     Loop
                     AppendLog($"[SafeMpzDiv§171 pass={_171Pass}] bTop=0x{_bTop171:X16} szDelta={_deltaSz171:N0} szRemBefore={_szRemBefore171:N0}{vbCrLf}")

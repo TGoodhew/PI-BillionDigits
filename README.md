@@ -5972,3 +5972,69 @@ point.  SHA equivalence against the 5 B oracle
 (`2218EE06…E08983A`) is the acceptance gate at run completion.
 
 
+
+## §239 — 64-bit-safe ar/b boundary reads in SafeMpzDiv (2026-05-31, issue #71 residual)
+
+5 B run-3 resume6 crashed at ~05:50 on 2026-05-31, **immediately after the a×r
+multiply completed** (the `[SafeMpzDiv§213] r cleared eagerly` line was the last
+log entry), with:
+
+```
+Fatal error.
+System.AccessViolationException: Attempted to read or write protected memory.
+   at System.Runtime.InteropServices.Marshal.ReadInt64(IntPtr, Int32)
+   at PI_BillionDigits.Form1.SafeMpzDiv(...)
+   at PI_BillionDigits.Form1.ComputePiGMP(...)
+```
+
+a×r had just produced `ar` at **1,258,058,355 limbs** (`WS=52,621 MB` peak — the
+true high-water mark of the whole run, higher than the 48 GB the 60 s CPU sampler
+caught). This is the residual category #71 flagged as *"twelve other latent sites
+that don't fire at 5 B"* — same class as §215/§237 but in `SafeMpzDiv`'s own body.
+
+### Root cause
+
+The `If _logLevel >= 2` pre-shift diagnostic block at [Form1.vb:5063](Form1.vb#L5063)
+logs the `ar` boundary limbs around the shift point `_kLimb = kBits\64 ≈ 998 M`.
+The §215 fix at [:5066](Form1.vb#L5066) converted `_arTop`/`_arTop2` to the
+64-bit-safe pattern but **missed the two `_arBnd0`/`_arBnd1` reads right below**:
+
+```vb
+' OLD (overflows):
+Marshal.ReadInt64(_arDPtr, CInt(_kLimb * 8L))     ' _kLimb*8 = 7.99 GB
+```
+
+`CInt(7.99e9)` exceeds `Int32.MaxValue`. With integer-overflow checks off (perf
+build) `CInt` **wraps to a negative Int32** (≈ −601 M), so `Marshal.ReadInt64`
+reads ~601 MB *before* the buffer → AV. (With checks on it would have thrown
+`OverflowException` — either way it never read a valid address.)
+
+### Fix
+
+Apply the §237/c7a0c76 pattern — compute the absolute limb address in Int64:
+
+```vb
+' NEW:
+Marshal.ReadInt64(New IntPtr(_arDPtr.ToInt64() + _kLimb * 8L), 0)
+```
+
+Five sites fixed, all firing only at 5 B-class operand sizes:
+- [:5071-5072](Form1.vb#L5071) `_arBnd0`/`_arBnd1` — `ar` at `_kLimb ≈ 998 M` (**the crash**)
+- [:5613](Form1.vb#L5613) `_bTop171e` and [:5678](Form1.vb#L5678) `_bTop171` — `b` at `szB-1 ≈ 739 M` (§171 correction path)
+- [:5688](Form1.vb#L5688) `_deltaBuf171` scan — defensive (`_deltaSz171` can approach 2²⁸)
+
+All other unsafe `CInt(idx*8L)` reads in the q×b / remainder diagnostics are
+guarded by 1 B-scale size checks (`szB=21875001`, `szQ=87500001 AndAlso
+szB=87500001`, `_F5_ENABLED`) and skip at 5 B.
+
+### Verification
+
+The crash is in **diagnostic logging only** — the a×r result was correct; only
+the read of it faulted. `div_q.bin` saves at [Form1.vb:5281](Form1.vb#L5281)
+right after `BigShiftRight` (before q×b), so the fix carries the run from the
+diagnostic past the shift to that checkpoint (~10-30 min after a×r), which then
+protects all downstream work — a later crash resumes from `div_q`, skipping the
+~5 h15 m a×r. Restart re-runs a×r once (`nr_r.bin`@iter37 reloads the reciprocal
+instantly; no Newton replay). Empirical a×r wall: **~5 h15 m** (00:35 → 05:50,
+serial-nested under §238) — direct baseline for #42. SHA equivalence vs the 5 B
+oracle (`2218EE06…E08983A`) is the acceptance gate at completion.
