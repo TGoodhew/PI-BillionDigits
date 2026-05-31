@@ -7189,6 +7189,38 @@ Phase2:
     '   * Verification: byte-identical output to GMP's mpz_get_str / §216
     '     chunked path.  Validated at 1B against the 2026-05-22 post-§225
     '     verified pi_digits.txt.
+    ' §240 (issue #89): safe 10^k for the §226 power table.  GMP's mpz_ui_pow_ui
+    ' computes the power by internal squaring with mpz_mul, which AccessViolation-
+    ' crashes (0xC0000005) once an operand exceeds GMP's 33,554,431-limb FFT ceiling.
+    ' At 5B the table needs 10^2.5B (~65M-limb internal squaring) → crash.  This does
+    ' the same square-and-multiply but routes every multiply through SafeMpzMul, which
+    ' applies the §143 3×3 split above 5M limbs (and fast GmpRaw_mul below), keeping
+    ' all multiplies within the safe FFT range.  Squaring uses opA=opB (supported, §183);
+    ' GmpRaw_swap moves the product into place without a managed copy (§78-safe, as at
+    ' the SafeMpzDiv q-swap site).
+    Private Shared Sub SafeBigPow10(result As mpz_t, k As Long)
+        gmp_lib.mpz_set_ui(result, 1UI)
+        Dim b As New mpz_t()
+        gmp_lib.mpz_init(b)
+        gmp_lib.mpz_set_ui(b, 10UI)
+        Dim tmp As New mpz_t()
+        gmp_lib.mpz_init(tmp)
+        Dim e As Long = k
+        While e > 0L
+            If (e And 1L) = 1L Then
+                SafeMpzMul(tmp, result, b)                ' tmp = result * b
+                GmpRaw_swap(result.Pointer, tmp.Pointer)  ' result <- product
+            End If
+            e >>= 1
+            If e > 0L Then
+                SafeMpzMul(tmp, b, b)                     ' tmp = b^2 (square)
+                GmpRaw_swap(b.Pointer, tmp.Pointer)       ' b <- b^2
+            End If
+        End While
+        gmp_lib.mpz_clear(b)
+        gmp_lib.mpz_clear(tmp)
+    End Sub
+
     Private Sub ParallelMpzGetStr(pi As mpz_t, totalDigitsEstimate As Long)
         Const LEAF_THRESHOLD As Long = 50_000_000L
 
@@ -7232,7 +7264,13 @@ Phase2:
             Dim _kt As DateTime = DateTime.Now
             Dim m As New mpz_t()
             gmp_lib.mpz_init(m)
-            gmp_lib.mpz_ui_pow_ui(m, 10UI, CUInt(k))
+            ' §240 (issue #89): was gmp_lib.mpz_ui_pow_ui(m, 10UI, CUInt(k)).  At 5B the
+            ' table needs 10^2.5B, whose ~65M-limb internal squaring exceeds GMP's
+            ' 33,554,431-limb FFT ceiling and AccessViolation-crashes (0xC0000005).
+            ' SafeBigPow10 routes the square-and-multiply through SafeMpzMul (§143 split)
+            ' so every multiply stays in the safe range.  (10^1.25B = ~32.5M-limb square
+            ' just survived ui_pow_ui; 10^2.5B did not — the boundary is the 33.5M ceiling.)
+            SafeBigPow10(m, k)
             powTable(k) = m.Pointer
             AppendLog($"[§226] 10^{k:N0} computed in {(DateTime.Now - _kt).TotalSeconds:F1}s{vbCrLf}")
         Next

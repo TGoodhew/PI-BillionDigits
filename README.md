@@ -6075,6 +6075,29 @@ routing preserved as comments at the call site, grep `§240`).
 - `Parallel.Invoke` recursion (~7 levels, ~100 leaves at 5 B) is TPL-throttled to
   core count; conversion is not where the §238 nested-`Parallel.For` OOM lived.
 
+### First 5B validation crashed — power-table fix
+
+The first validation run (resume from `gmpPi.bin` → §226) **crashed** in the
+power-of-10 table build:
+
+```
+Fatal error. 0xC0000005
+   at __gmpz_ui_pow_ui   ← computing 10^2,500,000,000
+   at ParallelMpzGetStr
+```
+
+`mpz_ui_pow_ui` builds 10^k by internal squaring with `mpz_mul`. 10^1.25B
+(internal squaring ≈ 32.5 M limbs, just under GMP's 33,554,431-limb FFT ceiling)
+succeeded in 11.9 s; **10^2.5B** (≈ 65 M-limb squaring, over the ceiling) hit the
+same `mpn_mul_fft` AccessViolation §143 SafeMpzMul guards against. §226 had only
+ever been validated at 1 B, where the largest power (10^500M) stays small.
+
+**Fix:** new `SafeBigPow10(result, k)` replaces `mpz_ui_pow_ui` in the table loop —
+identical square-and-multiply, but every multiply is routed through `SafeMpzMul`
+(3×3 split above 5 M limbs, fast `GmpRaw_mul` below), so no operand exceeds the
+33.5 M ceiling. Squaring uses `opA=opB` (supported, §183); `GmpRaw_swap` moves the
+product into place §78-safely.
+
 ### Expected win
 
 Serial **46:49 (1 core)** → **~15-30 min** parallel across 24 cores.
