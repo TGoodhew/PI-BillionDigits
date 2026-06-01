@@ -6434,6 +6434,17 @@ PostShiftCheckpoint:
     '   interfering with compaction around live pinned objects (now gone) and
     '   adding overhead without benefit.  The between-level GC.Collect is kept
     '   since it runs only ~17 times per billion-digit computation.
+    ' §248 (issue #48): one Phase-1 chunk's computed (P,Q,T) handed from a compute worker to
+    ' an E-core serializer thread. Ownership of the three mpz_t transfers to the serializer,
+    ' which writes them to L0.bin and frees them.
+    Private NotInheritable Class ChunkWork
+        Public ReadOnly P As mpz_t, Q As mpz_t, T As mpz_t
+        Public ReadOnly Idx As Integer
+        Public Sub New(p_ As mpz_t, q_ As mpz_t, t_ As mpz_t, idx_ As Integer)
+            P = p_ : Q = q_ : T = t_ : Idx = idx_
+        End Sub
+    End Class
+
     Private Sub BinarySplitGMP(numTerms As Long,
                                 ByRef nodes As List(Of Result))
 
@@ -6587,6 +6598,7 @@ PostShiftCheckpoint:
         ' Results are written into a pre-sized array by index (no list locking).
         Dim chunkResults(CInt(numChunks) - 1) As DiskNode
         Dim completedChunks As Long = 0L
+        Dim _serializedChunks As Long = 0L   ' §248: chunks fully written to L0.bin (async path)
         ' §54: single-file format — all Level-0 chunks written to one L0.bin.
         ' Eliminates 137K individual file creates/deletes (the ~2 min NVMe
         ' metadata overhead at the start of every run).
@@ -6606,6 +6618,53 @@ PostShiftCheckpoint:
                                                  FileShare.None,
                                                  FileOptions.Asynchronous Or FileOptions.WriteThrough)
         End If
+        ' §248 (issue #48): on a HYBRID host, offload chunk serialization (serialize-to-buffer
+        ' + RandomAccess.Write) from the P-core compute workers to a few E-core serializer
+        ' threads, so the compute workers don't stall on disk I/O.  Compute workers push the
+        ' computed (P,Q,T) to a bounded queue; serializers drain it, write to L0.bin at an
+        ' atomically-reserved offset, fill chunkResults, and free the mpz_t.  Adaptive per the
+        ' host-adaptation rule: only when CpuTopologyIsHybrid (else the existing inline path runs
+        ' — extra serializer threads would just oversubscribe a non-hybrid box).  Safe for resume:
+        ' Phase 1 is all-or-nothing (no mid-phase checkpoint), so we only need to fully drain the
+        ' queue before Phase 2 — done via Task.WaitAll below.
+        Dim _asyncSer As Boolean = (numChunks > DISK_THRESHOLD) AndAlso CpuTopologyIsHybrid AndAlso l0Handle IsNot Nothing
+        Dim _l0Queue As System.Collections.Concurrent.BlockingCollection(Of ChunkWork) = Nothing
+        Dim _serTasks As System.Threading.Tasks.Task() = Nothing
+        If _asyncSer Then
+            Dim _nSer As Integer = System.Math.Max(1, System.Math.Min(4, CpuTopologyECoreIds.Length))
+            _l0Queue = New System.Collections.Concurrent.BlockingCollection(Of ChunkWork)(System.Math.Max(8, Environment.ProcessorCount))
+            _serTasks = New System.Threading.Tasks.Task(_nSer - 1) {}
+            For s As Integer = 0 To _nSer - 1
+                _serTasks(s) = System.Threading.Tasks.Task.Run(
+                    Sub()
+                        PinCurrentThreadToECores()   ' §247: run on E-cores, exempt from the P-core watchdog
+                        Dim _serStaging(4194303) As Byte
+                        For Each w As ChunkWork In _l0Queue.GetConsumingEnumerable()
+                            Dim wn As DiskNode
+                            wn.FilePath = Nothing : wn.MemP = Nothing : wn.MemQ = Nothing : wn.MemT = Nothing
+                            wn.Level = 0 : wn.Index = w.Idx : wn.IsInMemory = False
+                            Using ms As New System.IO.MemoryStream()
+                                Using bw As New System.IO.BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen:=True)
+                                    SerializeOneMpz(w.P, bw, _serStaging)
+                                    SerializeOneMpz(w.Q, bw, _serStaging)
+                                    SerializeOneMpz(w.T, bw, _serStaging)
+                                End Using
+                                gmp_lib.mpz_clears(w.P, w.Q, w.T, Nothing)
+                                Dim chunkLen As Long = ms.Length
+                                Dim fileOffset As Long = Interlocked.Add(l0NextOffset, chunkLen) - chunkLen
+                                wn.FileOffset = fileOffset
+                                RandomAccess.Write(l0Handle, ms.GetBuffer().AsMemory(0, CInt(chunkLen)).Span, fileOffset)
+                            End Using
+                            wn.FilePath = L0_BIN_PATH
+                            chunkResults(w.Idx) = wn
+                            Interlocked.Increment(_serializedChunks)
+                        Next
+                        UnpinCurrentThreadFromECores()
+                    End Sub)
+            Next
+            AppendLog($"[BinarySplitGMP§248] async Phase-1 serialization: {_nSer} E-core serializer thread(s) (hybrid host){vbCrLf}")
+        End If
+
         ' Dedicated background thread (not thread-pool) polls completedChunks
         ' every 500 ms.  System.Threading.Timer callbacks run on thread-pool
         ' threads, which Parallel.For exhausts — causing ~2 min delay before
@@ -6654,48 +6713,70 @@ PostShiftCheckpoint:
                     BinarySplitChunk(chunkStart, chunkEnd, tempP, tempQ, tempT)
                 End If
 
-                Dim node As DiskNode
-                node.FilePath = Nothing
-                node.MemP = Nothing
-                node.MemQ = Nothing
-                node.MemT = Nothing
-                node.Level = 0
-                node.Index = CInt(i)
-                node.IsInMemory = (numChunks <= DISK_THRESHOLD)
-
-                If node.IsInMemory Then
-                    node.MemP = tempP
-                    node.MemQ = tempQ
-                    node.MemT = tempT
+                Dim _isMem As Boolean = (numChunks <= DISK_THRESHOLD)
+                If (Not _isMem) AndAlso _asyncSer Then
+                    ' §248: hand the computed (P,Q,T) to an E-core serializer thread; it writes
+                    ' to L0.bin, fills chunkResults(i), and frees the mpz_t.  completedChunks
+                    ' tracks COMPUTE completion here (drives the §234 tail-mode trigger + poll);
+                    ' _serializedChunks tracks writes (drained below before Phase 2).
+                    _l0Queue.Add(New ChunkWork(tempP, tempQ, tempT, CInt(i)))
+                    Dim doneC As Long = Interlocked.Increment(completedChunks)
+                    If doneC Mod 5000L = 0L Then
+                        WriteToLog($"[Phase1] {doneC:N0}/{numChunks:N0} chunks computed (async serialize)")
+                    End If
                 Else
-                    ' §106 Gap 3: serialize to MemoryStream (no lock), atomically reserve
-                    ' a file region with Interlocked.Add, then write at the reserved offset
-                    ' via RandomAccess.Write — completely lock-free.
-                    Dim stagingBuf(4194303) As Byte  ' 4 MB staging buffer (§56)
-                    Using ms As New System.IO.MemoryStream()
-                        Using bw As New System.IO.BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen:=True)
-                            SerializeOneMpz(tempP, bw, stagingBuf)
-                            SerializeOneMpz(tempQ, bw, stagingBuf)
-                            SerializeOneMpz(tempT, bw, stagingBuf)
+                    Dim node As DiskNode
+                    node.FilePath = Nothing
+                    node.MemP = Nothing
+                    node.MemQ = Nothing
+                    node.MemT = Nothing
+                    node.Level = 0
+                    node.Index = CInt(i)
+                    node.IsInMemory = _isMem
+
+                    If node.IsInMemory Then
+                        node.MemP = tempP
+                        node.MemQ = tempQ
+                        node.MemT = tempT
+                    Else
+                        ' §106 Gap 3: serialize to MemoryStream (no lock), atomically reserve
+                        ' a file region with Interlocked.Add, then write at the reserved offset
+                        ' via RandomAccess.Write — completely lock-free.
+                        Dim stagingBuf(4194303) As Byte  ' 4 MB staging buffer (§56)
+                        Using ms As New System.IO.MemoryStream()
+                            Using bw As New System.IO.BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen:=True)
+                                SerializeOneMpz(tempP, bw, stagingBuf)
+                                SerializeOneMpz(tempQ, bw, stagingBuf)
+                                SerializeOneMpz(tempT, bw, stagingBuf)
+                            End Using
+                            gmp_lib.mpz_clears(tempP, tempQ, tempT, Nothing)
+                            Dim chunkLen As Long = ms.Length
+                            ' Reserve [offset, offset+chunkLen) atomically — no lock needed.
+                            Dim fileOffset As Long = Interlocked.Add(l0NextOffset, chunkLen) - chunkLen
+                            node.FileOffset = fileOffset
+                            Dim chunkData As ReadOnlyMemory(Of Byte) = ms.GetBuffer().AsMemory(0, CInt(chunkLen))
+                            RandomAccess.Write(l0Handle, chunkData.Span, fileOffset)
                         End Using
-                        gmp_lib.mpz_clears(tempP, tempQ, tempT, Nothing)
-                        Dim chunkLen As Long = ms.Length
-                        ' Reserve [offset, offset+chunkLen) atomically — no lock needed.
-                        Dim fileOffset As Long = Interlocked.Add(l0NextOffset, chunkLen) - chunkLen
-                        node.FileOffset = fileOffset
-                        Dim chunkData As ReadOnlyMemory(Of Byte) = ms.GetBuffer().AsMemory(0, CInt(chunkLen))
-                        RandomAccess.Write(l0Handle, chunkData.Span, fileOffset)
-                    End Using
-                    node.FilePath = L0_BIN_PATH
-                End If
+                        node.FilePath = L0_BIN_PATH
+                    End If
 
-                chunkResults(CInt(i)) = node
+                    chunkResults(CInt(i)) = node
 
-                Dim done As Long = Interlocked.Increment(completedChunks)
-                If done Mod 5000L = 0L Then
-                    WriteToLog($"[Phase1] {done:N0}/{numChunks:N0} chunks complete (parallel)")
+                    Dim done As Long = Interlocked.Increment(completedChunks)
+                    If done Mod 5000L = 0L Then
+                        WriteToLog($"[Phase1] {done:N0}/{numChunks:N0} chunks complete (parallel)")
+                    End If
                 End If
             End Sub)
+
+        ' §248: all chunks computed + pushed — drain the serializer queue and wait for every
+        ' write to land in L0.bin before Phase 2 reads the nodes (Phase 1's completion barrier).
+        If _asyncSer Then
+            _l0Queue.CompleteAdding()
+            System.Threading.Tasks.Task.WaitAll(_serTasks)
+            _l0Queue.Dispose()
+            WriteToLog($"[Phase1§248] async serialization drained: {Interlocked.Read(_serializedChunks):N0}/{numChunks:N0} chunks written to L0.bin")
+        End If
 
         phase1PollThread.Join()
 
@@ -6908,44 +6989,64 @@ Phase2:
                 System.Threading.Volatile.Write(_safeMulDop, _chosenDop231)  ' §231 (was hardcoded 3 in §95)
                 AppendLog($"[BinarySplit§231] serial-path DOP at level={level}: numTerms={numTerms:N0}, pairCount={pairCount}, chosen DOP={_chosenDop231}{vbCrLf}")
                 Dim nodeIdx As Long = 0
+                ' §249 (issue #49, Opportunity B): prefetch the NEXT pair's disk nodes on an
+                ' E-core while the current pair combines, hiding the read I/O behind the
+                ' multi-second combine.  (Opportunity A — compute on P-cores — is already
+                ' delivered by §247.)  Bit-identical: this only changes WHERE/WHEN a node is
+                ' read, not the data or the combine.  Adaptive: prefetch only on a hybrid host
+                ' with on-disk inputs; otherwise nodes load inline exactly as before.
+                Dim _loadNode As Func(Of Integer, ValueTuple(Of mpz_t, mpz_t, mpz_t)) =
+                    Function(idx As Integer)
+                        Dim nP As mpz_t = Nothing, nQ As mpz_t = Nothing, nT As mpz_t = Nothing
+                        If diskNodes(idx).IsInMemory Then
+                            nP = diskNodes(idx).MemP : nQ = diskNodes(idx).MemQ : nT = diskNodes(idx).MemT
+                        Else
+                            LoadNodeFromDisk(diskNodes(idx).FilePath, diskNodes(idx).FileOffset, nP, nQ, nT, isLastLevel)
+                            If diskNodes(idx).Level > 0 Then
+                                Try : System.IO.File.Delete(diskNodes(idx).FilePath) : Catch : End Try
+                            End If
+                        End If
+                        Return (nP, nQ, nT)
+                    End Function
+                Dim _loadPair As Func(Of Integer, ValueTuple(Of mpz_t, mpz_t, mpz_t, mpz_t, mpz_t, mpz_t)) =
+                    Function(baseIdx As Integer)
+                        Dim l = _loadNode(baseIdx)
+                        Dim r = _loadNode(baseIdx + 1)
+                        Return (l.Item1, l.Item2, l.Item3, r.Item1, r.Item2, r.Item3)
+                    End Function
+                Dim _pfEnabled As Boolean = CpuTopologyIsHybrid AndAlso diskNodes.Count > 0 AndAlso Not diskNodes(0).IsInMemory
+                Dim _pfTask As System.Threading.Tasks.Task(Of ValueTuple(Of mpz_t, mpz_t, mpz_t, mpz_t, mpz_t, mpz_t)) = Nothing
+                Dim _pfBase As Long = -1L
                 While nodeIdx < diskNodes.Count - 1
 
-                    ' Load left operand
-                    Dim leftP As mpz_t = Nothing
-                    Dim leftQ As mpz_t = Nothing
-                    Dim leftT As mpz_t = Nothing
-
-                    If diskNodes(CInt(nodeIdx)).IsInMemory Then
-                        leftP = diskNodes(CInt(nodeIdx)).MemP
-                        leftQ = diskNodes(CInt(nodeIdx)).MemQ
-                        leftT = diskNodes(CInt(nodeIdx)).MemT
+                    ' §249: current pair's operands — from the matching prefetch task, else inline.
+                    Dim _cur As ValueTuple(Of mpz_t, mpz_t, mpz_t, mpz_t, mpz_t, mpz_t)
+                    If _pfTask IsNot Nothing AndAlso _pfBase = nodeIdx Then
+                        _cur = _pfTask.Result
+                        _pfTask = Nothing
                     Else
-                        LoadNodeFromDisk(diskNodes(CInt(nodeIdx)).FilePath, diskNodes(CInt(nodeIdx)).FileOffset, leftP, leftQ, leftT, isLastLevel)
-                        If diskNodes(CInt(nodeIdx)).Level > 0 Then
-                            Try
-                                System.IO.File.Delete(diskNodes(CInt(nodeIdx)).FilePath)
-                            Catch
-                            End Try
-                        End If
+                        _cur = _loadPair(CInt(nodeIdx))
                     End If
+                    Dim leftP As mpz_t = _cur.Item1
+                    Dim leftQ As mpz_t = _cur.Item2
+                    Dim leftT As mpz_t = _cur.Item3
+                    Dim rightP As mpz_t = _cur.Item4
+                    Dim rightQ As mpz_t = _cur.Item5
+                    Dim rightT As mpz_t = _cur.Item6
 
-                    ' Load right operand
-                    Dim rightP As mpz_t = Nothing
-                    Dim rightQ As mpz_t = Nothing
-                    Dim rightT As mpz_t = Nothing
-
-                    If diskNodes(CInt(nodeIdx + 1)).IsInMemory Then
-                        rightP = diskNodes(CInt(nodeIdx + 1)).MemP
-                        rightQ = diskNodes(CInt(nodeIdx + 1)).MemQ
-                        rightT = diskNodes(CInt(nodeIdx + 1)).MemT
+                    ' §249: kick off prefetch of the next pair on an E-core (hybrid + disk only).
+                    Dim _nextBase As Integer = CInt(nodeIdx + 2L)
+                    If _pfEnabled AndAlso CLng(_nextBase) < diskNodes.Count - 1 Then
+                        _pfBase = CLng(_nextBase)
+                        _pfTask = System.Threading.Tasks.Task.Run(
+                            Function()
+                                PinCurrentThreadToECores()
+                                Dim _pp = _loadPair(_nextBase)
+                                UnpinCurrentThreadFromECores()
+                                Return _pp
+                            End Function)
                     Else
-                        LoadNodeFromDisk(diskNodes(CInt(nodeIdx + 1)).FilePath, diskNodes(CInt(nodeIdx + 1)).FileOffset, rightP, rightQ, rightT, isLastLevel)
-                        If diskNodes(CInt(nodeIdx + 1)).Level > 0 Then
-                            Try
-                                System.IO.File.Delete(diskNodes(CInt(nodeIdx + 1)).FilePath)
-                            Catch
-                            End Try
-                        End If
+                        _pfTask = Nothing
                     End If
 
                     ' Combine

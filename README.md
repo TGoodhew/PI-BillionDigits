@@ -6220,3 +6220,35 @@ serial shift+accumulate pass** (shared `_sv_shifted_hdr` + ordered `accumPtr` ad
 Bit-identical by construction (parallel adds on disjoint columns == serial adds). Layers 2/3
 (per-column shift buffers, pipelining) deferred. Validate: bit-correct output at a scale whose
 reciprocal hits §39 at DOP>1.
+
+## §248 — Phase-1 producer-consumer: E-core serializers (2026-06-01, issue #48)
+
+Phase-1 (`BinarySplitGMP`) compute workers used to serialize each chunk's (P,Q,T) to `L0.bin`
+inline — stalling the P-core compute thread on disk I/O. On a HYBRID host (§247 having freed
+the E-cores), compute workers now push the computed (P,Q,T) to a bounded queue and a few
+**E-core-pinned serializer threads** drain it, writing to `L0.bin` at the existing
+atomically-reserved offsets. Compute stays on P-cores at full throughput; serialization is
+hidden on the otherwise-idle E-cores.
+
+- `ChunkWork` carries one chunk's (P,Q,T)+index; ownership transfers to the serializer (it frees).
+- Serializer count = `min(4, ECoreIds.Length)`, each `PinCurrentThreadToECores()` (§247).
+- **Resume-safe:** Phase 1 is all-or-nothing (no mid-phase checkpoint — re-runs entirely on a
+  crash before the first Phase-2 snapshot), so the only requirement is to fully drain the queue
+  before Phase 2 — enforced by `Task.WaitAll` after the compute `Parallel.For`.
+- **Adaptive:** gated on `CpuTopologyIsHybrid`; a non-hybrid host keeps the inline path (extra
+  serializer threads would only oversubscribe). Addressable ~3-8% of total (Phase-1 I/O).
+
+## §249 — Phase-2 serial-path prefetch: E-core read-ahead (2026-06-01, issue #49)
+
+Issue #49 Opportunity A (compute on P-cores) is already delivered by §247. Opportunity B:
+the serial top-level Phase-2 combine loads `left`+`right` nodes from disk *before* the
+multi-second combine. On a hybrid host with on-disk inputs, an **E-core prefetch task** now
+reads the NEXT pair's nodes while the current pair combines; the loop consumes from the
+prefetch task (fallback to inline load on miss). Node-load factored into `_loadNode`/`_loadPair`.
+
+- **Bit-identical:** only reorders WHERE/WHEN a node is read — same bytes, same combine.
+- **Adaptive:** gated on `CpuTopologyIsHybrid` + on-disk inputs; else loads inline as before.
+- Lower leverage (~few % of Phase 2, top levels only) — the parallel Phase-2 path already
+  overlaps I/O across workers, so prefetch targets only the serial top levels.
+
+Both #48/#49 build on §247 (P-core preference, E-cores usable). Validated bit-identical at 1B.
