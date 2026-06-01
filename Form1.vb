@@ -112,6 +112,12 @@ Public Class Form1
     ' in one central place instead of policing it at every call site).
     <System.ThreadStatic> Private Shared _smm_innerForceSerial As Boolean
 
+    ' §250 (issue #94): high-half ("short") product flags for the capped-precision
+    ' reciprocal Newton iters.  _testMulHigh: --test-mulhigh ran the standalone bit-
+    ' correctness self-test (then exit).  Set in the arg loop; honoured after the
+    ' GMP allocator is installed.
+    Private Shared _testMulHigh As Boolean = False
+
     ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
     ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
     ' thread-safe.  Only the File.AppendAllText log writes need serialisation so
@@ -1503,6 +1509,8 @@ Public Class Form1
                     End If
                 Case "--auto-checkpoint"
                     _autoCheckpoint = True
+                Case "--test-mulhigh"
+                    _testMulHigh = True   ' §250 (#94): run SafeMpzMulHigh self-test after GMP init, then exit
                 Case "--log-level"
                     If i + 1 < args.Length Then
                         Dim lvl As Integer
@@ -1611,6 +1619,14 @@ Public Class Form1
         ' buffers are immediately decommitted on free, preventing commit-charge
         ' accumulation that caused abort() in multi-pass multiply.
         InitGmpVirtualAllocFunctions()
+
+        ' §250 (#94): standalone SafeMpzMulHigh bit-correctness self-test — runs now that the
+        ' GMP allocator is installed, writes results to %TEMP%\mulhigh_test.txt, then exits.
+        If _testMulHigh Then
+            Dim _mhOk As Boolean = TestMulHigh()
+            AppendLog($"[TestMulHigh] OVERALL: {If(_mhOk, "PASS", "FAIL")}{vbCrLf}")
+            Environment.Exit(If(_mhOk, 0, 1))
+        End If
 
         ' Initialize constant for Chudnovsky algorithm
         gmpC3Const = New mpz_t()
@@ -2787,6 +2803,189 @@ Public Class Form1
     ' ════════════════════════════════════════════════════════════════════════
     '  Safe large-integer multiply (avoids GMP 32-bit mp_size_t overflow)
     ' ════════════════════════════════════════════════════════════════════════
+
+    ' §250 (issue #94): High-half ("short") product for the capped-precision reciprocal
+    ' Newton iterations.  Computes opA*opB but returns an OVERESTIMATE of the true product
+    ' whose top limbs (down to ~cutoffLo) are exact.  The low-column 3×3 sub-products lying
+    ' entirely below the exact-region cutoff are skipped; an upper bound of their omitted
+    ' mass is then ADDED (round-up) so result ≥ true product.  Used where the caller
+    ' immediately right-shifts and forms r = 2r − (result>>S):
+    '     result ≥ true  ⟹  (result>>S) ≥ floor(true>>S)  ⟹  r stays a strict UNDERESTIMATE
+    ' (the §107 invariant), with a bounded few-ulp low error that SafeMpzDiv's §171/§218
+    ' quotient adjustment corrects to the exact quotient (so final π is bit-identical).
+    ' Reuses the proven SafeMpzMul per surviving sub-product; accumulates via BigShiftLeft +
+    ' GmpRaw_add into a pre-grown result (no GMP realloc abort).  The OVERESTIMATE contract
+    ' (result ≥ full, and (result>>S) within ~1 ulp of (full>>S)) is checked by --test-mulhigh.
+    ' Requires result to be a DISTINCT mpz_t from opA/opB (true at the reciprocal call sites).
+    Private Shared Sub SafeMpzMulHigh(result As mpz_t, opA As mpz_t, opB As mpz_t, keepLimbs As Long)
+        Const SAFE_LIMB_THRESHOLD As Long = 5_000_000L
+        Const GUARD_LIMBS As Long = 8L
+        Dim szA As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4))
+        Dim szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(opB.Pointer, 4))
+        Dim fullLimbs As Long = CLng(szA) + CLng(szB)
+        ' Fall back to the exact full product when truncation can't help or operands are small.
+        If keepLimbs <= 0L OrElse keepLimbs + GUARD_LIMBS >= fullLimbs OrElse fullLimbs <= SAFE_LIMB_THRESHOLD Then
+            SafeMpzMul(result, opA, opB)
+            Return
+        End If
+        Dim cutoffLo As Long = fullLimbs - keepLimbs - GUARD_LIMBS   ' result limbs < cutoffLo may be omitted
+        Dim mA As Long = (CLng(szA) + 2L) \ 3L
+        Dim mB As Long = (CLng(szB) + 2L) \ 3L
+        Dim opA_d As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
+        Dim opB_d As Long = Runtime.InteropServices.Marshal.ReadInt64(opB.Pointer, 8)
+
+        ' Build 3 zero-copy limb-window pieces per operand (headers only; data aliases opA/opB).
+        Dim Ahdr(2) As IntPtr, Bhdr(2) As IntPtr
+        Dim Asz(2) As Integer, Bsz(2) As Integer
+        For idx As Integer = 0 To 2
+            Dim aBase As Long = opA_d + CLng(idx) * mA * 8L
+            Dim aCnt As Integer = CInt(System.Math.Max(0L, System.Math.Min(CLng(szA) - CLng(idx) * mA, mA)))
+            Dim aT As Integer = aCnt
+            While aT > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(aBase + CLng(aT - 1) * 8L)) = 0L
+                aT -= 1
+            End While
+            Ahdr(idx) = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+            Runtime.InteropServices.Marshal.WriteInt32(Ahdr(idx), 0, CInt(mA))
+            Runtime.InteropServices.Marshal.WriteInt32(Ahdr(idx), 4, aT)
+            Runtime.InteropServices.Marshal.WriteInt64(Ahdr(idx), 8, aBase)
+            Asz(idx) = aT
+            Dim bBase As Long = opB_d + CLng(idx) * mB * 8L
+            Dim bCnt As Integer = CInt(System.Math.Max(0L, System.Math.Min(CLng(szB) - CLng(idx) * mB, mB)))
+            Dim bT As Integer = bCnt
+            While bT > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(bBase + CLng(bT - 1) * 8L)) = 0L
+                bT -= 1
+            End While
+            Bhdr(idx) = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+            Runtime.InteropServices.Marshal.WriteInt32(Bhdr(idx), 0, CInt(mB))
+            Runtime.InteropServices.Marshal.WriteInt32(Bhdr(idx), 4, bT)
+            Runtime.InteropServices.Marshal.WriteInt64(Bhdr(idx), 8, bBase)
+            Bsz(idx) = bT
+        Next idx
+
+        ' result := 0, pre-grown to full width so accumulation adds never trigger a GMP realloc.
+        Runtime.InteropServices.Marshal.WriteInt32(result.Pointer, 4, 0)   ' _mp_size = 0  ⟹ value 0
+        PreAllocMpzToLimbs(result, fullLimbs + 2L)
+
+        Dim tmp As New mpz_t()
+        tmp.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+        GmpRaw_init(tmp.Pointer)
+        Dim anySkipped As Boolean = False
+        For i As Integer = 0 To 2
+            For j As Integer = 0 To 2
+                If Asz(i) = 0 OrElse Bsz(j) = 0 Then Continue For
+                Dim colLimb As Long = CLng(i) * mA + CLng(j) * mB
+                Dim termTop As Long = colLimb + CLng(Asz(i)) + CLng(Bsz(j))
+                If termTop < cutoffLo Then
+                    anySkipped = True
+                    Continue For
+                End If
+                Dim Ai As New mpz_t() : Ai.Pointer = Ahdr(i)
+                Dim Bj As New mpz_t() : Bj.Pointer = Bhdr(j)
+                SafeMpzMul(tmp, Ai, Bj)
+                If colLimb > 0L Then BigShiftLeft(tmp, tmp, colLimb * 64L)
+                GmpRaw_add(result.Pointer, result.Pointer, tmp.Pointer)
+            Next j
+        Next i
+
+        ' Round UP by an upper bound of the omitted mass.  Omitted < 9·2^(64·cutoffLo)
+        ' < 2^(64·cutoffLo+4); adding 2^(64·cutoffLo+4) guarantees result ≥ true product.
+        If anySkipped Then
+            GmpRaw_set_ui(tmp.Pointer, 1UI)
+            BigShiftLeft(tmp, tmp, cutoffLo * 64L + 4L)
+            GmpRaw_add(result.Pointer, result.Pointer, tmp.Pointer)
+        End If
+
+        GmpRaw_clear(tmp.Pointer)
+        Runtime.InteropServices.Marshal.FreeHGlobal(tmp.Pointer)
+        For idx As Integer = 0 To 2
+            Runtime.InteropServices.Marshal.FreeHGlobal(Ahdr(idx))
+            Runtime.InteropServices.Marshal.FreeHGlobal(Bhdr(idx))
+        Next idx
+    End Sub
+
+    ' §250: fill m with nLimbs pseudo-random limbs (top limb forced nonzero), value positive.
+    ' m must be a fresh mpz_t header (AllocHGlobal(16)); this init2's it to the right size.
+    Private Shared Sub FillRandomMpz(m As mpz_t, nLimbs As Integer, rng As Random)
+        GmpRaw_init2(m.Pointer, CULng(nLimbs + 2) * 64UL)
+        Dim d As Long = Runtime.InteropServices.Marshal.ReadInt64(m.Pointer, 8)
+        Dim buf(7) As Byte
+        For k As Integer = 0 To nLimbs - 1
+            rng.NextBytes(buf)
+            Runtime.InteropServices.Marshal.WriteInt64(New IntPtr(d + CLng(k) * 8L), BitConverter.ToInt64(buf, 0))
+        Next k
+        If Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(d + CLng(nLimbs - 1) * 8L)) = 0L Then
+            Runtime.InteropServices.Marshal.WriteInt64(New IntPtr(d + CLng(nLimbs - 1) * 8L), &H4000000000000000L)
+        End If
+        Runtime.InteropServices.Marshal.WriteInt32(m.Pointer, 4, nLimbs)   ' _mp_size = nLimbs (positive)
+    End Sub
+
+    ' §250 (issue #94): standalone bit-correctness self-test for SafeMpzMulHigh.  For each
+    ' (szA, szB, keepLimbs) case it builds random operands, computes the full product and the
+    ' high product, and verifies the OVERESTIMATE contract:
+    '   (1) high ≥ full, and
+    '   (2) (high >> S) − (full >> S) ∈ {0,1} where S = (szA+szB−keep)·64  (≤ ~1 ulp at the cut).
+    ' Writes results to the temp file mulhigh_test.txt and returns True iff every case passes.
+    Private Shared Function TestMulHigh() As Boolean
+        Dim rng As New Random(12345)
+        Dim allPass As Boolean = True
+        Dim outPath As String = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "mulhigh_test.txt")
+        Try : System.IO.File.WriteAllText(outPath, $"[TestMulHigh] start {DateTime.Now}{vbCrLf}") : Catch : End Try
+        ' sq=True ⟹ exercise the squaring path (opA.Pointer = opB.Pointer), as rSq = r² does.
+        Dim caseA() As Integer = {8_000_000, 8_000_000, 10_000_000, 7_000_000, 8_000_000, 12_000_000}
+        Dim caseB() As Integer = {6_000_000, 8_000_000, 5_000_000, 7_000_000, 8_000_000, 12_000_000}
+        Dim caseK() As Long = {5_000_000L, 6_000_000L, 4_000_000L, 3_000_000L, 5_000_000L, 7_000_000L}
+        Dim caseSq() As Boolean = {False, False, False, False, True, True}
+        For ci As Integer = 0 To caseA.Length - 1
+            Dim szA As Integer = caseA(ci), szB As Integer = caseB(ci)
+            Dim keep As Long = caseK(ci)
+            Dim sq As Boolean = caseSq(ci)
+            Dim a As New mpz_t() : a.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+            Dim b As New mpz_t()
+            FillRandomMpz(a, szA, rng)
+            If sq Then
+                b.Pointer = a.Pointer   ' squaring: same operand buffer (rSq = r²)
+            Else
+                b.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+                FillRandomMpz(b, szB, rng)
+            End If
+            Dim full As New mpz_t() : full.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(full.Pointer)
+            Dim high As New mpz_t() : high.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(high.Pointer)
+            SafeMpzMul(full, a, b)
+            SafeMpzMulHigh(high, a, b, keep)
+            Dim cmp As Integer = GmpRaw_cmp(high.Pointer, full.Pointer)   ' want ≥ 0
+            Dim fullLimbs As Long = CLng(szA) + CLng(szB)
+            Dim S As Long = (fullLimbs - keep) * 64L
+            Dim fs As New mpz_t() : fs.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(fs.Pointer)
+            Dim hs As New mpz_t() : hs.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(hs.Pointer)
+            BigShiftRight(fs, full, S)
+            BigShiftRight(hs, high, S)
+            Dim diff As New mpz_t() : diff.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(diff.Pointer)
+            GmpRaw_sub(diff.Pointer, hs.Pointer, fs.Pointer)
+            Dim diffSz As Integer = Runtime.InteropServices.Marshal.ReadInt32(diff.Pointer, 4)   ' signed
+            Dim diffLow As Long = 0L
+            If diffSz <> 0 Then
+                Dim dD As Long = Runtime.InteropServices.Marshal.ReadInt64(diff.Pointer, 8)
+                diffLow = Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(dD), 0)
+            End If
+            Dim pass As Boolean = (cmp >= 0) AndAlso (diffSz >= 0) AndAlso (diffSz <= 1)
+            Dim line As String = $"[TestMulHigh] szA={szA:N0} szB={szB:N0} keep={keep:N0} sq={sq}: high>=full={cmp >= 0} shiftDiffSz={diffSz} diffLow={diffLow} -> {If(pass, "PASS", "FAIL")}{vbCrLf}"
+            Try : System.IO.File.AppendAllText(outPath, line) : Catch : End Try
+            AppendLog(line)
+            If Not pass Then allPass = False
+            GmpRaw_clear(a.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(a.Pointer)
+            If Not sq Then
+                GmpRaw_clear(b.Pointer)
+                Runtime.InteropServices.Marshal.FreeHGlobal(b.Pointer)
+            End If
+            GmpRaw_clear(full.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(full.Pointer)
+            GmpRaw_clear(high.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(high.Pointer)
+            GmpRaw_clear(fs.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(fs.Pointer)
+            GmpRaw_clear(hs.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(hs.Pointer)
+            GmpRaw_clear(diff.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(diff.Pointer)
+        Next ci
+        Try : System.IO.File.AppendAllText(outPath, $"[TestMulHigh] OVERALL {If(allPass, "PASS", "FAIL")}{vbCrLf}") : Catch : End Try
+        Return allPass
+    End Function
 
     ''' <summary>
     ''' GMP's MSVC build uses signed 32-bit mp_size_t.  mpn_mul_fft internally
