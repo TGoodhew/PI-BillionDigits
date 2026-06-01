@@ -339,6 +339,12 @@ Public Class Form1
         dwThreadId As UInteger) As IntPtr
     End Function
 
+    ' §247 (#48/#49): OS thread id of the calling thread, to register E-core I/O threads
+    ' with the affinity watchdog's exempt set (the watchdog keys on ProcessThread.Id).
+    <DllImport("kernel32.dll")>
+    Private Shared Function GetCurrentThreadId() As UInteger
+    End Function
+
     <DllImport("kernel32.dll", SetLastError:=True)>
     Private Shared Function SetThreadAffinityMask(
         hThread As IntPtr,
@@ -425,9 +431,14 @@ Public Class Form1
                 Loop
 
                 If pCoreMask <> 0L AndAlso eCoreMask <> 0L Then
-                    ' Hybrid CPU — restrict process to P-cores
-                    If SetProcessAffinityMask(GetCurrentProcess(), New IntPtr(pCoreMask)) Then
-                        AppendLog($"[Affinity] Hybrid CPU detected. P-core mask=0x{pCoreMask:X}  E-core mask=0x{eCoreMask:X}. Process restricted to P-cores.{vbCrLf}")
+                    ' §247 (#48/#49): keep the process mask on ALL cores (P|E) — NOT a hard
+                    ' lock to P.  The watchdog hard-pins compute threads to P (where it benefits
+                    ' the algorithm); the otherwise-idle E-cores stay AVAILABLE for the I/O
+                    ' threads that pin themselves there (and are exempted from the watchdog).
+                    ' A thread's SetThreadAffinityMask cannot exceed the process mask, so the
+                    ' process must include E for E-core pinning to take effect.
+                    If SetProcessAffinityMask(GetCurrentProcess(), New IntPtr(pCoreMask Or eCoreMask)) Then
+                        AppendLog($"[Affinity] Hybrid CPU. P-core mask=0x{pCoreMask:X} E-core mask=0x{eCoreMask:X}. Process on all cores; watchdog pins compute to P, E-cores free for I/O.{vbCrLf}")
                         System.Threading.Volatile.Write(_pCoreMask, pCoreMask)   ' §106: save for watchdog
                     Else
                         AppendLog($"[Affinity] Hybrid CPU detected but SetProcessAffinityMask failed. P=0x{pCoreMask:X} E=0x{eCoreMask:X}{vbCrLf}")
@@ -462,6 +473,10 @@ Public Class Form1
                     Try
                         For Each pt As Diagnostics.ProcessThread In
                                 Diagnostics.Process.GetCurrentProcess().Threads
+                            ' §247: skip E-core I/O threads (Phase 1 serializers / Phase 2
+                            ' prefetch) — they pin themselves to E-cores and must not be
+                            ' dragged back to P.  Compute/general threads are still pinned to P.
+                            If _affinityExempt.ContainsKey(CUInt(pt.Id)) Then Continue For
                             Dim h As IntPtr = OpenThread(
                                 THREAD_SET_INFORMATION Or THREAD_QUERY_INFORMATION,
                                 False, CUInt(pt.Id))
@@ -505,6 +520,12 @@ Public Class Form1
     ' §106: P-core affinity mask saved by SetPCoreAffinity for use by the watchdog.
     Private Shared _pCoreMask As Long = 0L
     Private Shared _affinityWatchdogToken As System.Threading.CancellationTokenSource = Nothing
+    ' §247 (#48/#49): TIDs the affinity watchdog must NOT re-pin to P-cores — the E-core I/O
+    ' threads (Phase 1 serializers, Phase 2 prefetch).  Registered by PinCurrentThreadToECores,
+    ' cleared by UnpinCurrentThreadFromECores.  Implements the user's "prefer P, don't lock out
+    ' E unless it benefits the algorithm": compute stays hard-pinned to P (watchdog), the
+    ' otherwise-idle E-cores carry I/O.  Empty/no-op on a non-hybrid host.
+    Private Shared ReadOnly _affinityExempt As New System.Collections.Concurrent.ConcurrentDictionary(Of UInteger, Byte)()
 
     ' GC-anchor ALL six delegates — collected delegates crash the process.
     ' Shared so the Shared callback methods can reach the saved defaults.
@@ -909,9 +930,23 @@ Public Class Form1
         Return PinCurrentThreadTo(CpuTopologyPCoreMask)
     End Function
 
+    ' §247 (#48/#49): pin the calling thread to E-cores AND register it with the affinity
+    ' watchdog's exempt set so it is NOT dragged back to P-cores.  Adaptive: on a non-hybrid
+    ' host (no E-cores) this is a harmless no-op — the thread keeps the (all-core) process mask.
     Public Shared Function PinCurrentThreadToECores() As ULong
+        If Not CpuTopologyIsHybrid OrElse CpuTopologyECoreMask = 0UL Then Return 0UL
+        _affinityExempt(GetCurrentThreadId()) = 0
         Return PinCurrentThreadTo(CpuTopologyECoreMask)
     End Function
+
+    ' §247: undo PinCurrentThreadToECores — drop the watchdog exemption and return the thread
+    ' to the P-core mask (where the watchdog will keep it).  No-op on a non-hybrid host.
+    Public Shared Sub UnpinCurrentThreadFromECores()
+        If Not CpuTopologyIsHybrid Then Return
+        Dim _dummy As Byte
+        _affinityExempt.TryRemove(GetCurrentThreadId(), _dummy)
+        If CpuTopologyPCoreMask <> 0UL Then SetThreadAffinityMask(GetCurrentThread(), New IntPtr(CLng(CpuTopologyPCoreMask)))
+    End Sub
 
     ''' <summary>
     ''' Restore the affinity mask previously returned by PinCurrentThreadTo.
