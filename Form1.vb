@@ -1227,17 +1227,22 @@ Public Class Form1
         Return MemBudget_Status().ullAvailPageFile / 1073741824.0
     End Function
 
-    ' Project peak working set for a §gen SafeMpzMul (issue #68 heuristic):
-    '   persistent state (current private bytes — already includes a, b, prior state)
-    '   + result accumulator (szA+szB limbs) + shifted buffer (~ result)
-    '   + dop concurrent sub-products (each ~ (szA+szB)/3 limbs for the 3×3 split).
+    ' §245 (#85 fix): project the INCREMENTAL new allocation for a §gen SafeMpzMul —
+    '   result accumulator (szA+szB limbs) + shifted buffer (~result)
+    '   + dop concurrent sub-products (each ~(szA+szB)/3 limbs for the 3×3 split).
+    ' Does NOT include current PrivateMemorySize64: that memory is already resident and
+    ' already excluded from availPhys, so adding it double-counts.  The §244 5B run floored
+    ' DOP to 1 ~6,466× because persist (~30 GB: P/Q/T + GMP pool) made even DOP=1 "not fit"
+    ' the available headroom.  The new buffers must fit in FREE space — SuggestSafeMulDop
+    ' compares this incremental projection to (min(availPhys,availCommit) − headroom).
+    ' Safety: total peak = resident + incremental; since incremental ≤ availPhys − headroom
+    ' and resident = total − availPhys, total peak ≤ total − headroom → never overruns RAM.
     Private Shared Function MemBudget_ProjectMulPeakGB(szA As Long, szB As Long, dop As Integer) As Double
         Const GB As Double = 1073741824.0
-        Dim persistentGB As Double = Process.GetCurrentProcess().PrivateMemorySize64 / GB
         Dim resultGB As Double = CDbl(szA + szB) * 8.0 / GB
         Dim shiftedGB As Double = resultGB
         Dim subGB As Double = CDbl(szA + szB) / 3.0 * 8.0 / GB
-        Return persistentGB + resultGB + shiftedGB + CDbl(System.Math.Max(1, dop)) * subGB
+        Return resultGB + shiftedGB + CDbl(System.Math.Max(1, dop)) * subGB
     End Function
 
     ' Suggest a §gen DOP (9/6/3/1) whose projected peak fits under (availCommit - headroom).
@@ -3058,7 +3063,7 @@ Public Class Form1
             MemBudget_MaybeTrimUnderPressure(10.0)
             Dim _budgetDop As Integer = MemBudget_SuggestSafeMulDop(CLng(szA), CLng(szB))
             If _budgetDop < _smmDop Then
-                If _logLevel >= 2 Then AppendLog($"[MemoryBudget§243] §gen DOP floored {_smmDop}→{_budgetDop} (szA={szA:N0} szB={szB:N0} availCommit={MemBudget_AvailableCommitGB():F1}GB projPeak@{_smmDop}={MemBudget_ProjectMulPeakGB(CLng(szA), CLng(szB), _smmDop):F1}GB){vbCrLf}")
+                If _logLevel >= 2 Then AppendLog($"[MemoryBudget§243] §gen DOP floored {_smmDop}→{_budgetDop} (szA={szA:N0} szB={szB:N0} availPhys={MemBudget_AvailablePhysicalGB():F1}GB availCommit={MemBudget_AvailableCommitGB():F1}GB projIncr@{_smmDop}={MemBudget_ProjectMulPeakGB(CLng(szA), CLng(szB), _smmDop):F1}GB){vbCrLf}")
                 _smmDop = _budgetDop
             End If
         End If

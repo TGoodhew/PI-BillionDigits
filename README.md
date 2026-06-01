@@ -6189,3 +6189,19 @@ physical → thrash; budgeting on physical too keeps the projected peak resident
 1B from-scratch / `snap_Phase3` (Step 1 = minutes): confirm `finalP` freed, Step 1/2 run
 multi-core (no longer DOP=1), `pow10.bin` saved, output bit-correct. Then 5B from
 `snap_Phase3` for the RAM-safety + speedup confirmation (the original OOM lived here).
+
+## §245 — Fix MemoryBudget floor double-counting (2026-06-01, issue #85 / #68)
+
+The §244 5B Steps-1/2 validation found the §243 floor **floored DOP to 1 ~6,466×** at 5B
+(Step 2 took 2.5 h, essentially serial — #85's parallelization did NOT materialize),
+while at 1B it correctly allowed DOP=9. Root cause: `MemBudget_ProjectMulPeakGB` included
+`persistentGB` (= `PrivateMemorySize64`, ~30 GB at 5B: P/Q/T + GMP pool) and
+`SuggestSafeMulDop` compared that total against **available** physical — **double-counting**
+the resident memory (effectively `2×persist + new ≤ total`). Once `persist` is large (5B),
+even DOP=1 "didn't fit." At 1B `persist` was small (~5 GB), masking the bug.
+
+**Fix:** `ProjectMulPeakGB` now projects only the **incremental** new allocation
+(result + shifted + dop×sub), compared to `min(availPhys,availCommit) − headroom` (the free
+space the new buffers need). 5B Step-1 incremental@9 ≈ 20 GB < ~41 GB free → **DOP=9 admitted**.
+Provably safe: total peak = resident + incremental ≤ (total−availPhys) + (availPhys−headroom)
+= total − headroom, so it never overruns physical RAM while now allowing the §85 parallelism.
