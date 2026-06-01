@@ -117,6 +117,12 @@ Public Class Form1
     ' correctness self-test (then exit).  Set in the arg loop; honoured after the
     ' GMP allocator is installed.
     Private Shared _testMulHigh As Boolean = False
+    ' Set at SafeMpzReciprocal entry from env: PI_RECIP_SHORTMUL=1 enables the high-half
+    ' product in capped iters; PI_RECIP_SHORTMUL_VERIFY=1 additionally computes the full
+    ' product, compares the exact region + overestimate, and falls back to full on any
+    ' mismatch (safety net + per-iter diagnostic for the validation gate).
+    Private Shared _recipShortMul As Boolean = False
+    Private Shared _recipShortMulVerify As Boolean = False
 
     ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
     ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
@@ -2903,6 +2909,44 @@ Public Class Form1
         Next idx
     End Sub
 
+    ' §250 (#94): reciprocal capped-iter multiply dispatcher.  Computes dst = A·B for the two
+    ' Newton multiplies (rSq = r², p = bTrunc·rSq) using the high-half product when
+    ' PI_RECIP_SHORTMUL is on.  In VERIFY mode it also computes the full product, checks the
+    ' OVERESTIMATE contract (dst ≥ full, and the guaranteed-exact region matches), FALLS BACK
+    ' to full on any mismatch, and logs the outcome per iter — so a mis-tuned keepLimbs can
+    ' never corrupt π during the gate run.  keepLimbs is chosen by the caller with margin.
+    Private Shared Sub RecipMul(dst As mpz_t, A As mpz_t, B As mpz_t, keepLimbs As Long, tag As String, iter As Integer)
+        If Not _recipShortMulVerify Then
+            SafeMpzMulHigh(dst, A, B, keepLimbs)
+            If _logLevel >= 2 Then AppendLog($"[SafeMpzReciprocal§250] {tag} shortmul keep={keepLimbs:N0} iter={iter}{vbCrLf}")
+            Return
+        End If
+        ' VERIFY: full into scratch, high into dst, compare guaranteed-exact region.
+        Dim szA As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(A.Pointer, 4))
+        Dim szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(B.Pointer, 4))
+        Dim fullLimbs As Long = CLng(szA) + CLng(szB)
+        Dim full As New mpz_t() : full.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(full.Pointer)
+        SafeMpzMul(full, A, B)
+        SafeMpzMulHigh(dst, A, B, keepLimbs)
+        Dim cmp As Integer = GmpRaw_cmp(dst.Pointer, full.Pointer)             ' want ≥ 0 (overestimate)
+        Dim cs As Long = System.Math.Max(0L, (fullLimbs - keepLimbs) * 64L)    ' guaranteed-exact region start
+        Dim fs As New mpz_t() : fs.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(fs.Pointer)
+        Dim hs As New mpz_t() : hs.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(hs.Pointer)
+        BigShiftRight(fs, full, cs)
+        BigShiftRight(hs, dst, cs)
+        Dim regionEq As Integer = GmpRaw_cmp(hs.Pointer, fs.Pointer)
+        Dim ok As Boolean = (cmp >= 0) AndAlso (regionEq = 0)
+        If Not ok Then
+            GmpRaw_set(dst.Pointer, full.Pointer)   ' FALLBACK to the exact product
+            AppendLog($"[SafeMpzReciprocal§250 VERIFY] {tag} iter={iter} MISMATCH (high>=full={cmp >= 0} regionCmp={regionEq}) keep={keepLimbs:N0} — FELL BACK to full product{vbCrLf}")
+        Else
+            AppendLog($"[SafeMpzReciprocal§250 VERIFY] {tag} iter={iter} OK (overestimate + exact region) keep={keepLimbs:N0}{vbCrLf}")
+        End If
+        GmpRaw_clear(fs.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(fs.Pointer)
+        GmpRaw_clear(hs.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(hs.Pointer)
+        GmpRaw_clear(full.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(full.Pointer)
+    End Sub
+
     ' §250: fill m with nLimbs pseudo-random limbs (top limb forced nonzero), value positive.
     ' m must be a fresh mpz_t header (AllocHGlobal(16)); this init2's it to the right size.
     Private Shared Sub FillRandomMpz(m As mpz_t, nLimbs As Integer, rng As Random)
@@ -4320,6 +4364,9 @@ Public Class Form1
     ' All large multiplications use SafeMpzMul — no direct mpn_mul_fft calls.
     Private Shared Sub SafeMpzReciprocal(r As mpz_t, b As mpz_t, kBits As Long)
         Const SAFE As Integer = 33_554_431
+        ' §250 (#94): read the high-half short-product flags once per reciprocal call.
+        _recipShortMul = (Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL") = "1")
+        _recipShortMulVerify = (Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL_VERIFY") = "1")
         ' §174-fix: mpz_sizeinbase returns UInt32 — overflows when bBits > 2^31 (szB > 33M limbs).
         ' Compute exact bBits from top limb via CLZ; avoids any overflow and is always precise.
         Dim _szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
@@ -4624,6 +4671,10 @@ Public Class Form1
             End If
             If CLng(szR) * 2L <= SAFE Then
                 GmpRaw_mul(rSq.Pointer, r.Pointer, r.Pointer)
+            ElseIf _recipShortMul AndAlso bShift = 0L Then
+                ' §250 (#94): r² is 2·szR limbs; only its top ~szR feed p's surviving region.
+                ' Keep top szR + margin (overestimate-rounded), skipping the low half.
+                RecipMul(rSq, r, r, CLng(szR) + 4096L, "rSq", _nrIter)
             Else
                 SafeMpzMul(rSq, r, r)
             End If
@@ -4654,6 +4705,11 @@ Public Class Form1
             Dim szRsq As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(rSq.Pointer, 4))
             If CLng(szBt) + CLng(szRsq) <= SAFE Then
                 GmpRaw_mul(p.Pointer, bTrunc.Pointer, rSq.Pointer)
+            ElseIf _recipShortMul AndAlso bShift = 0L Then
+                ' §250 (#94): p is shifted right by (kBits−bShift); only the limbs above that
+                ' survive into r. Keep that many + margin (overestimate-rounded) ⟹ r underestimate.
+                Dim _keepP As Long = CLng(szBt) + CLng(szRsq) - (kBits - bShift) \ 64L + 4096L
+                RecipMul(p, bTrunc, rSq, _keepP, "p", _nrIter)
             Else
                 SafeMpzMul(p, bTrunc, rSq)
             End If
