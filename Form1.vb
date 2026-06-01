@@ -1248,7 +1248,10 @@ Public Class Form1
         Dim _env As String = Environment.GetEnvironmentVariable("PI_MEMBUDGET_HEADROOM_GB")
         Dim _h As Double
         If _env IsNot Nothing AndAlso Double.TryParse(_env, _h) AndAlso _h >= 0.0 Then headroomGB = _h
-        Dim budgetGB As Double = MemBudget_AvailableCommitGB() - headroomGB
+        ' §244 (#85): budget against MIN(physical, commit) − headroom.  Commit alone (huge
+        ' with the pagefile) would let DOP exceed physical RAM → thrash (not OOM but kills the
+        ' speedup).  Using physical too keeps the projected peak resident, avoiding paging.
+        Dim budgetGB As Double = System.Math.Min(MemBudget_AvailablePhysicalGB(), MemBudget_AvailableCommitGB()) - headroomGB
         For Each d As Integer In New Integer() {9, 6, 3, 1}
             If MemBudget_ProjectMulPeakGB(szA, szB, d) <= budgetGB Then Return d
         Next
@@ -7777,30 +7780,52 @@ Phase3Start:
             ' mpn_mul_fft overflow once intermediates exceed ~33M limbs (~2GB).  At 5B digits
             ' 10^2,500,000,000 ≈ 130M limbs — well above that threshold.  SafeMpzPow10 routes
             ' every squaring through SafeMpzMul which splits around the 33M-limb boundary.
-            LogPhase($"[ComputePi] Step 1: SafeMpzPow10(10^{digits:N0})")
-            ' §Step1OOM: At 5B digits gmpOne ≈ 259M limbs.  P/Q/T are still resident (~15 GB),
-            ' leaving little headroom for 9 parallel shifted buffers (~2 GB each at the last
-            ' squaring).  Force serial sub-products for the entire Step 1, same rationale as
-            ' §Phase3OOM for Step 2.  Restore _safeMulDop afterwards.
-            Dim _savedDopStep1 As Integer = System.Threading.Volatile.Read(_safeMulDop)
-            System.Threading.Volatile.Write(_safeMulDop, 1)
-            SafeMpzPow10(gmpOne, digits)
-            System.Threading.Volatile.Write(_safeMulDop, _savedDopStep1)
-            LogPhase($"[ComputePi] Step 1 done: gmpOne={CLng(gmp_lib.mpz_sizeinbase(gmpOne, 10)):N0} digits")
-            LogPhase($"[ComputePi] Step 2: SafeMpzMul gmpSqrtInput = gmpOne^2")
-            ' §Phase3OOM: Force serial sub-products for the Step 2 squaring.
-            ' At 5B digits gmpOne ≈ 130M limbs (1 GB).  With _safeMulDop=24 the 9 sub-products
-            ' run concurrently; each is ~43M×43M limbs → ~700 MB, so 9 in parallel = ~6 GB
-            ' of simultaneous allocation on top of ~22 GB already in use → silent OOM crash
-            ' (Windows terminates the process when VirtualAlloc fails with no managed exception).
-            ' Forcing serial sub-products reduces peak concurrent memory to 1 sub-product at a
-            ' time (~700 MB extra), allowing the squaring to complete safely.
-            ' Restore _safeMulDop after Step 2 so subsequent SafeMpzSqrt/SafeMpzMul calls
-            ' continue to use all cores where memory pressure is lower.
-            Dim _savedDopStep2 As Integer = System.Threading.Volatile.Read(_safeMulDop)
-            System.Threading.Volatile.Write(_safeMulDop, 1)
-            SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)
-            System.Threading.Volatile.Write(_safeMulDop, _savedDopStep2)
+            ' §244 (issue #85): parallelize Step 1/2.  The §Step1OOM/§Phase3OOM force-serial
+            ' (_safeMulDop=1) is replaced by the §243 MemoryBudget floor inside SafeMpzMul,
+            ' which picks a RAM-safe DOP per squaring — turning the ~3 h single-core Step 1
+            ' into multi-core.  Enabler: free the DEAD finalP (~3.6 GB at 5B; never used in the
+            ' numerator — it was already freed later at the §"mpz_clears gmpSqrt, finalP" site)
+            ' up front, so the floor has headroom for full DOP.  5B projection: persist ~14 GB
+            ' + result/shifted/subs ~21 GB ≈ 35 GB < ~45 GB physical budget → floor admits DOP=9.
+            ' finalQ/finalT stay resident (spilling them adds numerator-corruption risk for no
+            ' extra DOP — the floor already allows 9).
+            If finalP.Pointer <> IntPtr.Zero Then
+                Dim _fpSz As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(finalP.Pointer, 4)))
+                If _fpSz > 1 Then
+                    gmp_lib.mpz_clear(finalP)
+                    gmp_lib.mpz_init(finalP)   ' 0-stub: later mpz_clears(gmpSqrt, finalP) stays safe
+                    LogPhase($"[ComputePi§244] freed finalP early (~{_fpSz * 8L \ 1048576L:N0} MB) — dead from Step 1 on; headroom for parallel Step 1/2")
+                End If
+            End If
+            TrimPoolAtBoundary("pre-step1", 1048576UL)   ' §69/§243: max headroom before the floor decides DOP
+
+            ' §83 Option A: 10^digits is a deterministic constant for this digit count.
+            ' Checkpoint it after Step 1 and skip Step 1 on resume — closes the snap_Phase3 →
+            ' gmpSqrtInput replay gap (a real ~3 h replay on the 2026-05-27 outage).
+            Dim _pow10Meta As String = System.IO.Path.Combine(p3SnapDir, "pow10_meta.txt")
+            Dim _pow10Resumed As Boolean = False
+            If _autoCheckpoint AndAlso System.IO.File.Exists(System.IO.Path.Combine(p3SnapDir, "pow10.bin")) AndAlso System.IO.File.Exists(_pow10Meta) Then
+                Dim _pm As Long = 0L
+                If Long.TryParse(System.IO.File.ReadAllText(_pow10Meta).Trim(), _pm) AndAlso _pm = digits AndAlso TryLoadPhase3Value("pow10", gmpOne, p3SnapDir) Then
+                    _pow10Resumed = True
+                    LogPhase($"[ComputePi§83] pow10.bin resumed (digits={digits:N0}) — skipping Step 1")
+                End If
+            End If
+
+            If Not _pow10Resumed Then
+                LogPhase($"[ComputePi] Step 1: SafeMpzPow10(10^{digits:N0}) [§244 adaptive DOP]")
+                SafeMpzPow10(gmpOne, digits)   ' §244: §243 floor manages DOP per squaring (was forced serial)
+                LogPhase($"[ComputePi] Step 1 done: gmpOne={CLng(gmp_lib.mpz_sizeinbase(gmpOne, 10)):N0} digits")
+                If _autoCheckpoint Then
+                    SavePhase3Value("pow10", gmpOne, p3SnapDir)   ' §83 Option A
+                    Try
+                        System.IO.File.WriteAllText(_pow10Meta, digits.ToString())
+                    Catch
+                    End Try
+                End If
+            End If
+            LogPhase($"[ComputePi] Step 2: SafeMpzMul gmpSqrtInput = gmpOne^2 [§244 adaptive DOP]")
+            SafeMpzMul(gmpSqrtInput, gmpOne, gmpOne)   ' §244: §243 floor manages DOP (was forced serial)
             LogPhase($"[ComputePi] Step 2 done: gmpSqrtInput={CLng(gmp_lib.mpz_sizeinbase(gmpSqrtInput, 10)):N0} digits")
             ' gmpOne is no longer needed — free its ~208 MB buffer now so it is
             ' not held alive through the sqrt, numerator multiply, and division.

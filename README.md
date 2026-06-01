@@ -6150,3 +6150,42 @@ on the unloaded 64 GB box; trades wall-time for an OOM-safe ceiling only when ne
 supersedes #58 (RAM-aware Phase-2 DOP). Validation: 250M run confirms DOP **unchanged** when
 RAM ample (no regression); a forced downshift (`PI_MEMBUDGET_HEADROOM_GB` huge) confirms the
 floor fires and output stays bit-correct.
+
+## §244 — Parallelize Phase-3 Step 1/2 + pow10 checkpoint (2026-05-31, issues #85, #83)
+
+Phase-3 Step 1 (`SafeMpzPow10(10^digits)` → `gmpOne`) and Step 2 (`gmpSqrtInput = gmpOne²`)
+were pinned to `_safeMulDop = 1` (§Step1OOM / §Phase3OOM) — a ~**3 h single-core stall** at 5B
+on a 24-core box, the largest such stall in early Phase 3.
+
+### #85 — replace force-serial with the §243 adaptive floor
+
+The hard `_safeMulDop = 1` is removed; the §243 MemoryBudget floor inside `SafeMpzMul` now
+picks a RAM-safe DOP **per squaring** (Step 1 squares a *growing* operand, so small early
+squarings run wide, the big final one auto-downshifts). Enabler: **free the dead `finalP`
+early** (~3.6 GB at 5B — never used in the numerator; previously freed only at the Step-5
+`mpz_clears(gmpSqrt, finalP)`). With `finalP` gone, the 5B projection (persist ~14 GB +
+result/shifted/subs ~21 GB ≈ **35 GB < ~45 GB physical budget**) admits **DOP=9**.
+
+Investigation finding: the originally-planned `finalQ`/`finalT` spill (idea 1) was **dropped**
+— `DOP=9` already fits after freeing `finalP`, so spilling them buys **no extra DOP** while
+adding numerator-corruption risk (they're entangled with the Step-5 finalT-spill / finalQ-split
+choreography). `TrimPoolAtBoundary("pre-step1")` (#69) maximizes headroom before the floor decides.
+
+### #83 — checkpoint `pow10.bin` after Step 1 (Option A)
+
+`10^digits` is a deterministic constant for a digit count. It's saved to `snap_Phase3/pow10.bin`
+(+ `pow10_meta.txt` with `digits`) after Step 1; on resume, Step 1 is **skipped** if the meta
+matches. Closes the snap_Phase3 → gmpSqrtInput replay gap — a real ~3 h replay on the
+2026-05-27 power outage. (Bonus: `pow10.bin` is reusable across every run of that digit count.)
+
+### #68 refine
+
+`MemBudget_SuggestSafeMulDop` now budgets against **`min(availPhys, availCommit) − headroom`**
+(was commit-only). Commit alone (huge with the pagefile) would let DOP exceed the 64 GB
+physical → thrash; budgeting on physical too keeps the projected peak resident.
+
+### Validation
+
+1B from-scratch / `snap_Phase3` (Step 1 = minutes): confirm `finalP` freed, Step 1/2 run
+multi-core (no longer DOP=1), `pow10.bin` saved, output bit-correct. Then 5B from
+`snap_Phase3` for the RAM-safety + speedup confirmation (the original OOM lived here).
