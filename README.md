@@ -6112,3 +6112,41 @@ against the ~30 h reciprocal, but **zero correctness risk** (deterministic; `r` 
 and it establishes the pattern. The larger reciprocal levers (parallelism, §201-raise resume
 seeding — #93 cand 2) carry convergence risk and are gated on a proof. Acceptance: §242
 cache-hit log fires on capped iters AND `r` bit-identical to baseline.
+
+## §243 — MemoryBudget: live RAM feedback + adaptive DOP floor (2026-05-31, issue #68)
+
+The codebase had rich memory *logging* but **no memory feedback** — DOP was binary
+(`_safeMulDop = 1` forced-serial, or `= ProcessorCount`), with no graduated response to
+RAM pressure. The 2026-05-15 depth-0 §gen AV (998M × 259M, ~50 GB peak on a 64 GB box)
+is the canonical failure: parallel sub-products + accumulator + shifted buffer overran
+physical+commit. `MemoryBudget` adds the missing feedback loop.
+
+### Module (`MemBudget_*`, all `Private Shared` on Form1)
+
+- `GlobalMemoryStatusEx` P/Invoke → available **physical** AND **commit** (`ullAvailPageFile`).
+  Commit is the metric that predicts the §238 VirtualAlloc/OOM (the run hit 98 % commit /
+  183 GB during the 5B divide). Readings **cached ~2 s** (Stopwatch ticks; `Date.Now` is
+  forbidden) so the per-call cost on the hot `SafeMpzMul` path is negligible.
+- `ProjectMulPeakGB(szA,szB,dop)` = privateBytes + result + shifted + dop·subproduct.
+- `SuggestSafeMulDop` returns 9/6/3/1 — the largest whose projected peak fits under
+  `availCommit − headroom`. `headroom` defaults 5 GB, overridable via
+  `PI_MEMBUDGET_HEADROOM_GB` (used to force a downshift in testing without a constrained VM).
+- `MaybeTrimUnderPressure(triggerGB)` → fires the #69 pool trim when commit headroom is low.
+- `MemBudget_LogSnapshot`, and `ShouldFallbackToChunkedGrid` (stub `False` — Phase C,
+  deferred to #70's chunked-grid path).
+
+### Wire-in (floor only)
+
+At the §gen `_smmDop` decision, when `_smmDop > 1` (top-level; inner recursion is forced
+to 1 by §238): trim-under-pressure, then `_smmDop = Min(_smmDop, SuggestSafeMulDop(szA,szB))`.
+**Invariant: it can only ever *reduce* DOP** — never raise it — so on a healthy box with
+ample RAM the behaviour is byte-for-byte identical to before (no-op). It only downshifts
+(and logs `[MemoryBudget§243] §gen DOP floored N→M`) when commit headroom is genuinely tight.
+
+### Scope
+
+Adaptive DOP only *reduces* parallelism under pressure → zero perf cost / behaviour change
+on the unloaded 64 GB box; trades wall-time for an OOM-safe ceiling only when needed. Also
+supersedes #58 (RAM-aware Phase-2 DOP). Validation: 250M run confirms DOP **unchanged** when
+RAM ample (no regression); a forced downshift (`PI_MEMBUDGET_HEADROOM_GB` huge) confirms the
+floor fires and output stays bit-correct.

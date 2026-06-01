@@ -1166,6 +1166,122 @@ Public Class Form1
         End Try
     End Sub
 
+    ' ════════════════════════════════════════════════════════════════════════
+    '  §243 (issue #68): MemoryBudget — live RAM feedback + adaptive DOP floor.
+    ' ════════════════════════════════════════════════════════════════════════
+    ' Reads available physical RAM AND commit headroom via GlobalMemoryStatusEx
+    ' (commit is the metric that predicts the §238 commit-limit OOM), projects a
+    ' SafeMpzMul §gen peak, and suggests a DOP that keeps the peak under budget.
+    ' Used ONLY as a FLOOR (Min with the existing policy) — it can only REDUCE
+    ' DOP under pressure, never raise it, so on a healthy box with ample RAM the
+    ' behaviour is identical to before.  Readings are cached (~2 s) so the per-call
+    ' cost on the hot SafeMpzMul path is negligible.
+    <Runtime.InteropServices.StructLayout(Runtime.InteropServices.LayoutKind.Sequential)>
+    Private Structure MEMORYSTATUSEX
+        Public dwLength As UInteger
+        Public dwMemoryLoad As UInteger
+        Public ullTotalPhys As ULong
+        Public ullAvailPhys As ULong
+        Public ullTotalPageFile As ULong
+        Public ullAvailPageFile As ULong
+        Public ullTotalVirtual As ULong
+        Public ullAvailVirtual As ULong
+        Public ullAvailExtendedVirtual As ULong
+    End Structure
+
+    <DllImport("kernel32.dll", SetLastError:=True)>
+    Private Shared Function GlobalMemoryStatusEx(ByRef lpBuffer As MEMORYSTATUSEX) As Boolean
+    End Function
+
+    ' Cached MEMORYSTATUSEX (refreshed every ~2 s via Stopwatch ticks — Date.Now is
+    ' unavailable/forbidden; Stopwatch.GetTimestamp is monotonic and cheap).
+    Private Shared _memStatusCache As MEMORYSTATUSEX
+    Private Shared _memStatusStamp As Long = 0L
+    Private Shared ReadOnly _memStatusLock As New Object()
+    Private Const MEM_CACHE_TICKS As Long = 2L  ' seconds; multiplied by Stopwatch.Frequency at use
+
+    Private Shared Function MemBudget_Status() As MEMORYSTATUSEX
+        Dim _now As Long = System.Diagnostics.Stopwatch.GetTimestamp()
+        SyncLock _memStatusLock
+            If _memStatusStamp = 0L OrElse (_now - _memStatusStamp) > MEM_CACHE_TICKS * System.Diagnostics.Stopwatch.Frequency Then
+                Dim _m As New MEMORYSTATUSEX()
+                _m.dwLength = CUInt(Runtime.InteropServices.Marshal.SizeOf(_m))
+                If GlobalMemoryStatusEx(_m) Then
+                    _memStatusCache = _m
+                    _memStatusStamp = _now
+                End If
+            End If
+            Return _memStatusCache
+        End SyncLock
+    End Function
+
+    Private Shared Function MemBudget_AvailablePhysicalGB() As Double
+        Return MemBudget_Status().ullAvailPhys / 1073741824.0
+    End Function
+    Private Shared Function MemBudget_TotalPhysicalGB() As Double
+        Return MemBudget_Status().ullTotalPhys / 1073741824.0
+    End Function
+    ' Commit headroom = available pagefile (RAM + pagefile not yet committed).  This
+    ' is the ceiling that, when hit, fails VirtualAlloc — the §238 OOM signature.
+    Private Shared Function MemBudget_AvailableCommitGB() As Double
+        Return MemBudget_Status().ullAvailPageFile / 1073741824.0
+    End Function
+
+    ' Project peak working set for a §gen SafeMpzMul (issue #68 heuristic):
+    '   persistent state (current private bytes — already includes a, b, prior state)
+    '   + result accumulator (szA+szB limbs) + shifted buffer (~ result)
+    '   + dop concurrent sub-products (each ~ (szA+szB)/3 limbs for the 3×3 split).
+    Private Shared Function MemBudget_ProjectMulPeakGB(szA As Long, szB As Long, dop As Integer) As Double
+        Const GB As Double = 1073741824.0
+        Dim persistentGB As Double = Process.GetCurrentProcess().PrivateMemorySize64 / GB
+        Dim resultGB As Double = CDbl(szA + szB) * 8.0 / GB
+        Dim shiftedGB As Double = resultGB
+        Dim subGB As Double = CDbl(szA + szB) / 3.0 * 8.0 / GB
+        Return persistentGB + resultGB + shiftedGB + CDbl(System.Math.Max(1, dop)) * subGB
+    End Function
+
+    ' Suggest a §gen DOP (9/6/3/1) whose projected peak fits under (availCommit - headroom).
+    ' headroomGB overridable via env PI_MEMBUDGET_HEADROOM_GB (default 5) — lets validation
+    ' force a downshift without a constrained VM.
+    Private Shared Function MemBudget_SuggestSafeMulDop(szA As Long, szB As Long) As Integer
+        Dim headroomGB As Double = 5.0
+        Dim _env As String = Environment.GetEnvironmentVariable("PI_MEMBUDGET_HEADROOM_GB")
+        Dim _h As Double
+        If _env IsNot Nothing AndAlso Double.TryParse(_env, _h) AndAlso _h >= 0.0 Then headroomGB = _h
+        Dim budgetGB As Double = MemBudget_AvailableCommitGB() - headroomGB
+        For Each d As Integer In New Integer() {9, 6, 3, 1}
+            If MemBudget_ProjectMulPeakGB(szA, szB, d) <= budgetGB Then Return d
+        Next
+        Return 1
+    End Function
+
+    ' Trigger a #69 pool trim when commit headroom drops below triggerGB.  Returns True
+    ' if a trim ran.  Frees the ≤16 MB pooled granules (can be GB-scale) before a big alloc.
+    Private Shared Function MemBudget_MaybeTrimUnderPressure(triggerGB As Double) As Boolean
+        If MemBudget_AvailableCommitGB() >= triggerGB Then Return False
+        Try
+            Dim _freed As UInteger = 0UI, _bytes As ULong = 0UL
+            GmpNativeAlloc_Trim(1048576UL, _freed, _bytes)
+            If _logLevel >= 2 Then AppendLog($"[MemoryBudget§243] pressure trim (commit {MemBudget_AvailableCommitGB():F1}GB < {triggerGB:F0}GB): freed {_freed:N0} blks {_bytes / 1073741824.0:N2} GB{vbCrLf}")
+            Return True
+        Catch _ex As Exception
+            Return False
+        End Try
+    End Function
+
+    ' §243 Phase C (deferred to #70): no chunked-grid §gen path exists yet, so never
+    ' recommend fallback.  Wire to the real predicate when #70 lands.
+    Private Shared Function MemBudget_ShouldFallbackToChunkedGrid(szA As Long, szB As Long) As Boolean
+        Return False
+    End Function
+
+    Private Shared Sub MemBudget_LogSnapshot(context As String)
+        If _logLevel < 2 Then Return
+        Dim _ws As Double = Process.GetCurrentProcess().WorkingSet64 / 1073741824.0
+        Dim _pv As Double = Process.GetCurrentProcess().PrivateMemorySize64 / 1073741824.0
+        AppendLog($"[MemoryBudget§243 {context}] availPhys={MemBudget_AvailablePhysicalGB():F1}GB availCommit={MemBudget_AvailableCommitGB():F1}GB WS={_ws:F1}GB priv={_pv:F1}GB{vbCrLf}")
+    End Sub
+
     ' §32B: Batch GMP operations — single managed→native crossing per term/combine.
     <DllImport("GmpNativeAlloc.dll", EntryPoint:="GmpBatch_ComputeTerm",
                CallingConvention:=CallingConvention.Winapi)>
@@ -2929,6 +3045,20 @@ Public Class Form1
             _smmDop = System.Threading.Volatile.Read(_safeMulDop)  ' §27: cross-thread read
         End If
         If _smmDop <= 0 Then _smmDop = Environment.ProcessorCount
+        ' §243 (issue #68): MemoryBudget DOP floor.  Only at top-level large muls (_smmDop>1,
+        ' i.e. depth-0 — inner recursion is forced to 1 by §238).  First trim the pool if
+        ' commit headroom is low (frees GB-scale ≤16MB granules per #69), then reduce DOP if
+        ' the projected 9-sub-product §gen peak would exceed available commit.  FLOOR ONLY
+        ' (Min): never raises DOP, so on a healthy box with ample RAM this is a no-op.  Reading
+        ' is cached (~2 s) so the cost is negligible even though SafeMpzMul is called often.
+        If _smmDop > 1 Then
+            MemBudget_MaybeTrimUnderPressure(10.0)
+            Dim _budgetDop As Integer = MemBudget_SuggestSafeMulDop(CLng(szA), CLng(szB))
+            If _budgetDop < _smmDop Then
+                If _logLevel >= 2 Then AppendLog($"[MemoryBudget§243] §gen DOP floored {_smmDop}→{_budgetDop} (szA={szA:N0} szB={szB:N0} availCommit={MemBudget_AvailableCommitGB():F1}GB projPeak@{_smmDop}={MemBudget_ProjectMulPeakGB(CLng(szA), CLng(szB), _smmDop):F1}GB){vbCrLf}")
+                _smmDop = _budgetDop
+            End If
+        End If
         ' §138/§165 LIFTED by §221 (issue #44, 2026-05-22): the size-gate that forced
         ' serial 9-sub-product computation for q×b (szA=szB=21875001) and a×r
         ' (szA=43750001, szB=21875001) when opA_d≠opB_d. The original "wrong prods(8)"
