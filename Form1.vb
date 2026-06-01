@@ -3402,38 +3402,52 @@ Public Class Form1
                 New Integer() {7},
                 New Integer() {}
             }
+            ' §246 (issue #45 Layer 1): parallel per-column add-chains.  Each column's adds
+            ' target a DISTINCT prods slot (col0:{0} col1:{1,3} col2:{2,4,6} col3:{5,7}
+            ' col4:{8} — disjoint), the GmpNativeAlloc pool is per-CPU-safe, and the pre-grow
+            ' below prevents any GMP realloc — so the 5 columns' add-chains are independent and
+            ' run concurrently.  Gated on _smmDop>1: when this §39 call is itself a nested
+            ' sub-product, §238 has set _smmDop=1 and we keep the plain serial path (no nested
+            ' parallel blow-up, no Parallel.For overhead on the hot 1B path).  The shift +
+            ' accumulate that follows stays SERIAL (shared _sv_shifted_hdr + ordered accumPtr).
+            Dim _doColAdd As Action(Of Integer) =
+                Sub(_colA As Integer)
+                    Dim _bkA As Integer = _col_base(_colA)
+                    ' §Phase3ColAdd: pre-grow prods(_bkA) before each add so GMP never calls its
+                    ' realloc callback (a VirtualAlloc+memcpy+VirtualFree that can fail → abort()).
+                    For Each _ak As Integer In _col_extra(_colA)
+                        Dim _bk_sz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prods(_bkA).Pointer, 4))
+                        Dim _ak_sz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prods(_ak).Pointer, 4))
+                        Dim _needed As Integer = System.Math.Max(_bk_sz, _ak_sz) + 2  ' +2 for carry safety
+                        Dim _bk_alloc As Integer = Runtime.InteropServices.Marshal.ReadInt32(prods(_bkA).Pointer, 0)
+                        If _bk_alloc < _needed Then
+                            Dim _oldBuf As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(prods(_bkA).Pointer, 8))
+                            Dim _oldBytes As Long = CLng(_bk_alloc) * 8L
+                            Dim _newBytes As Long = CLng(_needed) * 8L
+                            Dim _newBuf As IntPtr = GmpNativeAlloc_PoolGet(_newBytes)
+                            If _newBuf = IntPtr.Zero Then
+                                Throw New OutOfMemoryException($"SafeMpzMul §39 pre-grow: GmpNativeAlloc_PoolGet failed ({_newBytes \ 1048576L} MB)")
+                            End If
+                            CopyMemory(_newBuf, _oldBuf, New UIntPtr(CULng(_bk_sz) * 8UL))
+                            GmpNativeAlloc_FreeRaw(_oldBuf, _oldBytes)
+                            Runtime.InteropServices.Marshal.WriteInt32(prods(_bkA).Pointer, 0, _needed)
+                            Runtime.InteropServices.Marshal.WriteInt64(prods(_bkA).Pointer, 8, _newBuf.ToInt64())
+                        End If
+                        GmpRaw_add(prods(_bkA).Pointer, prods(_bkA).Pointer, prods(_ak).Pointer)
+                        GmpRaw_clear(prods(_ak).Pointer)
+                        Dim _tmp_ak = prods(_ak).Pointer : prods(_ak).Pointer = IntPtr.Zero : Runtime.InteropServices.Marshal.FreeHGlobal(_tmp_ak)
+                    Next
+                End Sub
+            If _smmDop > 1 Then
+                Dim _colOpts As New System.Threading.Tasks.ParallelOptions() With {.MaxDegreeOfParallelism = System.Math.Min(5, _smmDop)}
+                System.Threading.Tasks.Parallel.For(0, 5, _colOpts, _doColAdd)
+            Else
+                For _colS As Integer = 0 To 4 : _doColAdd(_colS) : Next
+            End If
+
+            ' §246: serial shift + accumulate pass (shared _sv_shifted_hdr + ordered accumPtr).
             For _col As Integer = 0 To 4
                 Dim _bk As Integer = _col_base(_col)
-                ' Add extra sub-products into the base slot.
-                ' §Phase3ColAdd fix: pre-grow prods(_bk) before each add so GMP never needs
-                ' to call its internal realloc callback. When prods(_bk) is exactly szA+szB+2
-                ' limbs and the result needs one more limb (carry), GMP calls NativeReallocFunc
-                ' which does VirtualAlloc+memcpy+VirtualFree for a potentially large buffer.
-                ' At peak memory pressure that VirtualAlloc can fail → GMP calls abort() →
-                ' silent process termination. Pre-growing here prevents the realloc entirely.
-                For Each _ak As Integer In _col_extra(_col)
-                    Dim _bk_sz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prods(_bk).Pointer, 4))
-                    Dim _ak_sz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prods(_ak).Pointer, 4))
-                    Dim _needed As Integer = System.Math.Max(_bk_sz, _ak_sz) + 2  ' +2 for carry safety
-                    Dim _bk_alloc As Integer = Runtime.InteropServices.Marshal.ReadInt32(prods(_bk).Pointer, 0)
-                    If _bk_alloc < _needed Then
-                        Dim _oldBuf As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(prods(_bk).Pointer, 8))
-                        Dim _oldBytes As Long = CLng(_bk_alloc) * 8L
-                        Dim _newBytes As Long = CLng(_needed) * 8L
-                        Dim _newBuf As IntPtr = GmpNativeAlloc_PoolGet(_newBytes)
-                        If _newBuf = IntPtr.Zero Then
-                            AppendLog($"[SafeMpzMul§39] pre-grow FAILED for {_newBytes \ 1048576L:N0} MB — throwing OOM{vbCrLf}")
-                            Throw New OutOfMemoryException($"SafeMpzMul §39 pre-grow: GmpNativeAlloc_PoolGet failed ({_newBytes \ 1048576L} MB)")
-                        End If
-                        CopyMemory(_newBuf, _oldBuf, New UIntPtr(CULng(_bk_sz) * 8UL))
-                        GmpNativeAlloc_FreeRaw(_oldBuf, _oldBytes)
-                        Runtime.InteropServices.Marshal.WriteInt32(prods(_bk).Pointer, 0, _needed)
-                        Runtime.InteropServices.Marshal.WriteInt64(prods(_bk).Pointer, 8, _newBuf.ToInt64())
-                    End If
-                    GmpRaw_add(prods(_bk).Pointer, prods(_bk).Pointer, prods(_ak).Pointer)
-                    GmpRaw_clear(prods(_ak).Pointer)
-                    Dim _tmp_ak = prods(_ak).Pointer : prods(_ak).Pointer = IntPtr.Zero : Runtime.InteropServices.Marshal.FreeHGlobal(_tmp_ak)
-                Next
                 ' Shift column sum and add to accumulator
                 Dim _colShift As ULong = CULng(_col) * bitsA
                 Dim _sv_bk As IntPtr = prods(_bk).Pointer

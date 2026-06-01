@@ -6205,3 +6205,18 @@ even DOP=1 "didn't fit." At 1B `persist` was small (~5 GB), masking the bug.
 space the new buffers need). 5B Step-1 incremental@9 ≈ 20 GB < ~41 GB free → **DOP=9 admitted**.
 Provably safe: total peak = resident + incremental ≤ (total−availPhys) + (availPhys−headroom)
 = total − headroom, so it never overruns physical RAM while now allowing the §85 parallelism.
+
+## §246 — Parallel per-column add-chains in the §39 column-group path (2026-06-01, issue #45)
+
+The §39 column-group fast path (symmetric `mA=mB` muls — the reciprocal's q×b / rSq) grouped
+the 9 sub-products into 5 columns but ran them **serially**. Layer 1 of #45 parallelizes the
+per-column **add-chains** (`prods(_bk) += extras`): the 5 columns target **disjoint** prods
+slots (col0:{0} col1:{1,3} col2:{2,4,6} col3:{5,7} col4:{8}), the GmpNativeAlloc pool is
+per-CPU-safe, and the pre-grow prevents any GMP realloc — so they're independent.
+
+Restructured into a **parallel add-chain pre-pass** (`Parallel.For(0,5)`, gated `_smmDop>1`
+so nested/§238 calls stay serial with no Parallel.For overhead) followed by the **existing
+serial shift+accumulate pass** (shared `_sv_shifted_hdr` + ordered `accumPtr` adds — unchanged).
+Bit-identical by construction (parallel adds on disjoint columns == serial adds). Layers 2/3
+(per-column shift buffers, pipelining) deferred. Validate: bit-correct output at a scale whose
+reciprocal hits §39 at DOP>1.
