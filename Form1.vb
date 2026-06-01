@@ -4164,6 +4164,14 @@ Public Class Form1
         ' headroom (covers seed scaling rounding + convergence slack).  Without raising,
         ' the seed has only 1 bit of precision, so log2(rBits)+3 iters are required.
         Dim _minNrIters As Integer = If(_raiseUsed, 5, CInt(System.Math.Ceiling(System.Math.Log(System.Math.Max(2L, rBits), 2))) + 3)
+        ' §242 (issue #93 cand 1): bTrunc cache.  bShift = max(0, bBits-prec-2) DECREASES while
+        ' prec doubles (iters 1..~27), then is CONSTANT once prec caps at rBits+2 (iters 28-37;
+        ' at the 5B final divide bShift ≈ 30.7 Gbit).  Since b is constant too, floor(b/2^bShift)
+        ' is bit-identical across the capped iters, yet BigShiftRight (a chunked, ~0.35-core,
+        ' bandwidth-bound truncation of the ~47 Gbit b — minutes per iter) recomputes it each
+        ' time.  Track the last bShift and skip the recompute when unchanged.  Safe: bTrunc is
+        ' read-only after it is set (only consumed by p = bTrunc·rSq).
+        Dim _prevBShift As Long = -1L
         ' §230: exact-reuse loaded r at full precision — skip the Newton loop body entirely.
         Do While Not _exactReuse AndAlso (prec < rBits + 2L OrElse _nrIter < _minNrIters)
             _nrIter += 1
@@ -4186,9 +4194,16 @@ Public Class Form1
             ' Floor is safe: any slight overestimate of r is corrected by SafeMpzDiv's
             ' adjustment loop (which already handles q too-large by decrementing).
             Dim bShift As Long = System.Math.Max(0L, bBits - prec - 2L)
-            If bShift > 0L Then
+            If bShift = _prevBShift Then
+                ' §242 (#93): bShift unchanged since last iter and b is constant, so bTrunc
+                ' already holds the correct floor(b/2^bShift) — skip the recompute.  This is
+                ' the win: on capped-prec iters (28-37 at 5B) it elides a minutes-long,
+                ' bandwidth-bound BigShiftRight.  bTrunc is read-only after this block.
+                If _logLevel >= 2 Then AppendLog($"[SafeMpzReciprocal§242] iter={_nrIter} bShift={bShift:N0} unchanged — reusing cached bTrunc (BigShiftRight skipped){vbCrLf}")
+            ElseIf bShift > 0L Then
                 BigShiftRight(bTrunc, b, bShift)
                 ' No ceiling +1: floor truncation avoids catastrophic overshoot in final step.
+                _prevBShift = bShift
             Else
                 ' §PreAlloc-bTrunc: bTrunc._mp_alloc from prior BigShiftRight may be < _szB.
                 ' GMP's __gmpz_realloc aborts when new_alloc > 33,554,431 limbs (INT_MAX/64,
@@ -4196,6 +4211,7 @@ Public Class Form1
                 ' Pre-allocate via our pool to bypass it, same pattern as BigShiftRight/BigShiftLeft.
                 PreAllocMpzToLimbs(bTrunc, CLng(_szB))
                 GmpRaw_set(bTrunc.Pointer, b.Pointer)  ' §35
+                _prevBShift = 0L
             End If
 
             ' §127: log r[20,904,662..665] BEFORE rSq — this is r_24 (input to final Newton step)

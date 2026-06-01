@@ -6080,3 +6080,35 @@ to quantify retention and freed bytes at each boundary, and confirm correctness
 (SHA-identical output). If retention is large, keep/extend the hooks; if it's MB-scale,
 #69 is low-value and the threshold/hook set can be trimmed back. Bit-identity is the
 acceptance gate (trim only frees *unreferenced* pool blocks — must not change output).
+
+## §242 — Cache bTrunc across capped-precision reciprocal iterations (2026-05-31, issue #93 cand 1)
+
+The final-divide reciprocal Newton (`SafeMpzReciprocal`) is the **single largest cost in a
+5B run (~30 h)**. Each iteration recomputes the truncated divisor
+`bTrunc = floor(b / 2^bShift)` via `BigShiftRight` ([Form1.vb:4189](Form1.vb#L4189)),
+where `bShift = max(0, bBits - prec - 2)`.
+
+### The redundancy
+
+`prec` doubles each iter until it caps at `rBits + 2` (iter 28 of 37 at 5B). While
+doubling, `bShift` strictly decreases (cache always misses — correct). **Once `prec` caps,
+`bShift` is constant** (≈ 30.7 Gbit at the 5B final divide) and `b` is constant, so
+`bTrunc` is **bit-identical on every capped iter (28-37)** — yet `BigShiftRight` recomputed
+it from scratch each time. That BSR is a chunked, **memory-bandwidth-bound, ~0.35-core**
+truncation of the ~47 Gbit `b` — minutes per iteration, ×~9 capped iters.
+
+### Fix
+
+Track the previous `bShift`; when unchanged, skip the recompute (bTrunc still holds the
+correct value). Safe because `bTrunc` is **read-only after it is set** — only consumed by
+`p = bTrunc·rSq`. `bShift` is monotone non-increasing then constant, so a repeat only ever
+occurs consecutively in the capped phase — no false cache hit. `_prevBShift` resets to −1
+per `SafeMpzReciprocal` call, so resumes recompute on their first iter.
+
+### Impact / scope
+
+Elides ~9 bandwidth-bound `BigShiftRight`s per final divide (~10-30 min at 5B). Modest
+against the ~30 h reciprocal, but **zero correctness risk** (deterministic; `r` bit-identical)
+and it establishes the pattern. The larger reciprocal levers (parallelism, §201-raise resume
+seeding — #93 cand 2) carry convergence risk and are gated on a proof. Acceptance: §242
+cache-hit log fires on capped iters AND `r` bit-identical to baseline.
