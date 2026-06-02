@@ -2964,8 +2964,13 @@ Public Class Form1
         Dim szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(B.Pointer, 4))
         Dim fullLimbs As Long = CLng(szA) + CLng(szB)
         Dim full As New mpz_t() : full.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(full.Pointer)
+        Dim _tg As Long = System.Diagnostics.Stopwatch.GetTimestamp()
         SafeMpzMul(full, A, B)
+        Dim _msGen As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _tg) * 1000.0 / System.Diagnostics.Stopwatch.Frequency
+        Dim _tc As Long = System.Diagnostics.Stopwatch.GetTimestamp()
         SafeMpzMul_ChunkedGrid(dst, A, B, keepLimbs)
+        Dim _msCg As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _tc) * 1000.0 / System.Diagnostics.Stopwatch.Frequency
+        AppendLog($"[SafeMpzReciprocal§251 TIMING] {tag} iter={iter} §gen={_msGen:F0}ms chunked={_msCg:F0}ms speedup={If(_msCg > 0.0, _msGen / _msCg, 0.0):F2}x{vbCrLf}")
         Dim cmp As Integer = GmpRaw_cmp(dst.Pointer, full.Pointer)             ' want ≥ 0 (overestimate)
         Dim cs As Long = System.Math.Max(0L, (fullLimbs - keepLimbs) * 64L)    ' guaranteed-exact region start
         Dim fs As New mpz_t() : fs.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(fs.Pointer)
