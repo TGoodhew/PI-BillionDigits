@@ -125,6 +125,11 @@ Public Class Form1
     ' mismatch (safety net + per-iter diagnostic for the validation gate).
     Private Shared _recipShortMul As Boolean = False
     Private Shared _recipShortMulVerify As Boolean = False
+    ' §251 (#70): DOP gate.  The chunked-grid reciprocal (serial cells, pt1) only BEATS §gen when
+    ' §gen would itself run at LOW DOP (memory-floored, i.e. 5B-class) — at high DOP (1B in-memory)
+    ' parallel §gen wins.  Engage chunked only when MemBudget_SuggestSafeMulDop ≤ this threshold.
+    ' Default 1 (proven 2.5-6.4× at DOP=1); env PI_RECIP_SHORTMUL_MAXDOP raises it to experiment.
+    Private Shared _recipShortMulMaxDop As Integer = 1
 
     ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
     ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
@@ -1650,6 +1655,19 @@ Public Class Form1
             Dim _cgOk As Boolean = TestChunkedGrid()
             AppendLog($"[TestChunkedGrid] OVERALL: {If(_cgOk, "PASS", "FAIL")}{vbCrLf}")
             Environment.Exit(If(_cgOk, 0, 1))
+        End If
+        If Environment.GetEnvironmentVariable("PI_TEST_DOPGATE") = "1" Then
+            ' §251 (#70): print the would-be §gen DOP for the 1B & 5B reciprocal mul sizes, so we can
+            ' confirm the DOP gate declines chunked at 1B (high DOP) and may engage at 5B (low DOP).
+            Dim _p As String = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "dopgate_test.txt")
+            Dim _szR1 As Long = 52_000_000L, _szR5 As Long = 87_500_000L
+            Dim _txt As String =
+                $"availPhys={MemBudget_AvailablePhysicalGB():F1}GB availCommit={MemBudget_AvailableCommitGB():F1}GB{vbCrLf}" &
+                $"1B  rSq(52M×52M)  DOP={MemBudget_SuggestSafeMulDop(_szR1, _szR1)}  p(52M×104M) DOP={MemBudget_SuggestSafeMulDop(_szR1, _szR1 * 2L)}{vbCrLf}" &
+                $"5B  rSq(87M×87M)  DOP={MemBudget_SuggestSafeMulDop(_szR5, _szR5)}  p(68M×175M) DOP={MemBudget_SuggestSafeMulDop(68_000_000L, 175_000_000L)}{vbCrLf}"
+            Try : System.IO.File.WriteAllText(_p, _txt) : Catch : End Try
+            AppendLog("[DopGate] " & _txt)
+            Environment.Exit(0)
         End If
 
         ' Initialize constant for Chudnovsky algorithm
@@ -4571,6 +4589,9 @@ Public Class Form1
         ' §250 (#94): read the high-half short-product flags once per reciprocal call.
         _recipShortMul = (Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL") = "1")
         _recipShortMulVerify = (Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL_VERIFY") = "1")
+        Dim _rsmDopEnv As String = Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL_MAXDOP")  ' §251 (#70) DOP gate
+        Dim _rsmDopParsed As Integer
+        If _rsmDopEnv IsNot Nothing AndAlso Integer.TryParse(_rsmDopEnv, _rsmDopParsed) AndAlso _rsmDopParsed >= 1 Then _recipShortMulMaxDop = _rsmDopParsed Else _recipShortMulMaxDop = 1
         ' §174-fix: mpz_sizeinbase returns UInt32 — overflows when bBits > 2^31 (szB > 33M limbs).
         ' Compute exact bBits from top limb via CLZ; avoids any overflow and is always precise.
         Dim _szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
@@ -4875,9 +4896,10 @@ Public Class Form1
             End If
             If CLng(szR) * 2L <= SAFE Then
                 GmpRaw_mul(rSq.Pointer, r.Pointer, r.Pointer)
-            ElseIf _recipShortMul AndAlso bShift = 0L Then
-                ' §250 (#94): r² is 2·szR limbs; only its top ~szR feed p's surviving region.
-                ' Keep top szR + margin (overestimate-rounded), skipping the low half.
+            ElseIf _recipShortMul AndAlso bShift = 0L AndAlso MemBudget_SuggestSafeMulDop(CLng(szR), CLng(szR)) <= _recipShortMulMaxDop Then
+                ' §250/§251 (#94/#70): chunked-grid high product, but ONLY when §gen would run at low
+                ' DOP (memory-floored / 5B-class) — else parallel §gen wins (DOP gate, §251).
+                ' r² is 2·szR limbs; keep top szR + margin (overestimate-rounded), skipping the low half.
                 RecipMul(rSq, r, r, CLng(szR) + 4096L, "rSq", _nrIter)
             Else
                 SafeMpzMul(rSq, r, r)
@@ -4909,9 +4931,10 @@ Public Class Form1
             Dim szRsq As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(rSq.Pointer, 4))
             If CLng(szBt) + CLng(szRsq) <= SAFE Then
                 GmpRaw_mul(p.Pointer, bTrunc.Pointer, rSq.Pointer)
-            ElseIf _recipShortMul AndAlso bShift = 0L Then
-                ' §250 (#94): p is shifted right by (kBits−bShift); only the limbs above that
-                ' survive into r. Keep that many + margin (overestimate-rounded) ⟹ r underestimate.
+            ElseIf _recipShortMul AndAlso bShift = 0L AndAlso MemBudget_SuggestSafeMulDop(CLng(szBt), CLng(szRsq)) <= _recipShortMulMaxDop Then
+                ' §250/§251 (#94/#70): chunked-grid high product, gated to low §gen DOP (§251 DOP gate).
+                ' p is shifted right by (kBits−bShift); only the limbs above that survive into r.
+                ' Keep that many + margin (overestimate-rounded) ⟹ r underestimate.
                 Dim _keepP As Long = CLng(szBt) + CLng(szRsq) - (kBits - bShift) \ 64L + 4096L
                 RecipMul(p, bTrunc, rSq, _keepP, "p", _nrIter)
             Else
