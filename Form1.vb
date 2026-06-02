@@ -2934,9 +2934,11 @@ Public Class Form1
     ' to full on any mismatch, and logs the outcome per iter — so a mis-tuned keepLimbs can
     ' never corrupt π during the gate run.  keepLimbs is chosen by the caller with margin.
     Private Shared Sub RecipMul(dst As mpz_t, A As mpz_t, B As mpz_t, keepLimbs As Long, tag As String, iter As Integer)
+        ' §251 (#70): use the chunked-grid high product (fine cells skip ~½–⅔ + small FFT-safe
+        ' mults) — 2.55× (rSq) / 6.42× (p) vs §gen at DOP=1, vs §250 SafeMpzMulHigh's 1.13×.
         If Not _recipShortMulVerify Then
-            SafeMpzMulHigh(dst, A, B, keepLimbs)
-            If _logLevel >= 2 Then AppendLog($"[SafeMpzReciprocal§250] {tag} shortmul keep={keepLimbs:N0} iter={iter}{vbCrLf}")
+            SafeMpzMul_ChunkedGrid(dst, A, B, keepLimbs)
+            If _logLevel >= 2 Then AppendLog($"[SafeMpzReciprocal§251] {tag} chunked-grid high keep={keepLimbs:N0} iter={iter}{vbCrLf}")
             Return
         End If
         ' VERIFY: full into scratch, high into dst, compare guaranteed-exact region.
@@ -2945,7 +2947,7 @@ Public Class Form1
         Dim fullLimbs As Long = CLng(szA) + CLng(szB)
         Dim full As New mpz_t() : full.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(full.Pointer)
         SafeMpzMul(full, A, B)
-        SafeMpzMulHigh(dst, A, B, keepLimbs)
+        SafeMpzMul_ChunkedGrid(dst, A, B, keepLimbs)
         Dim cmp As Integer = GmpRaw_cmp(dst.Pointer, full.Pointer)             ' want ≥ 0 (overestimate)
         Dim cs As Long = System.Math.Max(0L, (fullLimbs - keepLimbs) * 64L)    ' guaranteed-exact region start
         Dim fs As New mpz_t() : fs.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(fs.Pointer)
