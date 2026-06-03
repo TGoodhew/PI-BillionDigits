@@ -125,11 +125,12 @@ Public Class Form1
     ' mismatch (safety net + per-iter diagnostic for the validation gate).
     Private Shared _recipShortMul As Boolean = False
     Private Shared _recipShortMulVerify As Boolean = False
-    ' §251 (#70): DOP gate.  The chunked-grid reciprocal (serial cells, pt1) only BEATS §gen when
-    ' §gen would itself run at LOW DOP (memory-floored, i.e. 5B-class) — at high DOP (1B in-memory)
-    ' parallel §gen wins.  Engage chunked only when MemBudget_SuggestSafeMulDop ≤ this threshold.
-    ' Default 1 (proven 2.5-6.4× at DOP=1); env PI_RECIP_SHORTMUL_MAXDOP raises it to experiment.
-    Private Shared _recipShortMulMaxDop As Integer = 1
+    ' §251 (#70): DOP gate.  pt1 (serial cells) only beat §gen at low §gen DOP, so this gated on
+    ' MemBudget_SuggestSafeMulDop ≤ threshold.  pt2 PARALLELISES the chunked cells (tiny, fit at
+    ' 16-way even under memory pressure), so chunked now beats §gen at EVERY DOP — measured 2.81×
+    ' (rSq 26M²) / 6.97× (p 68M×52M) vs §gen at DOP=9.  Default raised to 9 (§gen's max DOP) ⟹
+    ' chunked engages broadly; env PI_RECIP_SHORTMUL_MAXDOP can lower it to restrict.
+    Private Shared _recipShortMulMaxDop As Integer = 9
 
     ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
     ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
@@ -3018,12 +3019,16 @@ Public Class Form1
         If accBuf = IntPtr.Zero Then Throw New OutOfMemoryException($"SafeMpzMul_ChunkedGrid: PoolGet {accBytes \ 1048576L} MB failed")
         ZeroMemory(accBuf, New UIntPtr(CULng(accBytes)))
 
-        Dim ckP As New mpz_t() : ckP.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(ckP.Pointer)
-        Dim ckA As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
-        Dim ckB As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
         Dim numA As Integer = (szA + CHUNK - 1) \ CHUNK
         Dim numB As Integer = (szB + CHUNK - 1) \ CHUNK
         Dim anySkipped As Boolean = False
+        ' §251 pt2: build the kept-cell list (trailing-zero-trimmed; high-mode skips cells below
+        ' the cutoff), then multiply cells in PARALLEL waves with a serial carry-safe accumulate.
+        Dim cAOff As New System.Collections.Generic.List(Of Long)()
+        Dim cASz As New System.Collections.Generic.List(Of Integer)()
+        Dim cBOff As New System.Collections.Generic.List(Of Long)()
+        Dim cBSz As New System.Collections.Generic.List(Of Integer)()
+        Dim cOff As New System.Collections.Generic.List(Of Long)()
         For i As Integer = 0 To numA - 1
             Dim aOff As Long = CLng(i) * CLng(CHUNK)
             Dim aSzCk As Integer = CInt(System.Math.Min(CLng(CHUNK), CLng(szA) - aOff))
@@ -3032,9 +3037,6 @@ Public Class Form1
                 aSzCk -= 1
             End While
             If aSzCk <= 0 Then Continue For
-            Runtime.InteropServices.Marshal.WriteInt32(ckA, 0, CHUNK)
-            Runtime.InteropServices.Marshal.WriteInt32(ckA, 4, aSzCk)
-            Runtime.InteropServices.Marshal.WriteInt64(ckA, 8, aD + aOff * 8L)
             For j As Integer = 0 To numB - 1
                 Dim bOff As Long = CLng(j) * CLng(CHUNK)
                 Dim bSzCk As Integer = CInt(System.Math.Min(CLng(CHUNK), CLng(szB) - bOff))
@@ -3048,18 +3050,59 @@ Public Class Form1
                     anySkipped = True
                     Continue For
                 End If
-                Runtime.InteropServices.Marshal.WriteInt32(ckB, 0, CHUNK)
-                Runtime.InteropServices.Marshal.WriteInt32(ckB, 4, bSzCk)
-                Runtime.InteropServices.Marshal.WriteInt64(ckB, 8, bD + bOff * 8L)
-                GmpRaw_mul(ckP.Pointer, ckA, ckB)
-                Dim pSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(ckP.Pointer, 4))
+                cAOff.Add(aOff) : cASz.Add(aSzCk) : cBOff.Add(bOff) : cBSz.Add(bSzCk) : cOff.Add(offset)
+            Next j
+        Next i
+
+        ' §251 pt2: cells are tiny (≤3M-limb products ≈ 24MB), so high DOP fits in RAM even when
+        ' §gen's GB-scale sub-products force MemoryBudget to floor §gen's DOP — this is why parallel
+        ' chunked beats §gen at 5B.  DOP from env PI_CG_DOP, default ProcessorCount (capped 16).
+        Dim _cgDop As Integer = Environment.ProcessorCount
+        Dim _cgEnv As String = Environment.GetEnvironmentVariable("PI_CG_DOP")
+        Dim _cgParsed As Integer
+        If _cgEnv IsNot Nothing AndAlso Integer.TryParse(_cgEnv, _cgParsed) AndAlso _cgParsed >= 1 Then _cgDop = _cgParsed
+        _cgDop = System.Math.Max(1, System.Math.Min(_cgDop, 16))
+        Dim nCells As Integer = cOff.Count
+        Dim prods(_cgDop - 1) As mpz_t
+        Dim ckAh(_cgDop - 1) As IntPtr, ckBh(_cgDop - 1) As IntPtr
+        For w As Integer = 0 To _cgDop - 1
+            prods(w) = New mpz_t() : prods(w).Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(prods(w).Pointer)
+            ckAh(w) = Runtime.InteropServices.Marshal.AllocHGlobal(16) : ckBh(w) = Runtime.InteropServices.Marshal.AllocHGlobal(16)
+        Next
+        Dim _cgOpts As New System.Threading.Tasks.ParallelOptions() With {.MaxDegreeOfParallelism = _cgDop}
+        Dim waveStart As Integer = 0
+        While waveStart < nCells
+            Dim waveN As Integer = System.Math.Min(_cgDop, nCells - waveStart)
+            ' Parallel: each slot multiplies one cell (independent; concurrent GmpRaw_mul on
+            ' distinct prods(w) is safe — same pattern as §gen's parallel sub-products).
+            System.Threading.Tasks.Parallel.For(0, waveN, _cgOpts,
+                Sub(w As Integer)
+                    Dim c As Integer = waveStart + w
+                    Runtime.InteropServices.Marshal.WriteInt32(ckAh(w), 0, CHUNK)
+                    Runtime.InteropServices.Marshal.WriteInt32(ckAh(w), 4, cASz(c))
+                    Runtime.InteropServices.Marshal.WriteInt64(ckAh(w), 8, aD + cAOff(c) * 8L)
+                    Runtime.InteropServices.Marshal.WriteInt32(ckBh(w), 0, CHUNK)
+                    Runtime.InteropServices.Marshal.WriteInt32(ckBh(w), 4, cBSz(c))
+                    Runtime.InteropServices.Marshal.WriteInt64(ckBh(w), 8, bD + cBOff(c) * 8L)
+                    GmpRaw_mul(prods(w).Pointer, ckAh(w), ckBh(w))
+                End Sub)
+            ' Serial carry-safe accumulate of this wave into accBuf at each cell's limb offset.
+            For w As Integer = 0 To waveN - 1
+                Dim c As Integer = waveStart + w
+                Dim pSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prods(w).Pointer, 4))
                 If pSz > 0 Then
-                    Dim pD As Long = Runtime.InteropServices.Marshal.ReadInt64(ckP.Pointer, 8)
+                    Dim pD As Long = Runtime.InteropServices.Marshal.ReadInt64(prods(w).Pointer, 8)
+                    Dim offset As Long = cOff(c)
                     GmpRaw_mpn_add(New IntPtr(accBuf.ToInt64() + offset * 8L), New IntPtr(accBuf.ToInt64() + offset * 8L),
                                    CInt(maxLimbs - offset), New IntPtr(pD), pSz)
                 End If
-            Next j
-        Next i
+            Next w
+            waveStart += waveN
+        End While
+        For w As Integer = 0 To _cgDop - 1
+            GmpRaw_clear(prods(w).Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(prods(w).Pointer)
+            Runtime.InteropServices.Marshal.FreeHGlobal(ckAh(w)) : Runtime.InteropServices.Marshal.FreeHGlobal(ckBh(w))
+        Next w
         ' Round UP by an upper bound of the omitted mass (< 9·2^(64·cutoffLo) < 16·2^(64·cutoffLo))
         ' ⟹ result ≥ true product, so the caller's r = 2r − (result>>S) stays an underestimate.
         If anySkipped AndAlso cutoffLo >= 0L Then
@@ -3080,9 +3123,6 @@ Public Class Form1
         Runtime.InteropServices.Marshal.WriteInt32(result.Pointer, 0, CInt(maxLimbs))
         Runtime.InteropServices.Marshal.WriteInt32(result.Pointer, 4, sz)
         Runtime.InteropServices.Marshal.WriteInt64(result.Pointer, 8, accBuf.ToInt64())
-        GmpRaw_clear(ckP.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(ckP.Pointer)
-        Runtime.InteropServices.Marshal.FreeHGlobal(ckA)
-        Runtime.InteropServices.Marshal.FreeHGlobal(ckB)
     End Sub
 
     ' §250: fill m with nLimbs pseudo-random limbs (top limb forced nonzero), value positive.
@@ -3189,7 +3229,9 @@ Public Class Form1
     Private Shared Function TestChunkedGrid() As Boolean
         Dim rng As New Random(2468)
         Dim allPass As Boolean = True
-        System.Threading.Volatile.Write(_safeMulDop, 1)   ' mirror production inner-serial
+        ' §251 pt2: compare against §gen at DOP=9 (what 5B actually floors §gen to) for a FAIR
+        ' fight — the chunked grid parallelizes its cells independently via _cgDop (ProcessorCount).
+        System.Threading.Volatile.Write(_safeMulDop, 9)
         Dim outPath As String = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "chunkedgrid_test.txt")
         Try : System.IO.File.WriteAllText(outPath, $"[TestChunkedGrid] start {DateTime.Now}{vbCrLf}") : Catch : End Try
         ' §70 isolation: PI_CG_ISOLATE=1 runs ONLY the 68M×52M case (the one that crashed back-to-back).
@@ -4596,7 +4638,7 @@ Public Class Form1
         _recipShortMulVerify = (Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL_VERIFY") = "1")
         Dim _rsmDopEnv As String = Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL_MAXDOP")  ' §251 (#70) DOP gate
         Dim _rsmDopParsed As Integer
-        If _rsmDopEnv IsNot Nothing AndAlso Integer.TryParse(_rsmDopEnv, _rsmDopParsed) AndAlso _rsmDopParsed >= 1 Then _recipShortMulMaxDop = _rsmDopParsed Else _recipShortMulMaxDop = 1
+        If _rsmDopEnv IsNot Nothing AndAlso Integer.TryParse(_rsmDopEnv, _rsmDopParsed) AndAlso _rsmDopParsed >= 1 Then _recipShortMulMaxDop = _rsmDopParsed Else _recipShortMulMaxDop = 9
         ' §174-fix: mpz_sizeinbase returns UInt32 — overflows when bBits > 2^31 (szB > 33M limbs).
         ' Compute exact bBits from top limb via CLZ; avoids any overflow and is always precise.
         Dim _szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
