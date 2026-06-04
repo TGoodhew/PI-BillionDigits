@@ -6386,3 +6386,28 @@ items — the very large methods (`ComputePiGMP`/`SafeMpzDiv`/`SafeMpzMul`) and 
 `Form1.vb` into partial-class files — plus the `BYTES_PER_MB` magic-number sweep are deliberately
 deferred to dedicated, individually-1B-SHA-validated commits so they cannot endanger the verified
 math (recommended order: BYTES_PER_MB → pure file-split → leaf-helper extraction).
+
+## §262 — Chunked-HIGH a×r in SafeMpzDiv (2026-06-04, issue #42)
+
+`SafeMpzDiv` computes the Barrett quotient as `ar = a × r` then `q = ar >> kBits` — so the low
+`kBits\64` limbs of `ar` are computed by the full §gen multiply and then **immediately thrown away**
+by the shift. At 5 B this a×r is the single dominant cost (≈5 h 40 m, vs q×b ≈1 h 34 m).
+
+**What #42 asked for vs what was done.** The issue proposed *pipelining* a×r ‖ q×b. But at the real
+measured 3.6:1 ratio that overlaps only the *smaller* q×b (~22% saving) **and doubles** the divide's
+peak RAM (both `ar` + `qb` alive) — and §235 already identified the divide as the RAM-binding stage,
+so doubling it risks OOM at 5 B on the 64 GB box. Instead §262 attacks the dominant cost directly:
+compute a×r as a chunked-grid **HIGH** product (the #70 `SafeMpzMul_ChunkedGrid` with
+`keepLimbs = (szA+szR) − kBits\64`), skipping the cells whose entire output is below the `>>kBits`
+cut. The round-up overestimate ⇒ q overestimate ⇒ §171 adj-**down** corrects (the §107 contract that
+already makes the chunked reciprocal bit-exact), so π is unchanged. This **lowers** a×r's peak RAM
+(one chunked accumulator vs the full result + shifted + sub-products) instead of doubling it.
+
+ON by default (opt-out `PI_DIV_AR_SHORTMUL=0`); gated on flag + size (>1 cell) + the §251 DOP gate,
+and disabled under `_5b_verify` (those diagnostics read the low limbs a high product omits).
+`[SafeMpzDiv§262-gate]` (level 2) logs each engagement.
+
+**Validation:** 1 B resume-from-`snap_Phase3` (forces the full Phase 3 incl. the divide) — π SHA-256
+bit-identical to the oracle (`b153e8d5…56d9b`), §171 adjustment within its normal window. The
+literal pipeline is left as a documented non-goal (net-negative + RAM-doubling) unless the
+a×r:q×b ratio ever drops below 2:1.

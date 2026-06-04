@@ -152,6 +152,13 @@ Public Class Form1
     ' (rSq 26M²) / 6.97× (p 68M×52M) vs §gen at DOP=9.  Default raised to 9 (§gen's max DOP) ⟹
     ' chunked engages broadly; env PI_RECIP_SHORTMUL_MAXDOP can lower it to restrict.
     Private Shared _recipShortMulMaxDop As Integer = 9
+    ' §262 (#42): route the dominant SafeMpzDiv a×r through the chunked-grid HIGH product.  Only the
+    ' bits above the >>kBits cut survive (q = ar >> kBits), so the low cells are computed-then-thrown-
+    ' away by the full §gen multiply.  Computing a×r as a high product (skip those cells, round-up
+    ' overestimate ⇒ q overestimate ⇒ §171 adj-down corrects, the §107 contract) attacks the
+    ' dominant 5B divide cost (a×r ≈ 5h40m vs q×b ≈ 1h34m) AND ~halves its peak RAM.  ON by default
+    ' (opt-out PI_DIV_AR_SHORTMUL=0); reuses the proven #70 SafeMpzMul_ChunkedGrid + DOP gate.
+    Private Shared _divArShortMul As Boolean = True
 
     ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
     ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
@@ -4666,6 +4673,7 @@ Public Class Form1
         Dim _rsmDopEnv As String = Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL_MAXDOP")  ' §251 (#70) DOP gate
         Dim _rsmDopParsed As Integer
         If _rsmDopEnv IsNot Nothing AndAlso Integer.TryParse(_rsmDopEnv, _rsmDopParsed) AndAlso _rsmDopParsed >= 1 Then _recipShortMulMaxDop = _rsmDopParsed Else _recipShortMulMaxDop = 9
+        _divArShortMul = (Environment.GetEnvironmentVariable("PI_DIV_AR_SHORTMUL") <> "0")   ' §262 (#42): chunked-HIGH a×r, opt-out
         ' §174-fix: mpz_sizeinbase returns UInt32 — overflows when bBits > 2^31 (szB > 33M limbs).
         ' Compute exact bBits from top limb via CLZ; avoids any overflow and is always precise.
         Dim _szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
@@ -5479,7 +5487,26 @@ Public Class Form1
         ' always correct so a×r is always correct regardless of DOP.
         ' Original lines preserved as comments for easy revert (grep §220).
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§220] §166 lifted — a×r runs at caller DOP={System.Threading.Volatile.Read(_safeMulDop)}{vbCrLf}")
-        SafeMpzMul(ar, a, r)
+        ' §262 (#42): a×r is computed in full then `BigShiftRight(ar, ar, kBits)` throws away the low
+        ' kLimb=kBits\64 limbs — so only the HIGH part is ever used (q = ar >> kBits).  Route it
+        ' through the #70 chunked-grid HIGH product: keep only the top (fullLimbs − kLimb) result
+        ' limbs (+GUARD), skipping the cells whose entire output lies below the cut.  The round-up
+        ' overestimate ⇒ q overestimate ⇒ §171 adj-DOWN corrects (the §107 contract), so π stays
+        ' bit-identical.  This attacks the dominant divide cost (a×r ≈ 5h40m vs q×b ≈ 1h34m at 5B)
+        ' AND ~halves a×r's peak RAM (chunked accumulator vs the full §gen result+shifted+sub).
+        ' Gated: flag + size (>1 cell) + DOP, and OFF under _5b_verify (those diagnostics read the
+        ' low limbs, which a high product does not compute).
+        Dim _arFull As Long = CLng(szA) + CLng(szR)
+        Dim _arKLimb As Long = kBits \ 64L
+        Dim _arKeep As Long = _arFull - _arKLimb
+        If _divArShortMul AndAlso (Not _5b_verify) AndAlso _arKeep > 0L _
+           AndAlso (CLng(szA) > 1500000L OrElse CLng(szR) > 1500000L) _
+           AndAlso MemBudget_SuggestSafeMulDop(CLng(szA), CLng(szR)) <= _recipShortMulMaxDop Then
+            AppendLog($"[SafeMpzDiv§262-gate] a×r HIGH ENGAGE szA={szA:N0} szR={szR:N0} fullLimbs={_arFull:N0} kLimb={_arKLimb:N0} keep={_arKeep:N0}{vbCrLf}", 2)
+            SafeMpzMul_ChunkedGrid(ar, a, r, _arKeep)
+        Else
+            SafeMpzMul(ar, a, r)
+        End If
         ' §5B-f1: r's data buffer is needed by the §5B-f1 chunked-grid reference (below).
         ' Defer mpz_clear(r) until AFTER §5B-f1 completes to keep r alive.  Before §5B-f1
         ' was added the clear lived here directly; now it's at the end of the §5B-f1 block.
