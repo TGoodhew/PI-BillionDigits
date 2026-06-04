@@ -1368,10 +1368,20 @@ Public Class Form1
         End Try
     End Function
 
-    ' §243 Phase C (deferred to #70): no chunked-grid §gen path exists yet, so never
-    ' recommend fallback.  Wire to the real predicate when #70 lands.
+    ' §70 (#70 RAM-cap dispatch): fall back to the chunked grid (SafeMpzMul_ChunkedGrid full mode)
+    ' when even §gen at DOP=1 would exceed the budget.  §gen-DOP1 peak ≈ result + shifted +
+    ' one sub-product (~2.3× result); chunked-full ≈ result + tiny per-cell temps (~1× result), so
+    ' it completes where §gen OOMs (the ~40-70 GB depth-0 peak this issue targets).  On a roomy box
+    ' §gen-DOP1 fits → this returns False → no-op, no perf regression (chunked-full is ~1.4× slower).
+    ' Budget = min(availPhys, availCommit) − headroom (PI_MEMBUDGET_HEADROOM_GB; large value forces
+    ' the fallback for 1B testing).  §68 Phase C consumer.
     Private Shared Function MemBudget_ShouldFallbackToChunkedGrid(szA As Long, szB As Long) As Boolean
-        Return False
+        Dim headroomGB As Double = 5.0
+        Dim _env As String = Environment.GetEnvironmentVariable("PI_MEMBUDGET_HEADROOM_GB")
+        Dim _h As Double
+        If _env IsNot Nothing AndAlso Double.TryParse(_env, _h) AndAlso _h >= 0.0 Then headroomGB = _h
+        Dim budgetGB As Double = System.Math.Min(MemBudget_AvailablePhysicalGB(), MemBudget_AvailableCommitGB()) - headroomGB
+        Return MemBudget_ProjectMulPeakGB(szA, szB, 1) > budgetGB
     End Function
 
     Private Shared Sub MemBudget_LogSnapshot(context As String)
@@ -3433,9 +3443,20 @@ Public Class Form1
             Return
         End If
 
+        ' §70 (#70 RAM-cap dispatch): at depth-0 (Not _smm_innerForceSerial), if even §gen at DOP=1
+        ' would exceed the memory budget, route to the chunked grid (full mode) instead — it has a
+        ' ~half-size peak (no shifted buffer, tiny per-cell temps) so it completes where §gen OOMs,
+        ' capping the ~40-70 GB depth-0 peak (§68 Phase C).  No-op on a roomy box (§gen-DOP1 fits);
+        ' chunked-full is bit-identical to §gen (validated --test-chunkedgrid) but ~1.4× slower.
+        If (Not _smm_innerForceSerial) AndAlso MemBudget_ShouldFallbackToChunkedGrid(CLng(szA), CLng(szB)) Then
+            If _logLevel >= 2 Then AppendLog($"[MemoryBudget§70] §gen DOP=1 peak {MemBudget_ProjectMulPeakGB(CLng(szA), CLng(szB), 1):F1}GB > budget — routing {szA:N0}×{szB:N0} to chunked-grid full product (RAM cap){vbCrLf}")
+            SafeMpzMul_ChunkedGrid(result, opA, opB, 0L)
+            Return
+        End If
+
         ' §143: Log when recursion is triggered for large multiplications (szA+szB > threshold).
-        If _logLevel >= 2 AndAlso CLng(szA) + CLng(szB) > 5_000_000L Then
-            AppendLog($"[SafeMpzMul§143] RECURSE szA={szA:N0} szB={szB:N0} total={CLng(szA)+CLng(szB):N0} (threshold={SAFE_LIMB_THRESHOLD:N0}) — using 3×3 split to avoid GMP FFT precision error{vbCrLf}")
+        If _logLevel >= 5 AndAlso CLng(szA) + CLng(szB) > 5_000_000L Then
+            AppendLog($"[SafeMpzMul§143] RECURSE szA={szA:N0} szB={szB:N0} total={CLng(szA)+CLng(szB):N0} (threshold={SAFE_LIMB_THRESHOLD:N0}) — using 3×3 split to avoid GMP FFT precision error{vbCrLf}", 5)
         End If
 
         Dim resultSign As Integer = System.Math.Sign(szA_signed) * System.Math.Sign(szB_signed)
