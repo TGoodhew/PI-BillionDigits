@@ -139,7 +139,7 @@ Public Class Form1
     ' product in capped iters; PI_RECIP_SHORTMUL_VERIFY=1 additionally computes the full
     ' product, compares the exact region + overestimate, and falls back to full on any
     ' mismatch (safety net + per-iter diagnostic for the validation gate).
-    Private Shared _recipShortMul As Boolean = False
+    Private Shared _recipShortMul As Boolean = True    ' §254 (#70): chunked reciprocal ON by default (opt-out PI_RECIP_SHORTMUL=0)
     Private Shared _recipShortMulVerify As Boolean = False
     ' §251 (#70): DOP gate.  pt1 (serial cells) only beat §gen at low §gen DOP, so this gated on
     ' MemBudget_SuggestSafeMulDop ≤ threshold.  pt2 PARALLELISES the chunked cells (tiny, fit at
@@ -4666,7 +4666,11 @@ Public Class Form1
     Private Shared Sub SafeMpzReciprocal(r As mpz_t, b As mpz_t, kBits As Long)
         Const SAFE As Integer = 33_554_431
         ' §250 (#94): read the high-half short-product flags once per reciprocal call.
-        _recipShortMul = (Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL") = "1")
+        ' §254 (#70): chunked-grid reciprocal is now ON BY DEFAULT (opt-out with PI_RECIP_SHORTMUL=0).
+        ' Validated: 1B π bit-identical to oracle, 500M VERIFY all-OK incl bShift>0, 5B engages cleanly
+        ' (259.5M² ~33min/iter), harness 2.81×(rSq)/6.97×(p) vs §gen-DOP9.  Only routes the reciprocal
+        ' capped-iter muls (RecipMul); the gate (size>SAFE + DOP≤MAXDOP) fires it only where it wins.
+        _recipShortMul = (Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL") <> "0")
         _recipShortMulVerify = (Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL_VERIFY") = "1")
         Dim _rsmDopEnv As String = Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL_MAXDOP")  ' §251 (#70) DOP gate
         Dim _rsmDopParsed As Integer
