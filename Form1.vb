@@ -4943,10 +4943,13 @@ Public Class Form1
             End If
             If CLng(szR) * 2L <= SAFE Then
                 GmpRaw_mul(rSq.Pointer, r.Pointer, r.Pointer)
-            ElseIf _recipShortMul AndAlso bShift = 0L AndAlso MemBudget_SuggestSafeMulDop(CLng(szR), CLng(szR)) <= _recipShortMulMaxDop Then
-                ' §250/§251 (#94/#70): chunked-grid high product, but ONLY when §gen would run at low
-                ' DOP (memory-floored / 5B-class) — else parallel §gen wins (DOP gate, §251).
+            ElseIf _recipShortMul AndAlso MemBudget_SuggestSafeMulDop(CLng(szR), CLng(szR)) <= _recipShortMulMaxDop Then
+                ' §250/§251 (#94/#70): chunked-grid high product for the large reciprocal squaring.
+                ' Engages on SIZE (already past szR·2 ≤ SAFE) + low §gen DOP — NOT bShift=0.  §251-fix:
+                ' at the 5B DIVIDE the denominator bBits (≈47e9) >> rBits (≈16.6e9), so bShift stays
+                ' ≈30e9 and NEVER reaches 0 — the old bShift=0 gate wrongly excluded the 5B reciprocal.
                 ' r² is 2·szR limbs; keep top szR + margin (overestimate-rounded), skipping the low half.
+                If _logLevel >= 2 Then AppendLog($"[§251-gate] rSq iter={_nrIter} ENGAGE szR={szR:N0} prec={prec:N0} rBits={rBits:N0} bShift={bShift:N0} dop={MemBudget_SuggestSafeMulDop(CLng(szR), CLng(szR))}{vbCrLf}")
                 RecipMul(rSq, r, r, CLng(szR) + 4096L, "rSq", _nrIter)
             Else
                 SafeMpzMul(rSq, r, r)
@@ -4978,11 +4981,13 @@ Public Class Form1
             Dim szRsq As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(rSq.Pointer, 4))
             If CLng(szBt) + CLng(szRsq) <= SAFE Then
                 GmpRaw_mul(p.Pointer, bTrunc.Pointer, rSq.Pointer)
-            ElseIf _recipShortMul AndAlso bShift = 0L AndAlso MemBudget_SuggestSafeMulDop(CLng(szBt), CLng(szRsq)) <= _recipShortMulMaxDop Then
-                ' §250/§251 (#94/#70): chunked-grid high product, gated to low §gen DOP (§251 DOP gate).
-                ' p is shifted right by (kBits−bShift); only the limbs above that survive into r.
-                ' Keep that many + margin (overestimate-rounded) ⟹ r underestimate.
+            ElseIf _recipShortMul AndAlso MemBudget_SuggestSafeMulDop(CLng(szBt), CLng(szRsq)) <= _recipShortMulMaxDop Then
+                ' §250/§251 (#94/#70): chunked-grid high product for p = bTrunc·rSq.  Engages on SIZE
+                ' + low §gen DOP — NOT bShift=0 (§251-fix; see rSq site).  p is shifted right by
+                ' (kBits−bShift); keep the surviving top limbs + margin (overestimate ⟹ r underestimate).
+                ' keepP uses bShift, so it's correct for the 5B bShift≈30e9 regime too.
                 Dim _keepP As Long = CLng(szBt) + CLng(szRsq) - (kBits - bShift) \ 64L + 4096L
+                If _logLevel >= 2 Then AppendLog($"[§251-gate] p iter={_nrIter} ENGAGE szBt={szBt:N0} szRsq={szRsq:N0} keepP={_keepP:N0} bShift={bShift:N0} dop={MemBudget_SuggestSafeMulDop(CLng(szBt), CLng(szRsq))}{vbCrLf}")
                 RecipMul(p, bTrunc, rSq, _keepP, "p", _nrIter)
             Else
                 SafeMpzMul(p, bTrunc, rSq)
