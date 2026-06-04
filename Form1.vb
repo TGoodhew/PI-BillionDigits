@@ -1462,7 +1462,7 @@ Public Class Form1
                 $"[NATIVE CRASH] Process terminating — unhandled native exception at {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}" &
                 vbCrLf &
                 "[NATIVE CRASH] Review the last log entries above to identify the failing GMP call." &
-                vbCrLf)
+                vbCrLf, 1)   ' §252 (#95): native crash = level 1 (error)
         Catch
         End Try
         Return 0   ' EXCEPTION_CONTINUE_SEARCH — let Windows handle it (WER, minidump, etc.)
@@ -1922,7 +1922,7 @@ Public Class Form1
                 current = current.InnerException
                 depth += 1
             End While
-            WriteToLog(sb.ToString())
+            WriteToLog(sb.ToString(), 1)   ' §252 (#95): exceptions/crashes = level 1 (errors)
         Catch
         End Try
     End Sub
@@ -1980,12 +1980,16 @@ Public Class Form1
         LstBoxPhases.Items.Clear()
         LstBoxPhases.Items.Add($"Starting {DIGITS:N0} digits at {DateTime.Now:HH:mm:ss}")
         Try
-            Dim _levelNames() As String = {"None", "Performance", "Stages", "Last stage", "Full trace", "Allocator"}
+            ' §252 (#95): names match the 0-5 ladder.  At level 0 write an EMPTY file (truly silent —
+            ' the banner is the last ungated write; gating it makes level 0 byte-empty).
+            Dim _levelNames() As String = {"Silent", "Errors+result", "Phase milestones", "Sub-phase", "Detailed", "Exceptionally detailed"}
             Dim loggingMode As String = $"{_logLevel} ({If(_logLevel >= 0 AndAlso _logLevel < _levelNames.Length, _levelNames(_logLevel), "Custom")})"
             System.IO.File.WriteAllText(LOG_FILE,
-                $"=== PI Computation Started {DateTime.Now} ===" & vbCrLf &
-                $"=== Digits: {DIGITS:N0} ===" & vbCrLf &
-                $"=== Logging: {loggingMode} ===" & vbCrLf)
+                If(System.Threading.Volatile.Read(_logLevel) >= 1,
+                   $"=== PI Computation Started {DateTime.Now} ===" & vbCrLf &
+                   $"=== Digits: {DIGITS:N0} ===" & vbCrLf &
+                   $"=== Logging: {loggingMode} ===" & vbCrLf,
+                   ""))
         Catch
         End Try
         RtbPiDigits.AppendText("Starting computation..." & vbCrLf)
@@ -9687,7 +9691,7 @@ NumeratorDone:
 
             Dim summary As String = If(allOk, "Verify OK: ", "Verify: ") & String.Join(" | ", parts)
             LblStatus.Text = summary
-            WriteToLog("[Verify] " & summary)
+            WriteToLog("[Verify] " & summary, 1)   ' §252 (#95): verify outcome = level 1 (result)
 
             If _verifyAt.Count > 0 OrElse _verifyContains.Count > 0 Then
                 RunCustomVerificationsNative(_displayNativePtr, totalLen)
@@ -9732,7 +9736,7 @@ NumeratorDone:
 
         Dim summary2 As String = If(allOk, "Verify OK: ", "Verify: ") & String.Join(" | ", parts)
         LblStatus.Text = summary2
-        WriteToLog("[Verify] " & summary2)
+        WriteToLog("[Verify] " & summary2, 1)   ' §252 (#95): verify outcome = level 1 (result)
 
         If _verifyAt.Count > 0 OrElse _verifyContains.Count > 0 Then
             RunCustomVerifications(piText)
