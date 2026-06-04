@@ -690,14 +690,14 @@ Public Class Form1
         If rawSz > CULng(Long.MaxValue) Then
             ' Size > 9.2 EB — clearly corrupted GMP internal state.
             ' Return null so GMP will abort cleanly; native crash handler logs it.
-            AppendLog($"[GmpAllocFunc] CORRUPT SIZE ({rawSz}) — returning null{vbCrLf}")
+            AppendLog($"[GmpAllocFunc] CORRUPT SIZE ({rawSz}) — returning null{vbCrLf}", 1)   ' §252 (#95): allocator corruption → crash → level 1
             Return New void_ptr(IntPtr.Zero)
         End If
         Dim sz As Long = CLng(rawSz)
         If sz >= GMP_LARGE_THRESHOLD Then
             Dim ptr As IntPtr = PoolGet(sz)
             If ptr = IntPtr.Zero Then
-                AppendLog($"[GmpAlloc] PoolGet({sz:N0} bytes) FAILED — GMP will abort{vbCrLf}")
+                AppendLog($"[GmpAlloc] PoolGet({sz:N0} bytes) FAILED — GMP will abort{vbCrLf}", 1)   ' §252 (#95): OOM/abort → level 1
             End If
             Return New void_ptr(ptr)
         End If
@@ -711,7 +711,7 @@ Public Class Form1
         Dim rawOld As ULong = CULng(old_size)
         Dim rawNew As ULong = CULng(new_size)
         If rawOld > CULng(Long.MaxValue) OrElse rawNew > CULng(Long.MaxValue) Then
-            AppendLog($"[GmpReallocFunc] CORRUPT SIZE (old={rawOld}, new={rawNew}) — returning null{vbCrLf}")
+            AppendLog($"[GmpReallocFunc] CORRUPT SIZE (old={rawOld}, new={rawNew}) — returning null{vbCrLf}", 1)   ' §252 (#95): allocator corruption → crash → level 1
             Return New void_ptr(IntPtr.Zero)
         End If
         Dim oldSz As Long = CLng(rawOld)
@@ -743,7 +743,7 @@ Public Class Form1
                     AppendLog($"[GmpRealloc] L→L done → OK{vbCrLf}")
                 End If
             Else
-                AppendLog($"[GmpRealloc] large→large PoolGet({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
+                AppendLog($"[GmpRealloc] large→large PoolGet({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}", 1)   ' §252 (#95): OOM/abort → level 1
             End If
         ElseIf newSz >= GMP_LARGE_THRESHOLD Then
             ' small → large: pool-get new block, CRT-free old block
@@ -758,7 +758,7 @@ Public Class Form1
                     AppendLog($"[GmpRealloc] S→L done → OK{vbCrLf}")
                 End If
             Else
-                AppendLog($"[GmpRealloc] small→large PoolGet({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
+                AppendLog($"[GmpRealloc] small→large PoolGet({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}", 1)   ' §252 (#95): OOM/abort → level 1
             End If
         Else
             ' large → small: CRT-alloc new block, pool-return old block
@@ -768,7 +768,7 @@ Public Class Form1
                 If copyBytes.ToUInt64() > 0UL Then CopyMemory(newP, oldP, copyBytes)
                 PoolReturn(oldP, oldSz)
             Else
-                AppendLog($"[GmpRealloc] large→small CRT alloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}")
+                AppendLog($"[GmpRealloc] large→small CRT alloc({newSz:N0} bytes) FAILED (old={oldSz:N0}) — GMP will abort{vbCrLf}", 1)   ' §252 (#95): OOM/abort → level 1
             End If
         End If
 
@@ -3023,7 +3023,7 @@ Public Class Form1
         Dim _tc As Long = System.Diagnostics.Stopwatch.GetTimestamp()
         SafeMpzMul_ChunkedGrid(dst, A, B, keepLimbs)
         Dim _msCg As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _tc) * 1000.0 / System.Diagnostics.Stopwatch.Frequency
-        AppendLog($"[SafeMpzReciprocal§251 TIMING] {tag} iter={iter} §gen={_msGen:F0}ms chunked={_msCg:F0}ms speedup={If(_msCg > 0.0, _msGen / _msCg, 0.0):F2}x{vbCrLf}")
+        AppendLog($"[SafeMpzReciprocal§251 TIMING] {tag} iter={iter} §gen={_msGen:F0}ms chunked={_msCg:F0}ms speedup={If(_msCg > 0.0, _msGen / _msCg, 0.0):F2}x{vbCrLf}", 4)   ' §252 (#95): per-iter timing diagnostic → level 4
         Dim cmp As Integer = GmpRaw_cmp(dst.Pointer, full.Pointer)             ' want ≥ 0 (overestimate)
         Dim cs As Long = System.Math.Max(0L, (fullLimbs - keepLimbs) * 64L)    ' guaranteed-exact region start
         Dim fs As New mpz_t() : fs.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(fs.Pointer)
@@ -3036,7 +3036,7 @@ Public Class Form1
             GmpRaw_set(dst.Pointer, full.Pointer)   ' FALLBACK to the exact product
             AppendLog($"[SafeMpzReciprocal§250 VERIFY] {tag} iter={iter} MISMATCH (high>=full={cmp >= 0} regionCmp={regionEq}) keep={keepLimbs:N0} — FELL BACK to full product{vbCrLf}")
         Else
-            AppendLog($"[SafeMpzReciprocal§250 VERIFY] {tag} iter={iter} OK (overestimate + exact region) keep={keepLimbs:N0}{vbCrLf}")
+            AppendLog($"[SafeMpzReciprocal§250 VERIFY] {tag} iter={iter} OK (overestimate + exact region) keep={keepLimbs:N0}{vbCrLf}", 4)   ' §252 (#95): per-iter VERIFY-OK confirmation → level 4 (MISMATCH stays at 2)
         End If
         GmpRaw_clear(fs.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(fs.Pointer)
         GmpRaw_clear(hs.Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(hs.Pointer)
@@ -3406,7 +3406,7 @@ Public Class Form1
                 Dim _183_r0 As Long = Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_183_opAd), 0)
                 Dim _183_r1 As Long = Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_183_opAd + 8L), 0)
                 If _183_r0 = 0L AndAlso _183_r1 = 0L Then
-                    AppendLog($"[SafeMpzMul§183] ENTRY zero-data squaring: szA={szA:N0} opA_d={_183_opAd:X16} r[0]={_183_r0:X16} r[1]={_183_r1:X16} opAptr={opA.Pointer.ToInt64():X16} resPtr={result.Pointer.ToInt64():X16}{vbCrLf}")
+                    AppendLog($"[SafeMpzMul§183] ENTRY zero-data squaring: szA={szA:N0} opA_d={_183_opAd:X16} r[0]={_183_r0:X16} r[1]={_183_r1:X16} opAptr={opA.Pointer.ToInt64():X16} resPtr={result.Pointer.ToInt64():X16}{vbCrLf}", 5)   ' §252 (#95)
                 End If
             End If
         End If
@@ -3437,7 +3437,7 @@ Public Class Form1
                     Dim _178aD As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
                     Dim _178r0 As Long = If(_178aD <> 0L, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_178aD), 0), 0L)
                     Dim _178r1 As Long = If(_178aD <> 0L AndAlso szA >= 2, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_178aD + 8L), 0), 0L)
-                    AppendLog($"[SafeMpzMul§178] zero-result squaring: szA={szA:N0} opA.Ptr={opA.Pointer.ToInt64():X16} opA._mp_d={_178aD:X16} raw[0]={_178r0:X16} raw[1]={_178r1:X16}{vbCrLf}")
+                    AppendLog($"[SafeMpzMul§178] zero-result squaring: szA={szA:N0} opA.Ptr={opA.Pointer.ToInt64():X16} opA._mp_d={_178aD:X16} raw[0]={_178r0:X16} raw[1]={_178r1:X16}{vbCrLf}", 5)   ' §252 (#95)
                 End If
             End If
             Return
@@ -3500,7 +3500,7 @@ Public Class Form1
         Dim accumBuf As IntPtr = GmpNativeAlloc_PoolGet(_resultBytes)
         If accumBuf = IntPtr.Zero Then
             AppendLog(
-                $"[SafeMpzMul] accum pre-alloc FAILED for {_resultBytes \ 1048576L:N0} MB — throwing OOM{vbCrLf}")
+                $"[SafeMpzMul] accum pre-alloc FAILED for {_resultBytes \ 1048576L:N0} MB — throwing OOM{vbCrLf}", 1)   ' §252 (#95): OOM → level 1
             Throw New OutOfMemoryException($"SafeMpzMul: GmpNativeAlloc_PoolGet failed for accum buffer ({_resultBytes \ 1048576L} MB)")
         End If
         Dim accumPtr As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
@@ -3752,7 +3752,7 @@ Public Class Form1
             ' Max final/intermediate buffer size: prods(7|8) = ≤ 87.5M limbs; pad to 90M for safety.
             Const _E_MAX_LIMBS As Integer = 90_000_000
             Dim _E_MAX_BYTES As Long = CLng(_E_MAX_LIMBS) * 8L
-            AppendLog($"[SafeMpzMul§5B-e] starting chunked-grid reference (chunk={_CHUNK_E:N0}, prealloc={_E_MAX_LIMBS:N0} limbs/buf, {_E_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}")
+            AppendLog($"[SafeMpzMul§5B-e] starting chunked-grid reference (chunk={_CHUNK_E:N0}, prealloc={_E_MAX_LIMBS:N0} limbs/buf, {_E_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}", 5)   ' §252 (#95)
             For Each _refIdx As Integer In New Integer() {7, 8}
                 Dim _refTargetIdx As Long = If(_refIdx = 7, 72916666L, 43749999L)
                 Dim _ref_A_d As Long = Runtime.InteropServices.Marshal.ReadInt64(A_parts(2).Pointer, 8)
@@ -3760,12 +3760,12 @@ Public Class Form1
                 Dim _ref_B_partIdx As Integer = If(_refIdx = 7, 1, 2)
                 Dim _ref_B_d As Long = Runtime.InteropServices.Marshal.ReadInt64(B_parts(_ref_B_partIdx).Pointer, 8)
                 Dim _ref_B_sz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(B_parts(_ref_B_partIdx).Pointer, 4))
-                AppendLog($"[SafeMpzMul§5B-e prods({_refIdx})] A_2 sz={_ref_A_sz:N0} B_{_ref_B_partIdx} sz={_ref_B_sz:N0} target idx={_refTargetIdx:N0}{vbCrLf}")
+                AppendLog($"[SafeMpzMul§5B-e prods({_refIdx})] A_2 sz={_ref_A_sz:N0} B_{_ref_B_partIdx} sz={_ref_B_sz:N0} target idx={_refTargetIdx:N0}{vbCrLf}", 5)   ' §252 (#95)
                 ' Per-refIdx VirtualAlloc'd buffers (zeroed by VirtualAlloc, freed at end)
                 Dim _eAccBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_E_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
                 Dim _eShiftBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_E_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
                 If _eAccBuf = IntPtr.Zero OrElse _eShiftBuf = IntPtr.Zero Then
-                    AppendLog($"[SafeMpzMul§5B-e prods({_refIdx})] VirtualAlloc FAILED — skipping{vbCrLf}")
+                    AppendLog($"[SafeMpzMul§5B-e prods({_refIdx})] VirtualAlloc FAILED — skipping{vbCrLf}", 5)   ' §252 (#95)
                     If _eAccBuf <> IntPtr.Zero Then VirtualFree(_eAccBuf, UIntPtr.Zero, MEM_RELEASE)
                     If _eShiftBuf <> IntPtr.Zero Then VirtualFree(_eShiftBuf, UIntPtr.Zero, MEM_RELEASE)
                     Continue For
@@ -3848,7 +3848,7 @@ Public Class Form1
                 Dim _ourV As ULong = If(_refTargetIdx < CLng(_ourSz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_ourD, CInt(_refTargetIdx * 8L))), 0UL)
                 Dim _ourV_lo As ULong = If(_refTargetIdx - 1L < CLng(_ourSz) AndAlso _refTargetIdx - 1L >= 0L, CULng(Runtime.InteropServices.Marshal.ReadInt64(_ourD, CInt((_refTargetIdx - 1L) * 8L))), 0UL)
                 Dim _ourV_hi As ULong = If(_refTargetIdx + 1L < CLng(_ourSz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_ourD, CInt((_refTargetIdx + 1L) * 8L))), 0UL)
-                AppendLog($"[SafeMpzMul§5B-e prods({_refIdx}) idx={_refTargetIdx:N0}] subProducts={_ckCount:N0} refSz={_refAccSz:N0} ourSz={_ourSz:N0} reference[idx-1,idx,idx+1]=[{_refV_lo:X16} {_refV:X16} {_refV_hi:X16}] ourSafeMpzMul[idx-1,idx,idx+1]=[{_ourV_lo:X16} {_ourV:X16} {_ourV_hi:X16}] match@idx={(_refV = _ourV)}{vbCrLf}")
+                AppendLog($"[SafeMpzMul§5B-e prods({_refIdx}) idx={_refTargetIdx:N0}] subProducts={_ckCount:N0} refSz={_refAccSz:N0} ourSz={_ourSz:N0} reference[idx-1,idx,idx+1]=[{_refV_lo:X16} {_refV:X16} {_refV_hi:X16}] ourSafeMpzMul[idx-1,idx,idx+1]=[{_ourV_lo:X16} {_ourV:X16} {_ourV_hi:X16}] match@idx={(_refV = _ourV)}{vbCrLf}", 5)   ' §252 (#95)
                 ' Cleanup — _refAcc and _ckShifted have swapped-in VirtualAlloc'd buffers.
                 ' Do NOT GmpRaw_clear (would call NativeFreeFunc on a pointer that has no
                 ' SLIST_ENTRY prefix → catastrophic).  Free the 16-byte struct headers and
@@ -3864,7 +3864,7 @@ Public Class Form1
                 VirtualFree(_eAccBuf, UIntPtr.Zero, MEM_RELEASE)
                 VirtualFree(_eShiftBuf, UIntPtr.Zero, MEM_RELEASE)
             Next
-            AppendLog($"[SafeMpzMul§5B-e] chunked-grid reference complete{vbCrLf}")
+            AppendLog($"[SafeMpzMul§5B-e] chunked-grid reference complete{vbCrLf}", 5)   ' §252 (#95)
         End If
 
         ' §136: directly call GmpRaw_mul for A2×B2 and compare to prods(8)[13612996] for q×b.
@@ -3884,7 +3884,7 @@ Public Class Form1
             Dim _p8sz136 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(prods(8).Pointer, 4))
             Dim _p8D136 As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(prods(8).Pointer, 8))
             Dim _p8v136 As Long = If(_IDX136 < CLng(_p8sz136), Runtime.InteropServices.Marshal.ReadInt64(_p8D136, CInt(_IDX136 * 8L)), 0L)
-            AppendLog($"[SafeMpzMul§136] serial A2×B2[{_IDX136:N0}]={_fr136v:X16} prods(8)[{_IDX136:N0}]={_p8v136:X16} match={_fr136v = _p8v136}{vbCrLf}")
+            AppendLog($"[SafeMpzMul§136] serial A2×B2[{_IDX136:N0}]={_fr136v:X16} prods(8)[{_IDX136:N0}]={_p8v136:X16} match={_fr136v = _p8v136}{vbCrLf}", 5)   ' §252 (#95)
             GmpRaw_clear(_fr136.Pointer)
             Runtime.InteropServices.Marshal.FreeHGlobal(_fr136.Pointer)
         End If
@@ -3953,7 +3953,7 @@ Public Class Form1
         If _sharedSjBuf = IntPtr.Zero Then
             GmpNativeAlloc_FreeRaw(accumBuf, _resultBytes)   ' §30 fix: match PoolGet allocation above
             Runtime.InteropServices.Marshal.FreeHGlobal(accumPtr)
-            AppendLog($"[SafeMpzMul] shared shifted pre-alloc FAILED for {_maxShiftedLimbs * 8L \ 1048576L:N0} MB — throwing OOM{vbCrLf}")
+            AppendLog($"[SafeMpzMul] shared shifted pre-alloc FAILED for {_maxShiftedLimbs * 8L \ 1048576L:N0} MB — throwing OOM{vbCrLf}", 1)   ' §252 (#95): OOM → level 1
             Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shared shifted ({_maxShiftedLimbs * 8L \ 1048576L} MB)")
         End If
         If _logLevel >= 2 Then AppendLog($"[SafeMpzMul§accum] shifted buffer OK ({_maxShiftedLimbs * 8L \ 1048576L:N0} MB); starting accumulation (§39={mA = mB AndAlso CLng(mA) + CLng(mB) <= 100_000_000L}){vbCrLf}")
@@ -4146,7 +4146,7 @@ Public Class Form1
                         End While
                     End If
                 End Sub)
-                If _logLevel >= 2 Then AppendLog($"[SafeMpzMul§222] parallel shift pre-pass complete (DOP={_gen222_opts.MaxDegreeOfParallelism}){vbCrLf}")
+                If _logLevel >= 3 Then AppendLog($"[SafeMpzMul§222] parallel shift pre-pass complete (DOP={_gen222_opts.MaxDegreeOfParallelism}){vbCrLf}", 3)
             End If
 
             ' §23/§90: Original per-product accumulation for asymmetric case (mA ≠ mB).
@@ -4204,8 +4204,8 @@ Public Class Form1
                         Dim _ai5_bot As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_opA_d5, CInt(CLng(ki) * CLng(mA) * 8L)))
                         Dim _bj5_bot As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(_opB_d5, CInt(CLng(kj) * CLng(mB) * 8L)))
                         Dim _exp5SpBot As ULong = _ai5_bot * _bj5_bot
-                        AppendLog($"[SafeMpzMul§5B-sub k={k} ki={ki} kj={kj}] szProd={_logPre:N0} bot=[{_sp5Bot:X16} {_sp5Bot2:X16}] mid[{_logPre\2:N0}]={_sp5Mid:X16} top=[{_sp5Top2:X16} {_sp5Top:X16}]{vbCrLf}")
-                        AppendLog($"[SafeMpzMul§5B-sub k={k} verify] A_{ki}[0]={_ai5_bot:X16} B_{kj}[0]={_bj5_bot:X16} (A_{ki}*B_{kj})_lo={_exp5SpBot:X16} actual prod[0]={_sp5Bot:X16} match={(_exp5SpBot = _sp5Bot)}{vbCrLf}")
+                        AppendLog($"[SafeMpzMul§5B-sub k={k} ki={ki} kj={kj}] szProd={_logPre:N0} bot=[{_sp5Bot:X16} {_sp5Bot2:X16}] mid[{_logPre\2:N0}]={_sp5Mid:X16} top=[{_sp5Top2:X16} {_sp5Top:X16}]{vbCrLf}", 5)   ' §252 (#95)
+                        AppendLog($"[SafeMpzMul§5B-sub k={k} verify] A_{ki}[0]={_ai5_bot:X16} B_{kj}[0]={_bj5_bot:X16} (A_{ki}*B_{kj})_lo={_exp5SpBot:X16} actual prod[0]={_sp5Bot:X16} match={(_exp5SpBot = _sp5Bot)}{vbCrLf}", 5)   ' §252 (#95)
                         ' §5B-sub-1: verify prods(k)[1].  prods[0] receives only one term
                         ' (A_i[0]*B_j[0].lo) so its carry to limb 1 is 0.  prods[1] receives:
                         '   hi(A_i[0]*B_j[0]) + lo(A_i[0]*B_j[1]) + lo(A_i[1]*B_j[0])
@@ -4220,7 +4220,7 @@ Public Class Form1
                             Dim _lo10 As ULong = _ai51_1 * _bj5_bot
                             Dim _expProd1 As ULong = _hi00 + _lo01 + _lo10
                             Dim _actProd1 As ULong = _sp5Bot2
-                            AppendLog($"[SafeMpzMul§5B-sub k={k} verify1] A_{ki}[1]={_ai51_1:X16} B_{kj}[1]={_bj51_1:X16} hi00={_hi00:X16} lo01={_lo01:X16} lo10={_lo10:X16}  expected prod[1]={_expProd1:X16}  actual prod[1]={_actProd1:X16}  match={(_actProd1 = _expProd1)}{vbCrLf}")
+                            AppendLog($"[SafeMpzMul§5B-sub k={k} verify1] A_{ki}[1]={_ai51_1:X16} B_{kj}[1]={_bj51_1:X16} hi00={_hi00:X16} lo01={_lo01:X16} lo10={_lo10:X16}  expected prod[1]={_expProd1:X16}  actual prod[1]={_actProd1:X16}  match={(_actProd1 = _expProd1)}{vbCrLf}", 5)   ' §252 (#95)
                         End If
                         ' §5B-sub-T: verify prods(k) TOP limb ≈ hi(A_i[topA] * B_j[topB]).
                         ' The top limb of A_i × B_j is dominated by hi(A_i[topA]*B_j[topB])
@@ -4240,7 +4240,7 @@ Public Class Form1
                         Dim _expSzProd As ULong = _szAi + _szBj
                         Dim _expTopForCmp As ULong = If(_expSzProd = CULng(_logPre), _expTopHi, _expTopLo)
                         Dim _topDiff As ULong = _sp5Top - _expTopForCmp
-                        AppendLog($"[SafeMpzMul§5B-sub k={k} verifyT] A_{ki}[{_szAi - 1UL:N0}]={_ai5_top:X16} B_{kj}[{_szBj - 1UL:N0}]={_bj5_top2:X16} expHi={_expTopHi:X16} expLo={_expTopLo:X16} expSzProd={_expSzProd:N0} actSzProd={_logPre:N0} actTop={_sp5Top:X16} actTop-1={_sp5Top2:X16} cmpExp={_expTopForCmp:X16} diff(act-exp)={_topDiff:X16}{vbCrLf}")
+                        AppendLog($"[SafeMpzMul§5B-sub k={k} verifyT] A_{ki}[{_szAi - 1UL:N0}]={_ai5_top:X16} B_{kj}[{_szBj - 1UL:N0}]={_bj5_top2:X16} expHi={_expTopHi:X16} expLo={_expTopLo:X16} expSzProd={_expSzProd:N0} actSzProd={_logPre:N0} actTop={_sp5Top:X16} actTop-1={_sp5Top2:X16} cmpExp={_expTopForCmp:X16} diff(act-exp)={_topDiff:X16}{vbCrLf}", 5)   ' §252 (#95)
                     End If
                 End If
                 ' §222 (issue #60): use the parallel-pre-shifted buffer when available.
@@ -4319,7 +4319,7 @@ Public Class Form1
                     Dim _accC3v0 As ULong = If(_IDX_C3 - 1L < CLng(_accC3sz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_accC3DPtr, CInt((_IDX_C3 - 1L) * 8L))), 0UL)
                     Dim _accC3v1 As ULong = If(_IDX_C3 < CLng(_accC3sz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_accC3DPtr, CInt(_IDX_C3 * 8L))), 0UL)
                     Dim _accC3v2 As ULong = If(_IDX_C3 + 1L < CLng(_accC3sz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_accC3DPtr, CInt((_IDX_C3 + 1L) * 8L))), 0UL)
-                    AppendLog($"[SafeMpzMul§5B-c3 k={k}] post-add accum[{_IDX_C3 - 1L:N0}]={_accC3v0:X16} accum[{_IDX_C3:N0}]={_accC3v1:X16} accum[{_IDX_C3 + 1L:N0}]={_accC3v2:X16} accumSz={_accC3sz:N0}{vbCrLf}")
+                    AppendLog($"[SafeMpzMul§5B-c3 k={k}] post-add accum[{_IDX_C3 - 1L:N0}]={_accC3v0:X16} accum[{_IDX_C3:N0}]={_accC3v1:X16} accum[{_IDX_C3 + 1L:N0}]={_accC3v2:X16} accumSz={_accC3sz:N0}{vbCrLf}", 5)   ' §252 (#95)
                 End If
                 ' §5B-d-L2: Level-2 recursive C-3 — at the inner SafeMpzMul calls that produce
                 ' prods(6/7/8) of the outer 175M × 87.5M call (gated by szA=58,333,333 ∧
@@ -4343,7 +4343,7 @@ Public Class Form1
                     Dim _accD8 As ULong = If(_IDX_D_P8 < CLng(_accDsz), CULng(Runtime.InteropServices.Marshal.ReadInt64(_accDDPtr, CInt(_IDX_D_P8 * 8L))), 0UL)
                     Dim _opBd_d2 As Long = Runtime.InteropServices.Marshal.ReadInt64(opB.Pointer, 8)
                     Dim _opB0_d2 As ULong = If(_opBd_d2 <> 0L, CULng(Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_opBd_d2), 0)), 0UL)
-                    AppendLog($"[SafeMpzMul§5B-d-L2 k={k} opB[0]={_opB0_d2:X16}] post-add accum[{_IDX_D_P7:N0}]={_accD7:X16} accum[{_IDX_D_P8:N0}]={_accD8:X16} accumSz={_accDsz:N0}{vbCrLf}")
+                    AppendLog($"[SafeMpzMul§5B-d-L2 k={k} opB[0]={_opB0_d2:X16}] post-add accum[{_IDX_D_P7:N0}]={_accD7:X16} accum[{_IDX_D_P8:N0}]={_accD8:X16} accumSz={_accDsz:N0}{vbCrLf}", 5)   ' §252 (#95)
                 End If
                 ' §212 (2026-05-15): depth-0 RAM diagnostics for top-level §gen calls.
                 ' Gated on szA + szB > 800M limbs — at 5B scale this fires ONLY at the
@@ -4359,9 +4359,9 @@ Public Class Form1
                         Dim _212priv As Long = _212proc.PrivateMemorySize64
                         Dim _212accSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
                         Dim _212accAlloc As Integer = Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0)
-                        AppendLog($"[SafeMpzMul§212] depth-0 k={k} END  szA={szA:N0} szB={szB:N0} WS={_212ws \ 1048576L:N0}MB Priv={_212priv \ 1048576L:N0}MB accumSz={_212accSz:N0} accumAlloc={_212accAlloc:N0}{vbCrLf}")
+                        AppendLog($"[SafeMpzMul§212] depth-0 k={k} END  szA={szA:N0} szB={szB:N0} WS={_212ws \ 1048576L:N0}MB Priv={_212priv \ 1048576L:N0}MB accumSz={_212accSz:N0} accumAlloc={_212accAlloc:N0}{vbCrLf}", 5)   ' §252 (#95)
                     Catch _212ex As Exception
-                        AppendLog($"[SafeMpzMul§212] depth-0 k={k} diag failed: {_212ex.Message}{vbCrLf}")
+                        AppendLog($"[SafeMpzMul§212] depth-0 k={k} diag failed: {_212ex.Message}{vbCrLf}", 5)   ' §252 (#95)
                     End Try
                 End If
                 GmpRaw_clear(prods(k).Pointer) : Runtime.InteropServices.Marshal.FreeHGlobal(prods(k).Pointer)
@@ -5491,8 +5491,8 @@ Public Class Form1
             _5b_rMid = CULng(Runtime.InteropServices.Marshal.ReadInt64(_rD5, CInt(CLng(szR \ 2) * 8L)))
             _5b_rTop2 = CULng(Runtime.InteropServices.Marshal.ReadInt64(_rD5, CInt(CLng(szR - 2) * 8L)))
             _5b_rTop = CULng(Runtime.InteropServices.Marshal.ReadInt64(_rD5, CInt(CLng(szR - 1) * 8L)))
-            AppendLog($"[SafeMpzDiv§5B-a] a[0]={_5b_aBot:X16} a[1]={_5b_aBot2:X16} a[mid={szA \ 2:N0}]={_5b_aMid:X16} a[szA-2]={_5b_aTop2:X16} a[szA-1]={_5b_aTop:X16}{vbCrLf}")
-            AppendLog($"[SafeMpzDiv§5B-r] r[0]={_5b_rBot:X16} r[1]={_5b_rBot2:X16} r[mid={szR \ 2:N0}]={_5b_rMid:X16} r[szR-2]={_5b_rTop2:X16} r[szR-1]={_5b_rTop:X16}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-a] a[0]={_5b_aBot:X16} a[1]={_5b_aBot2:X16} a[mid={szA \ 2:N0}]={_5b_aMid:X16} a[szA-2]={_5b_aTop2:X16} a[szA-1]={_5b_aTop:X16}{vbCrLf}", 5)   ' §252 (#95)
+            AppendLog($"[SafeMpzDiv§5B-r] r[0]={_5b_rBot:X16} r[1]={_5b_rBot2:X16} r[mid={szR \ 2:N0}]={_5b_rMid:X16} r[szR-2]={_5b_rTop2:X16} r[szR-1]={_5b_rTop:X16}{vbCrLf}", 5)   ' §252 (#95)
         End If
 
         ' §220 (issue #55, 2026-05-22): §166 force-serial LIFTED.
@@ -5539,9 +5539,9 @@ Public Class Form1
             Dim _expArBot As ULong = _5b_aBot * _5b_rBot
             Dim _expArTopLow As ULong = 0UL
             Dim _expArTopHigh As ULong = System.Math.BigMul(_5b_aTop, _5b_rTop, _expArTopLow)
-            AppendLog($"[SafeMpzDiv§5B-ar] ar[0]={_arBot5:X16} ar[1]={_arBot5_2:X16} ar[mid={szAR \ 2:N0}]={_arMid5:X16} ar[szAR-2]={_arTop5_2:X16} ar[szAR-1]={_arTop5:X16}{vbCrLf}")
-            AppendLog($"[SafeMpzDiv§5B-arBot] actual ar[0]={_arBot5:X16}  expected (a[0]*r[0])_lo={_expArBot:X16}  match={(_arBot5 = _expArBot)}{vbCrLf}")
-            AppendLog($"[SafeMpzDiv§5B-arTop] actual ar[szAR-1..szAR-2]=[{_arTop5:X16} {_arTop5_2:X16}]  a[top]*r[top]=[hi={_expArTopHigh:X16} lo={_expArTopLow:X16}]  (top should be ≈ hi+carry; lo+carry should be near {_arTop5_2:X16}){vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-ar] ar[0]={_arBot5:X16} ar[1]={_arBot5_2:X16} ar[mid={szAR \ 2:N0}]={_arMid5:X16} ar[szAR-2]={_arTop5_2:X16} ar[szAR-1]={_arTop5:X16}{vbCrLf}", 5)   ' §252 (#95)
+            AppendLog($"[SafeMpzDiv§5B-arBot] actual ar[0]={_arBot5:X16}  expected (a[0]*r[0])_lo={_expArBot:X16}  match={(_arBot5 = _expArBot)}{vbCrLf}", 5)   ' §252 (#95)
+            AppendLog($"[SafeMpzDiv§5B-arTop] actual ar[szAR-1..szAR-2]=[{_arTop5:X16} {_arTop5_2:X16}]  a[top]*r[top]=[hi={_expArTopHigh:X16} lo={_expArTopLow:X16}]  (top should be ≈ hi+carry; lo+carry should be near {_arTop5_2:X16}){vbCrLf}", 5)   ' §252 (#95)
             ' §5B-q-mid: capture ar at the q-mid and q-quart shift positions for post-shift verification.
             ' kBits=11,200,000,067 ⇒ kLimb=175,000,001, kRem=3.  q has szQ=87,500,001 limbs.
             ' q[mid=43,750,000] derives from ar[218,750,001] and ar[218,750,002].
@@ -5553,7 +5553,7 @@ Public Class Form1
             _5b_arMid1 = CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt((_5bMidArIdx + 1L) * 8L)))
             _5b_arQuart0 = CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt(_5bQuartArIdx * 8L)))
             _5b_arQuart1 = CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt((_5bQuartArIdx + 1L) * 8L)))
-            AppendLog($"[SafeMpzDiv§5B-arQ-src] ar[{_5bQuartArIdx:N0}]={_5b_arQuart0:X16} ar[{_5bQuartArIdx+1:N0}]={_5b_arQuart1:X16} ar[{_5bMidArIdx:N0}]={_5b_arMid0:X16} ar[{_5bMidArIdx+1:N0}]={_5b_arMid1:X16}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-arQ-src] ar[{_5bQuartArIdx:N0}]={_5b_arQuart0:X16} ar[{_5bQuartArIdx+1:N0}]={_5b_arQuart1:X16} ar[{_5bMidArIdx:N0}]={_5b_arMid0:X16} ar[{_5bMidArIdx+1:N0}]={_5b_arMid1:X16}{vbCrLf}", 5)   ' §252 (#95)
             ' §5B-f3 capture: 100 evenly-spaced ar samples covering q's full range [0..szQ-1].
             ' szQ = 87,500,001, kLimb = 175,000,001.  Sample positions evenly across q indices.
             For _f3s As Integer = 0 To 99
@@ -5564,7 +5564,7 @@ Public Class Form1
                 _f3_arLo(_f3s) = If(_f3_arIdxLo >= 0L AndAlso _f3_arIdxLo < CLng(szAR), CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt(_f3_arIdxLo * 8L))), 0UL)
                 _f3_arHi(_f3s) = If(_f3_arIdxHi >= 0L AndAlso _f3_arIdxHi < CLng(szAR), CULng(Runtime.InteropServices.Marshal.ReadInt64(_arD5, CInt(_f3_arIdxHi * 8L))), 0UL)
             Next
-            AppendLog($"[SafeMpzDiv§5B-f3] captured 100 ar samples for post-shift verification (kLimb={_5bKLimb:N0} kRem=3){vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-f3] captured 100 ar samples for post-shift verification (kLimb={_5bKLimb:N0} kRem=3){vbCrLf}", 5)   ' §252 (#95)
         End If
 
         ' §5B-f1 (DONE — run 14 confirmed ar = a × r is fully correct via 1000
@@ -5596,12 +5596,12 @@ Public Class Form1
             Dim _F1_aSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(a.Pointer, 4))
             Dim _F1_rD As Long = Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8)
             Dim _F1_rSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
-            AppendLog($"[SafeMpzDiv§5B-f1] starting chunked-grid a × r reference (chunk={_F1_CHUNK:N0}, prealloc={_F1_MAX_LIMBS:N0} limbs/buf, {_F1_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}")
-            AppendLog($"[SafeMpzDiv§5B-f1] a sz={_F1_aSz:N0} r sz={_F1_rSz:N0}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-f1] starting chunked-grid a × r reference (chunk={_F1_CHUNK:N0}, prealloc={_F1_MAX_LIMBS:N0} limbs/buf, {_F1_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}", 5)   ' §252 (#95)
+            AppendLog($"[SafeMpzDiv§5B-f1] a sz={_F1_aSz:N0} r sz={_F1_rSz:N0}{vbCrLf}", 5)   ' §252 (#95)
             Dim _F1_eAccBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F1_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             Dim _F1_eShiftBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F1_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             If _F1_eAccBuf = IntPtr.Zero OrElse _F1_eShiftBuf = IntPtr.Zero Then
-                AppendLog($"[SafeMpzDiv§5B-f1] VirtualAlloc FAILED — skipping{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-f1] VirtualAlloc FAILED — skipping{vbCrLf}", 5)   ' §252 (#95)
                 If _F1_eAccBuf <> IntPtr.Zero Then VirtualFree(_F1_eAccBuf, UIntPtr.Zero, MEM_RELEASE)
                 If _F1_eShiftBuf <> IntPtr.Zero Then VirtualFree(_F1_eShiftBuf, UIntPtr.Zero, MEM_RELEASE)
             Else
@@ -5672,7 +5672,7 @@ Public Class Form1
                 Dim _F1_refSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_F1_refAcc, 4))
                 Dim _F1_refDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_F1_refAcc, 8))
                 Dim _F1_arDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(ar.Pointer, 8))
-                AppendLog($"[SafeMpzDiv§5B-f1] reference complete: subProducts={_F1_ckCount:N0} refSz={_F1_refSz:N0} ourArSz={szAR:N0}{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-f1] reference complete: subProducts={_F1_ckCount:N0} refSz={_F1_refSz:N0} ourArSz={szAR:N0}{vbCrLf}", 5)   ' §252 (#95)
                 ' Scan ar against reference at 1,000 evenly-spaced positions across the full range.
                 Const _F1_NUM_SAMPLES As Integer = 1000
                 Dim _F1_mismatchCount As Integer = 0
@@ -5687,12 +5687,12 @@ Public Class Form1
                         _F1_mismatchCount += 1
                         If _F1_firstMismatchIdx = -1L Then _F1_firstMismatchIdx = _F1_idx
                         If _F1_logCount < 10 Then
-                            AppendLog($"[SafeMpzDiv§5B-f1 MISMATCH] sample={_F1s} ar[{_F1_idx:N0}] reference={_F1_refV:X16} ourSafeMpzMul={_F1_arV:X16}{vbCrLf}")
+                            AppendLog($"[SafeMpzDiv§5B-f1 MISMATCH] sample={_F1s} ar[{_F1_idx:N0}] reference={_F1_refV:X16} ourSafeMpzMul={_F1_arV:X16}{vbCrLf}", 5)   ' §252 (#95)
                             _F1_logCount += 1
                         End If
                     End If
                 Next
-                AppendLog($"[SafeMpzDiv§5B-f1 SUMMARY] scanned {_F1_NUM_SAMPLES} ar positions across [0..{_F1_maxIdx:N0}], mismatches={_F1_mismatchCount}, firstMismatchArIdx={_F1_firstMismatchIdx}{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-f1 SUMMARY] scanned {_F1_NUM_SAMPLES} ar positions across [0..{_F1_maxIdx:N0}], mismatches={_F1_mismatchCount}, firstMismatchArIdx={_F1_firstMismatchIdx}{vbCrLf}", 5)   ' §252 (#95)
                 ' Cleanup — _refAcc and _ckShifted have swapped-in VirtualAlloc'd buffers.
                 Runtime.InteropServices.Marshal.FreeHGlobal(_F1_refAcc)
                 Runtime.InteropServices.Marshal.FreeHGlobal(_F1_ckShifted)
@@ -5726,12 +5726,12 @@ Public Class Form1
             Dim _F2_bSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
             Dim _F2_kLimb As Long = kBits \ 64L
             Dim _F2_kRem As Integer = CInt(kBits Mod 64L)
-            AppendLog($"[SafeMpzDiv§5B-f2] starting r×b chunked-grid reference (chunk={_F2_CHUNK:N0}, prealloc={_F2_MAX_LIMBS:N0} limbs/buf, {_F2_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}")
-            AppendLog($"[SafeMpzDiv§5B-f2] r sz={_F2_rSz:N0} b sz={_F2_bSz:N0} kBits={kBits:N0} kLimb={_F2_kLimb:N0} kRem={_F2_kRem}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-f2] starting r×b chunked-grid reference (chunk={_F2_CHUNK:N0}, prealloc={_F2_MAX_LIMBS:N0} limbs/buf, {_F2_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}", 5)   ' §252 (#95)
+            AppendLog($"[SafeMpzDiv§5B-f2] r sz={_F2_rSz:N0} b sz={_F2_bSz:N0} kBits={kBits:N0} kLimb={_F2_kLimb:N0} kRem={_F2_kRem}{vbCrLf}", 5)   ' §252 (#95)
             Dim _F2_eAccBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F2_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             Dim _F2_eShiftBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F2_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             If _F2_eAccBuf = IntPtr.Zero OrElse _F2_eShiftBuf = IntPtr.Zero Then
-                AppendLog($"[SafeMpzDiv§5B-f2] VirtualAlloc FAILED — skipping{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-f2] VirtualAlloc FAILED — skipping{vbCrLf}", 5)   ' §252 (#95)
                 If _F2_eAccBuf <> IntPtr.Zero Then VirtualFree(_F2_eAccBuf, UIntPtr.Zero, MEM_RELEASE)
                 If _F2_eShiftBuf <> IntPtr.Zero Then VirtualFree(_F2_eShiftBuf, UIntPtr.Zero, MEM_RELEASE)
             Else
@@ -5801,7 +5801,7 @@ Public Class Form1
                 Next i
                 Dim _F2_refSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_F2_refAcc, 4))
                 Dim _F2_refDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_F2_refAcc, 8))
-                AppendLog($"[SafeMpzDiv§5B-f2] r×b reference complete: subProducts={_F2_ckCount:N0} refSz={_F2_refSz:N0}{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-f2] r×b reference complete: subProducts={_F2_ckCount:N0} refSz={_F2_refSz:N0}{vbCrLf}", 5)   ' §252 (#95)
                 ' Inspect (r×b) at and around kLimb to assess r's correctness.
                 ' If r is exact: refSz should be kLimb or kLimb+1 (with limb kLimb in [0, 2^kRem)).
                 ' If r is short: refSz < kLimb (high zone is empty), or limb kLimb-1 is much smaller than 2^64.
@@ -5825,8 +5825,8 @@ Public Class Form1
                 Dim _F2_v_kL_aboveKRem As ULong = _F2_v_kL >> _F2_kRem
                 Dim _F2_v_kL_inRange As Boolean = (_F2_v_kL <= _F2_kBitsBoundary)
                 Dim _F2_aboveKLimbAllZero As Boolean = (_F2_v_kLp1 = 0UL AndAlso _F2_v_kLp2 = 0UL)
-                AppendLog($"[SafeMpzDiv§5B-f2 inspect] r×b[0]={_F2_v_bot:X16} r×b[1]={_F2_v_bot1:X16} r×b[kLimb-2]={_F2_v_kLm2:X16} r×b[kLimb-1]={_F2_v_kLm1:X16} r×b[kLimb]={_F2_v_kL:X16} r×b[kLimb+1]={_F2_v_kLp1:X16} r×b[kLimb+2]={_F2_v_kLp2:X16} r×b[top-1]={_F2_v_top2:X16} r×b[top]={_F2_v_top:X16}{vbCrLf}")
-                AppendLog($"[SafeMpzDiv§5B-f2 verdict] refSz={_F2_refSz:N0} kLimb={_F2_kLimb:N0} kRem={_F2_kRem} kRemMask={_F2_kBitsBoundary:X16} r×b[kLimb]>>kRem={_F2_v_kL_aboveKRem:X16} (should be 0 if r×b<2^kBits) inKBitsRange={_F2_v_kL_inRange} aboveKLimbAllZero={_F2_aboveKLimbAllZero}{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-f2 inspect] r×b[0]={_F2_v_bot:X16} r×b[1]={_F2_v_bot1:X16} r×b[kLimb-2]={_F2_v_kLm2:X16} r×b[kLimb-1]={_F2_v_kLm1:X16} r×b[kLimb]={_F2_v_kL:X16} r×b[kLimb+1]={_F2_v_kLp1:X16} r×b[kLimb+2]={_F2_v_kLp2:X16} r×b[top-1]={_F2_v_top2:X16} r×b[top]={_F2_v_top:X16}{vbCrLf}", 5)   ' §252 (#95)
+                AppendLog($"[SafeMpzDiv§5B-f2 verdict] refSz={_F2_refSz:N0} kLimb={_F2_kLimb:N0} kRem={_F2_kRem} kRemMask={_F2_kBitsBoundary:X16} r×b[kLimb]>>kRem={_F2_v_kL_aboveKRem:X16} (should be 0 if r×b<2^kBits) inKBitsRange={_F2_v_kL_inRange} aboveKLimbAllZero={_F2_aboveKLimbAllZero}{vbCrLf}", 5)   ' §252 (#95)
                 ' Option H: extended r×b logging at intermediate positions to discriminate
                 ' "r correct" (FF block extends ~87.5M limbs from kLimb-1 down) from
                 ' "r short by 2^5.45B" (FF block extends only ~3M limbs).
@@ -5840,17 +5840,17 @@ Public Class Form1
                     Dim _F2_idx As Long = _F2_kLimb - _F2_off
                     Dim _F2_v As ULong = _f2GetLimb(_F2_idx)
                     Dim _F2_isFF As Boolean = (_F2_v = &HFFFFFFFFFFFFFFFFUL)
-                    AppendLog($"[SafeMpzDiv§5B-f2 H] r×b[kLimb-{_F2_off:N0}={_F2_idx:N0}]={_F2_v:X16} isFF={_F2_isFF}{vbCrLf}")
+                    AppendLog($"[SafeMpzDiv§5B-f2 H] r×b[kLimb-{_F2_off:N0}={_F2_idx:N0}]={_F2_v:X16} isFF={_F2_isFF}{vbCrLf}", 5)   ' §252 (#95)
                     If Not _F2_isFF AndAlso _F2_ffBoundary = -1L Then _F2_ffBoundary = _F2_off
                 Next
                 If _F2_ffBoundary = -1L Then
-                    AppendLog($"[SafeMpzDiv§5B-f2 H verdict] All checked positions are 0xFF...FF: FF block extends >130M limbs → r is essentially correct.{vbCrLf}")
+                    AppendLog($"[SafeMpzDiv§5B-f2 H verdict] All checked positions are 0xFF...FF: FF block extends >130M limbs → r is essentially correct.{vbCrLf}", 5)   ' §252 (#95)
                 ElseIf _F2_ffBoundary < 5000000L Then
-                    AppendLog($"[SafeMpzDiv§5B-f2 H verdict] FF block ends within {_F2_ffBoundary:N0} limbs of top → r SHORT BY ≥ ~2^5.45B (Newton precision failure).{vbCrLf}")
+                    AppendLog($"[SafeMpzDiv§5B-f2 H verdict] FF block ends within {_F2_ffBoundary:N0} limbs of top → r SHORT BY ≥ ~2^5.45B (Newton precision failure).{vbCrLf}", 5)   ' §252 (#95)
                 ElseIf _F2_ffBoundary < 87000000L Then
-                    AppendLog($"[SafeMpzDiv§5B-f2 H verdict] FF block ends within {_F2_ffBoundary:N0} limbs of top → r SHORT BY some amount; investigate Newton precision.{vbCrLf}")
+                    AppendLog($"[SafeMpzDiv§5B-f2 H verdict] FF block ends within {_F2_ffBoundary:N0} limbs of top → r SHORT BY some amount; investigate Newton precision.{vbCrLf}", 5)   ' §252 (#95)
                 Else
-                    AppendLog($"[SafeMpzDiv§5B-f2 H verdict] FF block ends at {_F2_ffBoundary:N0} limbs (at/past expected ≈87.5M boundary) → r appears correct; bug is elsewhere.{vbCrLf}")
+                    AppendLog($"[SafeMpzDiv§5B-f2 H verdict] FF block ends at {_F2_ffBoundary:N0} limbs (at/past expected ≈87.5M boundary) → r appears correct; bug is elsewhere.{vbCrLf}", 5)   ' §252 (#95)
                 End If
                 ' Cleanup
                 Runtime.InteropServices.Marshal.FreeHGlobal(_F2_refAcc)
@@ -5980,7 +5980,7 @@ Public Class Form1
                 Dim _qMid5 As Long = If(CLng(szQ \ 2) < CLng(szQ), Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, CInt(CLng(szQ \ 2) * 8L)), 0L)
                 Dim _qBotPos5 As Long = If(1L < CLng(szQ), Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, 8), 0L)
                 Dim _qQuart5 As Long = Runtime.InteropServices.Marshal.ReadInt64(_qDPtr, CInt(21875000L * 8L))
-                AppendLog($"[SafeMpzDiv§5B-q] q[0]={_qBot:X16} q[1]={_qBotPos5:X16} q[quart=21,875,000]={_qQuart5:X16} q[mid={szQ \ 2:N0}]={_qMid5:X16} q[szQ-2]={_qTop2:X16} q[szQ-1]={_qTop:X16}{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-q] q[0]={_qBot:X16} q[1]={_qBotPos5:X16} q[quart=21,875,000]={_qQuart5:X16} q[mid={szQ \ 2:N0}]={_qMid5:X16} q[szQ-2]={_qTop2:X16} q[szQ-1]={_qTop:X16}{vbCrLf}", 5)   ' §252 (#95)
                 ' §5B-q-mid: verify q[mid] and q[quart] derive correctly from saved ar limbs.
                 ' kRem=3, so q[i] = (ar[kLimb+i] >> 3) | (ar[kLimb+i+1] << 61).
                 ' If actual ≠ expected ⇒ BigShiftRight has a 5B middle-limb bug.
@@ -5991,8 +5991,8 @@ Public Class Form1
                 Dim _expQQuart As ULong = (_5b_arQuart0 >> 3) Or (_5b_arQuart1 << 61)
                 Dim _actQMidU As ULong = CULng(_qMid5)
                 Dim _actQQuartU As ULong = CULng(_qQuart5)
-                AppendLog($"[SafeMpzDiv§5B-q-quart] actual q[21,875,000]={_actQQuartU:X16}  expected (ar[{21875000L+_kLimbQ5:N0}]>>3)|(ar[+1]<<61)={_expQQuart:X16}  match={(_actQQuartU = _expQQuart)}{vbCrLf}")
-                AppendLog($"[SafeMpzDiv§5B-q-mid]   actual q[43,750,000]={_actQMidU:X16}  expected (ar[{43750000L+_kLimbQ5:N0}]>>3)|(ar[+1]<<61)={_expQMid:X16}  match={(_actQMidU = _expQMid)}{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-q-quart] actual q[21,875,000]={_actQQuartU:X16}  expected (ar[{21875000L+_kLimbQ5:N0}]>>3)|(ar[+1]<<61)={_expQQuart:X16}  match={(_actQQuartU = _expQQuart)}{vbCrLf}", 5)   ' §252 (#95)
+                AppendLog($"[SafeMpzDiv§5B-q-mid]   actual q[43,750,000]={_actQMidU:X16}  expected (ar[{43750000L+_kLimbQ5:N0}]>>3)|(ar[+1]<<61)={_expQMid:X16}  match={(_actQMidU = _expQMid)}{vbCrLf}", 5)   ' §252 (#95)
                 ' §5B-f3 verify: scan all 100 captured pre-shift samples against actual q.
                 ' Mismatch ⇒ BigShiftRight is wrong at that index.  All match ⇒ shift is faithful
                 ' (so the bug must be in ar itself, or in the kBits computation, or upstream).
@@ -6007,12 +6007,12 @@ Public Class Form1
                         _f3_mismatchCount += 1
                         If _f3_firstMismatch = -1 Then _f3_firstMismatch = _f3s
                         If _f3_logCount < 10 Then
-                            AppendLog($"[SafeMpzDiv§5B-f3 MISMATCH] sample={_f3s} q[{_f3_qi:N0}] expected={_f3_expQ:X16} actual={_f3_actQ:X16} (ar_pre[{_kLimbQ5 + _f3_qi:N0}]={_f3_arLo(_f3s):X16} ar_pre[+1]={_f3_arHi(_f3s):X16}){vbCrLf}")
+                            AppendLog($"[SafeMpzDiv§5B-f3 MISMATCH] sample={_f3s} q[{_f3_qi:N0}] expected={_f3_expQ:X16} actual={_f3_actQ:X16} (ar_pre[{_kLimbQ5 + _f3_qi:N0}]={_f3_arLo(_f3s):X16} ar_pre[+1]={_f3_arHi(_f3s):X16}){vbCrLf}", 5)   ' §252 (#95)
                             _f3_logCount += 1
                         End If
                     End If
                 Next
-                AppendLog($"[SafeMpzDiv§5B-f3 SUMMARY] scanned 100 q positions, mismatches={_f3_mismatchCount}, firstMismatchSampleIdx={_f3_firstMismatch}{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-f3 SUMMARY] scanned 100 q positions, mismatches={_f3_mismatchCount}, firstMismatchSampleIdx={_f3_firstMismatch}{vbCrLf}", 5)   ' §252 (#95)
             End If
             ' §113: log q middle limbs to verify BigShiftRight correctness.
             If szQ = 21875001 Then
@@ -6188,7 +6188,7 @@ PostShiftCheckpoint:
         ' Capture qb's raw pointer immediately — before any native call that could corrupt qb.Pointer.
         Dim _qbPtr As IntPtr = qb.Pointer   ' = savedResultPtr set by SafeMpzMul
         Dim szQB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4))
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§184] qb raw: alloc={Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 0):N0} size={Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4):N0} _mp_d={Runtime.InteropServices.Marshal.ReadInt64(_qbPtr, 8):X16}{vbCrLf}")
+        If _logLevel >= 4 Then AppendLog($"[SafeMpzDiv§184] qb raw: alloc={Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 0):N0} size={Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4):N0} _mp_d={Runtime.InteropServices.Marshal.ReadInt64(_qbPtr, 8):X16}{vbCrLf}")
 
         ' §241 (issue #69): trim pooled temporaries left over from q×b. Census-before
         ' here captures the post-q×b retention (the highest-RAM point in the divide).
@@ -6219,13 +6219,13 @@ PostShiftCheckpoint:
             Dim _f4_aTop As ULong = If(szA >= 1, CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_aD, CInt(CLng(szA - 1) * 8L))), 0UL)
             Dim _f4_aTop1 As ULong = If(szA >= 2, CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_aD, CInt(CLng(szA - 2) * 8L))), 0UL)
             Dim _f4_aTop2 As ULong = If(szA >= 3, CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_aD, CInt(CLng(szA - 3) * 8L))), 0UL)
-            AppendLog($"[SafeMpzDiv§5B-f4 inputs] q[0]={_f4_q0:X16} q[1]={CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_qD, 8)):X16} b[0]={_f4_b0:X16} b[1]={CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_bD, 8)):X16}{vbCrLf}")
-            AppendLog($"[SafeMpzDiv§5B-f4 qbBot] qb[0]={_f4_qb0:X16} qb[1]={_f4_qb1:X16} (q[0]*b[0])_lo={_f4_expQb0:X16} match={(_f4_qb0 = _f4_expQb0)}{vbCrLf}")
-            AppendLog($"[SafeMpzDiv§5B-f4 qbTop] qb[szQB-1..-3]=[{_f4_qbTop:X16} {_f4_qbTop1:X16} {_f4_qbTop2:X16}] vs a[szA-1..-3]=[{_f4_aTop:X16} {_f4_aTop1:X16} {_f4_aTop2:X16}] szQB={szQB:N0} szA={szA:N0}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-f4 inputs] q[0]={_f4_q0:X16} q[1]={CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_qD, 8)):X16} b[0]={_f4_b0:X16} b[1]={CULng(Runtime.InteropServices.Marshal.ReadInt64(_f4_bD, 8)):X16}{vbCrLf}", 5)   ' §252 (#95)
+            AppendLog($"[SafeMpzDiv§5B-f4 qbBot] qb[0]={_f4_qb0:X16} qb[1]={_f4_qb1:X16} (q[0]*b[0])_lo={_f4_expQb0:X16} match={(_f4_qb0 = _f4_expQb0)}{vbCrLf}", 5)   ' §252 (#95)
+            AppendLog($"[SafeMpzDiv§5B-f4 qbTop] qb[szQB-1..-3]=[{_f4_qbTop:X16} {_f4_qbTop1:X16} {_f4_qbTop2:X16}] vs a[szA-1..-3]=[{_f4_aTop:X16} {_f4_aTop1:X16} {_f4_aTop2:X16}] szQB={szQB:N0} szA={szA:N0}{vbCrLf}", 5)   ' §252 (#95)
             ' Sanity: q × b should be ≤ a (since q = floor(a/b) ≈ q_true, q × b ≤ q_true × b ≤ a).
             ' qb's top limb should equal or be just below a's top.
             If _f4_qbTop > _f4_aTop Then
-                AppendLog($"[SafeMpzDiv§5B-f4 ALARM] qb[top]={_f4_qbTop:X16} > a[top]={_f4_aTop:X16} — qb is bigger than a in top limb (extreme overshoot){vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-f4 ALARM] qb[top]={_f4_qbTop:X16} > a[top]={_f4_aTop:X16} — qb is bigger than a in top limb (extreme overshoot){vbCrLf}", 5)   ' §252 (#95)
             End If
 
             ' §5B-f6: re-read a at the same positions §5B-a captured, verify integrity.
@@ -6245,11 +6245,11 @@ PostShiftCheckpoint:
             Dim _f6_okBot As Boolean = (_f6_a0 = _F6_EXP_A0 AndAlso _f6_a1 = _F6_EXP_A1)
             Dim _f6_okMid As Boolean = (_f6_aMid = _F6_EXP_AMID)
             Dim _f6_okTop As Boolean = (_f6_aTop2 = _F6_EXP_ATOP2 AndAlso _f6_aTop = _F6_EXP_ATOP)
-            AppendLog($"[SafeMpzDiv§5B-f6 a-integrity] a[0]={_f6_a0:X16} (exp {_F6_EXP_A0:X16}) a[1]={_f6_a1:X16} (exp {_F6_EXP_A1:X16}) okBot={_f6_okBot}{vbCrLf}")
-            AppendLog($"[SafeMpzDiv§5B-f6 a-integrity] a[mid=87,500,000]={_f6_aMid:X16} (exp {_F6_EXP_AMID:X16}) okMid={_f6_okMid}{vbCrLf}")
-            AppendLog($"[SafeMpzDiv§5B-f6 a-integrity] a[szA-2]={_f6_aTop2:X16} (exp {_F6_EXP_ATOP2:X16}) a[szA-1]={_f6_aTop:X16} (exp {_F6_EXP_ATOP:X16}) okTop={_f6_okTop}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-f6 a-integrity] a[0]={_f6_a0:X16} (exp {_F6_EXP_A0:X16}) a[1]={_f6_a1:X16} (exp {_F6_EXP_A1:X16}) okBot={_f6_okBot}{vbCrLf}", 5)   ' §252 (#95)
+            AppendLog($"[SafeMpzDiv§5B-f6 a-integrity] a[mid=87,500,000]={_f6_aMid:X16} (exp {_F6_EXP_AMID:X16}) okMid={_f6_okMid}{vbCrLf}", 5)   ' §252 (#95)
+            AppendLog($"[SafeMpzDiv§5B-f6 a-integrity] a[szA-2]={_f6_aTop2:X16} (exp {_F6_EXP_ATOP2:X16}) a[szA-1]={_f6_aTop:X16} (exp {_F6_EXP_ATOP:X16}) okTop={_f6_okTop}{vbCrLf}", 5)   ' §252 (#95)
             If Not (_f6_okBot AndAlso _f6_okMid AndAlso _f6_okTop) Then
-                AppendLog($"[SafeMpzDiv§5B-f6 ALARM] a was corrupted between SafeMpzDiv entry and qb completion!{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-f6 ALARM] a was corrupted between SafeMpzDiv entry and qb completion!{vbCrLf}", 5)   ' §252 (#95)
             End If
         End If
 
@@ -6277,12 +6277,12 @@ PostShiftCheckpoint:
             Dim _F5_qSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qPtr, 4))
             Dim _F5_bD As Long = Runtime.InteropServices.Marshal.ReadInt64(_bPtr, 8)
             Dim _F5_bSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_bPtr, 4))
-            AppendLog($"[SafeMpzDiv§5B-f5] starting q×b chunked-grid reference (chunk={_F5_CHUNK:N0}, prealloc={_F5_MAX_LIMBS:N0} limbs/buf, {_F5_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}")
-            AppendLog($"[SafeMpzDiv§5B-f5] q sz={_F5_qSz:N0} b sz={_F5_bSz:N0}{vbCrLf}")
+            AppendLog($"[SafeMpzDiv§5B-f5] starting q×b chunked-grid reference (chunk={_F5_CHUNK:N0}, prealloc={_F5_MAX_LIMBS:N0} limbs/buf, {_F5_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}", 5)   ' §252 (#95)
+            AppendLog($"[SafeMpzDiv§5B-f5] q sz={_F5_qSz:N0} b sz={_F5_bSz:N0}{vbCrLf}", 5)   ' §252 (#95)
             Dim _F5_eAccBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F5_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             Dim _F5_eShiftBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F5_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             If _F5_eAccBuf = IntPtr.Zero OrElse _F5_eShiftBuf = IntPtr.Zero Then
-                AppendLog($"[SafeMpzDiv§5B-f5] VirtualAlloc FAILED — skipping{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-f5] VirtualAlloc FAILED — skipping{vbCrLf}", 5)   ' §252 (#95)
                 If _F5_eAccBuf <> IntPtr.Zero Then VirtualFree(_F5_eAccBuf, UIntPtr.Zero, MEM_RELEASE)
                 If _F5_eShiftBuf <> IntPtr.Zero Then VirtualFree(_F5_eShiftBuf, UIntPtr.Zero, MEM_RELEASE)
             Else
@@ -6353,7 +6353,7 @@ PostShiftCheckpoint:
                 Dim _F5_refSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_F5_refAcc, 4))
                 Dim _F5_refDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_F5_refAcc, 8))
                 Dim _F5_qbDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_qbPtr, 8))
-                AppendLog($"[SafeMpzDiv§5B-f5] reference complete: subProducts={_F5_ckCount:N0} refSz={_F5_refSz:N0} ourQbSz={szQB:N0}{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-f5] reference complete: subProducts={_F5_ckCount:N0} refSz={_F5_refSz:N0} ourQbSz={szQB:N0}{vbCrLf}", 5)   ' §252 (#95)
                 Const _F5_NUM_SAMPLES As Integer = 1000
                 Dim _F5_mismatchCount As Integer = 0
                 Dim _F5_firstMismatchIdx As Long = -1L
@@ -6367,12 +6367,12 @@ PostShiftCheckpoint:
                         _F5_mismatchCount += 1
                         If _F5_firstMismatchIdx = -1L Then _F5_firstMismatchIdx = _F5_idx
                         If _F5_logCount < 10 Then
-                            AppendLog($"[SafeMpzDiv§5B-f5 MISMATCH] sample={_F5s} qb[{_F5_idx:N0}] reference={_F5_refV:X16} ourSafeMpzMul={_F5_qbV:X16}{vbCrLf}")
+                            AppendLog($"[SafeMpzDiv§5B-f5 MISMATCH] sample={_F5s} qb[{_F5_idx:N0}] reference={_F5_refV:X16} ourSafeMpzMul={_F5_qbV:X16}{vbCrLf}", 5)   ' §252 (#95)
                             _F5_logCount += 1
                         End If
                     End If
                 Next
-                AppendLog($"[SafeMpzDiv§5B-f5 SUMMARY] scanned {_F5_NUM_SAMPLES} qb positions across [0..{_F5_maxIdx:N0}], mismatches={_F5_mismatchCount}, firstMismatchQbIdx={_F5_firstMismatchIdx}{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§5B-f5 SUMMARY] scanned {_F5_NUM_SAMPLES} qb positions across [0..{_F5_maxIdx:N0}], mismatches={_F5_mismatchCount}, firstMismatchQbIdx={_F5_firstMismatchIdx}{vbCrLf}", 5)   ' §252 (#95)
                 Runtime.InteropServices.Marshal.FreeHGlobal(_F5_refAcc)
                 Runtime.InteropServices.Marshal.FreeHGlobal(_F5_ckShifted)
                 GmpRaw_clear(_F5_ckPartial) : Runtime.InteropServices.Marshal.FreeHGlobal(_F5_ckPartial)
@@ -6423,7 +6423,7 @@ PostShiftCheckpoint:
             GmpRaw_sub_ui(_qPtr, _qPtr, 1UI)
             GmpRaw_add(_remRaw, _remRaw, _bPtr)
         Loop
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv] adj-down complete: {_adjDown} iter(s){vbCrLf}")
+        If _logLevel >= 3 Then AppendLog($"[SafeMpzDiv] adj-down complete: {_adjDown} iter(s){vbCrLf}", 3)
 
         Dim _adjUp As Integer = 0
         Dim _171Done As Boolean = False
@@ -6527,7 +6527,7 @@ PostShiftCheckpoint:
                     Do While _deltaSz171 > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_deltaBuf171.ToInt64() + CLng(_deltaSz171 - 1) * 8L), 0) = 0L  ' §239: 64-bit-safe
                         _deltaSz171 -= 1
                     Loop
-                    AppendLog($"[SafeMpzDiv§171 pass={_171Pass}] bTop=0x{_bTop171:X16} szDelta={_deltaSz171:N0} szRemBefore={_szRemBefore171:N0}{vbCrLf}")
+                    AppendLog($"[SafeMpzDiv§171 pass={_171Pass}] bTop=0x{_bTop171:X16} szDelta={_deltaSz171:N0} szRemBefore={_szRemBefore171:N0}{vbCrLf}", 3)   ' §252 (#95)
                     If _deltaSz171 = 0 Then
                         GmpNativeAlloc_FreeRaw(_deltaBuf171, _deltaBytes171)
                         Throw New InvalidOperationException($"SafeMpzDiv §171 delta=0 on pass {_171Pass}: top-limb ratio too small. szRem={_szRem171}, szB={_szBForCorr218}, bTop=0x{_bTop171:X16}, shift218={_shift218}")
@@ -6549,7 +6549,7 @@ PostShiftCheckpoint:
                     ' §171-fix: read prod size from _prodHdr171 (captured raw) — _prod171.Pointer may be stale per §175.
                     Dim _szProd171 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_prodHdr171, 4))
                     Dim _ptrMatch171 As Boolean = (_prodHdr171 = _prod171.Pointer)
-                    AppendLog($"[SafeMpzDiv§171 pass={_171Pass}] szProd={_szProd171:N0} prodHdr=0x{_prodHdr171.ToInt64():X} prod.Ptr=0x{_prod171.Pointer.ToInt64():X} match={_ptrMatch171}{vbCrLf}")
+                    AppendLog($"[SafeMpzDiv§171 pass={_171Pass}] szProd={_szProd171:N0} prodHdr=0x{_prodHdr171.ToInt64():X} prod.Ptr=0x{_prod171.Pointer.ToInt64():X} match={_ptrMatch171}{vbCrLf}", 3)   ' §252 (#95)
                     GmpRaw_sub(_remRaw, _remRaw, _prodHdr171)
                     GmpRaw_clear(_prodHdr171)
                     Runtime.InteropServices.Marshal.FreeHGlobal(_prodHdr171)
@@ -6557,12 +6557,12 @@ PostShiftCheckpoint:
                     Runtime.InteropServices.Marshal.FreeHGlobal(_deltaHdr171)
                     GmpNativeAlloc_FreeRaw(_deltaBuf171, _deltaBytes171)
                     _szRem171 = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_remRaw, 4))
-                    AppendLog($"[SafeMpzDiv§171 pass={_171Pass}] done: szRemAfter={_szRem171:N0} Δ={_szRemBefore171 - _szRem171:N0}{vbCrLf}")
+                    AppendLog($"[SafeMpzDiv§171 pass={_171Pass}] done: szRemAfter={_szRem171:N0} Δ={_szRemBefore171 - _szRem171:N0}{vbCrLf}", 3)   ' §252 (#95)
                     If _szRem171 >= _szRemBefore171 Then
                         Throw New InvalidOperationException($"SafeMpzDiv §171 pass {_171Pass} did not reduce rem SIZE: before={_szRemBefore171}, after={_szRem171}, szB={_szBForCorr218}, szProd={_szProd171}, ptrMatch={_ptrMatch171}, bTopBits_orig={_bTopBits171}, shift218={_shift218}. After §218 normalization this should not occur — investigate further.")
                     End If
                 Loop
-                AppendLog($"[SafeMpzDiv§171-done] {_171Pass} pass(es); szRem={_szRem171:N0} ≤ szB={_szBForCorr218:N0}{vbCrLf}")
+                AppendLog($"[SafeMpzDiv§171-done] {_171Pass} pass(es); szRem={_szRem171:N0} ≤ szB={_szBForCorr218:N0}{vbCrLf}", 3)   ' §252 (#95)
 
                 ' §218 (issue #78): denormalize rem back to original scale, then free the
                 ' normalized b copy. The outer adj-up loop and any downstream code references
@@ -6594,11 +6594,11 @@ PostShiftCheckpoint:
         ' §202-trace: dense logging through SafeMpzDiv exit cleanup.  The 5B-run-1 process
         ' died silently between "SafeMpzDiv done" and the next outer Newton checkpoint —
         ' this trace pinpoints which exit step (rem free, ckpt cleanup, return) was last.
-        AppendLog($"[SafeMpzDiv§202-exit] start cleanup; scope={_divCkptScope} szQ={szQ:N0}{vbCrLf}")
+        AppendLog($"[SafeMpzDiv§202-exit] start cleanup; scope={_divCkptScope} szQ={szQ:N0}{vbCrLf}", 3)   ' §252 (#95)
         q.Pointer = _qPtr  ' §§78-qptr: restore after adj loops used _qPtr directly
         GmpRaw_clear(_remRaw) : Runtime.InteropServices.Marshal.FreeHGlobal(_remRaw)
         remainder.Pointer = IntPtr.Zero
-        AppendLog($"[SafeMpzDiv§202-exit] remainder cleared and freed{vbCrLf}")
+        AppendLog($"[SafeMpzDiv§202-exit] remainder cleared and freed{vbCrLf}", 3)   ' §252 (#95)
 
         ' §217 (2026-05-19, user directive after gmpPi.bin loss on 5B run):
         ' NO CHECKPOINT IS DELETED MID-RUN.  The previous §171-ckpt and §211 §NR-ckpt
@@ -6617,7 +6617,7 @@ PostShiftCheckpoint:
         ' Cleanup happens externally between runs (Run-PiCompute.ps1's
         ' Invoke-CheckpointBackup + the §94 stale-snapshot purge at the start of a
         ' fresh non-resume run), never inside ComputePiGMP or SafeMpzDiv.
-        AppendLog($"[SafeMpzDiv§202-exit] returning to caller (§217: ckpt files preserved){vbCrLf}")
+        AppendLog($"[SafeMpzDiv§202-exit] returning to caller (§217: ckpt files preserved){vbCrLf}", 3)   ' §252 (#95)
     End Sub
 
     ' Compute result = floor(sqrt(n)).  Safe for any size n.
@@ -8091,7 +8091,7 @@ Phase2:
         _displayNativeLen = actualLen + 1L   ' includes null terminator (mirrors mpz_get_str path)
         _displayNativeBufSize = bufSize
 
-        AppendLog($"[§216] Chunked decimal conversion complete: {actualLen:N0} digits in {chunkIdx} chunks{vbCrLf}")
+        AppendLog($"[§216] Chunked decimal conversion complete: {actualLen:N0} digits in {chunkIdx} chunks{vbCrLf}", 1)   ' §252 (#95): final digit-count result → level 1
     End Sub
 
     ' ════════════════════════════════════════════════════════════════════════
@@ -8208,7 +8208,7 @@ Phase2:
         _displayNativeBufSize = bufSize
 
         Dim _totalElapsed As Double = (DateTime.Now - _t0).TotalSeconds
-        AppendLog($"[§226] Parallel decimal conversion complete: {actualDigits:N0} digits in {_totalElapsed:F2}s (powTable={_powElapsed:F1}s + convert={_convElapsed:F1}s){vbCrLf}")
+        AppendLog($"[§226] Parallel decimal conversion complete: {actualDigits:N0} digits in {_totalElapsed:F2}s (powTable={_powElapsed:F1}s + convert={_convElapsed:F1}s){vbCrLf}", 1)   ' §252 (#95): final digit-count result → level 1
     End Sub
 
     ' §226 helper: recursive halving.  Writes exactly `digits` chars to outBuf[offset..],

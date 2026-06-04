@@ -6301,3 +6301,36 @@ RAM; eliminating them is the real win.)
 and the harness `fullEq` check (chunked-full == §gen-full) is bit-identical (`fullEq=True`) ⟹ the
 §39 accumulate output is unchanged to the limb. Asymmetric cases (general non-§39 path, `bitsA`/`bitsB`
 shifts untouched) also still pass.
+
+## §252 / §257 — Logging-level ladder, single 0–5 integer scale (2026-06-04, issue #95)
+
+Supersedes the old compile-time `LOGGING_DETAIL` constant (Section 2.6) with a single **runtime**
+0–5 scale set by `--log-level N` (or the UI spinner), where each level is a strict superset of the
+one below. Every log line funnels through `AppendLog(message, Optional level As Integer = 2)` (and
+`WriteToLog`, which prepends a timestamp); a line is written **iff `level ≤ _logLevel`**.
+
+| Level | Name | Contains |
+|-------|------|----------|
+| **0** | Silent | Nothing — byte-empty log even through a full run. |
+| **1** | Errors + result | Crashes/exceptions (`WriteExceptionToLog`), OOM / allocator-abort / corruption, final digit-count result, verify outcome. |
+| **2** | Phase milestones *(default)* | Phase 1/2/3 start/done, checkpoint save/restore, level-combine summaries, reciprocal/sqrt/divide start+done, DOP/MemoryBudget decisions. |
+| **3** | Sub-phase progress | Per-level combine, per-Newton-iter, divide stages (`§171`/`§202`/`§144`/`§222`), `[§251-gate]`. |
+| **4** | Detailed diagnostics | Per-large-mul path decisions, `BinarySplitChunk`, `§184` qb-raw header dumps, `§250`/`§251 TIMING` per-iter. |
+| **5** | Exceptionally detailed | Per-sub-product `[SafeMpzMul§gen]` limb dumps, `[NR1xx]`/`§5B-*` verify traces, native per-alloc logging — debugging only, expected to be slow. |
+
+**§252 (core, commit 5630de4):** added the gated `AppendLog`/`WriteToLog` sink + the ladder; moved
+the per-sub-product `§gen` spam (which had been firing at the default level and adding **hours** of
+log I/O to 1B/5B runs) down to level 5; `#52` Newton status box.
+
+**§257 (the tail, this commit):** populated **level 1** (allocator OOM/abort/corruption messages and
+the decimal-conversion `complete: N digits` result line were defaulting to 2 ⟹ invisible at level 1);
+gated the always-on `§250 VERIFY-OK` / `§251 TIMING` per-iter diagnostics to level 4; demoted the
+`§5B-*` full-reference verify dumps and the `§136/§178/§183/§212` size-gated probes to level 5; and
+moved divide-adjust detail (`§171`-pass/`§202`-exit/`§222`/`§184`) to 3–4. The `§171-ckpt` checkpoint
+lines stay at 2 (checkpoint save/restore is a milestone).
+
+**Validation (quick, 1 M from-scratch at each level):** L0 = **0 bytes** (truly silent); L1 = banner
++ `Verify OK` only; L2 = phase milestones with **zero `§gen`/`§NR`/`§5B` spam**; monotonic byte
+spread **0 < 476 < 11 197 < 16 559** (L0/L1/L2/L5). Logging is orthogonal to the math, so no long run
+or checkpoint is needed to verify. (Remaining `#95`-open polish: a handful of `WriteToLog` progress
+lines could still be re-tiered, but the four acceptance criteria are met.)
