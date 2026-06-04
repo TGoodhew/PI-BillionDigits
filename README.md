@@ -6334,3 +6334,40 @@ lines stay at 2 (checkpoint save/restore is a milestone).
 spread **0 < 476 < 11 197 < 16 559** (L0/L1/L2/L5). Logging is orthogonal to the math, so no long run
 or checkpoint is needed to verify. (Remaining `#95`-open polish: a handful of `WriteToLog` progress
 lines could still be re-tiered, but the four acceptance criteria are met.)
+
+## §258–§260 — Run telemetry, ETA estimator, performance advisor (2026-06-04, issues #62 / #63)
+
+Three small partial-class files add a run-observability layer. All purely additive — they never
+touch the π math, checkpoint format, or SnapshotStore; every I/O path is best-effort.
+
+- **§258 telemetry foundation (`Form1.Telemetry.vb`):** `LogPhase` now feeds `Telemetry_OnPhase`,
+  which records each canonical stage's wall time keyed on a stable `RunStageId`
+  enum (Phase1/Phase2/Sqrt/Numerator/Divide/Output) — NOT the freeform log text, so re-wording a
+  log line can't silently break the consumers. At run end the compute thread appends one JSON-lines
+  record to `%APPDATA%\PI-BillionDigits\run_history.json` (schema_version, outcome, digits,
+  per-stage wall_seconds, and a cached hardware fingerprint: P/E cores via §224, RAM via §243, and a
+  best-effort `Win32_PhysicalMemory` CIM probe for DRAM speed/configured-speed/DIMM count). Written
+  synchronously on success (the headless `Application.Exit` can pre-empt the `Finally`), with the
+  `Finally` as the crash/abort fallback.
+- **§259 ETA estimator (`Form1.Eta.vb`, #62):** `Eta_ProjectRemainingSeconds` is a PURE function —
+  ETA = Σ remaining-stage cost; done/skipped stages contribute 0, the in-flight stage projects from
+  its own elapsed/fraction, not-started stages draw from history (exact same-digit match ⇒ *high*
+  confidence) else a 1 B default scaled by `digits^exponent` (*low*). Live-refreshed on each stage
+  boundary and, for the dominant Divide stage, on each reciprocal Newton iteration (fraction =
+  iter/`_minNrIters`, encoding the §200 fixed-iteration cost model). Minimal UI: window title +
+  level-2 `[ETA§259]` log line.
+- **§260 performance advisor (`Form1.Advisor.vb`, #63):** `Advisor_Evaluate` is a PURE conservative
+  rules engine — a rule fires only when its inputs are known (XMP-off when configured < rated;
+  single-channel when one DIMM; bandwidth-bound `#88` when many cores busy at rated speed in a
+  compute stage; under-utilisation `#42` when few cores busy; an *info* line when memory topology is
+  unknown). Savings are shown as ranges scaled from the 2026-05-10 audit, never averaged into false
+  precision. Rendered at run start (hardware advice) to the level-2 log.
+
+**Validation (headless):** `--test-eta` (7 assertions — monotonic projection, exact live-fraction
+projection, formatter units/confidence) and `--test-advisor` (6 profiles incl. a well-tuned machine
+yielding **zero** recommendations) both PASS. End-to-end 1 M runs confirm `run_history.json` is
+written with all 6 stages + full hardware fingerprint, `[ETA§259]` refreshes across stage
+transitions, a 2nd same-digit run flips ETA confidence low→**high**, and `[Advisor§260]` correctly
+emits 0 recommendations on this XMP-on dual-channel box. Deferred (logic present, UI/sampling
+follow-ups): live per-minute CPU-utilisation sampling to drive the compute-load advisor rules during
+a run, and a dedicated designer label/tab (the data layer + rules are done and unit-tested).

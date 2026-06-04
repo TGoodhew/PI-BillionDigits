@@ -81,6 +81,8 @@ Public Class Form1
     ' one-line progress string to LblStatus.  Set by Form1_Load to marshal onto the UI thread;
     ' null/try-wrapped so headless runs and races are harmless.  Not gated by _logLevel (it's the UI).
     Private Shared _statusHook As Action(Of String) = Nothing
+    ' §259 (#62): per-iter reciprocal ETA refinement hook (iterDone, minIters). Set by Form1_Load.
+    Private Shared _etaReciprocalHook As Action(Of Integer, Integer) = Nothing
     ' §93: Checkpoint/resume support.
     ' --checkpoint-from-level N: serialize nodes at level >= N regardless of threshold.
     ' --resume-from-level N: skip Phase 1 + levels 1..N-1; reload checkpoint files for level N.
@@ -135,6 +137,9 @@ Public Class Form1
     Private Shared _testMulHigh As Boolean = False
     ' §251 (#70): --test-chunkedgrid ran the standalone chunked-grid self-test (then exit).
     Private Shared _testChunkedGrid As Boolean = False
+    ' §259/§260 (#62/#63): --test-eta / --test-advisor run the estimator + advisor self-tests, then exit.
+    Private Shared _testEta As Boolean = False
+    Private Shared _testAdvisor As Boolean = False
     ' Set at SafeMpzReciprocal entry from env: PI_RECIP_SHORTMUL=1 enables the high-half
     ' product in capped iters; PI_RECIP_SHORTMUL_VERIFY=1 additionally computes the full
     ' product, compares the exact region + overestimate, and falls back to full on any
@@ -1573,6 +1578,10 @@ Public Class Form1
                     _testMulHigh = True   ' §250 (#94): run SafeMpzMulHigh self-test after GMP init, then exit
                 Case "--test-chunkedgrid"
                     _testChunkedGrid = True   ' §251 (#70): run SafeMpzMul_ChunkedGrid self-test, then exit
+                Case "--test-eta"
+                    _testEta = True           ' §259 (#62): run ETA-estimator self-test, then exit
+                Case "--test-advisor"
+                    _testAdvisor = True       ' §260 (#63): run performance-advisor self-test, then exit
                 Case "--log-level"
                     If i + 1 < args.Length Then
                         Dim lvl As Integer
@@ -1599,6 +1608,10 @@ Public Class Form1
                           Catch
                           End Try
                       End Sub
+        ' §259 (#62): wire the per-iter reciprocal ETA refinement onto this instance.
+        _etaReciprocalHook = Sub(iterDone As Integer, minIters As Integer)
+                                 Try : Eta_OnReciprocalProgress(iterDone, minIters) : Catch : End Try
+                             End Sub
         TxtDigitsofPI.Text = If(TxtDigitsofPI.Text <> "", TxtDigitsofPI.Text, "1,000,000")
         ChkboxDisplay.Checked = Not _headless
         Label3.Visible = ChkboxDisplay.Checked
@@ -1701,6 +1714,16 @@ Public Class Form1
             Dim _cgOk As Boolean = TestChunkedGrid()
             AppendLog($"[TestChunkedGrid] OVERALL: {If(_cgOk, "PASS", "FAIL")}{vbCrLf}")
             Environment.Exit(If(_cgOk, 0, 1))
+        End If
+        If _testEta Then
+            Dim _etaOk As Boolean = TestEta()                          ' §259 (#62)
+            AppendLog($"[TestEta] OVERALL: {If(_etaOk, "PASS", "FAIL")}{vbCrLf}", 1)
+            Environment.Exit(If(_etaOk, 0, 1))
+        End If
+        If _testAdvisor Then
+            Dim _advOk As Boolean = TestAdvisor()                      ' §260 (#63)
+            AppendLog($"[TestAdvisor] OVERALL: {If(_advOk, "PASS", "FAIL")}{vbCrLf}", 1)
+            Environment.Exit(If(_advOk, 0, 1))
         End If
         If Environment.GetEnvironmentVariable("PI_TEST_DOPGATE") = "1" Then
             ' §251 (#70): print the would-be §gen DOP for the 1B & 5B reciprocal mul sizes, so we can
@@ -1944,6 +1967,7 @@ Public Class Form1
     End Sub
 
     Private Sub LogPhase(phaseName As String)
+        Telemetry_OnPhase(phaseName)   ' §258 (#62/#63): record canonical stage timing + refresh ETA
         Dim elapsed As TimeSpan = stopWatch.Elapsed
         Dim phaseTime As TimeSpan = phaseStopWatch.Elapsed
         phaseStopWatch.Restart()
@@ -2011,8 +2035,20 @@ Public Class Form1
         RtbPiDigits.AppendText("Starting computation..." & vbCrLf)
         Dim computeThread As New System.Threading.Thread(
             Sub()
+                Dim _runOutcome As String = "crashed"   ' §258 (#62/#63): run_history.json outcome
+                Dim _telDone As Boolean = False
+                ' §260 (#63): surface the evergreen hardware advice (XMP/channel/DRAM speed) at run
+                ' start.  coresActive=0 ⇒ the live compute-utilisation rules are skipped (they need a
+                ' CPU sample, deferred); only the hardware rules fire.  Also warms the HW fingerprint.
+                Try : Advisor_Render(Advisor_CurrentMetrics(0.0, RunStageId.Phase1)) : Catch : End Try
                 Try
                     Dim result As String = ComputePiGMP(DIGITS, cts.Token)
+                    _runOutcome = If(cts.IsCancellationRequested, "aborted", "success")
+                    ' §258: write the run record HERE (all stages are recorded inside ComputePiGMP,
+                    ' which has returned).  The headless autoverify path below calls Application.Exit
+                    ' via a synchronous Invoke and the process can tear down before the Finally runs,
+                    ' so the success/abort write must happen synchronously on this thread first.
+                    Try : Telemetry_WriteRunHistory(_runOutcome, DIGITS) : _telDone = True : Catch : End Try
                     If _displayNativePtr <> IntPtr.Zero OrElse result <> "" Then
                         Me.Invoke(Sub() StreamPiToScreen(result))
                     End If
@@ -2075,6 +2111,12 @@ Public Class Form1
                                   BtnPause.Enabled = False
                                   Timer1.Stop()
                               End Sub)
+                Finally
+                    ' §258 (#62/#63): fallback for the crash/abort paths (the success path already
+                    ' wrote synchronously above).  Best-effort — never rethrows.
+                    If Not _telDone Then
+                        Try : Telemetry_WriteRunHistory(_runOutcome, DIGITS) : Catch : End Try
+                    End If
                 End Try
             End Sub, 256 * 1024 * 1024)
         computeThread.IsBackground = True
@@ -4938,6 +4980,8 @@ Public Class Form1
             ' §253 (#52): surface reciprocal-Newton progress in the UI status box (not gated by
             ' _logLevel — it's the UI).  Shows iter / target-iters and precision reached.
             If _statusHook IsNot Nothing Then _statusHook($"Reciprocal Newton: iter {_nrIter}/{_minNrIters}  prec {prec:N0}/{rBits + 2L:N0} bits")
+            ' §259 (#62): refine the Divide-stage ETA from the §200 fixed iteration schedule.
+            If _etaReciprocalHook IsNot Nothing Then _etaReciprocalHook(_nrIter, _minNrIters)
 
             ' §107-fix: do NOT truncate r.  Keep r in full domain (magnitude ~2^rBits).
             ' The shift formula kBits-bShift is calibrated for r at full domain.
