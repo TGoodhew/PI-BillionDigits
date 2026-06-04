@@ -6283,3 +6283,21 @@ regime; **1 B π SHA bit-identical to the oracle**; 5 B engages cleanly (`§251-
 szR = 259.5 M, ~33 min per capped iter, no crash). Correctness rests on the overestimate→underestimate
 →§171-corrects chain, not on bit-exact `r`. RAM-cap full-product dispatch (a×r/q×b) is a separate,
 lower-priority follow-up (chunked-full is ~1.4× slower than §gen — a memory win, not speed).
+
+## §256 — §39 column-group accumulate via mpn offset (2026-06-04, issue #45)
+
+The §39 symmetric fast path (`mA = mB`, `mA+mB ≤ 50 M`) combined its five column sums into the
+result by **shifting each by `col·bitsA` bits** (`mul_2exp` into a shared ~1.2 GB scratch buffer)
+then `mpz_add`-ing into an accumulator — five whole-buffer shift-copies (O(5×result) memory
+bandwidth) plus the big scratch alloc. Since `bitsA = mA·64`, a column's shift of `col·bitsA` **bits**
+is exactly a `col·mA`-**limb** offset (no sub-limb remainder), so the shift is unnecessary: each
+column sum now `__gmpn_add`s straight into the zeroed result buffer at limb offset `col·mA` (the same
+offset-accumulation trick §251 uses). This removes all five `mul_2exp` shifts and the 1.2 GB scratch
+buffer; the accumulate drops to O(Σ column-sums). (#45 originally proposed *parallelising* the
+shifts — rejected: the shifts are memory-bandwidth-bound, so parallel threads would just contend on
+RAM; eliminating them is the real win.)
+
+**Validation:** `--test-chunkedgrid` — the symmetric squaring cases (8 M², 26 M²) route through §39,
+and the harness `fullEq` check (chunked-full == §gen-full) is bit-identical (`fullEq=True`) ⟹ the
+§39 accumulate output is unchanged to the limb. Asymmetric cases (general non-§39 path, `bitsA`/`bitsB`
+shifts untouched) also still pass.

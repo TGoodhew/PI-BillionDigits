@@ -4055,47 +4055,34 @@ Public Class Form1
                 For _colS As Integer = 0 To 4 : _doColAdd(_colS) : Next
             End If
 
-            ' §246: serial shift + accumulate pass (shared _sv_shifted_hdr + ordered accumPtr).
+            ' §256 (#45 Layer 2/3): mpn OFFSET-accumulation — replaces the per-column mul_2exp shift
+            ' (+ shared _sv_shifted_hdr buffer + ordered GmpRaw_add) with a direct mpn_add at limb
+            ' offset col·mA.  bitsA = mA·64, so a column's shift of col·bitsA bits is exactly col·mA
+            ' LIMBS (no sub-limb shift) — the column-sum adds straight into accumBuf at that offset
+            ' (the chunked-grid pattern).  Eliminates the O(result) shift copy + the ~1.2 GB shifted
+            ' buffer; accumulate is now O(Σ col-sum) not O(5×result).  accumBuf is zeroed first (the
+            ' offset adds read the gaps).  Shifts are memory-bandwidth-bound, so this beats the
+            ' originally-planned "parallelise the shifts" (which would just contend on RAM bandwidth).
+            ZeroMemory(accumBuf, New UIntPtr(CULng(CLng(_resultLimbs) * 8L)))
             For _col As Integer = 0 To 4
                 Dim _bk As Integer = _col_base(_col)
-                ' Shift column sum and add to accumulator
-                Dim _colShift As ULong = CULng(_col) * bitsA
                 Dim _sv_bk As IntPtr = prods(_bk).Pointer
-                If _colShift = 0UL Then
-                    GmpRaw_add(accumPtr, accumPtr, _sv_bk)
-                Else
-                    Runtime.InteropServices.Marshal.WriteInt32(_sv_shifted_hdr, 4, 0)
-                    Dim _shiftSrc As IntPtr = _sv_bk
-                    Dim _shiftRem As ULong = _colShift
-                    While _shiftRem > 0UL
-                        Dim _chunk As UInteger = CUInt(System.Math.Min(_shiftRem, CULng(UInt32.MaxValue)))
-                        GmpRaw_mul_2exp(_sv_shifted_hdr, _shiftSrc, _chunk)
-                        _shiftSrc = _sv_shifted_hdr
-                        _shiftRem -= CULng(_chunk)
-                    End While
-                    GmpRaw_add(accumPtr, accumPtr, _sv_shifted_hdr)
-                End If
-                ' §114: per-column diagnostic for q*b (mA=mB=7,291,667 symmetric call).
-                If _logLevel >= 2 AndAlso mA = 7291667UL Then
-                    Dim _114bkSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_bk, 4))
-                    Dim _114shSz As Integer = If(_colShift = 0UL, _114bkSz, System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_shifted_hdr, 4)))
-                    Dim _114aSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
-                    Dim _114bkDPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(_sv_bk, 8))
-                    ' §237 (issue #86): 64-bit safe pointer arithmetic — latent at 5 B since this block is gated by mA=7291667 (1 B-tuned).
-                    Dim _114bkTop As Long = If(_114bkSz >= 1, Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(_114bkDPtr.ToInt64() + (CLng(_114bkSz) - 1L) * 8L), 0), 0L)
-                    Dim _114bkBot As Long = If(_114bkSz >= 1, Runtime.InteropServices.Marshal.ReadInt64(_114bkDPtr, 0), 0L)
-                    AppendLog($"[SafeMpzMul§114] §39 col={_col} shift={_colShift:N0} szBk={_114bkSz:N0} bkTop={_114bkTop:X16} bkBot={_114bkBot:X16} szShifted={_114shSz:N0} szAccum={_114aSz:N0}{vbCrLf}")
-                    ' For col=4 (A2*B2): log accum at the position driving the rem error.
-                    If _col = 4 Then
-                        Const _114EL As Long = 42779664L
-                        Dim _114ADPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(accumPtr, 8))
-                        Dim _114AV As Long = If(_114EL < CLng(_114aSz), Runtime.InteropServices.Marshal.ReadInt64(_114ADPtr, CInt(_114EL * 8L)), 0L)
-                        AppendLog($"[SafeMpzMul§114] accum[{_114EL:N0}]={_114AV:X16}{vbCrLf}")
-                    End If
+                Dim _bkSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_bk, 4))
+                If _bkSz > 0 Then
+                    Dim _bkD As Long = Runtime.InteropServices.Marshal.ReadInt64(_sv_bk, 8)
+                    Dim _off As Long = CLng(_col) * CLng(mA)   ' col·bitsA bits = col·mA limbs
+                    GmpRaw_mpn_add(New IntPtr(accumBuf.ToInt64() + _off * 8L), New IntPtr(accumBuf.ToInt64() + _off * 8L),
+                                   CInt(CLng(_resultLimbs) - _off), New IntPtr(_bkD), _bkSz)
                 End If
                 GmpRaw_clear(_sv_bk)
                 prods(_bk).Pointer = IntPtr.Zero : Runtime.InteropServices.Marshal.FreeHGlobal(_sv_bk)
             Next _col
+            ' Normalize accumPtr _mp_size (highest nonzero limb) — mpn_add wrote raw limbs into accumBuf.
+            Dim _accSz As Integer = CInt(_resultLimbs)
+            While _accSz > 0 AndAlso Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(accumBuf.ToInt64() + CLng(_accSz - 1) * 8L)) = 0L
+                _accSz -= 1
+            End While
+            Runtime.InteropServices.Marshal.WriteInt32(accumPtr, 4, _accSz)
         Else
             ' §222 (issue #60, 2026-05-22): parallel shift pre-pass for asymmetric §gen path.
             '
