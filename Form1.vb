@@ -624,6 +624,12 @@ Public Class Form1
     Private Shared Function PoolGet(sz As Long) As IntPtr
         If sz > 0L AndAlso sz <= POOL_MAX_BLOCK Then
             Dim b As Integer = PoolBucket(sz)
+            ' §96 (#96): the MANAGED pool (_gmpPool) is initialized ONLY in the fallback path
+            ' (InitGmpVirtualAllocFunctions, when GmpNativeAlloc_LoadGmp fails).  In normal NATIVE
+            ' mode _gmpPool(b) is Nothing, so this method NRE'd whenever a §79 compute-path pre-alloc
+            ' (tmpHigh/mpQ1/mpQ2/mpR0-2/Combine A-D in the §226 small-scale conversion) called it —
+            ' crashing small from-scratch runs in Phase 3.  Route to the native pool instead.
+            If _gmpPool(b) Is Nothing Then Return GmpNativeAlloc_PoolGet(sz)
             Dim ptr As IntPtr
             If _gmpPool(b).TryPop(ptr) Then
                 Interlocked.Decrement(_gmpPoolCount(b))  ' §20: maintain atomic count
@@ -8684,26 +8690,13 @@ BeforeStep4:
             Dim tmpHigh As New mpz_t()
             gmp_lib.mpz_init2(tmpHigh, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L))) ' seed with VirtualAlloc'd buffer
             Dim _tHNeeded As Long = _finalQSz - _k1Limbs + 2L   ' result ≤ finalQSz - k1Limbs limbs; +2 margin
-            Dim _tHBytes As Long = _tHNeeded * 8L
-            ' Only pre-alloc when the result buffer exceeds GMP_LARGE_THRESHOLD.
-            ' Below the threshold the init2 buffer (524 KB, VirtualAlloc'd) is already
-            ' large enough; replacing it with a smaller VirtualAlloc'd buffer would cause
-            ' GmpFreeFunc to route the later free through _savedGmpFree (CRT free) on a
-            ' VirtualAlloc'd pointer — crashing on small digit counts (< ~200K digits).
-            If _tHBytes >= GMP_LARGE_THRESHOLD Then
-                Dim _tHBuf As IntPtr = PoolGet(_tHBytes)  ' §79: PoolGet so pool bucket capacity matches actual allocation
-                If _tHBuf <> IntPtr.Zero Then
-                    Dim _tHOld As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(tmpHigh.Pointer, 8))
-                    VirtualFree(_tHOld, UIntPtr.Zero, MEM_RELEASE)  ' free the init2 seed buffer
-                    Runtime.InteropServices.Marshal.WriteInt32(tmpHigh.Pointer, 0, CInt(_tHNeeded))
-                    Runtime.InteropServices.Marshal.WriteInt64(tmpHigh.Pointer, 8, _tHBuf.ToInt64())
-                    WriteToLog($"[3PM-DBG] tmpHigh pre-alloc {_tHNeeded:N0} limbs ({_tHBytes \ 1048576L:N0} MB) ptr={_tHBuf:X}")
-                Else
-                    WriteToLog($"[3PM-DBG] tmpHigh pre-alloc FAILED for {_tHBytes \ 1048576L:N0} MB — will rely on GmpReallocFunc")
-                End If
-            Else
-                WriteToLog($"[3PM-DBG] tmpHigh pre-alloc skipped ({_tHNeeded:N0} limbs, {_tHBytes:N0} B < GMP threshold; init2 buffer sufficient)")
-            End If
+            ' §96 fix: pre-grow via PreAllocMpzToLimbs (NATIVE pool).  §79 originally called the
+            ' MANAGED PoolGet, but §30 later made the native allocator the default — leaving
+            ' _gmpPool(b) Nothing, so PoolGet threw NRE here in normal (native) mode and crashed
+            ' small from-scratch runs in Phase 3.  PreAllocMpzToLimbs uses GmpNativeAlloc_PoolGet +
+            ' frees the init2 seed buffer via GmpNativeAlloc_FreeRaw (the matching native free), and
+            ' no-ops below GMP_LARGE_THRESHOLD (init2 buffer kept) — same behaviour, native-correct.
+            PreAllocMpzToLimbs(tmpHigh, _tHNeeded)
             ' §227 (issue #61, 2026-05-22): pre-allocate mpQ1 + mpQ2 BEFORE the
             ' BigShiftRight + parallel-extraction block so both threads can use them.
             ' These k1-sized init+pre-alloc steps were previously between the Q0 and
