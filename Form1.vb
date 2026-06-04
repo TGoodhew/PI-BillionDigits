@@ -63,8 +63,24 @@ Public Class Form1
     ' Set by --autostart (suppress all dialogs) and --autoverify (run verify +
     ' Application.Exit after computation completes).
     Private _headless As Boolean = False
-    Private Shared _logLevel As Integer = 2   ' §107-diag: raised to 2 for Newton-loop trace
+    ' §252 (#95): single integer logging scale.  Every log goes through AppendLog(msg, level);
+    ' a message is written iff level <= _logLevel.  Strict superset ladder:
+    '   0 = Silent (nothing)
+    '   1 = Errors + final result (crashes/exceptions/OOM, final digit count + verify outcome)
+    '   2 = Phase milestones (default): Phase 1/2/3 start/done, checkpoints, reciprocal/sqrt/divide
+    '       start+done, DOP/MemoryBudget decisions, verify detail
+    '   3 = Sub-phase progress: per-level combine progress, per-Newton-iter, divide stages
+    '   4 = Detailed diagnostics: per-large-mul path/size decisions, reuse (§201/§230) detail
+    '   5 = Exceptionally detailed (debugging, expected slow): per-sub-product §gen limb dumps,
+    '       [NR1xx] limb traces, [BSR§129] per-chunk, §5B-* references, native per-alloc logging
+    ' Helpers: AppendLog(msg, Optional level=2), WriteToLog(msg, Optional level=2) [adds timestamp],
+    ' LogPhase [milestone, level 2 + UI].  --log-level N / UI spinner set _logLevel (0-5, default 2).
+    Private Shared _logLevel As Integer = 2
     Private _autoVerify As Boolean = False
+    ' §253 (#52): UI status hook so Shared compute code (SafeMpzReciprocal/SafeMpzDiv) can post a
+    ' one-line progress string to LblStatus.  Set by Form1_Load to marshal onto the UI thread;
+    ' null/try-wrapped so headless runs and races are harmless.  Not gated by _logLevel (it's the UI).
+    Private Shared _statusHook As Action(Of String) = Nothing
     ' §93: Checkpoint/resume support.
     ' --checkpoint-from-level N: serialize nodes at level >= N regardless of threshold.
     ' --resume-from-level N: skip Phase 1 + levels 1..N-1; reload checkpoint files for level N.
@@ -139,7 +155,12 @@ Public Class Form1
     ' on the log file and lose entries (or silently throw IOException).
     Private Shared ReadOnly _logLock As New Object()
 
-    Private Shared Sub AppendLog(message As String)
+    ' §252 (#95): single gated sink.  Writes iff level <= _logLevel.  Default level 2 (phase
+    ' milestones) so the ~155 historically-ungated AppendLog(msg) calls become level-2 (and are
+    ' suppressed at level 0/1).  Pass level:=1 for errors/result, 3-4 for progress/detail, 5 for
+    ' per-op limb-dump spam.  See the ladder at the _logLevel declaration.
+    Private Shared Sub AppendLog(message As String, Optional level As Integer = 2)
+        If level > System.Threading.Volatile.Read(_logLevel) Then Return   ' §27 cross-thread read
         SyncLock _logLock
             Try
                 System.IO.File.AppendAllText(LOG_FILE, message)
@@ -1554,6 +1575,14 @@ Public Class Form1
         Loop
 
         LblStatus.Text = "Ready"
+        ' §253 (#52): wire the Shared status hook so SafeMpzReciprocal can show NR-iter progress.
+        ' BeginInvoke marshals onto the UI thread; try-wrapped so a closing form can't throw.
+        _statusHook = Sub(s As String)
+                          Try
+                              If Not Me.IsDisposed Then Me.BeginInvoke(Sub() LblStatus.Text = s)
+                          Catch
+                          End Try
+                      End Sub
         TxtDigitsofPI.Text = If(TxtDigitsofPI.Text <> "", TxtDigitsofPI.Text, "1,000,000")
         ChkboxDisplay.Checked = Not _headless
         Label3.Visible = ChkboxDisplay.Checked
@@ -1860,12 +1889,15 @@ Public Class Form1
     ''' entry is guaranteed on disk before the next GMP call — which means the
     ''' last entry in the log identifies the operation that crashed the process.
     ''' </summary>
-    Private Sub WriteToLog(message As String)
+    ' §252 (#95): timestamped log line, gated via AppendLog(level).  Default level 2 (milestone);
+    ' the procMem/elapsed read is skipped when the level is above _logLevel so suppressed lines cost nothing.
+    Private Sub WriteToLog(message As String, Optional level As Integer = 2)
+        If level > System.Threading.Volatile.Read(_logLevel) Then Return
         Try
             Dim elapsed As TimeSpan = stopWatch.Elapsed
             Dim threadId As Integer = Thread.CurrentThread.ManagedThreadId
             Dim procMem As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
-            AppendLog($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} | T{threadId} | {elapsed:hh\:mm\:ss\.fff} | RAM:{procMem:N0}MB | {message}" & vbCrLf)
+            AppendLog($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} | T{threadId} | {elapsed:hh\:mm\:ss\.fff} | RAM:{procMem:N0}MB | {message}" & vbCrLf, level)
         Catch
         End Try
     End Sub
@@ -4107,8 +4139,8 @@ Public Class Form1
                 Dim kj As Integer = k Mod 3
                 Dim shiftBits As ULong = CULng(ki) * bitsA + CULng(kj) * bitsB
                 Dim _sv_prod As IntPtr = prods(k).Pointer
-                Dim _logPre As Integer = If(_logLevel >= 2, System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_prod, 4)), 0)
-                If _logLevel >= 2 Then
+                Dim _logPre As Integer = If(_logLevel >= 5, System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_sv_prod, 4)), 0)   ' §252 (#95): per-sub-product spam → level 5
+                If _logLevel >= 5 Then
                     ' §215: Int32 overflow in offset arithmetic.  _logPre is Integer; (_logPre-1)*8
                     ' overflows Int32 when _logPre > 2^28 = 268,435,456 limbs.  At the topmost a×r
                     ' recursion level for 5B (szA=998M × szB=259M), prods(k) reaches 419M limbs;
@@ -4205,7 +4237,7 @@ Public Class Form1
                     Else
                         GmpRaw_add(accumPtr, accumPtr, _sv_prod)
                     End If
-                    If _logLevel >= 2 Then
+                    If _logLevel >= 5 Then   ' §252 (#95): per-sub-product accumulation spam → level 5
                         Dim _accumSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
                         AppendLog($"[SafeMpzMul§gen] k={k} shift=0 szProd={_logPre:N0} accumSz={_accumSz:N0}{vbCrLf}")
                     End If
@@ -4233,7 +4265,7 @@ Public Class Form1
                         AppendLog($"[SafeMpzMul§150] pre-k8-add accum[42779664]={_pre150v:X16} (expect 0000000000000000){vbCrLf}")
                     End If
                     GmpRaw_add(accumPtr, accumPtr, _shiftedForK222)
-                    If _logLevel >= 2 Then
+                    If _logLevel >= 5 Then   ' §252 (#95): per-sub-product accumulation spam → level 5
                         Dim _shiftedSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_shiftedForK222, 4))
                         Dim _accumSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
                         AppendLog($"[SafeMpzMul§gen] k={k} shift={shiftBits:N0} szProd={_logPre:N0} szShifted={_shiftedSz:N0} accumSz={_accumSz:N0}{vbCrLf}")
@@ -4463,9 +4495,9 @@ Public Class Form1
         Dim bitsLeft As Long = bits
         Do
             Dim chunk As UInteger = CUInt(System.Math.Min(bitsLeft, 2_100_000_000L))
-            If _logLevel >= 2 Then AppendLog($"[BSR§129] dst={dst.ToInt64():X16} src={src.ToInt64():X16} chunk={chunk:N0} bitsLeft={bitsLeft:N0} rop_alloc={Runtime.InteropServices.Marshal.ReadInt32(dst, 0):N0} rop_sz={Runtime.InteropServices.Marshal.ReadInt32(dst, 4):N0} src_sz={Runtime.InteropServices.Marshal.ReadInt32(src, 4):N0}{vbCrLf}")
+            If _logLevel >= 5 Then AppendLog($"[BSR§129] dst={dst.ToInt64():X16} src={src.ToInt64():X16} chunk={chunk:N0} bitsLeft={bitsLeft:N0} rop_alloc={Runtime.InteropServices.Marshal.ReadInt32(dst, 0):N0} rop_sz={Runtime.InteropServices.Marshal.ReadInt32(dst, 4):N0} src_sz={Runtime.InteropServices.Marshal.ReadInt32(src, 4):N0}{vbCrLf}")
             GmpRaw_tdiv_q_2exp(dst, src, chunk)
-            If _logLevel >= 2 Then AppendLog($"[BSR§129] done chunk={chunk:N0} rop_sz={Runtime.InteropServices.Marshal.ReadInt32(dst, 4):N0}{vbCrLf}")
+            If _logLevel >= 5 Then AppendLog($"[BSR§129] done chunk={chunk:N0} rop_sz={Runtime.InteropServices.Marshal.ReadInt32(dst, 4):N0}{vbCrLf}")
             src = dst
             bitsLeft -= CLng(chunk)
         Loop While bitsLeft > 0L
@@ -4881,6 +4913,9 @@ Public Class Form1
         Do While Not _exactReuse AndAlso (prec < rBits + 2L OrElse _nrIter < _minNrIters)
             _nrIter += 1
             prec = System.Math.Min(prec * 2L + 4L, rBits + 2L)
+            ' §253 (#52): surface reciprocal-Newton progress in the UI status box (not gated by
+            ' _logLevel — it's the UI).  Shows iter / target-iters and precision reached.
+            If _statusHook IsNot Nothing Then _statusHook($"Reciprocal Newton: iter {_nrIter}/{_minNrIters}  prec {prec:N0}/{rBits + 2L:N0} bits")
 
             ' §107-fix: do NOT truncate r.  Keep r in full domain (magnitude ~2^rBits).
             ' The shift formula kBits-bShift is calibrated for r at full domain.
@@ -5064,7 +5099,7 @@ Public Class Form1
                 Dim _r124Val1 As Long = If(_sz124 > _idx124 + 1, Runtime.InteropServices.Marshal.ReadInt64(_r124DPtr, CLng(_idx124 + 1) * 8L), 0L)
                 AppendLog($"[NR124] iter={_nrIter} r_after_sub[{_idx124-2:N0}]={_r124Vm2:X16} [{_idx124-1:N0}]={_r124Vm1:X16} [{_idx124:N0}]={_r124Val:X16} [{_idx124+1:N0}]={_r124Val1:X16} sz={_sz124:N0}{vbCrLf}")
             End If
-            If _logLevel >= 2 Then
+            If _logLevel >= 3 Then   ' §252 (#95): per-Newton-iter detail → level 3 (sub-phase progress)
                 Dim _szR_after As Integer = Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4)
                 Dim _szP As Integer = Runtime.InteropServices.Marshal.ReadInt32(p.Pointer, 4)
                 ' §119: log r bottom+top 2 limbs at every NR iteration to track lower-bit convergence
