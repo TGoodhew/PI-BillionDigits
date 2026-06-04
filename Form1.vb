@@ -217,84 +217,15 @@ Public Class Form1
     End Structure
 
     ' ═══════════════════════════════════════════════════════════════════════
-    ' GMP Custom Memory Pool - COMMENTED OUT - CAUSED MEMORY CORRUPTION
-    ' The bump allocator violated GMP's memory contract causing crashes after
-    ' ~300 iterations due to incompatible free/realloc semantics.
-    ' Using system allocator instead (reliable and well-tested with GMP).
+    ' (§261 / #40) Removed dead code: an earlier custom GMP memory pool — a bump
+    ' allocator over a 20 GB VirtualAlloc reservation — was abandoned because it
+    ' violated GMP's free/realloc contract (freed blocks must become reusable;
+    ' CInt on the pool offset also overflowed at 2 GB), corrupting metadata and
+    ' crashing after ~300 iterations.  Production uses GmpNativeAlloc.dll (native
+    ' SLIST pool, #30) with the managed system allocator as fallback; the live
+    ' VirtualAlloc/VirtualFree wrappers for ≥512 KB blocks are declared below.
+    ' The ~78-line commented-out implementation lived here until §261 — see git.
     ' ═══════════════════════════════════════════════════════════════════════
-
-    '<DllImport("kernel32.dll", SetLastError:=True)>
-    'Private Shared Function VirtualAlloc(lpAddress As IntPtr,
-    '                                  dwSize As UIntPtr,
-    '                                  flAllocationType As UInteger,
-    '                                  flProtect As UInteger) As IntPtr
-    'End Function
-
-    '<DllImport("kernel32.dll", SetLastError:=True)>
-    'Private Shared Function VirtualFree(lpAddress As IntPtr,
-    '                                 dwSize As UIntPtr,
-    '                                 dwFreeType As UInteger) As Boolean
-    'End Function
-
-    '<DllImport("kernel32.dll", EntryPoint:="RtlMoveMemory")>
-    'Private Shared Sub CopyMemory(dest As IntPtr, src As IntPtr,
-    '                           length As UIntPtr)
-    'End Sub
-
-
-
-    'Private Const MEM_RESERVE As UInteger = &H2000UI
-    'Private Const MEM_COMMIT As UInteger = &H1000UI
-    'Private Const MEM_RELEASE As UInteger = &H8000UI
-    'Private Const PAGE_READWRITE As UInteger = &H4UI
-
-
-
-    '' Pool state
-    'Private _poolBase As IntPtr
-    'Private _poolSize As ULong = 20UL * 1024UL * 1024UL * 1024UL  ' 20GB
-    'Private _poolOffset As ULong
-
-    '' Keep delegates alive - GC must NOT collect these!
-    'Private _allocDel As allocate_function
-    'Private _reallocDel As reallocate_function
-    'Private _freeDel As free_function
-
-    'Private Function AlignUp(value As ULong, alignment As ULong) As ULong
-    '    Return (value + alignment - 1UL) And Not (alignment - 1UL)
-    'End Function
-
-    'Private Function GmpAlloc(size As size_t) As void_ptr
-    '    Dim needed As ULong = AlignUp(CULng(size), 16UL)
-    '    If _poolOffset + needed > _poolSize Then
-    '        Throw New OutOfMemoryException(
-    '        $"GMP pool exhausted! Used {_poolOffset \ (1024UL * 1024UL * 1024UL)}GB")
-    '    End If
-    '    Dim result As IntPtr = IntPtr.Add(_poolBase, CInt(_poolOffset))  ' BUG: CInt overflows at 2GB!
-    '    _poolOffset += needed
-    '    Return New void_ptr(result)
-    'End Function
-
-    'Private Function GmpRealloc(ptr As void_ptr,
-    '                          old_size As size_t,
-    '                          new_size As size_t) As void_ptr
-    '    Dim newPtr As void_ptr = GmpAlloc(new_size)
-    '    If ptr.ToIntPtr() <> IntPtr.Zero Then
-    '        Dim copyBytes As UIntPtr = New UIntPtr(
-    '        System.Math.Min(CULng(old_size), CULng(new_size)))
-    '        CopyMemory(newPtr.ToIntPtr(), ptr.ToIntPtr(), copyBytes)
-    '    End If
-    '    Return newPtr  ' BUG: Old pointer becomes dangling - GMP expects free to mark it reusable
-    'End Function
-
-    'Private Sub GmpFree(ptr As void_ptr, size As size_t)
-    '    ' Bump allocator - no-op
-    '    ' BUG: GMP expects freed memory to be tracked/reusable, causing metadata corruption
-    'End Sub
-
-    'Private Sub InitGmpPool()
-    '    ...commented out...
-    'End Sub
 
     ' ── GMP VirtualAlloc custom memory functions ─────────────────────────────
     ' Problem: GMP's default Windows CRT allocator keeps freed large blocks in

@@ -6371,3 +6371,18 @@ transitions, a 2nd same-digit run flips ETA confidence low→**high**, and `[Adv
 emits 0 recommendations on this XMP-on dual-channel box. Deferred (logic present, UI/sampling
 follow-ups): live per-minute CPU-utilisation sampling to drive the compute-load advisor rules during
 a run, and a dedicated designer label/tab (the data layer + rules are done and unit-tested).
+
+## §261 — Code-quality review + dead-code removal (2026-06-04, issue #40)
+
+A code-quality review of `Form1.vb` against the #40 checklist; findings written up in
+[docs/CODE_QUALITY_REVIEW.md](docs/CODE_QUALITY_REVIEW.md), categorized critical/major/minor/
+suggestion. **No Critical or correctness findings** — the bit-verified math paths are sound and
+thread-safe. Per the agreed "low-risk fixes only" scope, the one code change is removing ~78 lines
+of dead code: the abandoned custom bump-allocator block (commented-out `VirtualAlloc`/`CopyMemory`
+`DllImport`s + `GmpAlloc`/`GmpRealloc`/`GmpFree`/`InitGmpPool`), replaced by a concise note that
+preserves *why* it was abandoned (violated GMP's free/realloc contract; `CInt` pool-offset overflow
+at 2 GB). The live allocator (`GmpNativeAlloc.dll`, #30) is unaffected. The two Major maintainability
+items — the very large methods (`ComputePiGMP`/`SafeMpzDiv`/`SafeMpzMul`) and splitting the 9.7k-line
+`Form1.vb` into partial-class files — plus the `BYTES_PER_MB` magic-number sweep are deliberately
+deferred to dedicated, individually-1B-SHA-validated commits so they cannot endanger the verified
+math (recommended order: BYTES_PER_MB → pure file-split → leaf-helper extraction).
