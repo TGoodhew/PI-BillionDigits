@@ -8705,39 +8705,14 @@ BeforeStep4:
             Dim mpQ1 As New mpz_t()
             gmp_lib.mpz_init2(mpQ1, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
             Dim _q1Needed As Long = _k1Limbs + 2L
-            Dim _q1Bytes As Long = _q1Needed * 8L
-            If _q1Bytes >= GMP_LARGE_THRESHOLD Then
-                Dim _q1Buf As IntPtr = PoolGet(_q1Bytes)  ' §79
-                If _q1Buf <> IntPtr.Zero Then
-                    Dim _q1Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpQ1.Pointer, 8))
-                    VirtualFree(_q1Old, UIntPtr.Zero, MEM_RELEASE)
-                    Runtime.InteropServices.Marshal.WriteInt32(mpQ1.Pointer, 0, CInt(_q1Needed))
-                    Runtime.InteropServices.Marshal.WriteInt64(mpQ1.Pointer, 8, _q1Buf.ToInt64())
-                    WriteToLog($"[3PM-DBG] mpQ1 pre-alloc {_q1Needed:N0} limbs ({_q1Bytes \ 1048576L:N0} MB)")
-                Else
-                    WriteToLog($"[3PM-DBG] mpQ1 pre-alloc FAILED for {_q1Bytes \ 1048576L:N0} MB — will rely on GmpReallocFunc")
-                End If
-            Else
-                WriteToLog($"[3PM-DBG] mpQ1 pre-alloc skipped ({_q1Needed:N0} limbs, {_q1Bytes:N0} B < GMP threshold; init2 buffer sufficient)")
-            End If
+            ' §96 cleanup: native-pool pre-grow (replaces the §79 managed PoolGet + VirtualFree of
+            ' the init2 seed buffer, which leaked it as a native-pool block). Same gate/behaviour.
+            PreAllocMpzToLimbs(mpQ1, _q1Needed)
             Dim mpQ2 As New mpz_t()
             gmp_lib.mpz_init2(mpQ2, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
             Dim _q2Needed As Long = _k1Limbs + 2L  ' same upper bound as Q1
-            Dim _q2Bytes As Long = _q2Needed * 8L
-            If _q2Bytes >= GMP_LARGE_THRESHOLD Then
-                Dim _q2Buf As IntPtr = PoolGet(_q2Bytes)  ' §79
-                If _q2Buf <> IntPtr.Zero Then
-                    Dim _q2Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpQ2.Pointer, 8))
-                    VirtualFree(_q2Old, UIntPtr.Zero, MEM_RELEASE)
-                    Runtime.InteropServices.Marshal.WriteInt32(mpQ2.Pointer, 0, CInt(_q2Needed))
-                    Runtime.InteropServices.Marshal.WriteInt64(mpQ2.Pointer, 8, _q2Buf.ToInt64())
-                    WriteToLog($"[3PM-DBG] mpQ2 pre-alloc {_q2Needed:N0} limbs ({_q2Bytes \ 1048576L:N0} MB)")
-                Else
-                    WriteToLog($"[3PM-DBG] mpQ2 pre-alloc FAILED for {_q2Bytes \ 1048576L:N0} MB — will rely on GmpReallocFunc")
-                End If
-            Else
-                WriteToLog($"[3PM-DBG] mpQ2 pre-alloc skipped ({_q2Needed:N0} limbs, {_q2Bytes:N0} B < GMP threshold; init2 buffer sufficient)")
-            End If
+            ' §96 cleanup: native-pool pre-grow (replaces §79 managed PoolGet + init2-buffer leak).
+            PreAllocMpzToLimbs(mpQ2, _q2Needed)
 
             WriteToLog($"[3PM-DBG] tmpHigh _mp_alloc={Runtime.InteropServices.Marshal.ReadInt32(tmpHigh.Pointer, 0):N0}  about to BigShiftRight(tmpHigh, finalQ, thirdBits={thirdBits:N0})")
             BigShiftRight(tmpHigh, finalQ, thirdBits)  ' §209: tmpHigh = finalQ >> thirdBits = Q2*2^k + Q1
@@ -8828,57 +8803,15 @@ BeforeStep4:
 
             gmp_lib.mpz_init2(mpR0, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
             Dim _r0Needed As Long = _numerSz + _q0Sz + 2L
-            Dim _r0Bytes As Long = _r0Needed * 8L
-            If _r0Bytes >= GMP_LARGE_THRESHOLD Then
-                Dim _r0Buf As IntPtr = PoolGet(_r0Bytes)  ' §79
-                If _r0Buf <> IntPtr.Zero Then
-                    Dim _r0Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpR0.Pointer, 8))
-                    VirtualFree(_r0Old, UIntPtr.Zero, MEM_RELEASE)
-                    Runtime.InteropServices.Marshal.WriteInt32(mpR0.Pointer, 0, CInt(_r0Needed))
-                    Runtime.InteropServices.Marshal.WriteInt64(mpR0.Pointer, 8, _r0Buf.ToInt64())
-                    WriteToLog($"[ComputePi] mpR0 pre-alloc {_r0Needed:N0} limbs ({_r0Bytes \ 1048576L:N0} MB)")
-                Else
-                    WriteToLog($"[ComputePi] mpR0 pre-alloc FAILED for {_r0Bytes \ 1048576L:N0} MB — will rely on GmpReallocFunc")
-                End If
-            Else
-                WriteToLog($"[ComputePi] mpR0 pre-alloc skipped ({_r0Needed:N0} limbs, {_r0Bytes:N0} B < GMP threshold; init2 buffer sufficient)")
-            End If
+            PreAllocMpzToLimbs(mpR0, _r0Needed)   ' §96 cleanup: native-pool pre-grow (was §79 managed PoolGet + init2-buffer leak)
 
             gmp_lib.mpz_init2(mpR1, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
             Dim _r1Needed As Long = _numerSz + _q1SzR + 2L
-            Dim _r1Bytes As Long = _r1Needed * 8L
-            If _r1Bytes >= GMP_LARGE_THRESHOLD Then
-                Dim _r1Buf As IntPtr = PoolGet(_r1Bytes)  ' §79
-                If _r1Buf <> IntPtr.Zero Then
-                    Dim _r1Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpR1.Pointer, 8))
-                    VirtualFree(_r1Old, UIntPtr.Zero, MEM_RELEASE)
-                    Runtime.InteropServices.Marshal.WriteInt32(mpR1.Pointer, 0, CInt(_r1Needed))
-                    Runtime.InteropServices.Marshal.WriteInt64(mpR1.Pointer, 8, _r1Buf.ToInt64())
-                    WriteToLog($"[ComputePi] mpR1 pre-alloc {_r1Needed:N0} limbs ({_r1Bytes \ 1048576L:N0} MB)")
-                Else
-                    WriteToLog($"[ComputePi] mpR1 pre-alloc FAILED for {_r1Bytes \ 1048576L:N0} MB — will rely on GmpReallocFunc")
-                End If
-            Else
-                WriteToLog($"[ComputePi] mpR1 pre-alloc skipped ({_r1Needed:N0} limbs, {_r1Bytes:N0} B < GMP threshold; init2 buffer sufficient)")
-            End If
+            PreAllocMpzToLimbs(mpR1, _r1Needed)   ' §96 cleanup: native-pool pre-grow (was §79 managed PoolGet + init2-buffer leak)
 
             gmp_lib.mpz_init2(mpR2, New mp_bitcnt_t(CUInt(GMP_LARGE_THRESHOLD * 8L)))
             Dim _r2Needed As Long = _numerSz + _q2SzR + 2L
-            Dim _r2Bytes As Long = _r2Needed * 8L
-            If _r2Bytes >= GMP_LARGE_THRESHOLD Then
-                Dim _r2Buf As IntPtr = PoolGet(_r2Bytes)  ' §79
-                If _r2Buf <> IntPtr.Zero Then
-                    Dim _r2Old As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpR2.Pointer, 8))
-                    VirtualFree(_r2Old, UIntPtr.Zero, MEM_RELEASE)
-                    Runtime.InteropServices.Marshal.WriteInt32(mpR2.Pointer, 0, CInt(_r2Needed))
-                    Runtime.InteropServices.Marshal.WriteInt64(mpR2.Pointer, 8, _r2Buf.ToInt64())
-                    WriteToLog($"[ComputePi] mpR2 pre-alloc {_r2Needed:N0} limbs ({_r2Bytes \ 1048576L:N0} MB)")
-                Else
-                    WriteToLog($"[ComputePi] mpR2 pre-alloc FAILED for {_r2Bytes \ 1048576L:N0} MB — will rely on GmpReallocFunc")
-                End If
-            Else
-                WriteToLog($"[ComputePi] mpR2 pre-alloc skipped ({_r2Needed:N0} limbs, {_r2Bytes:N0} B < GMP threshold; init2 buffer sufficient)")
-            End If
+            PreAllocMpzToLimbs(mpR2, _r2Needed)   ' §96 cleanup: native-pool pre-grow (was §79 managed PoolGet + init2-buffer leak)
 
             If _logLevel >= 3 Then
                 Dim _procP_pre = Process.GetCurrentProcess()
@@ -9023,18 +8956,7 @@ BeforeStep4:
                 ' normal GmpReallocFunc L→L handles growth correctly.  A small
                 ' VirtualAlloc buffer would be freed by GmpFreeFunc via _savedGmpFree
                 ' (size < threshold) which is wrong for VirtualAlloc memory → crash.
-                If _shiftBytesA >= GMP_LARGE_THRESHOLD Then
-                    Dim _bigBufA As IntPtr = PoolGet(_shiftBytesA)  ' §79
-                    If _bigBufA <> IntPtr.Zero Then
-                        Dim _oldBufA As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpShiftA.Pointer, 8))
-                        VirtualFree(_oldBufA, UIntPtr.Zero, MEM_RELEASE)
-                        Runtime.InteropServices.Marshal.WriteInt32(mpShiftA.Pointer, 0, CInt(_shiftLimbs))
-                        Runtime.InteropServices.Marshal.WriteInt64(mpShiftA.Pointer, 8, _bigBufA.ToInt64())
-                        WriteToLog($"[ComputePi] Combine A: pre-alloc {_shiftLimbs:N0} limbs ({_shiftBytesA \ 1048576L:N0} MB) ptr={_bigBufA:X}")
-                    Else
-                        WriteToLog($"[ComputePi] Combine A: pre-alloc VirtualAlloc FAILED for {_shiftBytesA \ 1048576L:N0} MB — will rely on GmpReallocFunc")
-                    End If
-                End If
+                PreAllocMpzToLimbs(mpShiftA, _shiftLimbs)   ' §96 cleanup: native-pool pre-grow (was §79 managed PoolGet + init2-buffer leak)
             End If
             If _logLevel >= 3 Then
                 ' Dump the native __mpz_struct that GMP will use as the destination of
@@ -9090,19 +9012,7 @@ BeforeStep4:
                 Dim _numerAbsSzB As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
                 Dim _r1AbsSzB As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(mpR1.Pointer, 4)))
                 Dim _addLimbs As Long = System.Math.Max(_numerAbsSzB, _r1AbsSzB) + 2L
-                Dim _addBytesB As Long = _addLimbs * 8L
-                If _addBytesB >= GMP_LARGE_THRESHOLD Then
-                    Dim _bigBufB As IntPtr = PoolGet(_addBytesB)  ' §79
-                    If _bigBufB <> IntPtr.Zero Then
-                        Dim _oldBufB As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpAddB.Pointer, 8))
-                        VirtualFree(_oldBufB, UIntPtr.Zero, MEM_RELEASE)
-                        Runtime.InteropServices.Marshal.WriteInt32(mpAddB.Pointer, 0, CInt(_addLimbs))
-                        Runtime.InteropServices.Marshal.WriteInt64(mpAddB.Pointer, 8, _bigBufB.ToInt64())
-                        WriteToLog($"[ComputePi] Combine B: pre-alloc {_addLimbs:N0} limbs ({_addBytesB \ 1048576L:N0} MB) ptr={_bigBufB:X}")
-                    Else
-                        WriteToLog($"[ComputePi] Combine B: pre-alloc VirtualAlloc FAILED for {_addBytesB \ 1048576L:N0} MB — will rely on GmpReallocFunc")
-                    End If
-                End If
+                PreAllocMpzToLimbs(mpAddB, _addLimbs)   ' §96 cleanup: native-pool pre-grow (was §79 managed PoolGet + init2-buffer leak)
             End If
             If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine B: mpz_add")
             gmp_lib.mpz_add(mpAddB, gmpNumer, mpR1)
@@ -9129,19 +9039,7 @@ BeforeStep4:
                 Dim _numerAbsSzC As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
                 Dim _kBitsC As Long = CLng(k1)
                 Dim _shiftLimbs As Long = _numerAbsSzC + (_kBitsC \ 64L) + 2L
-                Dim _shiftBytesC As Long = _shiftLimbs * 8L
-                If _shiftBytesC >= GMP_LARGE_THRESHOLD Then
-                    Dim _bigBufC As IntPtr = PoolGet(_shiftBytesC)  ' §79
-                    If _bigBufC <> IntPtr.Zero Then
-                        Dim _oldBufC As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpShiftC.Pointer, 8))
-                        VirtualFree(_oldBufC, UIntPtr.Zero, MEM_RELEASE)
-                        Runtime.InteropServices.Marshal.WriteInt32(mpShiftC.Pointer, 0, CInt(_shiftLimbs))
-                        Runtime.InteropServices.Marshal.WriteInt64(mpShiftC.Pointer, 8, _bigBufC.ToInt64())
-                        WriteToLog($"[ComputePi] Combine C: pre-alloc {_shiftLimbs:N0} limbs ({_shiftBytesC \ 1048576L:N0} MB) ptr={_bigBufC:X}")
-                    Else
-                        WriteToLog($"[ComputePi] Combine C: pre-alloc VirtualAlloc FAILED for {_shiftBytesC \ 1048576L:N0} MB — will rely on GmpReallocFunc")
-                    End If
-                End If
+                PreAllocMpzToLimbs(mpShiftC, _shiftLimbs)   ' §96 cleanup: native-pool pre-grow (was §79 managed PoolGet + init2-buffer leak)
             End If
             If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine C: BigShiftLeft  thirdBits={thirdBits:N0} bits")
             ' §209: see Combine A above — use BigShiftLeft for Long bit counts safely.
@@ -9176,19 +9074,7 @@ BeforeStep4:
                 Dim _numerAbsSzD As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(gmpNumer.Pointer, 4)))
                 Dim _r0AbsSzD As Long = CLng(System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer, 4)))
                 Dim _addLimbs As Long = System.Math.Max(_numerAbsSzD, _r0AbsSzD) + 2L
-                Dim _addBytesD As Long = _addLimbs * 8L
-                If _addBytesD >= GMP_LARGE_THRESHOLD Then
-                    Dim _bigBufD As IntPtr = PoolGet(_addBytesD)  ' §79
-                    If _bigBufD <> IntPtr.Zero Then
-                        Dim _oldBufD As New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(mpAddD.Pointer, 8))
-                        VirtualFree(_oldBufD, UIntPtr.Zero, MEM_RELEASE)
-                        Runtime.InteropServices.Marshal.WriteInt32(mpAddD.Pointer, 0, CInt(_addLimbs))
-                        Runtime.InteropServices.Marshal.WriteInt64(mpAddD.Pointer, 8, _bigBufD.ToInt64())
-                        WriteToLog($"[ComputePi] Combine D: pre-alloc {_addLimbs:N0} limbs ({_addBytesD \ 1048576L:N0} MB) ptr={_bigBufD:X}")
-                    Else
-                        WriteToLog($"[ComputePi] Combine D: pre-alloc VirtualAlloc FAILED for {_addBytesD \ 1048576L:N0} MB — will rely on GmpReallocFunc")
-                    End If
-                End If
+                PreAllocMpzToLimbs(mpAddD, _addLimbs)   ' §96 cleanup: native-pool pre-grow (was §79 managed PoolGet + init2-buffer leak)
             End If
             If _logLevel >= 3 Then WriteToLog($"[ComputePi] Combine D: mpz_add")
             gmp_lib.mpz_add(mpAddD, gmpNumer, mpR0)
