@@ -6252,3 +6252,34 @@ prefetch task (fallback to inline load on miss). Node-load factored into `_loadN
   overlaps I/O across workers, so prefetch targets only the serial top levels.
 
 Both #48/#49 build on §247 (P-core preference, E-cores usable). Validated bit-identical at 1B.
+
+## §250–§254 — Chunked-grid high-product reciprocal (2026-06-01..04, issues #94, #70)
+
+Speeds up the dominant 5B cost — the reciprocal Newton (~30 h) — by computing its capped-iteration
+multiplies (`rSq = r²`, `p = bTrunc·rSq`) as a **chunked grid that skips the low cells** (a high /
+short product), instead of the full §gen multiply. Enabled by default (opt out with
+`PI_RECIP_SHORTMUL=0`); `PI_RECIP_SHORTMUL_VERIFY=1` adds a compare-vs-full fallback.
+
+- **§250 (#94):** `SafeMpzMulHigh` — high product via the §gen 3×3 split, skipping low-column
+  sub-products + adding an upper bound of the omitted mass (round-up) so the result is an
+  **overestimate** ⟹ `r = 2r − (p>>S)` stays a strict underestimate (§107 invariant) ⟹ SafeMpzDiv's
+  §171/§218 adjustment corrects to the exact quotient ⟹ **π bit-identical**. (3-way split only skips
+  1/9 for a squaring → too weak alone; folded into #70.)
+- **§251 (#70):** `SafeMpzMul_ChunkedGrid(result, opA, opB, keepLimbs)` — generalizes the §5B-f1 grid
+  into a real multiply with mpn-level **offset accumulation** (`__gmpn_add` into the result buffer at
+  each cell's limb offset — O(cell), no whole-buffer shift). `keepLimbs>0` skips cells entirely below
+  the cutoff. **Cells run in parallel** (`PI_CG_DOP`, default ProcessorCount): each cell is tiny
+  (≤3 M-limb product ≈ 24 MB) so 16-way fits even under memory pressure that caps §gen at DOP 9 — so
+  chunked **beats §gen at every DOP** (harness: 2.81× rSq 26 M², 6.97× p 68 M×52 M vs §gen-DOP9).
+- **Gate:** engage only when the mul is large (size > `SAFE`) and `MemBudget_SuggestSafeMulDop ≤
+  MAXDOP` (default 9). NOT gated on `bShift=0` — at the 5B *divide* the denominator `bBits` (≈47 e9)
+  ≫ `rBits` (≈16.6 e9) so `bShift≈30 e9` never reaches 0 (the bug that made two early 5B runs decline
+  chunked). `[§251-gate]` log (level 5) shows the decision.
+- **§254 (#70):** enabled by default.
+
+**Validation:** `--test-chunkedgrid` (full mode bit-identical to §gen; high mode overestimate +
+exact region, incl. squaring + 68 M×52 M); 500 M VERIFY all-OK including the `bShift>0` (5B-divide)
+regime; **1 B π SHA bit-identical to the oracle**; 5 B engages cleanly (`§251-gate ENGAGE` at
+szR = 259.5 M, ~33 min per capped iter, no crash). Correctness rests on the overestimate→underestimate
+→§171-corrects chain, not on bit-exact `r`. RAM-cap full-product dispatch (a×r/q×b) is a separate,
+lower-priority follow-up (chunked-full is ~1.4× slower than §gen — a memory win, not speed).
