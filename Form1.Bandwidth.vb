@@ -284,4 +284,103 @@ Partial Class Form1
         Return allMatch
     End Function
 
+    ' ════════════════════════════════════════════════════════════════════════
+    '  §272 (#88): reciprocal-Newton convergence probe — the last big 5B lever.
+    '
+    '  SafeMpzReciprocal computes r ≈ 2^kBits / b by Newton iteration.  §200 forces the
+    '  loop to run ceil(log2(rBits))+3 iters because correct-bits were OBSERVED to double
+    '  from a ~1-bit seed (≈2^iter), even though `prec` (the operand-WIDTH schedule) caps at
+    '  rBits+2 after only ~log2(rBits/62) doublings from 62.  At 5B those last several iters
+    '  are FULL-SIZE multiplies (~33 min each via the chunked grid).  Two possibilities:
+    '    • the 64-bit seed (floor(2^64/bHi)) actually delivers its ~62 bits, the prec-doubling
+    '      schedule is right, and the §200 tail iters run with correct-bits ALREADY == rBits —
+    '      pure waste a convergence detector could skip (sound: exit on real convergence, not
+    '      on prec — does NOT violate the "never gate convergence on prec" rule); OR
+    '    • the seed truly yields ~1 bit (lossy domain scaling), and the real lever is to inject
+    '      a genuine ~62-bit seed so fewer doublings are needed.
+    '
+    '  This harness builds a random b, computes the EXACT reference R_ref = floor(2^kBits / b)
+    '  via GMP truncating division, runs the PRODUCTION SafeMpzReciprocal with _recipConvRef set
+    '  so it logs correct-bits per iter, and prints the convergence curve.  Pure measurement —
+    '  no math-path change.  Size via PI_RECIPCONV_LIMBS (default 1,000,000 limbs of b = 64 Mbit;
+    '  kBits = 2·bBits ⇒ rBits ≈ bBits).  Small enough that every mul is well under the FFT cap,
+    '  so it exercises the SAME seed + iteration schedule the 5B run uses, just in seconds.
+    ' ════════════════════════════════════════════════════════════════════════
+    Friend Shared Function RecipConv_CorrectBits(r As mpz_t, rBits As Long) As Long
+        ' §272: correct-bits of r against the test reference = rBits − bitlen(|R_ref − r|).
+        ' mpz_sizeinbase measures |value| (sign-independent) so no abs is needed; the test
+        ' sizes are far below the 2^31-bit cap where mpz_sizeinbase (UInt32) would overflow.
+        Dim _d As New mpz_t() : gmp_lib.mpz_init(_d)
+        gmp_lib.mpz_sub(_d, _recipConvRef, r)
+        Dim _dbits As Long = If(Runtime.InteropServices.Marshal.ReadInt32(_d.Pointer, 4) = 0, 0L, CLng(gmp_lib.mpz_sizeinbase(_d, 2)))
+        gmp_lib.mpz_clear(_d)
+        Return rBits - _dbits
+    End Function
+
+    Friend Shared Function TestRecipConv() As Boolean
+        Dim outPath As String = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "recipconv_test.txt")
+        Dim log As Action(Of String) =
+            Sub(s)
+                Try : System.IO.File.AppendAllText(outPath, s & vbCrLf) : Catch : End Try
+                AppendLog($"[RecipConv§272] {s}{vbCrLf}", 1)
+            End Sub
+        Try : System.IO.File.WriteAllText(outPath, $"[TestRecipConv] start {DateTime.Now}{vbCrLf}") : Catch : End Try
+
+        Dim nB As Integer = 1_000_000
+        Dim envN As String = Environment.GetEnvironmentVariable("PI_RECIPCONV_LIMBS")
+        Dim parsedN As Integer
+        If envN IsNot Nothing AndAlso Integer.TryParse(envN, parsedN) AndAlso parsedN >= 1_000 Then nB = parsedN
+
+        Dim rng As New Random(20260605)
+        Dim b As New mpz_t() : b.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : FillRandomMpz(b, nB, rng)
+        ' bBits from the top limb (64-bit-safe, same derivation as SafeMpzReciprocal).
+        Dim szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
+        Dim bDataPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(b.Pointer, 8))
+        Dim topLimb As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(bDataPtr.ToInt64() + CLng(szB - 1) * 8L)))
+        Dim bBits As Long = CLng(szB - 1) * 64L + CLng(64 - System.Numerics.BitOperations.LeadingZeroCount(topLimb))
+        Dim kBits As Long = 2L * bBits
+        Dim rBits As Long = kBits - bBits + 1L
+
+        log($"b = {nB:N0} limbs ({bBits:N0} bits); kBits = {kBits:N0}; rBits ≈ {rBits:N0}; cores={Environment.ProcessorCount}")
+        Dim expFresh As Integer = CInt(System.Math.Ceiling(System.Math.Log(System.Math.Max(2L, rBits), 2))) + 3
+        Dim precDoublings As Integer = CInt(System.Math.Ceiling(System.Math.Log(System.Math.Max(2.0, rBits / 62.0), 2)))
+        log($"§200 fresh iters = ceil(log2(rBits))+3 = {expFresh}; prec hits rBits+2 after ~{precDoublings} doublings from 62.")
+        log($"⇒ if the seed is good, correct-bits should plateau at rBits by ~iter {precDoublings}, leaving ~{expFresh - precDoublings} wasted tail iters.")
+
+        ' Reference R_ref = floor(2^kBits / b), exact via GMP truncating division.
+        If _statusHook IsNot Nothing Then _statusHook("RecipConv: computing exact reference reciprocal…")
+        Dim twoK As New mpz_t() : gmp_lib.mpz_init(twoK)
+        gmp_lib.mpz_set_ui(twoK, 1UI)
+        gmp_lib.mpz_mul_2exp(twoK, twoK, New mp_bitcnt_t(CUInt(kBits)))
+        Dim refR As New mpz_t() : refR.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(refR.Pointer)
+        GmpRaw_tdiv_q(refR.Pointer, twoK.Pointer, b.Pointer)
+        gmp_lib.mpz_clear(twoK)
+
+        ' Run the PRODUCTION reciprocal with the convergence probe armed — it logs correct-bits/iter.
+        Dim r As New mpz_t() : r.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(r.Pointer)
+        _recipConvRef = refR
+        If _statusHook IsNot Nothing Then _statusHook($"RecipConv: running SafeMpzReciprocal ({bBits:N0}-bit b)…")
+        Dim sw As Stopwatch = Stopwatch.StartNew()
+        Try
+            SafeMpzReciprocal(r, b, kBits)
+        Finally
+            _recipConvRef = Nothing
+        End Try
+        sw.Stop()
+
+        _recipConvRef = refR
+        Dim finalCorrect As Long = RecipConv_CorrectBits(r, rBits)
+        _recipConvRef = Nothing
+        log($"FINAL correctBits = {finalCorrect:N0}/{rBits:N0}  (deficit {rBits - finalCorrect:N0} bits — a 1-2 ulp underestimate is expected/correct) in {sw.Elapsed.TotalSeconds:F1}s")
+        log("Reading the curve above:")
+        log("  • SEED ≈ 62 then doubling, plateau at rBits before the last iter ⇒ tail iters wasted → add a convergence detector.")
+        log("  • correct-bits doubling from ~1 ⇒ the 64-bit seed is lossy → inject a genuine ~62-bit seed.")
+
+        ' No mpz_clear: at large PI_RECIPCONV_LIMBS the reciprocal may swap a raw GmpNativeAlloc block
+        ' into r (chunked finalize), which GMP's free-fn does not match (teardown AV).  The dispatcher
+        ' Environment.Exit's right after, so the OS reclaims everything — same rationale as TestCellSweep.
+        log($"[TestRecipConv] done {DateTime.Now}")
+        Return True   ' measurement harness — always 'passes'; the convergence curve is the output
+    End Function
+
 End Class

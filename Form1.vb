@@ -157,6 +157,13 @@ Public Class Form1
     Private Shared _testDopScan As Boolean = False   ' §263 (#88): DOP/bandwidth-saturation microbenchmark
     Private Shared _testGridScan As Boolean = False  ' §265 (#88): split-factor (k×k) experiment
     Private Shared _testCellSweep As Boolean = False ' §266 (#88): cell-size sweep at 5B operand sizes
+    Private Shared _testRecipConv As Boolean = False ' §272 (#88): reciprocal-Newton convergence probe
+    ' §272 (#88): when set (only by --test-recipconv), SafeMpzReciprocal logs correct-bits per
+    ' Newton iter against this reference R_ref = floor(2^kBits / b).  Reveals whether the seed
+    ' delivers ~62 correct bits (⇒ the §200 forced tail iters are wasted, recoverable by an
+    ' early-exit detector) or only ~1 bit (⇒ the seed scaling is lossy and needs fixing).
+    ' Strictly test-gated; the instrumentation is a null-check no-op in production runs.
+    Private Shared _recipConvRef As mpz_t = Nothing
     ' Set at SafeMpzReciprocal entry from env: PI_RECIP_SHORTMUL=1 enables the high-half
     ' product in capped iters; PI_RECIP_SHORTMUL_VERIFY=1 additionally computes the full
     ' product, compares the exact region + overestimate, and falls back to full on any
@@ -1549,6 +1556,8 @@ Public Class Form1
                     _testGridScan = True      ' §265 (#88): run split-factor (k×k) comparison, then exit
                 Case "--test-cellsweep"
                     _testCellSweep = True     ' §266 (#88): run cell-size sweep at 5B sizes, then exit
+                Case "--test-recipconv"
+                    _testRecipConv = True     ' §272 (#88): probe reciprocal-Newton convergence, then exit
                 Case "--log-level"
                     If i + 1 < args.Length Then
                         Dim lvl As Integer
@@ -1677,7 +1686,7 @@ Public Class Form1
         ' never pumped WM_PAINT ⇒ the window never painted.  On a worker thread Form1_Load returns,
         ' the loop runs, the window paints, and the harness pushes live status via _statusHook
         ' (already wired above).  Each harness still Environment.Exit(0/1) — now from the worker.
-        If _testMulHigh OrElse _testChunkedGrid OrElse _testEta OrElse _testAdvisor OrElse _testDopScan OrElse _testGridScan OrElse _testCellSweep Then
+        If _testMulHigh OrElse _testChunkedGrid OrElse _testEta OrElse _testAdvisor OrElse _testDopScan OrElse _testGridScan OrElse _testCellSweep OrElse _testRecipConv Then
             Dim _testThread As New System.Threading.Thread(
                 Sub()
                     Dim ok As Boolean = True, tag As String = "Test"
@@ -1703,6 +1712,9 @@ Public Class Form1
                         ElseIf _testCellSweep Then
                             tag = "TestCellSweep" : If _statusHook IsNot Nothing Then _statusHook("Running --test-cellsweep…")
                             ok = TestCellSweep()                        ' §266 (#88)
+                        ElseIf _testRecipConv Then
+                            tag = "TestRecipConv" : If _statusHook IsNot Nothing Then _statusHook("Running --test-recipconv…")
+                            ok = TestRecipConv()                        ' §272 (#88)
                         End If
                         AppendLog($"[{tag}] OVERALL: {If(ok, "DONE/PASS", "FAIL")}{vbCrLf}", 1)
                         If _statusHook IsNot Nothing Then _statusHook($"{tag}: {If(ok, "DONE", "FAIL")} — results in %TEMP%")
@@ -4957,6 +4969,14 @@ Public Class Form1
             End Try
         End If
 
+        ' §272 (#88): record the seed's correct-bit count for the --test-recipconv probe.
+        ' Null-check no-op in production (only the harness sets _recipConvRef).  If the seed shows
+        ' ~62 correct bits the §200 forced-tail iters are largely wasted (early-exit recoverable);
+        ' if it shows ~1 bit the seed scaling is lossy and a better seed is the real lever.
+        If _recipConvRef IsNot Nothing Then
+            AppendLog($"[RecipConv§272] SEED correctBits={RecipConv_CorrectBits(r, rBits):N0}/{rBits:N0} (kBits={kBits:N0} bBits={bBits:N0} rBits={rBits:N0}){vbCrLf}", 1)
+        End If
+
         ' ── Newton: r ← 2r - ceil(b/2^bShift) · r² / 2^(kBits-bShift) ────
         ' Progressive precision: prec doubles each step from ~62 → rBits+2.
         ' Ceiling truncation of b maintains r as a strict underestimate throughout.
@@ -5173,6 +5193,12 @@ Public Class Form1
             PreAllocMpzToLimbs(r, CLng(szR) + 2L)
             GmpRaw_add(r.Pointer, r.Pointer, r.Pointer)    ' §NR-raw: r = 2r — bypass managed wrapper pointer corruption
             GmpRaw_sub(r.Pointer, r.Pointer, p.Pointer)    ' §NR-raw: r = 2r - p — bypass managed wrapper pointer corruption
+            ' §272 (#88): per-iter convergence probe for --test-recipconv (null-check no-op in production).
+            ' Shows whether correct-bits doubles from ~1 (lossy seed) or jumps to ~62 then doubles (good
+            ' seed), and whether it plateaus at rBits before _minNrIters (⇒ forced tail iters are wasted).
+            If _recipConvRef IsNot Nothing Then
+                AppendLog($"[RecipConv§272] iter={_nrIter}/{_minNrIters} prec={prec:N0} bShift={bShift:N0} correctBits={RecipConv_CorrectBits(r, rBits):N0}/{rBits:N0}{vbCrLf}", 1)
+            End If
             ' §124: log r[20,904,662..665] immediately after r = 2r - p (final iter)
             ' §147: extend to 20904662..663 — check if r[20904663] has a gross error vs §127/§123
             If _logLevel >= 2 AndAlso bShift = 0 Then

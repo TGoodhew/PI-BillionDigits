@@ -249,3 +249,44 @@ window, and a label shows "Digits A–B of N". For a large native result `Stream
 untouched, so there is no correctness impact. Build clean, offset bounds checked. It's an
 interactive-UI change (the headless `--autostart` path forces display off), so it needs an on-screen
 confirmation of the slider before #98 is closed. Landed in commit `8b97a5b` (alongside §270).
+
+## §272 — reciprocal-Newton convergence probe (--test-recipconv): the seed is 2 bits, not 62
+
+The final-divide reciprocal is the last big 5B lever. `--test-recipconv` builds a random b, computes
+the exact reference `R_ref = floor(2^kBits / b)`, runs the PRODUCTION `SafeMpzReciprocal` with a probe
+armed, and logs correct-bits per Newton iter. At b = 1M limbs (64 Mbit, rBits ≈ 64M, fresh
+min_nrIters = 29):
+
+```
+SEED correctBits = 2 / 64,000,000        ← the seed yields ~2 bits, NOT ~62
+iter  5  prec     2,108  correctBits        59     (correctBits ≈ prec/36 throughout)
+iter 10  prec    67,580  correctBits     1,883
+iter 15  prec 2,162,684  correctBits    60,247
+iter 19  prec 34,603,004 correctBits   963,959
+iter 20  prec 64,000,001 correctBits 1,927,918  ← prec CAPS at rBits+2; full-width from here
+iter 24  prec 64,000,001 correctBits 30,846,692
+iter 26  prec 64,000,001 correctBits 63,999,998  ← CONVERGED (rBits−1, the expected 1-ulp underestimate)
+iter 27-29 prec 64,000,001 correctBits 63,999,998  ← 3 FULLY WASTED full-width tail iters
+FINAL 63,999,998/64,000,000 (1-bit deficit, correct) in 13.3s
+```
+
+**Root cause of the 1-2-bit seed:** the seed is `rSeed = floor(2^64 / bHi)` with `bHi` = the top 64
+bits of b (magnitude ~2^63). `2^64 / 2^63 ≈ 2` — a 1-2-bit quotient. To get a P-bit reciprocal seed
+from an L-bit `bHi` the numerator must be `2^(L+P)` (e.g. `2^126` for ~62 bits); the code uses `2^64`,
+so the seed carries ~1 useful bit. The subsequent left-shift scaling sets the magnitude but adds no
+accuracy. This is exactly why §200 measured "correct-bits ≈ 2^iter" and had to force
+`min_nrIters = ceil(log2(rBits))+3` — the floor is correct *for a 1-bit seed*.
+
+**Consequences (both are levers):**
+1. `prec` (operand width) races ~32× ahead of accuracy ⇒ every iter computes ~32× wider than useful.
+2. From a 2-bit seed, convergence needs ~log2(rBits/2) doublings; iters 20-29 (~10) all run at the
+   capped FULL width, where a genuine ~62-bit seed would need only ~2 (prec and accuracy reach rBits
+   together at iter ~20-21).
+
+**Two-part fix (next):** (a) inject a genuine ~62-126-bit seed — numerator `2^(bitlen(bHi)+P)`,
+preserving the strict-underestimate invariant the §107/§200 logic depends on; (b) a SOUND
+convergence detector — exit when r is unchanged across a full-width iter (gates on ACTUAL r-stability,
+not on prec, so it never undershoots and does not violate the "never gate convergence on prec" rule).
+Together they cut the ~8-10 full-width tail iters to ~2 ⇒ a projected ~3-4× reciprocal speedup at 5B
+(each 5B iter ≈ 33 min). Must validate 1B bit-identical (resume-from-snap_Phase3, real divide) then 5B
+before shipping. Pure-measurement harness committed first; no math-path change yet.
