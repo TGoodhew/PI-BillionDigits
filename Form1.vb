@@ -165,6 +165,12 @@ Public Class Form1
     ' dominant 5B divide cost (a×r ≈ 5h40m vs q×b ≈ 1h34m) AND ~halves its peak RAM.  ON by default
     ' (opt-out PI_DIV_AR_SHORTMUL=0); reuses the proven #70 SafeMpzMul_ChunkedGrid + DOP gate.
     Private Shared _divArShortMul As Boolean = True
+    ' §269 (#88): route q×b (full product) through the chunked grid too.  §gen recursive q×b is the
+    ' divide's remaining bottleneck (~1h34m at 5B) — §267 only accelerated the reciprocal+a×r.  q×b
+    ' is a FULL product (keepLimbs=0; need all of it for rem = a−q×b); chunked-full is bit-exact and,
+    ' with the §268 adaptive 16M cell, far faster than §gen recursion.  ON by default (opt-out
+    ' PI_DIV_QB_CHUNKED=0).
+    Private Shared _divQbChunked As Boolean = True
 
     ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
     ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
@@ -4737,6 +4743,7 @@ Public Class Form1
         Dim _rsmDopParsed As Integer
         If _rsmDopEnv IsNot Nothing AndAlso Integer.TryParse(_rsmDopEnv, _rsmDopParsed) AndAlso _rsmDopParsed >= 1 Then _recipShortMulMaxDop = _rsmDopParsed Else _recipShortMulMaxDop = 9
         _divArShortMul = (Environment.GetEnvironmentVariable("PI_DIV_AR_SHORTMUL") <> "0")   ' §262 (#42): chunked-HIGH a×r, opt-out
+        _divQbChunked = (Environment.GetEnvironmentVariable("PI_DIV_QB_CHUNKED") <> "0")      ' §269 (#88): chunked-full q×b, opt-out
         ' §174-fix: mpz_sizeinbase returns UInt32 — overflows when bBits > 2^31 (szB > 33M limbs).
         ' Compute exact bBits from top limb via CLZ; avoids any overflow and is always precise.
         Dim _szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
@@ -6249,7 +6256,20 @@ PostShiftCheckpoint:
         ' execution is safe with current SafeMpzReciprocal.
         ' Original lines preserved as comments for easy revert (grep §220).
         If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§220] §167 lifted — q×b runs at caller DOP={System.Threading.Volatile.Read(_safeMulDop)}{vbCrLf}")
-        SafeMpzMul(qb, q, b)
+        ' §269 (#88): route the FULL q×b through the chunked grid (bit-exact full mode) instead of the
+        ' slow §gen recursion — the §268 adaptive 16M cell makes it far faster (§266: 260M² full ~8.6×
+        ' vs the old 1.5M chunked, and far beyond §gen).  Gated: flag + size(>1 cell) + DOP, and OFF
+        ' under _5b_verify (the §5B diagnostics read §gen internals of qb).  qb's buffer lifecycle is
+        ' unchanged (both §gen and chunked swap a GmpNativeAlloc accumulator into qb).
+        Dim _szQ269 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(q.Pointer, 4))
+        If _divQbChunked AndAlso (Not _5b_verify) _
+           AndAlso (CLng(_szQ269) > 1500000L OrElse CLng(szB) > 1500000L) _
+           AndAlso MemBudget_SuggestSafeMulDop(CLng(_szQ269), CLng(szB)) <= _recipShortMulMaxDop Then
+            AppendLog($"[SafeMpzDiv§269] q×b via chunked-full: szQ={_szQ269:N0} szB={szB:N0}{vbCrLf}", 2)
+            SafeMpzMul_ChunkedGrid(qb, q, b, 0L)
+        Else
+            SafeMpzMul(qb, q, b)
+        End If
         ' Capture qb's raw pointer immediately — before any native call that could corrupt qb.Pointer.
         Dim _qbPtr As IntPtr = qb.Pointer   ' = savedResultPtr set by SafeMpzMul
         Dim szQB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qbPtr, 4))
