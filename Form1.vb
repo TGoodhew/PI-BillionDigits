@@ -140,6 +140,7 @@ Public Class Form1
     ' §259/§260 (#62/#63): --test-eta / --test-advisor run the estimator + advisor self-tests, then exit.
     Private Shared _testEta As Boolean = False
     Private Shared _testAdvisor As Boolean = False
+    Private Shared _testDopScan As Boolean = False   ' §263 (#88): DOP/bandwidth-saturation microbenchmark
     ' Set at SafeMpzReciprocal entry from env: PI_RECIP_SHORTMUL=1 enables the high-half
     ' product in capped iters; PI_RECIP_SHORTMUL_VERIFY=1 additionally computes the full
     ' product, compares the exact region + overestimate, and falls back to full on any
@@ -1520,6 +1521,8 @@ Public Class Form1
                     _testEta = True           ' §259 (#62): run ETA-estimator self-test, then exit
                 Case "--test-advisor"
                     _testAdvisor = True       ' §260 (#63): run performance-advisor self-test, then exit
+                Case "--test-dopscan"
+                    _testDopScan = True       ' §263 (#88): run DOP/bandwidth-saturation sweep, then exit
                 Case "--log-level"
                     If i + 1 < args.Length Then
                         Dim lvl As Integer
@@ -1662,6 +1665,11 @@ Public Class Form1
             Dim _advOk As Boolean = TestAdvisor()                      ' §260 (#63)
             AppendLog($"[TestAdvisor] OVERALL: {If(_advOk, "PASS", "FAIL")}{vbCrLf}", 1)
             Environment.Exit(If(_advOk, 0, 1))
+        End If
+        If _testDopScan Then
+            Dim _dsOk As Boolean = TestDopScan()                       ' §263 (#88)
+            AppendLog($"[TestDopScan] OVERALL: {If(_dsOk, "DONE", "FAIL")}{vbCrLf}", 1)
+            Environment.Exit(If(_dsOk, 0, 1))
         End If
         If Environment.GetEnvironmentVariable("PI_TEST_DOPGATE") = "1" Then
             ' §251 (#70): print the would-be §gen DOP for the 1B & 5B reciprocal mul sizes, so we can
