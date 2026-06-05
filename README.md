@@ -6411,3 +6411,16 @@ and disabled under `_5b_verify` (those diagnostics read the low limbs a high pro
 bit-identical to the oracle (`b153e8d5…56d9b`), §171 adjustment within its normal window. The
 literal pipeline is left as a documented non-goal (net-negative + RAM-doubling) unless the
 a×r:q×b ratio ever drops below 2:1.
+
+## §263 / §264 — Bandwidth investigation tooling + test-harness UI fix (2026-06-04, `MemoryPerf` branch)
+
+- **§263 (#88):** `--test-dopscan` (`Form1.Bandwidth.vb`) — a DOP/bandwidth-saturation microbenchmark;
+  full findings in [docs/MEMORY_BANDWIDTH_88.md](docs/MEMORY_BANDWIDTH_88.md). Short version: §gen's
+  3×3 split = 9 sub-products ⇒ DOP=9 is optimal (wave-quantised), the 9 cores run at ~72% efficiency
+  (DDR5 contention caps 9× → ~6.5×), and the bigger limit is structural (9-way split leaves cores
+  idle). NUMA/channel-pinning is impossible on a single-NUMA-node dual-channel desktop.
+- **§264 (#97):** the `--test-*` self-test harnesses now run on a **background thread** instead of
+  inline in `Form1_Load`. Inline, they blocked the UI thread so the message loop never pumped
+  `WM_PAINT` and the window never painted; on a worker thread `Form1_Load` returns, the window paints,
+  and the harness pushes live progress to `LblStatus` via `_statusHook` (e.g. `DopScan: DOP 4/9…`).
+  UI-only; the harness logic + `%TEMP%\*_test.txt` output are unchanged.

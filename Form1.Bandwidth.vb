@@ -59,6 +59,7 @@ Partial Class Form1
         Dim prevSpeedup As Double = 0.0, prevDop As Integer = 0
         For i As Integer = 0 To dops.Length - 1
             Dim dop As Integer = dops(i)
+            If _statusHook IsNot Nothing Then _statusHook($"DopScan: DOP {dop}/9 on {n:N0}×{n:N0} §gen… ({i + 1}/{dops.Length})")
             System.Threading.Volatile.Write(_safeMulDop, dop)
             Dim best As Double = Double.MaxValue
             For rep As Integer = 0 To 1

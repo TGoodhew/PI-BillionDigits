@@ -1646,30 +1646,45 @@ Public Class Form1
 
         ' §250 (#94): standalone SafeMpzMulHigh bit-correctness self-test — runs now that the
         ' GMP allocator is installed, writes results to %TEMP%\mulhigh_test.txt, then exits.
-        If _testMulHigh Then
-            Dim _mhOk As Boolean = TestMulHigh()
-            AppendLog($"[TestMulHigh] OVERALL: {If(_mhOk, "PASS", "FAIL")}{vbCrLf}")
-            Environment.Exit(If(_mhOk, 0, 1))
-        End If
-        If _testChunkedGrid Then
-            Dim _cgOk As Boolean = TestChunkedGrid()
-            AppendLog($"[TestChunkedGrid] OVERALL: {If(_cgOk, "PASS", "FAIL")}{vbCrLf}")
-            Environment.Exit(If(_cgOk, 0, 1))
-        End If
-        If _testEta Then
-            Dim _etaOk As Boolean = TestEta()                          ' §259 (#62)
-            AppendLog($"[TestEta] OVERALL: {If(_etaOk, "PASS", "FAIL")}{vbCrLf}", 1)
-            Environment.Exit(If(_etaOk, 0, 1))
-        End If
-        If _testAdvisor Then
-            Dim _advOk As Boolean = TestAdvisor()                      ' §260 (#63)
-            AppendLog($"[TestAdvisor] OVERALL: {If(_advOk, "PASS", "FAIL")}{vbCrLf}", 1)
-            Environment.Exit(If(_advOk, 0, 1))
-        End If
-        If _testDopScan Then
-            Dim _dsOk As Boolean = TestDopScan()                       ' §263 (#88)
-            AppendLog($"[TestDopScan] OVERALL: {If(_dsOk, "DONE", "FAIL")}{vbCrLf}", 1)
-            Environment.Exit(If(_dsOk, 0, 1))
+        ' §264 (issue #97): run the self-test harnesses on a BACKGROUND thread (like the compute
+        ' path), not inline on the UI thread.  Inline they blocked Form1_Load ⇒ the message loop
+        ' never pumped WM_PAINT ⇒ the window never painted.  On a worker thread Form1_Load returns,
+        ' the loop runs, the window paints, and the harness pushes live status via _statusHook
+        ' (already wired above).  Each harness still Environment.Exit(0/1) — now from the worker.
+        If _testMulHigh OrElse _testChunkedGrid OrElse _testEta OrElse _testAdvisor OrElse _testDopScan Then
+            Dim _testThread As New System.Threading.Thread(
+                Sub()
+                    Dim ok As Boolean = True, tag As String = "Test"
+                    Try
+                        If _testMulHigh Then
+                            tag = "TestMulHigh" : If _statusHook IsNot Nothing Then _statusHook("Running --test-mulhigh…")
+                            ok = TestMulHigh()
+                        ElseIf _testChunkedGrid Then
+                            tag = "TestChunkedGrid" : If _statusHook IsNot Nothing Then _statusHook("Running --test-chunkedgrid…")
+                            ok = TestChunkedGrid()
+                        ElseIf _testEta Then
+                            tag = "TestEta" : If _statusHook IsNot Nothing Then _statusHook("Running --test-eta…")
+                            ok = TestEta()                              ' §259 (#62)
+                        ElseIf _testAdvisor Then
+                            tag = "TestAdvisor" : If _statusHook IsNot Nothing Then _statusHook("Running --test-advisor…")
+                            ok = TestAdvisor()                          ' §260 (#63)
+                        ElseIf _testDopScan Then
+                            tag = "TestDopScan" : If _statusHook IsNot Nothing Then _statusHook("Running --test-dopscan…")
+                            ok = TestDopScan()                          ' §263 (#88)
+                        End If
+                        AppendLog($"[{tag}] OVERALL: {If(ok, "DONE/PASS", "FAIL")}{vbCrLf}", 1)
+                        If _statusHook IsNot Nothing Then _statusHook($"{tag}: {If(ok, "DONE", "FAIL")} — results in %TEMP%")
+                    Catch ex As Exception
+                        ok = False
+                        Try : WriteExceptionToLog(tag, ex) : Catch : End Try
+                    End Try
+                    System.Threading.Thread.Sleep(250)   ' let the final status BeginInvoke paint before exit
+                    Environment.Exit(If(ok, 0, 1))
+                End Sub, 256 * 1024 * 1024)
+            _testThread.IsBackground = True
+            _testThread.Priority = Threading.ThreadPriority.AboveNormal
+            _testThread.Start()
+            Return   ' let Form1_Load return → message loop runs → window paints + shows status
         End If
         If Environment.GetEnvironmentVariable("PI_TEST_DOPGATE") = "1" Then
             ' §251 (#70): print the would-be §gen DOP for the 1B & 5B reciprocal mul sizes, so we can
