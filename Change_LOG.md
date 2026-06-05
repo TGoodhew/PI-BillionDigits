@@ -6150,3 +6150,119 @@ a×r:q×b ratio ever drops below 2:1.
   `WM_PAINT` and the window never painted; on a worker thread `Form1_Load` returns, the window paints,
   and the harness pushes live progress to `LblStatus` via `_statusHook` (e.g. `DopScan: DOP 4/9…`).
   UI-only; the harness logic + `%TEMP%\*_test.txt` output are unchanged.
+
+## §265 — Split-factor experiment: 4×4 grid rejected, cell SIZE is the lever (2026-06-04, issue #88)
+
+The `--test-gridscan` harness drives the chunked-grid full product at coarse k×k grids
+(cell ≈ N/k via `_cgCellOverride`) and bit-checks each against the §gen reference. It answers
+"does a 4×4 split beat 3×3?". At 24M×24M: §gen 3×3 = 1.00× (ref), chunked 3×3 = 6.69×, chunked
+4×4 = 6.38×, 5×5 = 4.70×, 6×6 = 3.89× — all bit-exact.
+
+**4×4 rejected:** more cells/cores lose to fewer/bigger cells under the DDR5 bandwidth ceiling,
+monotonically worse at 5×5/6×6. The #88 "use the idle cores" hypothesis is disproved. The
+serendipitous lead is that cell **size** dominates: flat coarse cells beat §gen's recursive
+re-split. A one-off **Release** re-measure (then reverted to Debug) gave 6.69× — identical to
+Debug — confirming the gap is real and not a managed-recursion Debug artifact (the heavy work is
+native GMP `mpz_mul`/`mpn`). Production's 1.5M cell was unaffected (`_cgCellOverride` is
+benchmark-only).
+
+## §266 — Cell-size sweep at 5B sizes: 16M cell = 8.62× bit-exact (2026-06-04, issue #88)
+
+`--test-cellsweep` sweeps the chunked-grid cell size at the 5B q×b shape (260M×260M), reference =
+the production 1.5M cell, all bit-exact:
+
+| cell | cells | time | vs 1.5M |
+|------|-------|------|---------|
+| 1.5M | 30,276 | 32.4 min | 1.00× (production) |
+| 4M | 4,225 | 13.3 min | 2.43× |
+| 8M | 1,089 | 6.8 min | 4.77× |
+| 16M | 289 | 3.8 min | 8.62× |
+
+Per-cell overhead (wave sync + serial accumulate) is ∝ cell **count**, so the fixed 1.5M cell is
+catastrophic at 5B (one q×b = 32 min vs 3.8 min at 16M). Since the chunked grid is already the
+production path for the dominant 5B muls (reciprocal #70, a×r §262), this is squarely on the
+critical path. **§160's 1.5M cap is a misdiagnosis:** it blamed GMP-FFT floating-point accuracy,
+but GMP uses the Schönhage-Strassen **integer** FFT (no float mantissa); the wrong products it
+chased were root-caused to §200/§201 (Newton). The real limit is GMP's ~33.5M-limb FFT size cap —
+a 16M cell = 32M-limb product, safe.
+
+## §267 — Adaptive chunked-grid cell size (2026-06-04, issue #88)
+
+`SafeMpzMul_ChunkedGrid` makes the cell size adaptive: cell ≈ max(szA,szB)/3 (the §266 sweet
+spot), capped at the FFT-safe maximum (`PI_CG_CELL_MAX`, default 16M ⇒ 32M-limb product < the
+33.55M-limb GMP-FFT cap) and floored at 1.5M. Initially behind `PI_CG_ADAPTIVE=1` (default OFF) so
+production was unchanged until validated. Correctness via `--test-chunkedgrid`: full mode bit-exact
+**and** HIGH mode correct (the §107 contract the reciprocal/a×r rely on). **1B end-to-end:**
+resume-from-`snap_Phase3` gave π SHA-256 `b153e8d5…56d9b` bit-identical to the oracle, 282
+adaptive-cell engagements (7.29M/14.58M/16M cells), Phase 3 ~1h07m vs ~1h50m baseline (~38% faster
+purely from cell size).
+
+## §268 — Adaptive chunked cell ENABLED BY DEFAULT — 5B bit-identical (2026-06-05, issue #88)
+
+Full-5B validation: resumed `snap_Phase3`/`gmpNumer` with the adaptive cell and ran the final 5B
+divide (reciprocal + a×r, adaptive 16M cells, 17×17 grids), §216 convert, autoverify. π SHA-256 =
+`2218ee06…e08983a` **bit-identical** to the 5B oracle; 75 engagements, 0 errors, adj-up 0 iters.
+RAM peaked ~40 GB (the 52 GB watchdog never fired). Divide 5h02m vs ~7-8h §gen baseline (~30-40%
+faster). `PI_CG_ADAPTIVE` now **defaults ON** (opt out `=0`). Follow-up surfaced: with the
+reciprocal and a×r accelerated, the still-§gen q×b (~1h34m) is now the divide bottleneck.
+
+## §269 — Route q×b through the chunked grid (full mode) (2026-06-05, issue #88)
+
+q×b was the divide's remaining bottleneck (§gen recursive, ~1h34m at 5B); §267/§268 only
+accelerated the reciprocal and a×r. q×b is a **full** product (all of it is needed for
+`rem = a − q×b`), so it now runs as `SafeMpzMul_ChunkedGrid(qb, q, b, 0L)` — chunked-full is
+bit-exact and, with the §268 adaptive 16M cell, far faster than §gen recursion. Gated like §262:
+flag (`PI_DIV_QB_CHUNKED`, default ON) + size (>1 cell) + DOP, disabled under `_5b_verify`.
+**1B:** π SHA `b153e8d5…` bit-identical. **5B:** q×b szQ=259.5M szB=739M, adj-up 0, `gmpPi.bin`
+SHA `34f40cde…` bit-identical to the run-3 oracle binary (value-deterministic compare). The whole
+5B divide (reciprocal + a×r + q×b) is now on the chunked grid at the FFT-safe-max cell: ~7-8h §gen
+baseline → **~3h14m (~2.3×)**.
+
+## §270 — Parallel decimal converter enabled by default, 5B-safe (2026-06-05, issue #90)
+
+The §226 parallel recursive-halving decimal converter (1B-validated, byte-identical) is now
+5B-safe via a **safe-peel split rule** that caps divisors at 10^500M (26M limbs) instead of the
+unsafe 10^2.5B (130M limbs) — the powers needed become 31.25M/62.5M/125M/250M/500M. `PI_CONV_PARALLEL`
+now **defaults ON** (opt out `=0` → §216 serial) for all digit counts ≥ 100M. **5B:** converted 5B
+digits in 933s (~15.6 min: 8s pow-table + 924.8s parallel halving) vs §216's ~47 min (~3× faster);
+π SHA `2218ee06…` bit-identical; RAM ~19 GB. Closes #90.
+
+## §271 — Movable 250k-digit window display (2026-06-05, issue #98)
+
+The Display option previously streamed every digit into the RichTextBox via `AppendText` — O(n²)
+(each append is O(current length)) and duplicating gigabytes of text on top of the native buffer,
+making it unusable at 1B/5B. §271 instead shows a bounded **250,000-digit window** read on demand
+from the native result buffer, with a `TrackBar` docked under the digit box that scrubs the window
+across the whole range (O(window) per move, constant memory); the RichTextBox scrollbar scrolls
+within the window and a label shows "Digits A–B of N". For a large native result `StreamPiToScreen`
+writes `pi_digits.txt`, runs Verify immediately, then calls `SetupNavWindow` — no streaming pass.
+**Display-only:** the output file and the Verify path both read the native buffer directly and are
+untouched, so there is no correctness impact. Landed in commit `8b97a5b` (alongside §270). Closes #98.
+
+## §272 — Reciprocal-Newton seed + sound convergence detector (2026-06-05, issue #88)
+
+The last big 5B lever. A measurement probe (`--test-recipconv`, `Form1.Bandwidth.vb`) runs the
+production `SafeMpzReciprocal` against an exact reference `R_ref = floor(2^kBits/b)` with a per-iter
+correct-bits hook (`_recipConvRef`, a null-check no-op in production), and revealed two flaws:
+
+- **Seed was ~2 bits, not ~62.** The seed numerator was 2^64 against the ~2^63 top limb of b,
+  giving a 1–2-bit quotient — while the precision schedule (starting at 62) assumed ~62 correct
+  bits. Correct-bits then doubled from 2 each iteration (≈2^iter, matching §200/#93), so prec ran
+  ~32× ahead of accuracy the whole way. **Fix:** numerator 2^254 against the top 128 bits of b
+  (`SEED_BBITS=128`, `SEED_PREC=126`) ⇒ a genuine ~126-bit seed, with the underestimate invariant
+  preserved for any numerator.
+- **~8 wasted full-width tail iterations.** The loop ran to a fixed `min_nrIters` rather than
+  detecting convergence. **Fix:** a sound r-stability detector — exit Newton when prec has reached
+  its cap (`prec ≥ rBits+2`) **and** `cmp(r,p)==0`. At the fixed point `r = 2r − p ⟹ p == r`, so
+  this gates on real r-stability, never on prec (it does **not** violate the "never gate
+  convergence on prec" rule of #93) and is bit-identical to the full §200 tail. The first cut
+  gated on `bShift==0`, which only holds in the square-ish case; in the real divide `bBits ≫ rBits`
+  so `bShift` stays ≫0 even at the cap — corrected to the `prec ≥ rBits+2` gate, which holds in
+  both regimes.
+
+Net: ~29→21 iters at probe scale; the full-width (capped-prec) region shrinks from ~10 to ~2 iters.
+**1B:** from-seed divide reciprocal converged iter 27 (vs old min 35), adj-up 0, π SHA `b153e8d5…`
+bit-identical, division 7m20s. **5B:** from-seed Newton (no §201-raise reuse), detector fired at
+`bShift = 47.3e9 ≫ 0` (the prec-cap branch), converged iter 29, 8 tail iters skipped, adj-up 0;
+whole divide **55m28s** (reciprocal ~41m) vs §269's ~3h14m; `gmpPi.bin` SHA `34f40cde…`
+bit-identical to the run-3 oracle. #88's last lever closed.
