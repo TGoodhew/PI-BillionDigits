@@ -78,17 +78,48 @@ a 5B run is high (~85% per the §235 trace); a bandwidth uplift `B` shrinks that
 (Model only — assumptions: ~85% memory-bound fraction, linear bandwidth scaling, no re-binding until
 EPYC. Real numbers need a run on the target.)
 
+## Split-factor experiment — `--test-gridscan` (§265)
+
+Tests the idle-core hypothesis directly: drive the chunked-grid full product at coarse k×k grids
+(cell ≈ N/k via `_cgCellOverride`) and compare split factors, each bit-checked against §gen. 24M × 24M:
+
+| method | cells | ms | vs §gen | bit-exact |
+|---|---:|---:|---:|:--|
+| §gen 3×3 (recursive, production) | 9 | 30,974 | 1.00× | ref |
+| **chunked 3×3** (flat cells) | 9 | **4,632** | **6.69×** | yes |
+| chunked 4×4 | 16 | 4,856 | 6.38× | yes |
+| chunked 5×5 | 25 | 6,583 | 4.70× | yes |
+| chunked 6×6 | 36 | 7,961 | 3.89× | yes |
+
+- **The higher-order split is REJECTED.** chunked 4×4 (16 cells / 16 cores) is *marginally slower*
+  than 3×3 (9 cells), and 5×5/6×6 are progressively worse. More cores don't help — **fewer, bigger
+  cells win** (better per-mul FFT efficiency, fewer accumulate passes, less bandwidth contention).
+  This is the bandwidth-bound prediction confirmed, and kills the "use the idle cores" idea.
+- **Serendipitous lead — cell SIZE is the dominant knob.** The chunked flat-cell path looks ~6.7×
+  faster than §gen's recursive 3×3 (which re-splits each 8M sub-product down to ~0.9M with managed
+  shift/accumulate at every level). The production chunked grid's 1.5M cell is far finer than the
+  ~8M FFT-safe optimum at this size.
+- **CAVEAT (load-bearing): this is a Debug build.** §gen's recursion is managed-code-heavy (the
+  per-level shift/accumulate), which Debug penalizes hard; the chunked grid's accumulate is native
+  `mpn` (unaffected). So the **6.7× §gen-vs-chunked gap is Debug-inflated** — likely far smaller in
+  Release (consistent with #70 measuring chunked *1.4× slower* than §gen, albeit at 1.5M cells). The
+  *relative* chunked-vs-chunked ranking (3×3 < 4×4 < 5×5 < 6×6) IS Debug-robust (same native path).
+- At 5B the coarse cells overflow GMP's 33M-limb FFT, so the grid must stay fine (≤~16M cell) — the
+  cell-size advantage shrinks there, which is why this is a *lead to measure*, not a drop-in.
+
 ## Conclusion / recommendation
 
 - **No channel-scheduling software lever exists on a single-socket dual-channel desktop** — Lanes 1–2
   are out, Lane 3 is marginal. The bandwidth ceiling caps §gen parallel speedup at ~6.5× (≈72% eff),
   and the bigger limit is the 9-way structural cap leaving cores idle.
-- **The one promising software direction is the higher-order split (4×4)** to use the idle cores —
-  but it must be prototyped and measured (it may simply move the bottleneck from "idle cores" to
-  "worse contention"). This is the recommended next step for #88, and the natural fit for a
-  `--test-dopscan`-style A/B at 5B operand sizes.
+- **The higher-order split (4×4) is tested and rejected** (§265) — more cells/cores lose to bigger,
+  fewer cells under the bandwidth ceiling.
+- **The remaining lead is cell SIZE**, not core count: use the biggest FFT-safe cell rather than
+  1.5M. But the apparent 6.7× is Debug-inflated; **next step = re-measure `--test-gridscan` in a
+  Release build** (and validate §160's reason for the 1.5M cap) before any production change, then a
+  cell-size sweep at 5B-representative (FFT-safe-fine) sizes.
 - **Breaking the bandwidth portion is fundamentally a hardware change** (more channels). The Lane 4
-  model says DDR5-7200 buys ~1.2×, quad-channel ~1.5–1.7×, 12-channel ~2.5–3× — useful for deciding
-  whether to chase software past this point.
+  model says DDR5-7200 buys ~1.2×, quad-channel ~1.5–1.7×, 12-channel ~2.5–3×.
 
-`--test-dopscan` is committed as the reusable measurement harness (size via `PI_DOPSCAN_LIMBS`).
+`--test-dopscan` (DOP sweep) and `--test-gridscan` (split-factor / cell-size) are committed as the
+reusable measurement harnesses (size via `PI_DOPSCAN_LIMBS`).

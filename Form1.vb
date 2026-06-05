@@ -121,6 +121,9 @@ Public Class Form1
     ' Restored to ProcessorCount before Phase 2 serial path and ComputePiGMP so
     ' those single-pair operations still use all cores.
     Private Shared _safeMulDop As Integer = -1   ' -1 = not yet set; reads as ProcessorCount
+    ' §265 (#88): chunked-grid cell-size override for the --test-gridscan split-factor experiment.
+    ' 0 = production default (1.5M).  Only the benchmark ever writes it.
+    Private Shared _cgCellOverride As Integer = 0
 
     ' §238 (issue #87, 2026-05-28): thread-local nesting cap.  Set True inside the
     ' Parallel.For sub-product lambda in SafeMpzMul; any recursive SafeMpzMul that
@@ -141,6 +144,7 @@ Public Class Form1
     Private Shared _testEta As Boolean = False
     Private Shared _testAdvisor As Boolean = False
     Private Shared _testDopScan As Boolean = False   ' §263 (#88): DOP/bandwidth-saturation microbenchmark
+    Private Shared _testGridScan As Boolean = False  ' §265 (#88): split-factor (k×k) experiment
     ' Set at SafeMpzReciprocal entry from env: PI_RECIP_SHORTMUL=1 enables the high-half
     ' product in capped iters; PI_RECIP_SHORTMUL_VERIFY=1 additionally computes the full
     ' product, compares the exact region + overestimate, and falls back to full on any
@@ -1523,6 +1527,8 @@ Public Class Form1
                     _testAdvisor = True       ' §260 (#63): run performance-advisor self-test, then exit
                 Case "--test-dopscan"
                     _testDopScan = True       ' §263 (#88): run DOP/bandwidth-saturation sweep, then exit
+                Case "--test-gridscan"
+                    _testGridScan = True      ' §265 (#88): run split-factor (k×k) comparison, then exit
                 Case "--log-level"
                     If i + 1 < args.Length Then
                         Dim lvl As Integer
@@ -1651,7 +1657,7 @@ Public Class Form1
         ' never pumped WM_PAINT ⇒ the window never painted.  On a worker thread Form1_Load returns,
         ' the loop runs, the window paints, and the harness pushes live status via _statusHook
         ' (already wired above).  Each harness still Environment.Exit(0/1) — now from the worker.
-        If _testMulHigh OrElse _testChunkedGrid OrElse _testEta OrElse _testAdvisor OrElse _testDopScan Then
+        If _testMulHigh OrElse _testChunkedGrid OrElse _testEta OrElse _testAdvisor OrElse _testDopScan OrElse _testGridScan Then
             Dim _testThread As New System.Threading.Thread(
                 Sub()
                     Dim ok As Boolean = True, tag As String = "Test"
@@ -1671,6 +1677,9 @@ Public Class Form1
                         ElseIf _testDopScan Then
                             tag = "TestDopScan" : If _statusHook IsNot Nothing Then _statusHook("Running --test-dopscan…")
                             ok = TestDopScan()                          ' §263 (#88)
+                        ElseIf _testGridScan Then
+                            tag = "TestGridScan" : If _statusHook IsNot Nothing Then _statusHook("Running --test-gridscan…")
+                            ok = TestGridScan()                         ' §265 (#88)
                         End If
                         AppendLog($"[{tag}] OVERALL: {If(ok, "DONE/PASS", "FAIL")}{vbCrLf}", 1)
                         If _statusHook IsNot Nothing Then _statusHook($"{tag}: {If(ok, "DONE", "FAIL")} — results in %TEMP%")
@@ -3057,7 +3066,11 @@ Public Class Form1
     '     short-mul, now parallel-ready and memory-light).  result must be DISTINCT from opA/opB.
     ' NOTE (pt1): cells run SERIALLY here; parallelisation of the cell mults is the pt2 perf step.
     Private Shared Sub SafeMpzMul_ChunkedGrid(result As mpz_t, opA As mpz_t, opB As mpz_t, keepLimbs As Long)
-        Const CHUNK As Integer = 1_500_000   ' ≤3M limbs total per cell → safe GMP FFT (§160)
+        ' §265 (#88): cell size is normally 1.5M (≤3M limbs/cell → safe GMP FFT, §160).  The
+        ' --test-gridscan bandwidth experiment overrides it via _cgCellOverride to force a coarse
+        ' k×k grid (cell≈N/k) and compare split factors; 0 = production default.  CALLERS other than
+        ' the benchmark never set it, so production is unaffected.
+        Dim CHUNK As Integer = If(_cgCellOverride > 0, _cgCellOverride, 1_500_000)
         Const GUARD_LIMBS As Long = 8L
         Dim szA As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4))
         Dim szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(opB.Pointer, 4))
