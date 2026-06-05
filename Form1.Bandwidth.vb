@@ -184,16 +184,104 @@ Partial Class Form1
         log($"NOTE: §gen 3×3 is recursive (sub-products re-split); chunked k×k cells are FLAT GMP muls.")
         log($"Bit-exact vs §gen: {If(allMatch, "ALL grids match", "MISMATCH — see *** above")}.")
 
-        Try
-            gmp_lib.mpz_clear(a) : gmp_lib.mpz_clear(b) : gmp_lib.mpz_clear(rRef) : gmp_lib.mpz_clear(rTest)
-            Runtime.InteropServices.Marshal.FreeHGlobal(a.Pointer)
-            Runtime.InteropServices.Marshal.FreeHGlobal(b.Pointer)
-            Runtime.InteropServices.Marshal.FreeHGlobal(rRef.Pointer)
-            Runtime.InteropServices.Marshal.FreeHGlobal(rTest.Pointer)
-        Catch
-        End Try
+        ' No explicit mpz_clear: SafeMpzMul_ChunkedGrid swaps a raw GmpNativeAlloc block into rTest,
+        ' which GMP's free-function doesn't match (native AV).  The harness exits immediately ⇒ OS
+        ' reclaims.  (§266 — fixed the teardown segfault here too.)
         log($"[TestGridScan] done {DateTime.Now}")
         Return allMatch   ' fail the harness if a grid is not bit-identical to §gen
+    End Function
+
+    ' ════════════════════════════════════════════════════════════════════════
+    '  §266 (#88): CELL-SIZE sweep at 5B operand sizes.  §gridscan showed coarse
+    '  flat cells beat §gen at 24M, but 8M cells only stay FFT-safe up to ~48M
+    '  operands.  At 5B (operands ≈260M limbs) cells must be ≤~16M (cell·cell ≤
+    '  33M-limb GMP-FFT limit).  This sweeps the chunked grid over cell sizes
+    '  {1.5M (production), 4M, 8M, 16M} at a large N and compares vs §gen — to see
+    '  whether ≤16M cells still beat §gen at 5B, i.e. whether the production grid's
+    '  1.5M cell leaves a large win on the table.  Each result is bit-checked vs
+    '  §gen.  Size via PI_DOPSCAN_LIMBS (default 260M = the 5B q×b shape).
+    ' ════════════════════════════════════════════════════════════════════════
+    Friend Shared Function TestCellSweep() As Boolean
+        Dim outPath As String = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cellsweep_test.txt")
+        Dim log As Action(Of String) =
+            Sub(s)
+                Try : System.IO.File.AppendAllText(outPath, s & vbCrLf) : Catch : End Try
+                AppendLog($"[CellSweep§266] {s}{vbCrLf}", 1)
+            End Sub
+        Try : System.IO.File.WriteAllText(outPath, $"[TestCellSweep] start {DateTime.Now}{vbCrLf}") : Catch : End Try
+
+        Dim n As Integer = 260_000_000   ' 5B q×b ≈ 260M × 260M limbs
+        Dim envN As String = Environment.GetEnvironmentVariable("PI_DOPSCAN_LIMBS")
+        Dim parsedN As Integer
+        If envN IsNot Nothing AndAlso Integer.TryParse(envN, parsedN) AndAlso parsedN >= 6_000_000 Then n = parsedN
+
+        log($"operands: {n:N0} × {n:N0} limbs ({CLng(n) * 8L \ 1048576L:N0} MB each); cores={Environment.ProcessorCount}")
+        log($"  availPhys={MemBudget_AvailablePhysicalGB():F1}GB availCommit={MemBudget_AvailableCommitGB():F1}GB")
+        If _statusHook IsNot Nothing Then _statusHook($"CellSweep: filling 2×{n:N0}-limb operands…")
+        Dim rng As New Random(20260604)
+        Dim a As New mpz_t() : a.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : FillRandomMpz(a, n, rng)
+        Dim b As New mpz_t() : b.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : FillRandomMpz(b, n, rng)
+        Dim rRef As New mpz_t() : rRef.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(rRef.Pointer)
+        Dim rTest As New mpz_t() : rTest.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(rTest.Pointer)
+        Dim savedDop As Integer = System.Threading.Volatile.Read(_safeMulDop)
+
+        Dim oneShot As Func(Of Action, Double) =
+            Function(act)
+                GC.Collect() : GC.WaitForPendingFinalizers()
+                Dim sw As Stopwatch = Stopwatch.StartNew()
+                act() : sw.Stop()
+                Return sw.Elapsed.TotalMilliseconds   ' 1 rep at 5B sizes (each mul is minutes)
+            End Function
+
+        ' REFERENCE = chunked grid at 1.5M (the PRODUCTION cell size), RAM-safe.  Bigger cells are
+        ' bit-checked against it and reported as "vs 1.5M" — directly answering "does raising the cell
+        ' help at 5B?".  §gen is RAM-bound at the 5B q×b size (260M § peak ≈36 GB ⇒ pages on a 64 GB
+        ' box, observed thrashing >30 min), so it is OPT-IN (PI_CELLSWEEP_GEN=1) and runs LAST — the
+        ' chunked cell-size answer lands first regardless.
+        Dim allMatch As Boolean = True
+        Dim refMs As Double = 0.0
+        Dim cells() As Integer = {1_500_000, 4_000_000, 8_000_000, 16_000_000}
+        log("  cell  | cells |    ms    | vs 1.5M | bit-exact")
+        log("  ------+-------+----------+---------+----------")
+        For Each cell As Integer In cells
+            If CLng(cell) > CLng(n) Then Continue For                       ' cell can't exceed operand
+            If CLng(cell) * 2L > 33_000_000L Then Continue For              ' keep cell·cell product FFT-safe
+            Dim ncell As Long = (CLng(n) + cell - 1L) \ CLng(cell)
+            Dim isRef As Boolean = (refMs = 0.0)                            ' first (1.5M) is the reference
+            If _statusHook IsNot Nothing Then _statusHook($"CellSweep: cell {cell:N0} ({ncell}×{ncell}) on {n:N0}²…")
+            log($"[{DateTime.Now:HH:mm:ss}] cell={cell:N0} ({ncell}×{ncell}={ncell * ncell} cells) starting…")
+            _cgCellOverride = cell
+            Dim dst As mpz_t = If(isRef, rRef, rTest)
+            Dim cms As Double = oneShot(Sub() SafeMpzMul_ChunkedGrid(dst, a, b, 0L))
+            Dim match As Boolean = isRef OrElse (GmpRaw_cmp(rTest.Pointer, rRef.Pointer) = 0)
+            If Not match Then allMatch = False
+            If isRef Then refMs = cms
+            Dim su As Double = If(cms > 0.0, refMs / cms, 0.0)
+            log($"  {cell \ 1_000_000,4}M  | {ncell * ncell,5} | {cms,8:F0} | {su,5:F2}×  | {If(isRef, "(ref)", If(match, "yes", "NO ***"))}")
+        Next
+        _cgCellOverride = 0
+
+        ' Optional §gen baseline (recursive) — RAM-bound at 5B sizes; opt-in so it never blocks the run.
+        If Environment.GetEnvironmentVariable("PI_CELLSWEEP_GEN") = "1" Then
+            System.Threading.Volatile.Write(_safeMulDop, 9)
+            If _statusHook IsNot Nothing Then _statusHook($"CellSweep: §gen baseline on {n:N0}² (RAM-bound, may page)…")
+            log($"[{DateTime.Now:HH:mm:ss}] §gen baseline starting (opt-in; may thrash/page)…")
+            Dim genMs As Double = oneShot(Sub() SafeMpzMul(rTest, a, b))
+            Dim gmatch As Boolean = (GmpRaw_cmp(rTest.Pointer, rRef.Pointer) = 0)
+            If Not gmatch Then allMatch = False
+            log($"  §gen  |    -- | {genMs,8:F0} | {If(refMs > 0.0, refMs / genMs, 0.0),5:F2}×  | {If(gmatch, "yes", "NO ***")}  (recursive)")
+        End If
+        System.Threading.Volatile.Write(_safeMulDop, savedDop)
+        log($"Bit-exact vs chunked-1.5M ref: {If(allMatch, "ALL match", "MISMATCH — see *** above")}.")
+        log("Reading: vs-1.5M >1× AND bit-exact ⇒ the production 1.5M cell is leaving that speedup on")
+        log("the table at 5B — raise the chunked cell toward the ~16M FFT-safe maximum.")
+
+        ' NOTE: no explicit mpz_clear here — SafeMpzMul_ChunkedGrid swaps a raw GmpNativeAlloc block
+        ' into rTest's _mp_d, which GMP's mpz_clear free-function does not match (native AV, bypasses
+        ' Try/Catch).  The harness Environment.Exit's immediately, so the OS reclaims everything; an
+        ' explicit clear would only risk a teardown segfault after the data is already written.
+        log($"[TestCellSweep] done {DateTime.Now}")
+        Return allMatch
     End Function
 
 End Class

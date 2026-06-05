@@ -110,20 +110,54 @@ Tests the idle-core hypothesis directly: drive the chunked-grid full product at 
   whether **≤16M cells still beat §gen at 5B** — needs a dedicated cell-size sweep at large N (the
   current k=3..6 grids FFT-overflow above ~48M).
 
+## Cell-size sweep at 5B operand sizes — `--test-cellsweep` (§266) — THE headline result
+
+Sweeps the chunked grid over cell sizes at **260M × 260M** (the 5B q×b shape, where the 8M cell
+overflows GMP's FFT so cells must be ≤16M — the real 5B regime). Reference = 1.5M (production cell);
+each bigger cell bit-checked against it. (§gen is opt-in here: at 260M its ~36 GB peak pages on a
+64 GB box — observed thrashing >30 min — so it does not gate the run.)
+
+| cell | cells | time | vs 1.5M | bit-exact |
+|---|---:|---:|---:|:--|
+| **1.5M (production)** | 30,276 | **32.4 min** | 1.00× | ref |
+| 4M | 4,225 | 13.3 min | 2.43× | yes |
+| 8M | 1,089 | 6.8 min | 4.77× | yes |
+| **16M** | 289 | **3.8 min** | **8.62×** | yes |
+
+**The production 1.5M cell takes 32 minutes for one 5B q×b multiply; a 16M cell does it in 3.8 —
+8.62×, bit-for-bit identical.** The cost is dominated by per-cell overhead (parallel-wave sync +
+serial accumulate), which scales with cell *count*: 1.5M → 30,276 cells, 16M → 289. And the chunked
+grid is **already the production path for the dominant 5B muls** — the reciprocal Newton (#70) and
+a×r (§262) — so this is on the critical path, not a niche.
+
+**Is the 1.5M cap safe to raise? §160 says no — but §160 is almost certainly a misdiagnosis.** §160
+([Form1.vb:3393](../Form1.vb)) capped cells at 1.5M (≤5M product) believing GMP's FFT produces
+"silently wrong products" above ~5M total because "FFT coefficients exceed double precision (53-bit
+mantissa)." But GMP's large multiply is **Schönhage–Strassen — integer modular arithmetic, not
+floating-point** — so there is no double-precision mantissa to overflow. The wrong products §160 was
+chasing were later root-caused to the **§200/§201 Newton-convergence bug** (which is why §220 lifted
+the sibling force-serial measures §166/167/168). §160's cell cap was simply never revisited. The
+*real* hard limit is the FFT size cap — `pl·64 < 2^31 ⇒ ≤ 33,554,431 limbs` — and a 16M cell = 32M
+product sits just under it. The sweep being bit-exact at 16M is consistent with this.
+
+**Caveat:** the sweep uses random operands + full products (keepLimbs=0); the production reciprocal/
+a×r use HIGH mode (keepLimbs>0). So this is strong evidence, not proof, for the real path. A 1B (then
+5B) run at a raised cell size, π bit-identical to the oracle, is required before shipping — the
+downside of a silently-wrong 5B digit is catastrophic.
+
 ## Conclusion / recommendation
 
 - **No channel-scheduling software lever exists on a single-socket dual-channel desktop** — Lanes 1–2
-  are out, Lane 3 is marginal. The bandwidth ceiling caps §gen parallel speedup at ~6.5× (≈72% eff),
-  and the bigger limit is the 9-way structural cap leaving cores idle.
+  are out, Lane 3 is marginal. The bandwidth ceiling caps §gen parallel speedup at ~6.5× (≈72% eff).
 - **The higher-order split (4×4) is tested and rejected** (§265) — more cells/cores lose to bigger,
   fewer cells under the bandwidth ceiling.
-- **The remaining lead is cell SIZE**, not core count: at 24M, chunked flat 8M-cells are ~6.7×
-  faster than §gen — **confirmed in Release** (so it is not a Debug artifact). The production chunked
-  grid's 1.5M cell is far below the FFT-safe optimum. **Next step = a cell-size sweep at large N**
-  (the k=3..6 grids FFT-overflow above ~48M, so a dedicated sweep over cells {1.5M, 4M, 8M, 16M} at
-  e.g. 100–260M operands is needed to see whether ≤16M cells still beat §gen at 5B), plus validating
-  §160's reason for the 1.5M cap. If it holds, routing §gen's large muls through a coarser-celled
-  chunked grid is a potentially large 5B win.
+- **THE lead: raise the chunked-grid cell size from 1.5M toward the ~16M FFT-safe maximum.** Measured
+  **8.62×** on a 5B-q×b-sized full product, bit-exact, and the chunked grid is already the production
+  path for the dominant 5B muls (reciprocal #70, a×r §262). §160's 1.5M cap rests on an FFT-accuracy
+  concern that does not apply to GMP's integer FFT (the real bug was §200/§201). **Next step:** make
+  the cell size adaptive (≈`min(operand/√cores-ish, 16M-FFT-safe-max)` behind a flag), test HIGH mode
+  (keepLimbs>0) at coarse cells, then validate 1B → 5B π bit-identical. Potentially the single biggest
+  5B speedup on the table.
 - **Breaking the bandwidth portion is fundamentally a hardware change** (more channels). The Lane 4
   model says DDR5-7200 buys ~1.2×, quad-channel ~1.5–1.7×, 12-channel ~2.5–3×.
 

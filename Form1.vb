@@ -145,6 +145,7 @@ Public Class Form1
     Private Shared _testAdvisor As Boolean = False
     Private Shared _testDopScan As Boolean = False   ' §263 (#88): DOP/bandwidth-saturation microbenchmark
     Private Shared _testGridScan As Boolean = False  ' §265 (#88): split-factor (k×k) experiment
+    Private Shared _testCellSweep As Boolean = False ' §266 (#88): cell-size sweep at 5B operand sizes
     ' Set at SafeMpzReciprocal entry from env: PI_RECIP_SHORTMUL=1 enables the high-half
     ' product in capped iters; PI_RECIP_SHORTMUL_VERIFY=1 additionally computes the full
     ' product, compares the exact region + overestimate, and falls back to full on any
@@ -1529,6 +1530,8 @@ Public Class Form1
                     _testDopScan = True       ' §263 (#88): run DOP/bandwidth-saturation sweep, then exit
                 Case "--test-gridscan"
                     _testGridScan = True      ' §265 (#88): run split-factor (k×k) comparison, then exit
+                Case "--test-cellsweep"
+                    _testCellSweep = True     ' §266 (#88): run cell-size sweep at 5B sizes, then exit
                 Case "--log-level"
                     If i + 1 < args.Length Then
                         Dim lvl As Integer
@@ -1657,7 +1660,7 @@ Public Class Form1
         ' never pumped WM_PAINT ⇒ the window never painted.  On a worker thread Form1_Load returns,
         ' the loop runs, the window paints, and the harness pushes live status via _statusHook
         ' (already wired above).  Each harness still Environment.Exit(0/1) — now from the worker.
-        If _testMulHigh OrElse _testChunkedGrid OrElse _testEta OrElse _testAdvisor OrElse _testDopScan OrElse _testGridScan Then
+        If _testMulHigh OrElse _testChunkedGrid OrElse _testEta OrElse _testAdvisor OrElse _testDopScan OrElse _testGridScan OrElse _testCellSweep Then
             Dim _testThread As New System.Threading.Thread(
                 Sub()
                     Dim ok As Boolean = True, tag As String = "Test"
@@ -1680,6 +1683,9 @@ Public Class Form1
                         ElseIf _testGridScan Then
                             tag = "TestGridScan" : If _statusHook IsNot Nothing Then _statusHook("Running --test-gridscan…")
                             ok = TestGridScan()                         ' §265 (#88)
+                        ElseIf _testCellSweep Then
+                            tag = "TestCellSweep" : If _statusHook IsNot Nothing Then _statusHook("Running --test-cellsweep…")
+                            ok = TestCellSweep()                        ' §266 (#88)
                         End If
                         AppendLog($"[{tag}] OVERALL: {If(ok, "DONE/PASS", "FAIL")}{vbCrLf}", 1)
                         If _statusHook IsNot Nothing Then _statusHook($"{tag}: {If(ok, "DONE", "FAIL")} — results in %TEMP%")
