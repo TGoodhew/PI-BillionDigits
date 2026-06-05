@@ -5200,16 +5200,19 @@ Public Class Form1
                 Dim _p123Val1 As Long = If(_sz123 > _idx123 + 1, Runtime.InteropServices.Marshal.ReadInt64(_p123DPtr, CLng(_idx123 + 1) * 8L), 0L)
                 AppendLog($"[NR123] iter={_nrIter} p_after_shift[{_idx123-2:N0}]={_p123Vm2:X16} [{_idx123-1:N0}]={_p123Vm1:X16} [{_idx123:N0}]={_p123Val:X16} [{_idx123+1:N0}]={_p123Val1:X16} sz={_sz123:N0}{vbCrLf}")
             End If
-            ' §272 (#88): sound convergence detector.  At the full-precision fixed point r = 2r − p,
-            ' so r == p means this iteration is a no-op and r is frozen at the iteration's fixed point
+            ' §272 (#88): sound convergence detector.  At the fixed point r = 2r − p ⟹ p == r, so
+            ' r == p means this iteration is a no-op and r is frozen at the iteration's fixed point
             ' (within the §107 ±1-2 ulp that SafeMpzDiv's §171 adjust already corrects).  Compare BEFORE
             ' the 2r−p update (r is still the previous estimate, p is this iter's product).  Gated on
-            ' bShift = 0 so it can only fire at FULL precision — it detects ACTUAL r-stability, never a
-            ' prec proxy, so it cannot undershoot (while r still gains low bits, p ≠ r and we iterate).
-            ' Self-validating: it exits only when r is exactly stable, so the result is bit-identical to
-            ' running the remaining §200 min_nrIters tail.  §272 also fixed the 1-bit seed ⇒ accuracy now
-            ' tracks prec and reaches rBits as prec caps (~9 iters before the old min_nrIters floor).
-            Dim _converged272 As Boolean = (bShift = 0L) AndAlso (GmpRaw_cmp(r.Pointer, p.Pointer) = 0)
+            ' prec having reached its cap (prec >= rBits+2) so it can only fire at FULL target precision
+            ' — NOT on bShift, which at the real divide stays ≫0 because bBits ≫ rBits (the §251-fix
+            ' regime: bTrunc keeps only the top ~rBits bits of b, the rest don't affect r's rBits sig
+            ' bits).  It detects ACTUAL r-stability, never a prec proxy, so it cannot undershoot (while r
+            ' still gains low bits, p ≠ r and we iterate).  Self-validating: it exits only when r is
+            ' exactly stable, so the result is bit-identical to running the remaining §200 min_nrIters
+            ' tail.  §272 also fixed the 1-bit seed ⇒ accuracy now tracks prec and reaches rBits as prec
+            ' caps (~9-13 iters before the old min_nrIters floor at 1B/5B).
+            Dim _converged272 As Boolean = (prec >= rBits + 2L) AndAlso (GmpRaw_cmp(r.Pointer, p.Pointer) = 0)
             ' §PreAlloc-r-add: After checkpoint restore r._mp_alloc equals _mp_size exactly.
             ' GmpRaw_add(r,r,r) → 2r may need one extra limb → __gmpz_realloc > 33.5M limit → GMP abort.
             ' Pre-allocate 2 extra limbs via our pool to bypass it.

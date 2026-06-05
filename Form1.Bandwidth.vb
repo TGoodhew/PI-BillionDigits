@@ -338,10 +338,18 @@ Partial Class Form1
         Dim bDataPtr As IntPtr = New IntPtr(Runtime.InteropServices.Marshal.ReadInt64(b.Pointer, 8))
         Dim topLimb As ULong = CULng(Runtime.InteropServices.Marshal.ReadInt64(New IntPtr(bDataPtr.ToInt64() + CLng(szB - 1) * 8L)))
         Dim bBits As Long = CLng(szB - 1) * 64L + CLng(64 - System.Numerics.BitOperations.LeadingZeroCount(topLimb))
-        Dim kBits As Long = 2L * bBits
+        ' kBits = bBits + bBits\KDIV.  KDIV=1 ⇒ kBits = 2·bBits (rBits ≈ bBits, bShift→0 at the prec
+        ' cap — the "square-ish" case).  KDIV>1 ⇒ rBits ≈ bBits/KDIV < bBits, so bShift stays ≫0 at the
+        ' cap: the REAL divide regime (bBits ≫ rBits) where the §272 detector must still fire even
+        ' though bShift never reaches 0.  Set PI_RECIPCONV_KDIV=3 to mimic the 1B/5B divide reciprocal.
+        Dim kdiv As Long = 1L
+        Dim envK As String = Environment.GetEnvironmentVariable("PI_RECIPCONV_KDIV")
+        Dim parsedK As Long
+        If envK IsNot Nothing AndAlso Long.TryParse(envK, parsedK) AndAlso parsedK >= 1L Then kdiv = parsedK
+        Dim kBits As Long = bBits + bBits \ kdiv
         Dim rBits As Long = kBits - bBits + 1L
 
-        log($"b = {nB:N0} limbs ({bBits:N0} bits); kBits = {kBits:N0}; rBits ≈ {rBits:N0}; cores={Environment.ProcessorCount}")
+        log($"b = {nB:N0} limbs ({bBits:N0} bits); KDIV={kdiv} ⇒ kBits = {kBits:N0}; rBits ≈ {rBits:N0}; bShift@cap ≈ {bBits - rBits - 2L:N0}; cores={Environment.ProcessorCount}")
         Dim expFresh As Integer = CInt(System.Math.Ceiling(System.Math.Log(System.Math.Max(2L, rBits), 2))) + 3
         Dim precDoublings As Integer = CInt(System.Math.Ceiling(System.Math.Log(System.Math.Max(2.0, rBits / 62.0), 2)))
         log($"§200 fresh iters = ceil(log2(rBits))+3 = {expFresh}; prec hits rBits+2 after ~{precDoublings} doublings from 62.")
