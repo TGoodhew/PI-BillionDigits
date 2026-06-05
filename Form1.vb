@@ -3079,16 +3079,18 @@ Public Class Form1
         ' (parallel-wave sync + serial accumulate) scales with cell COUNT, so a tiny cell is
         ' catastrophic at 5B operand sizes — measured 260M² = 32.4 min at 1.5M (30,276 cells) vs
         ' 3.8 min at 16M (289 cells), bit-identical (§266 --test-cellsweep).  ADAPTIVE mode
-        ' (PI_CG_ADAPTIVE=1; OPT-IN until 1B→5B π is validated bit-identical) sizes the cell ≈ maxSz/3
-        ' (the measured sweet spot) capped at the FFT-safe maximum (PI_CG_CELL_MAX, default 16M: a cell
-        ' product 2·16M = 32M < the 33,554,431-limb GMP-FFT size cap), floored at 1.5M.  §160's lower
-        ' "FFT accuracy" cap is a misdiagnosis (GMP uses INTEGER Schönhage–Strassen, not float; the
-        ' wrong products it chased were the §200/§201 Newton bug, lifted by §220).  _cgCellOverride>0
-        ' (the --test-gridscan/cellsweep benchmarks) still wins.  Flag OFF ⇒ exactly 1.5M as before.
+        ' (§267 §268: ENABLED BY DEFAULT 2026-06-05; opt out with PI_CG_ADAPTIVE=0) sizes the cell ≈
+        ' maxSz/3 (the measured sweet spot) capped at the FFT-safe maximum (PI_CG_CELL_MAX, default
+        ' 16M: a cell product 2·16M = 32M < the 33,554,431-limb GMP-FFT size cap), floored at 1.5M.
+        ' §160's lower "FFT accuracy" cap is a misdiagnosis (GMP uses INTEGER Schönhage–Strassen, not
+        ' float; the wrong products it chased were the §200/§201 Newton bug, lifted by §220).
+        ' VALIDATED bit-identical at 1B (~38% faster Phase 3) AND 5B (SHA 2218ee06…, divide ~30-40%
+        ' faster, RAM peak ~40 GB).  _cgCellOverride>0 (the --test-gridscan/cellsweep benchmarks) wins;
+        ' PI_CG_ADAPTIVE=0 restores the old fixed 1.5M cell.
         Dim CHUNK As Integer
         If _cgCellOverride > 0 Then
             CHUNK = _cgCellOverride
-        ElseIf Environment.GetEnvironmentVariable("PI_CG_ADAPTIVE") = "1" Then
+        ElseIf Environment.GetEnvironmentVariable("PI_CG_ADAPTIVE") <> "0" Then
             Dim cellMax As Long = 16_000_000L
             Dim cmEnv As String = Environment.GetEnvironmentVariable("PI_CG_CELL_MAX")
             Dim cmParsed As Integer

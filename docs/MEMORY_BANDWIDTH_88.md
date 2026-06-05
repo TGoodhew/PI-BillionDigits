@@ -176,6 +176,16 @@ capped at the FFT-safe 16M (`PI_CG_CELL_MAX`), floored at 1.5M.
   **BIT-IDENTICAL to the 1B oracle**; 282 adaptive-cell engagements (7.29M/14.58M/16M cells), 0
   errors. Phase 3 ran in **1h07m vs the §262 baseline's ~1h50m — ~38% faster at 1B**. Confirms §160's
   FFT-accuracy concern was a misdiagnosis: 16M cells are bit-exact in the real pipeline.
-- **Before default-on:** a full-5B run validated bit-identical (5B uses the 16M cap, where §266
-  projected 8.62× on the dominant muls). RAM: 16M cells hold 32M-limb products × DOP parallel
-  (~6 GB vs ~0.6 GB at 1.5M) — fine on 64 GB, watch at 5B.
+## §268 — adaptive cell ENABLED BY DEFAULT (2026-06-05) — 5B VALIDATED bit-identical
+
+Full-5B validation: resumed from the run-2 `snap_Phase3`/`gmpNumer` with `PI_CG_ADAPTIVE=1`, ran the
+final 5B divide (reciprocal + a×r with adaptive **16M** cells — 17×17 = 289-cell grids), §216
+conversion, autoverify. Result: **π SHA-256 = `2218ee06…e08983a` — BIT-IDENTICAL to the 5B oracle**;
+75 adaptive-cell engagements, 0 errors, **adj-up 0 iters (exact quotient)**. RAM peaked ~40 GB (the
+52 GB watchdog never fired — 16M cells are RAM-safe at 5B). Timing: divide 5h02m vs the ~7–8h §gen
+baseline (~30–40% faster); the **un-accelerated §gen q×b (~1h34m+) is now the divide bottleneck** —
+routing it through the chunked grid (as §262 did for a×r) is the obvious follow-up.
+
+⇒ **`PI_CG_ADAPTIVE` now defaults ON** (§268; opt out `=0`). The chunked grid — the production path
+for the dominant 5B reciprocal (#70) + a×r (§262) — uses the FFT-safe-max cell. Validated 1B
+(~38% faster Phase 3) + 5B (bit-identical, ~30–40% faster divide), both SHA-matched.
