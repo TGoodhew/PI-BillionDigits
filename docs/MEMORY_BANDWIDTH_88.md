@@ -290,3 +290,28 @@ not on prec, so it never undershoots and does not violate the "never gate conver
 Together they cut the ~8-10 full-width tail iters to ~2 ⇒ a projected ~3-4× reciprocal speedup at 5B
 (each 5B iter ≈ 33 min). Must validate 1B bit-identical (resume-from-snap_Phase3, real divide) then 5B
 before shipping. Pure-measurement harness committed first; no math-path change yet.
+
+### §272 fix — better seed + sound convergence detector (harness-validated; 1B pending)
+
+Two changes to `SafeMpzReciprocal`, both validated at 64 Mbit via `--test-recipconv`:
+
+1. **Seed (root cause).** Numerator `2^64` → `2^(SEED_BBITS+SEED_PREC)` = `2^254`, against the top
+   `SEED_BBITS=128` bits of b, for a genuine `SEED_PREC≈126`-bit seed. The underestimate invariant
+   holds for any numerator (`bHi = ceil(b/2^bHiShift) ≥ b/2^bHiShift ⟹ floor(2^N/bHi)·2^scale ≤
+   2^kBits/b`). Probe after the fix: **SEED correctBits 2 → 127**, and correct-bits now tracks `prec`
+   exactly (iter 19: prec 34.6M, correct 34.55M) instead of doubling from 2 — convergence moves from
+   iter 26 to **iter 20** (prec and accuracy reach rBits together, as the schedule was designed for).
+
+2. **Convergence detector (sound).** Exit the Newton loop when `bShift==0` (full b in use) AND
+   `cmp(r,p)==0`. At the fixed point `r = 2r−p ⟹ p == r`, so `cmp==0` means the iteration is a proven
+   no-op and r is frozen at the iteration's fixed point (the §107 ±1-2 ulp SafeMpzDiv's §171 corrects).
+   It gates on ACTUAL r-stability, never on prec, so it cannot undershoot (while r still gains low
+   bits, `p ≠ r`); it is self-validating, so the result is bit-identical to running the full §200
+   `min_nrIters` tail. Probe: **exits at iter 21** (8 tail iters skipped), FINAL correctBits
+   63,999,998 — identical to the 29-iter run. 8.2 s vs 13.4 s even where all muls are sub-FFT cheap.
+
+Net at this size: 29 → 21 iters, and the full-width (capped-prec) region shrinks from ~10 iters to
+**~2**. At 5B each full-width iter is the ~33-min chunked mul, so this is the dominant remaining
+reciprocal lever — projected multi-hour divide saving. `PI_RECIP_SHORTMUL` etc. unaffected (the change
+is to the seed + loop-exit only). Validating 1B bit-identical (resume snap_Phase3, fresh divide
+reciprocal: nr_r/nr_raise/div_q/gmpPi deleted) vs reference π SHA b153e8d5… before any 5B claim.

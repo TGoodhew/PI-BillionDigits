@@ -4890,10 +4890,23 @@ Public Class Form1
             End Try
         End If
 
-        ' ── Seed: ~64-bit approximation from top 64 bits of b ──────────────
+        ' ── Seed: ~126-bit approximation from the top 128 bits of b ────────
         ' Skipped if §201-raise loaded a prior r as the seed.
+        ' §272 (#88): the old seed used numerator 2^64 against the top 64 bits of b (bHi ≈ 2^63),
+        ' so floor(2^64 / bHi) ≈ 2 — a 1-2 BIT quotient, NOT the ~62-bit reciprocal the prec
+        ' schedule (which starts at 62) was designed for.  --test-recipconv measured SEED
+        ' correctBits = 2 and correct-bits doubling from 2 (≈2^iter), which is exactly why §200
+        ' had to force min_nrIters = ceil(log2(rBits))+3 extra full-width iters to converge.
+        ' A P-bit quotient needs numerator 2^(bitlen(bHi)+P): keep the top SEED_BBITS=128 bits of
+        ' b and divide 2^(SEED_BBITS+SEED_PREC) by bHi to get a genuine ~SEED_PREC=126-bit seed.
+        ' The underestimate invariant is preserved for ANY numerator: bHi = ceil(b/2^bHiShift) ≥
+        ' b/2^bHiShift ⟹ floor(2^N/bHi) ≤ 2^N·2^bHiShift/b ⟹ r ≤ 2^kBits/b after scaling.  With
+        ' accuracy now ~126 ≥ the prec-schedule's 62, accuracy tracks prec and the Newton loop
+        ' converges ~9 iters sooner (the §272 detector below exits on real r-stability).
         If Not _raiseUsed Then
-            Dim bHiShift As Long = System.Math.Max(0L, bBits - 64L)
+            Const SEED_BBITS As Long = 128L   ' bits of b retained in bHi
+            Const SEED_PREC As Long = 126L    ' target correct bits in the seed (≤ SEED_BBITS−2)
+            Dim bHiShift As Long = System.Math.Max(0L, bBits - SEED_BBITS)
             Dim bHi As New mpz_t()
             gmp_lib.mpz_init(bHi)
             If bHiShift > 0L Then
@@ -4902,15 +4915,15 @@ Public Class Form1
             Else
                 GmpRaw_set(bHi.Pointer, b.Pointer)  ' §35
             End If
-            ' rSeed = floor(2^64 / bHi)  [safe: both operands tiny]
+            ' rSeed = floor(2^(SEED_BBITS+SEED_PREC) / bHi)  [both operands ≤ ~256 bits ⇒ tiny/fast]
             Dim rSeed As New mpz_t()
             gmp_lib.mpz_init(rSeed)
             gmp_lib.mpz_set_ui(rSeed, 1UI)
-            gmp_lib.mpz_mul_2exp(rSeed, rSeed, New mp_bitcnt_t(64UI))
+            gmp_lib.mpz_mul_2exp(rSeed, rSeed, New mp_bitcnt_t(CUInt(SEED_BBITS + SEED_PREC)))
             GmpRaw_tdiv_q(rSeed.Pointer, rSeed.Pointer, bHi.Pointer)  ' §35
             gmp_lib.mpz_clear(bHi)
-            ' Scale to r's domain: rSeed * 2^(kBits-64-bHiShift) ≈ 2^kBits / b (underestimate)
-            Dim seedScale As Long = kBits - 64L - bHiShift
+            ' Scale to r's domain: rSeed * 2^(kBits-(SEED_BBITS+SEED_PREC)-bHiShift) ≈ 2^kBits / b
+            Dim seedScale As Long = kBits - (SEED_BBITS + SEED_PREC) - bHiShift
             If seedScale > 0L Then
                 BigShiftLeft(rSeed, rSeed, seedScale)
             ElseIf seedScale < 0L Then
@@ -5187,6 +5200,16 @@ Public Class Form1
                 Dim _p123Val1 As Long = If(_sz123 > _idx123 + 1, Runtime.InteropServices.Marshal.ReadInt64(_p123DPtr, CLng(_idx123 + 1) * 8L), 0L)
                 AppendLog($"[NR123] iter={_nrIter} p_after_shift[{_idx123-2:N0}]={_p123Vm2:X16} [{_idx123-1:N0}]={_p123Vm1:X16} [{_idx123:N0}]={_p123Val:X16} [{_idx123+1:N0}]={_p123Val1:X16} sz={_sz123:N0}{vbCrLf}")
             End If
+            ' §272 (#88): sound convergence detector.  At the full-precision fixed point r = 2r − p,
+            ' so r == p means this iteration is a no-op and r is frozen at the iteration's fixed point
+            ' (within the §107 ±1-2 ulp that SafeMpzDiv's §171 adjust already corrects).  Compare BEFORE
+            ' the 2r−p update (r is still the previous estimate, p is this iter's product).  Gated on
+            ' bShift = 0 so it can only fire at FULL precision — it detects ACTUAL r-stability, never a
+            ' prec proxy, so it cannot undershoot (while r still gains low bits, p ≠ r and we iterate).
+            ' Self-validating: it exits only when r is exactly stable, so the result is bit-identical to
+            ' running the remaining §200 min_nrIters tail.  §272 also fixed the 1-bit seed ⇒ accuracy now
+            ' tracks prec and reaches rBits as prec caps (~9 iters before the old min_nrIters floor).
+            Dim _converged272 As Boolean = (bShift = 0L) AndAlso (GmpRaw_cmp(r.Pointer, p.Pointer) = 0)
             ' §PreAlloc-r-add: After checkpoint restore r._mp_alloc equals _mp_size exactly.
             ' GmpRaw_add(r,r,r) → 2r may need one extra limb → __gmpz_realloc > 33.5M limit → GMP abort.
             ' Pre-allocate 2 extra limbs via our pool to bypass it.
@@ -5198,6 +5221,11 @@ Public Class Form1
             ' seed), and whether it plateaus at rBits before _minNrIters (⇒ forced tail iters are wasted).
             If _recipConvRef IsNot Nothing Then
                 AppendLog($"[RecipConv§272] iter={_nrIter}/{_minNrIters} prec={prec:N0} bShift={bShift:N0} correctBits={RecipConv_CorrectBits(r, rBits):N0}/{rBits:N0}{vbCrLf}", 1)
+            End If
+            ' §272 (#88): exit as soon as the full-precision iteration is a proven no-op (r frozen).
+            If _converged272 Then
+                AppendLog($"[SafeMpzReciprocal§272] converged at iter={_nrIter} (r==p fixed point, prec={prec:N0} rBits={rBits:N0}) — exiting Newton ({_minNrIters - _nrIter} min-iter tail skipped){vbCrLf}", 2)
+                Exit Do
             End If
             ' §124: log r[20,904,662..665] immediately after r = 2r - p (final iter)
             ' §147: extend to 20904662..663 — check if r[20904663] has a gross error vs §127/§123
