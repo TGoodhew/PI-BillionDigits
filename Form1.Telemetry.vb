@@ -130,10 +130,15 @@ Partial Class Form1
                 "-NoProfile -NonInteractive -Command ""Get-CimInstance Win32_PhysicalMemory | " &
                 "Select-Object Speed,ConfiguredClockSpeed | ConvertTo-Json -Compress""") With {
                 .RedirectStandardOutput = True, .UseShellExecute = False, .CreateNoWindow = True}
-            Dim p As Process = Process.Start(psi)
-            If p Is Nothing Then Return
-            Dim outp As String = p.StandardOutput.ReadToEnd()
-            If Not p.WaitForExit(8000) Then Return
+            Dim outp As String = Nothing
+            Using p As Process = Process.Start(psi)
+                If p Is Nothing Then Return
+                outp = p.StandardOutput.ReadToEnd()
+                If Not p.WaitForExit(8000) Then
+                    Try : p.Kill() : Catch : End Try   ' don't leak a stuck powershell.exe on timeout
+                    Return
+                End If
+            End Using
             If String.IsNullOrWhiteSpace(outp) Then Return
             ' ConvertTo-Json yields a single object for one DIMM, an array for many.
             Dim maxSpeed As Integer = 0, maxConfig As Integer = 0, modules As Integer = 0
