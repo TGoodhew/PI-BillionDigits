@@ -161,5 +161,21 @@ downside of a silently-wrong 5B digit is catastrophic.
 - **Breaking the bandwidth portion is fundamentally a hardware change** (more channels). The Lane 4
   model says DDR5-7200 buys ~1.2×, quad-channel ~1.5–1.7×, 12-channel ~2.5–3×.
 
-`--test-dopscan` (DOP sweep) and `--test-gridscan` (split-factor / cell-size) are committed as the
-reusable measurement harnesses (size via `PI_DOPSCAN_LIMBS`).
+`--test-dopscan` (DOP sweep), `--test-gridscan` (split-factor) and `--test-cellsweep` (cell-size at
+5B sizes) are committed as the reusable measurement harnesses (size via `PI_DOPSCAN_LIMBS`).
+
+## §267 — adaptive cell size (prototype) — 1B VALIDATED bit-identical
+
+`PI_CG_ADAPTIVE=1` (opt-in; default OFF = unchanged 1.5M) sizes the chunked cell ≈ `max(szA,szB)/3`
+capped at the FFT-safe 16M (`PI_CG_CELL_MAX`), floored at 1.5M.
+
+- **`--test-chunkedgrid` under the flag:** all PASS — full bit-exact AND HIGH mode correct
+  (`highOver`+`highRegionEq`, the §107 contract the reciprocal/a×r rely on). Speedups ~doubled vs
+  1.5M (26M² cgHigh 2.79×→**6.84×**, 68M×52M 7.51×→**10.96×**).
+- **1B resume-from-snap_Phase3 with `PI_CG_ADAPTIVE=1`:** π SHA-256 = `b153e8d5…56d9b`
+  **BIT-IDENTICAL to the 1B oracle**; 282 adaptive-cell engagements (7.29M/14.58M/16M cells), 0
+  errors. Phase 3 ran in **1h07m vs the §262 baseline's ~1h50m — ~38% faster at 1B**. Confirms §160's
+  FFT-accuracy concern was a misdiagnosis: 16M cells are bit-exact in the real pipeline.
+- **Before default-on:** a full-5B run validated bit-identical (5B uses the 16M cap, where §266
+  projected 8.62× on the dominant muls). RAM: 16M cells hold 32M-limb products × DOP parallel
+  (~6 GB vs ~0.6 GB at 1.5M) — fine on 64 GB, watch at 5B.
