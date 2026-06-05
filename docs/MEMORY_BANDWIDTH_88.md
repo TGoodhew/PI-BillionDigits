@@ -328,3 +328,20 @@ exactly the same converged value). Division phase 7m20s; §270 convert 86s; **π
 b153e8d58b045fc65e86… BIT-IDENTICAL to the reference**, Verify OK (999999@762 / 777777777@24.66M /
 nine-9s@564.67M). Confirms seed (2→126 bits) + sound detector are value-preserving in the full
 pipeline. 5B run pending user go-ahead; projected ~8 full-width reciprocal iters saved.
+
+### §272 — 5B BIT-IDENTICAL ✓ (2026-06-05, resume, fresh divide reciprocal)
+
+Resumed `C:\PiOutput_5B_272test` snap_Phase3 (copied from PiPreserved_5B_run2; gmpNumer+gmpSqrt+finalT
+kept, `nr_raise.*` DELETED from NodeCache AND SnapshotStore to force from-seed Newton — no §201-raise
+reuse), launched exe directly `--digits 5000000000 --auto-checkpoint --autoverify --log-level 2
+--threshold 200000 --autostart`. Real-divide reciprocal: szR=259,525,633 limbs, rBits=16,609,640,488,
+**bShift=47,296,453,594 ≫ 0** at iter 1 (confirms the detector ran its prec-cap branch, NOT bShift==0
+— the §a11d14d fix is what made 5B work). 126-bit seed gave **prec=128 at iter 1**. The §272 detector
+fired: **"converged at iter=29 (r==p fixed point, prec=16,609,640,490 ≥ rBits+2) — 8 min-iter tail
+skipped"**. **adj-up 0 iters** (§171 made ZERO corrections ⇒ new-seed reciprocal is exactly the
+converged value). §262 a×r-HIGH + §269 q×b-chunked engaged. **Whole divide (recip+a×r+q×b+adj) =
+55m28s** from process start (reciprocal ~41m of that), vs §269 ~3h14m reference and ~7-8h §gen baseline
+— all chunked opts stacked. **gmpPi.bin SHA-256 =
+34F40CDE9FFAFAC4EFFFDCA2925F340FE399F452D441A601B7621B7AC2DD0709 BIT-IDENTICAL to
+PiPreserved_5B_run3_VERIFIED gmpPi.bin** (value-deterministic SerializeOneMpz). §272 seed + sound
+detector PROVEN correct at 5B. #88's last big lever is closed.
