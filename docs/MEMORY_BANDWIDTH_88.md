@@ -209,3 +209,43 @@ accumulator into qb).
 ⇒ **The whole 5B divide (reciprocal + a×r + q×b) is now on the chunked grid at the FFT-safe-max cell**,
 down from the ~7–8h §gen baseline to **~3h14m (~2.3×)**. Remaining divide cost is the reciprocal
 Newton; next slow stage is §216 conversion (#90).
+
+## §270 — 5B-safe parallel decimal conversion (#90 closed) — default ON
+
+The §226 parallel converter (mpz→decimal by recursive halving: split `d` digits at `10^(d/2)`,
+`Parallel.Invoke` on hi/lo, leaf `mpz_get_str`; byte-identical to §216) was validated at 1B but
+**unsafe at 5B** — a naive halve there needs a `10^2.5B` divisor (130M limbs). §270 adds a peel rule:
+
+```vbnet
+Private Const CONV_SAFE_PEEL As Long = 500_000_000L
+Private Shared Function ConvSplitLowDigits(digits As Long) As Long
+    If digits > 2L * CONV_SAFE_PEEL Then Return CONV_SAFE_PEEL  ' peel a fixed 500M-digit low chunk
+    Return digits \ 2                                           ' else halve as before
+End Function
+```
+
+This caps every split divisor at `10^500M` (26M limbs); the 5B power table becomes
+31.25M / 62.5M / 125M / 250M / 500M digits — no `10^2.5B`. Parallelism and byte-identity are
+preserved (the same divide-and-conquer tree, just with a bounded top split).
+
+- **5B:** resume from gmpNumer+gmpPi, converter only — **5B digits in 933 s (~15.6 min)**: 8 s
+  power-table build + 924.8 s parallel halving, vs §216 serial ~47 min (**~3×**). Verify OK;
+  **π SHA-256 = `2218ee06…e08983a` bit-identical to the oracle**; RAM ~19 GB.
+
+⇒ **`PI_CONV_PARALLEL` now defaults ON** (opt out `=0` → §216 serial); routes for all digits ≥ 100M.
+#90 closed.
+
+## §271 — movable digit-window display (#98)
+
+The display option streamed every digit into a RichTextBox via `AppendText` — ~O(n²) (each append is
+O(current length)) and duplicated GB of text on top of the native buffer, so it was unusable at
+1B/5B. §271 instead shows a bounded **250k-digit window** read on demand from the native result
+buffer, with a `TrackBar` docked under the digit box that scrubs the window across the *whole* digit
+range (O(window) per move, constant memory); the RichTextBox's own scrollbar scrolls within the
+window, and a label shows "Digits A–B of N". For a large native result `StreamPiToScreen` writes
+`pi_digits.txt` and runs Verify immediately, then calls `SetupNavWindow` — no streaming pass.
+
+**Display-only:** the output file and the Verify path both read the native buffer directly and are
+untouched, so there is no correctness impact. Build clean, offset bounds checked. It's an
+interactive-UI change (the headless `--autostart` path forces display off), so it needs an on-screen
+confirmation of the slider before #98 is closed. Landed in commit `8b97a5b` (alongside §270).
