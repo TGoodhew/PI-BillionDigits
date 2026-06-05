@@ -1459,16 +1459,21 @@ Public Class Form1
 
     Private Sub Form1_Load(sender As Object, e As EventArgs) Handles MyBase.Load
         ' ── Parse command-line arguments ─────────────────────────────────────
-        ' Supported flags:
+        ' Supported flags (see README "Command-line options" for the full reference):
         '   --digits N                  Set the digit count (no commas required)
-        '   --autostart                 Suppress all dialogs and auto-begin computation
+        '   --autostart                 Suppress all dialogs and auto-begin computation (headless)
         '   --autoverify                After computation, auto-run verify + exit
+        '   --verify-at "D:P"           Assert digit string D occurs at position P (repeatable)
+        '   --verify-contains "D"       Assert digit string D occurs anywhere (repeatable)
         '   --threshold N               Override the RAM/disk threshold (nodes)
-        '   --log-level N               Set runtime logging level 0–5 (default 1)
+        '   --log-level N               Set runtime logging level 0–5 (default 2)
         '   --output-dir D              Override output directory for digits, log, and node cache
         '   --checkpoint-from-level N   Serialize nodes at level >= N to disk (for resume)
         '   --resume-from-level N       Skip Phase 1 + levels 1..N-1; load checkpoint files for level N
         '   --auto-checkpoint           Write RAM snapshot at end of each level; auto-resume on next run
+        '   --test-mulhigh | --test-chunkedgrid | --test-eta | --test-advisor |
+        '   --test-dopscan | --test-gridscan | --test-cellsweep | --test-recipconv
+        '                               Run the named self-test / benchmark harness, then exit
         Dim args() As String = Environment.GetCommandLineArgs()
         ' Log all received args so we can diagnose unexpected headless activation.
         ' args(0) is always the exe path; user args start at index 1.
@@ -1668,11 +1673,12 @@ Public Class Form1
         ' to E-cores and halving their CPU quota.
         DisablePowerThrottling()
 
-        ' Restrict process affinity to P-cores on hybrid CPUs (Intel 12th gen+,
-        ' AMD Zen 4c).  E-cores run GMP arithmetic ~30-50% slower and cause
-        ' cache-topology mismatches in parallel workloads.
+        ' Affinity on hybrid CPUs (Intel 12th gen+, AMD Zen 4c).  E-cores run GMP
+        ' arithmetic ~30-50% slower, so the compute threads belong on P-cores.  §247
+        ' keeps the PROCESS mask on all cores (P | E) and the watchdog hard-pins the
+        ' compute threads to P, leaving E-cores free for the §248/§249 I/O threads.
         SetPCoreAffinity()
-        StartAffinityWatchdog()   ' §106: keep all threads on P-cores throughout the run
+        StartAffinityWatchdog()   ' §106: keep compute threads on P-cores throughout the run
 
         ' Install VirtualAlloc/VirtualFree custom GMP allocator so large limb
         ' buffers are immediately decommitted on free, preventing commit-charge
@@ -2155,6 +2161,16 @@ Public Class Form1
     '  Chudnovsky binary splitting — chunk level
     ' ════════════════════════════════════════════════════════════════════════
 
+    ''' <summary>
+    ''' Recursively binary-splits the Chudnovsky term range [a, b) into the three integer partial
+    ''' products P, Q, T for that range (the leaf-to-chunk level of the binary-splitting tree).
+    ''' Serial recursion; the parallel variant is <see cref="BinarySplitChunkParallelTop"/>.
+    ''' </summary>
+    ''' <param name="a">Inclusive start term index.</param>
+    ''' <param name="b">Exclusive end term index.</param>
+    ''' <param name="Pab">Receives P for [a, b).</param>
+    ''' <param name="Qab">Receives Q for [a, b).</param>
+    ''' <param name="Tab">Receives T for [a, b).</param>
     Private Sub BinarySplitChunk(a As Long, b As Long,
                           ByRef Pab As mpz_t,
                           ByRef Qab As mpz_t,
@@ -2290,6 +2306,17 @@ Public Class Form1
     ' Parallel.Invoke scheduling).  The outer queue depth has dropped below the
     ' 24-core DOP at that point, so the inner Parallel.Invoke fills idle cores
     ' without oversubscribing.
+    ''' <summary>
+    ''' Top-split parallel variant of <see cref="BinarySplitChunk"/> (§234): splits [a, b) at the
+    ''' midpoint and computes the two halves via Parallel.Invoke before combining. Used only by Phase 1's
+    ''' outer Parallel.For for the last ~24 chunks (≥ 512 terms each), where the outer queue depth has
+    ''' dropped below the core count so the inner parallelism fills idle cores without oversubscribing.
+    ''' </summary>
+    ''' <param name="a">Inclusive start term index.</param>
+    ''' <param name="b">Exclusive end term index.</param>
+    ''' <param name="Pab">Receives P for [a, b).</param>
+    ''' <param name="Qab">Receives Q for [a, b).</param>
+    ''' <param name="Tab">Receives T for [a, b).</param>
     Private Sub BinarySplitChunkParallelTop(a As Long, b As Long,
                                             ByRef Pab As mpz_t,
                                             ByRef Qab As mpz_t,
@@ -2341,6 +2368,15 @@ Public Class Form1
     ' Issue #6 fix (partial): signature takes three mpz_t directly instead of a
     ' Tuple(Of mpz_t,mpz_t,mpz_t), eliminating one throw-away heap allocation
     ' per call (~137 K calls for 1 B digits).
+    ''' <summary>
+    ''' Writes one binary-split node's (P, Q, T) to a single binary file, using a reused 4 MB staging
+    ''' buffer (§56) to avoid per-field LOH allocations. The unit of Phase 1's disk-based node cache.
+    ''' </summary>
+    ''' <param name="p">Node P value.</param>
+    ''' <param name="q">Node Q value.</param>
+    ''' <param name="t">Node T value.</param>
+    ''' <param name="filePath">Destination file (overwritten if present).</param>
+    ''' <param name="detailLog">When True, emit per-node serialize logging.</param>
     Private Sub SerializeNodeToDisk(p As mpz_t, q As mpz_t, t As mpz_t, filePath As String,
                                     Optional detailLog As Boolean = True)
         If _logLevel >= 2 Then WriteToLog($"[Serialize] Writing {System.IO.Path.GetFileName(filePath)}")
@@ -2369,6 +2405,15 @@ Public Class Form1
     ' before GC/FlushGmpPool so that in-memory nodes are still live.
     ' meta.txt is written last; its presence on disk signals a complete snapshot.
     ' numTerms and numChunks are embedded in meta.txt for validation on resume.
+    ''' <summary>
+    ''' Writes a complete Phase 2 level snapshot to NodeCache\snap_L{level}\ (§94). meta.txt is written
+    ''' last and embeds numTerms/numChunks; its presence signals a complete, resumable snapshot.
+    ''' </summary>
+    ''' <param name="level">Phase 2 combine level being snapshotted.</param>
+    ''' <param name="nodes">The level's disk nodes to record.</param>
+    ''' <param name="numTerms">Run's total term count (validated on resume).</param>
+    ''' <param name="numChunks">Run's chunk count (validated on resume).</param>
+    ''' <returns>True if the snapshot was written completely.</returns>
     Private Function WriteLevelSnapshot(level As Integer,
                                        nodes As List(Of DiskNode),
                                        numTerms As Long,
@@ -2421,6 +2466,12 @@ Public Class Form1
     ' §94: Scan NodeCache for the highest-level complete snapshot that matches
     ' the current run parameters (digits + numChunks).  Returns the level number
     ' or -1 if no valid snapshot is found.
+    ''' <summary>
+    ''' Scans NodeCache for the highest-level complete snapshot whose metadata (digits + numChunks)
+    ''' matches the current run, so Phase 2 can resume from it (§94).
+    ''' </summary>
+    ''' <param name="numChunks">Current run's chunk count, matched against each snapshot's meta.txt.</param>
+    ''' <returns>The matching level number, or -1 if no valid snapshot exists.</returns>
     Private Function TryFindBestSnapshot(numChunks As Long) As Integer
         If Not System.IO.Directory.Exists(DISK_CACHE_DIR) Then Return -1
         Dim bestLevel As Integer = -1
@@ -2464,6 +2515,12 @@ Public Class Form1
 
     ' §104: Immediately copy a NodeCache snapshot to SnapshotStore after it is
     ' written, so the backup is current before Phase 2 loads and deletes the files.
+    ''' <summary>
+    ''' Synchronously mirrors a NodeCache snapshot directory to SnapshotStore (§104) so a current backup
+    ''' exists before Phase 2 consumes (and deletes) the live NodeCache files. See
+    ''' <see cref="BackupSnapshotToStoreAsync"/> for the off-critical-path variant.
+    ''' </summary>
+    ''' <param name="snapName">Snapshot directory name (e.g. "snap_L7", "snap_Phase3").</param>
     Private Shared Sub BackupSnapshotToStore(snapName As String)
         Try
             Dim storeDir As String = System.IO.Path.Combine(_outputDir, "SnapshotStore")
@@ -2508,6 +2565,12 @@ Public Class Form1
     Private Shared _bkstoreTail As Task = Task.CompletedTask
     Private Shared ReadOnly _bkstoreTailLock As New Object()
 
+    ''' <summary>
+    ''' Tail-chained async variant of <see cref="BackupSnapshotToStore"/> (§232): queues the mirror on a
+    ''' background ThreadPool thread so the copy overlaps the next Newton iteration. Backups serialize via
+    ''' a single tail Task; WaitForPendingBackups drains the chain at shutdown.
+    ''' </summary>
+    ''' <param name="snapName">Snapshot directory name to mirror to SnapshotStore.</param>
     Private Shared Sub BackupSnapshotToStoreAsync(snapName As String)
         SyncLock _bkstoreTailLock
             Dim _capturedSnap As String = snapName  ' explicit capture to avoid closure surprises
@@ -2596,6 +2659,17 @@ Public Class Form1
         End Try
     End Function
 
+    ''' <summary>
+    ''' Saves the Phase 3 entry checkpoint — the root binary-split values (finalP, finalQ, finalT) to
+    ''' snap_Phase3\ (§103) — so a crash during the long Phase 3 arithmetic resumes without re-running
+    ''' Phase 1/2. Backed up to SnapshotStore asynchronously (§232).
+    ''' </summary>
+    ''' <param name="snapDir">Target snapshot directory.</param>
+    ''' <param name="digits">Run digit count (recorded for resume validation).</param>
+    ''' <param name="numTerms">Run term count (recorded for resume validation).</param>
+    ''' <param name="finalP">Root P.</param>
+    ''' <param name="finalQ">Root Q.</param>
+    ''' <param name="finalT">Root T.</param>
     Private Sub SavePhase3Snapshot(snapDir As String, digits As Long, numTerms As Long,
                                     finalP As mpz_t, finalQ As mpz_t, finalT As mpz_t)
         Try
@@ -2644,6 +2718,16 @@ Public Class Form1
     ' §103: Load finalP/finalQ/finalT from snap_Phase3/ if it exists and matches digits.
     ' Returns True and populates outP/outQ/outT on success; returns False on any mismatch or error.
     ' outP/outQ/outT must already be mpz_init'd by the caller.
+    ''' <summary>
+    ''' Loads the Phase 3 checkpoint (finalP/finalQ/finalT) from snap_Phase3\ if present and matching the
+    ''' current digit count (§103), letting Phase 3 resume without recomputing Phase 1/2.
+    ''' </summary>
+    ''' <param name="snapDir">Snapshot directory to load from.</param>
+    ''' <param name="digits">Expected digit count; a mismatch is rejected.</param>
+    ''' <param name="outP">Receives root P (must be mpz_init'd by the caller).</param>
+    ''' <param name="outQ">Receives root Q (must be mpz_init'd by the caller).</param>
+    ''' <param name="outT">Receives root T (must be mpz_init'd by the caller).</param>
+    ''' <returns>True on a successful, validated load; False on any mismatch or error.</returns>
     Private Function TryLoadPhase3Snapshot(snapDir As String, digits As Long,
                                             outP As mpz_t, outQ As mpz_t, outT As mpz_t) As Boolean
         Try
@@ -2706,6 +2790,15 @@ Public Class Form1
     ' at 5B scale).  outP and outQ are left mpz_init'd as 0; downstream code on the
     ' gmpNumer-resume path never touches them.  Falls back gracefully (returns False) if
     ' the snap dir is incomplete — caller then retries the full load.
+    ''' <summary>
+    ''' T-only sibling of <see cref="TryLoadPhase3Snapshot"/> (§214). When the caller has confirmed the
+    ''' gmpNumer.bin resume path (which skips Steps 1–5), only T is needed downstream as the SafeMpzDiv
+    ''' divisor, so P and Q are not loaded — saving ~9.3 GB of working set at 5 B startup.
+    ''' </summary>
+    ''' <param name="snapDir">Snapshot directory to load from.</param>
+    ''' <param name="digits">Expected digit count; a mismatch is rejected.</param>
+    ''' <param name="outT">Receives root T (must be mpz_init'd by the caller).</param>
+    ''' <returns>True if T was loaded; False (graceful) if the snapshot is incomplete or mismatched.</returns>
     Private Function TryLoadPhase3SnapshotTOnly(snapDir As String, digits As Long,
                                                  outT As mpz_t) As Boolean
         Try
@@ -2959,6 +3052,18 @@ Public Class Form1
     ' GmpRaw_add into a pre-grown result (no GMP realloc abort).  The OVERESTIMATE contract
     ' (result ≥ full, and (result>>S) within ~1 ulp of (full>>S)) is checked by --test-mulhigh.
     ' Requires result to be a DISTINCT mpz_t from opA/opB (true at the reciprocal call sites).
+    ''' <summary>
+    ''' High-half ("short") product for the capped-precision reciprocal-Newton iterations (§250, #94).
+    ''' Returns an OVERESTIMATE of opA·opB whose top limbs (down to the kept region) are exact: low
+    ''' 3×3 sub-products entirely below the cutoff are skipped and an upper bound of their omitted mass
+    ''' is added (round-up). Contract: result ≥ true product, so after the caller's right-shift the
+    ''' reciprocal r = 2r − (result≫S) stays a strict UNDERESTIMATE (the §107 invariant); the bounded
+    ''' few-ulp low error is corrected to exactness by SafeMpzDiv's §171/§218 quotient adjustment.
+    ''' </summary>
+    ''' <param name="result">Receives the high product; must be a DISTINCT mpz_t from opA/opB.</param>
+    ''' <param name="opA">First operand.</param>
+    ''' <param name="opB">Second operand.</param>
+    ''' <param name="keepLimbs">Number of high-order product limbs required to be exact; cells entirely below that region are dropped.</param>
     Private Shared Sub SafeMpzMulHigh(result As mpz_t, opA As mpz_t, opB As mpz_t, keepLimbs As Long)
         Const SAFE_LIMB_THRESHOLD As Long = 5_000_000L
         Const GUARD_LIMBS As Long = 8L
@@ -3100,6 +3205,17 @@ Public Class Form1
     '     an upper bound of the omitted mass (round-up) so result ≥ true product (the §94 reciprocal
     '     short-mul, now parallel-ready and memory-light).  result must be DISTINCT from opA/opB.
     ' NOTE (pt1): cells run SERIALLY here; parallelisation of the cell mults is the pt2 perf step.
+    ''' <summary>
+    ''' Chunked-grid multiply (§251, #70) — the production path for the dominant 5 B multiplies
+    ''' (reciprocal RecipMul §254, divide a×r §262, q×b §269). Computes opA·opB as a grid of
+    ''' ≤CHUNK×CHUNK GMP-FFT-safe cells, accumulated by mpn_add at each cell's limb offset (O(cell)
+    ''' per cell, no whole-buffer shift). Cell size is adaptive (§267, see PI_CG_ADAPTIVE / PI_CG_CELL_MAX)
+    ''' and cells run in parallel (PI_CG_DOP). result must be DISTINCT from opA/opB.
+    ''' </summary>
+    ''' <param name="result">Receives the product.</param>
+    ''' <param name="opA">First operand.</param>
+    ''' <param name="opB">Second operand.</param>
+    ''' <param name="keepLimbs">0 = exact full product; &gt; 0 = HIGH product keeping that many top limbs exact (cells fully below the cutoff are skipped and an upper bound of the omitted mass added, so result ≥ true — the §94/§107 overestimate contract).</param>
     Private Shared Sub SafeMpzMul_ChunkedGrid(result As mpz_t, opA As mpz_t, opB As mpz_t, keepLimbs As Long)
         Const GUARD_LIMBS As Long = 8L
         Dim szA As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4))
@@ -4753,6 +4869,21 @@ Public Class Form1
     ' Compute r = floor(2^kBits / b) for b > 0, kBits > sizeinbase(b,2).
     ' Newton iteration with progressive precision; r is always an underestimate.
     ' All large multiplications use SafeMpzMul — no direct mpn_mul_fft calls.
+    ''' <summary>
+    ''' Barrett-style reciprocal: computes r ≈ floor(2^kBits / b) by progressive-precision Newton
+    ''' iteration (r ← 2r − r²·b≫…), routing every large multiply through the chunked grid / SafeMpzMul
+    ''' so GMP's FFT is never handed an over-large operand. Seeded with a ~126-bit estimate and exited
+    ''' by a sound r-stability detector (§272).
+    ''' </summary>
+    ''' <param name="r">Receives the reciprocal.</param>
+    ''' <param name="b">Divisor.</param>
+    ''' <param name="kBits">Fixed-point scale — the reciprocal is of 2^kBits.</param>
+    ''' <remarks>
+    ''' CONTRACT: r is always a strict UNDERESTIMATE of floor(2^kBits/b) (the §107 invariant — the
+    ''' high-product short-muls round up, so r never overshoots). <see cref="SafeMpzDiv"/> depends on
+    ''' this and corrects the resulting quotient to the exact value with its §171/§218 adjust loop.
+    ''' Convergence must be gated only on real r-stability, NEVER on the precision schedule (#93).
+    ''' </remarks>
     Private Shared Sub SafeMpzReciprocal(r As mpz_t, b As mpz_t, kBits As Long)
         Const SAFE As Integer = 33_554_431
         ' §250 (#94): read the high-half short-product flags once per reciprocal call.
@@ -4761,7 +4892,7 @@ Public Class Form1
         ' (259.5M² ~33min/iter), harness 2.81×(rSq)/6.97×(p) vs §gen-DOP9.  Only routes the reciprocal
         ' capped-iter muls (RecipMul); the gate (size>SAFE + DOP≤MAXDOP) fires it only where it wins.
         _recipShortMul = (Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL") <> "0")
-        _recipShortMulVerify = (Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL_VERIFY") = "1")
+        _recipShortMulVerify = (Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL_VERIFY") = "1")   ' =1 cross-checks each chunked RecipMul vs §gen (default off)
         Dim _rsmDopEnv As String = Environment.GetEnvironmentVariable("PI_RECIP_SHORTMUL_MAXDOP")  ' §251 (#70) DOP gate
         Dim _rsmDopParsed As Integer
         If _rsmDopEnv IsNot Nothing AndAlso Integer.TryParse(_rsmDopEnv, _rsmDopParsed) AndAlso _rsmDopParsed >= 1 Then _recipShortMulMaxDop = _rsmDopParsed Else _recipShortMulMaxDop = 9
@@ -5374,6 +5505,22 @@ Public Class Form1
     ' Compute q = floor(a / b).  Safe for any operand size.
     ' Uses Barrett-style Newton reciprocal + SafeMpzMul — no direct GMP division
     ' for large inputs (which would crash via mpn_mul_fft overflow at 5B digits).
+    ''' <summary>
+    ''' Computes q = floor(a / b), safe for any operand size. Forms the Barrett quotient from
+    ''' <see cref="SafeMpzReciprocal"/> (q ≈ (a · r) ≫ kBits, the a×r §262 and q×b §269 multiplies
+    ''' running on the chunked grid), then corrects it to the exact floor. No direct GMP division —
+    ''' which would crash via mpn_mul_fft overflow at 5 B digits.
+    ''' </summary>
+    ''' <param name="q">Receives the exact integer quotient floor(a / b).</param>
+    ''' <param name="a">Dividend.</param>
+    ''' <param name="b">Divisor.</param>
+    ''' <remarks>
+    ''' CONTRACT: the reciprocal r is a strict underestimate (§107), so the raw Barrett quotient is at
+    ''' or just below the true value; the §171/§218 adjust loop then nudges q by ±1 (bounded by
+    ''' MAX_ADJ_ITERS) until a − q·b ∈ [0, b), yielding the exact floor. This is why over-estimating the
+    ''' a×r / q×b high-products (§262/§269) is safe — the adjustment converges either way and π is
+    ''' bit-identical.
+    ''' </remarks>
     Private Shared Sub SafeMpzDiv(q As mpz_t, a As mpz_t, b As mpz_t)
         Const SAFE As Integer = 33_554_431
         Const MAX_ADJ_ITERS As Integer = 10   ' Barrett should need ≤ 2; >10 means reciprocal is wrong
@@ -6789,6 +6936,14 @@ PostShiftCheckpoint:
     '   q        = floor(nTrunc / xTrunc) (~target bits)
     '   xNew     = ((xTrunc + q) >> 1) << xHalf  [scaled back to sqrt(n) domain]
     ' Convergence: Newton quadratic convergence, ~6 large iterations for 5B digits.
+    ''' <summary>
+    ''' Computes result = floor(sqrt(n)), safe for any size n (§100). A progressive-precision Newton
+    ''' iteration in sqrt(n)'s domain that routes every large multiply through SafeMpzMul and every
+    ''' large division through <see cref="SafeMpzDiv"/> — neither calls mpn_mul_fft directly, which
+    ''' GMP's mpz_sqrt would and which overflows at 5 B digits. ~6 large iterations at 5 B.
+    ''' </summary>
+    ''' <param name="result">Receives floor(sqrt(n)).</param>
+    ''' <param name="n">Radicand.</param>
     Private Shared Sub SafeMpzSqrt(result As mpz_t, n As mpz_t)
         Const SAFE As Integer = 33_554_431
         Dim szN As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(n.Pointer, 4))
@@ -7189,6 +7344,14 @@ PostShiftCheckpoint:
         End Sub
     End Class
 
+    ''' <summary>
+    ''' Phase 1 driver for the Chudnovsky binary split: divides the full term range into adaptive-size
+    ''' chunks (clamp(numTerms\10000, 512, 8192) terms each), computes each chunk's (P, Q, T) in parallel
+    ''' via <see cref="BinarySplitChunk"/>, and streams the results to disk / collects them as the leaf
+    ''' nodes that Phase 2 combines bottom-up into the root P, Q, T.
+    ''' </summary>
+    ''' <param name="numTerms">Total number of Chudnovsky series terms to sum.</param>
+    ''' <param name="nodes">Receives the per-chunk leaf results (in RAM mode; disk mode streams to NodeCache).</param>
     Private Sub BinarySplitGMP(numTerms As Long,
                                 ByRef nodes As List(Of Result))
 
@@ -8061,8 +8224,18 @@ Phase2:
     ' shrinking dividend sizes (5B → 4.7B → ... → 300M digits) divided by a
     ' fixed 300M-digit divisor.  Expected wall time at 5B: ~4-8 h.
     '
-    ' Issue #37 plans a parallel recursive halving version of this — §216 is
-    ' the minimal serial workaround to unblock the in-flight 5B run.
+    ' NOTE: §270 (#90) shipped the parallel recursive-halving converter that issue #37 had only
+    ' planned — see ParallelMpzGetStr.  As of §270 that parallel path is the DEFAULT at ≥ 1.5 B digits;
+    ' this §216 serial slab converter is now the fallback (selected when PI_CONV_PARALLEL=0).
+    ''' <summary>
+    ''' Serial chunked decimal conversion (§216) — replaces GMP's mpz_get_str, which crashes with an
+    ''' AccessViolation when the output exceeds ~2 GB (Int32 overflow in its divide-and-conquer). Extracts
+    ''' fixed-size decimal slabs via repeated (rem = pi mod 10^k ; pi = pi \ 10^k), converts each slab
+    ''' (safely small) and writes them right-to-left into a pre-allocated native buffer.
+    ''' Superseded as the default by <see cref="ParallelMpzGetStr"/> (§270); used as the fallback.
+    ''' </summary>
+    ''' <param name="pi">The computed value to render (consumed/shrunk during extraction).</param>
+    ''' <param name="totalDigitsEstimate">Estimated decimal digit count, used to size the output buffer.</param>
     Private Sub ChunkedMpzGetStr(pi As mpz_t, totalDigitsEstimate As Long)
         ' §216d: reduced chunk from 300M → 50M.  At 300M chunk, mpz_get_str crashed
         ' inside __gmpn_dc_get_str on a 15.5M-limb chunkRem producing 300M-char output.
@@ -8277,6 +8450,14 @@ Phase2:
     '   * Verification: byte-identical output to GMP's mpz_get_str / §216
     '     chunked path.  Validated at 1B against the 2026-05-22 post-§225
     '     verified pi_digits.txt.
+    ''' <summary>
+    ''' Parallel recursive-halving decimal converter (§226/§270, #90) — the DEFAULT decimal conversion
+    ''' at ≥ 1.5 B digits (opt out with PI_CONV_PARALLEL=0 to use the §216 serial path). Splits the value
+    ''' against a pre-built power-of-10 table and recurses in parallel, writing each leaf's digits at its
+    ''' absolute output offset. 5 B-safe via the §270 safe-peel split rule; byte-identical to mpz_get_str.
+    ''' </summary>
+    ''' <param name="pi">The computed value to render.</param>
+    ''' <param name="totalDigitsEstimate">Estimated decimal digit count, used to size the output buffer and power table.</param>
     Private Sub ParallelMpzGetStr(pi As mpz_t, totalDigitsEstimate As Long)
         Const LEAF_THRESHOLD As Long = 50_000_000L
 

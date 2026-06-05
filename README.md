@@ -40,7 +40,7 @@ Profiling (dotnet-trace topN) shows `SafeMpzMul` exclusive time dropped from **1
 
 ### How to run at 5 billion digits
 
-The `Run-PiCompute.ps1` script accepts a `-Threshold` parameter that overrides the RAM/disk threshold. At 5 billion digits the number of Phase 1 chunks (~688,000) exceeds the default threshold; pass a large value to keep everything in RAM and avoid disk I/O during the combine phase.
+The `Run-PiCompute.ps1` script accepts a `-Threshold` parameter that overrides the RAM/disk threshold. At 5 billion digits the number of Phase 1 chunks (~43,000) exceeds the default threshold; pass a large value to keep everything in RAM and avoid disk I/O during the combine phase. (The chunk count does not scale linearly with digits — `CHUNK_SIZE` saturates at 8,192 terms per chunk, so 1 billion digits yields ~137,700 chunks and 5 billion yields ~43,000.)
 
 **Requirements:** ~40 GB available RAM for an all-in-RAM 5-billion-digit run (peak occurs during the final division), 64-bit Windows, .NET 10. The app auto-detects available RAM at startup and lowers the RAM/disk threshold (spilling the binary-split tree to the NVMe cache) on smaller machines, so it still runs — more slowly — with less RAM.
 
@@ -74,7 +74,7 @@ The computation uses the **Chudnovsky algorithm** with **binary splitting**, whi
 |---------|-------------|
 | **Digits of PI** text box | Number of decimal digits to compute. Accepts values like `1,000,000` or `1000000000`. Auto-formatted with commas as you type. Default: 1,000,000. |
 | **Start** button | Begins the computation on a high-priority background thread (256 MB stack). Disabled while a run is in progress. |
-| **Cancel** button | Cancels the current run via a cancellation token. If "Write to File" is checked, the digits computed so far are saved before stopping. |
+| **Cancel** button | Cancels the current run via a cancellation token. All in-progress work is **discarded** — nothing is written to file (an interactive run has no mid-run checkpoint). A confirmation dialog warns that all progress will be lost. |
 | **Display** checkbox | When checked, the computed digits are shown in the output panel after computation completes — streamed in for runs up to 250,000 digits, or presented via the navigable window (below) for larger runs. Unchecking this is useful when only the file output matters, since rendering a billion digits is expensive. |
 | **Write to File** checkbox | When checked, the full digit string is saved to `pi_digits.txt` in the output directory (default `C:\PiOutput`) after computation. |
 | **Verify after compute** checkbox | When checked, the known-digit verification (see **Verify Now**) runs automatically as soon as the computation finishes, with the result reported in the status bar — no dialog boxes. |
@@ -89,6 +89,41 @@ The computation uses the **Chudnovsky algorithm** with **binary splitting**, whi
 
 ---
 
+## Command-line options
+
+The executable accepts the following flags (most are also surfaced through `Run-PiCompute.ps1` parameters). Headless/automation runs typically combine `--autostart` with `--autoverify`.
+
+| Flag | Argument | Purpose |
+|------|----------|---------|
+| `--digits` | `N` | Digit count to compute (commas optional, e.g. `--digits 1000000000`). |
+| `--autostart` | — | Suppress all dialogs and begin computing immediately (headless mode). |
+| `--autoverify` | — | After the run, auto-run verification and exit. |
+| `--verify-at` | `"D:P"` | Assert that digit string `D` occurs at position `P` (e.g. `"999999:762"`). Repeatable. |
+| `--verify-contains` | `"D"` | Assert that digit string `D` occurs somewhere in the result. Repeatable. |
+| `--threshold` | `N` | Override the RAM/disk node-count threshold (see **RAM Threshold** above). |
+| `--log-level` | `N` | Runtime logging level 0–5 (default **2**). |
+| `--output-dir` | `D` | Output directory for `pi_digits.txt`, the phase log, and `NodeCache\`. |
+| `--checkpoint-from-level` | `N` | Serialize nodes at level ≥ `N` to disk (enables resume). |
+| `--resume-from-level` | `N` | Skip Phase 1 and levels `1..N-1`; load checkpoint files for level `N`. |
+| `--auto-checkpoint` | — | Write a RAM snapshot at the end of each level; auto-resume on the next launch. |
+
+**Diagnostic / benchmark harnesses** (each runs after GMP init, writes results to `%TEMP%\*_test.txt`, then exits; several are tuned by the test-only environment variables above):
+
+| Flag | Harness |
+|------|---------|
+| `--test-mulhigh` | `SafeMpzMulHigh` correctness self-test (§250). |
+| `--test-chunkedgrid` | `SafeMpzMul_ChunkedGrid` full/HIGH correctness self-test (§251). |
+| `--test-eta` | ETA-estimator self-test (§259). |
+| `--test-advisor` | Performance-advisor self-test (§260). |
+| `--test-dopscan` | DOP / memory-bandwidth saturation sweep (§263). |
+| `--test-gridscan` | Split-factor (k×k grid) comparison (§265). |
+| `--test-cellsweep` | Chunked-grid cell-size sweep at 5 B sizes (§266). |
+| `--test-recipconv` | Reciprocal-Newton convergence probe (§272). |
+
+> There is currently no `--help` flag; unknown arguments are ignored. (Tracked separately.)
+
+---
+
 ## Cumulative Summary of Changes
 
 A high-level overview of everything that was changed from the original implementation to reach a working 1-billion-digit computation. The detailed [Change Log](Change_LOG.md) documents each individual change and its root cause.
@@ -99,7 +134,7 @@ A high-level overview of everything that was changed from the original implement
 
 **Three-pass multiply (§7, §46, §47):** The final `gmpNumer *= finalQ` multiplication (~1.1 GB × ~1.1 GB) peaks at ~2.3 GB, exceeding available headroom after the other live buffers. `finalQ` is split into three equal bit-thirds (Q0, Q1, Q2) and multiplied separately; the three partial products are shifted and summed to reconstruct the full result. Peak per-pass is ~1.2 GB.
 
-**`SafeMpzMul` (§17–§45):** GMP's internal FFT uses a 32-bit `mp_size_t` (signed `int` on Windows MSVC). For operands above ~67 million limbs (≈ 536 MB each) the FFT's internal size arithmetic overflows, producing garbage or crashing. `SafeMpzMul` is a schoolbook 3×3 split: each operand is divided into three equal thirds by bit position and the nine sub-products are computed separately with GMP's fast routines, which never see an operand large enough to trigger the overflow. Recursive: sub-products that still exceed the threshold recurse.
+**`SafeMpzMul` (§17–§45, §160):** GMP's internal FFT uses a 32-bit `mp_size_t` (signed `int` on Windows MSVC), and very large operands also push GMP's Schönhage-Strassen FFT past the range where it returns reliably. `SafeMpzMul` therefore splits whenever the **combined** operand size `szA + szB` exceeds `SAFE_LIMB_THRESHOLD = 5,000,000` limbs (the conservative cap set by §160). It is a schoolbook 3×3 split: each operand is divided into three equal thirds by bit position and the nine sub-products are computed separately with GMP's fast routines, which never see an operand large enough to trigger the problem. Recursive: sub-products that still exceed the threshold recurse. (At the very largest scales the dominant multiplies route instead through the chunked-grid path — see the Change Log, §251/§262/§267–§269.)
 
 ---
 
@@ -131,7 +166,7 @@ A high-level overview of everything that was changed from the original implement
 
 **`mp_bitcnt_t` 32-bit limit (§22, §46):** On Windows, GMP is compiled with MSVC where `unsigned long` is 32 bits. `mp_bitcnt_t` (used for bit-shift counts) therefore caps at 4,294,967,295. At 1-billion-digit scale several shift counts exceed this. Fixed by splitting operations that would require a shift > 4.29 billion bits into two sequential shifts each within the 32-bit range.
 
-**`mp_size_t` 32-bit overflow (§17):** GMP's FFT code computes intermediate sizes as `mp_size_t` (32-bit signed int on Windows). Numbers above ~67 million limbs cause overflow in that arithmetic, producing wrong results or crashes. `SafeMpzMul` ensures GMP never sees an operand that large.
+**`mp_size_t` 32-bit overflow (§17, §160):** GMP's FFT code computes intermediate sizes as `mp_size_t` (32-bit signed int on Windows), and large operands also strain its FFT accuracy. `SafeMpzMul` ensures GMP never sees a multiply whose combined operand size exceeds `SAFE_LIMB_THRESHOLD = 5,000,000` limbs, splitting 3×3 (and recursing) before that point.
 
 **`Chr()` encoding (§24):** VB.NET's `Chr()` uses Windows-1252 code page encoding, unavailable in .NET Core. Replaced with `ChrW()` (Unicode) throughout.
 
@@ -151,9 +186,11 @@ A high-level overview of everything that was changed from the original implement
 
 ### P-Core Affinity on Hybrid CPUs
 
-Intel 12th-gen+ (Alder Lake, Raptor Lake) and AMD Zen 4c CPUs expose two classes of cores: **P-cores** (full-power, high IPC, preferred for GMP math) and **E-cores** (lower power, lower single-thread performance, shared L2). Without affinity pinning, the Windows thread pool schedules tasks onto whichever logical processors are available — including E-cores — which can unpredictably slow down bandwidth-bound GMP operations.
+Intel 12th-gen+ (Alder Lake, Raptor Lake) and AMD Zen 4c CPUs expose two classes of cores: **P-cores** (full-power, high IPC, preferred for GMP math) and **E-cores** (lower power, lower single-thread performance, shared L2). Without affinity control, the Windows thread pool schedules tasks onto whichever logical processors are available — including E-cores — which can unpredictably slow down bandwidth-bound GMP operations.
 
-**How it works (§66):**
+The original approach (§66) restricted the whole process to P-cores. That was **superseded by §247 (#48/#49)**: pinning the entire process to P-cores left the E-cores idle, but the E-cores are useful for overlapping disk I/O with compute. The current design keeps the **process** affinity mask on **all cores (P | E)** and instead uses an *affinity watchdog* (§106) that hard-pins the heavy **compute** threads to P-cores, while the §248/§249 I/O threads (chunk serializers, Phase-2 prefetch) pin *themselves* to the E-cores and are exempted from the watchdog. Because a thread's affinity mask can never exceed the process mask, the E-cores must remain in the process mask for that E-core I/O pinning to take effect.
+
+**How P/E detection works (§66):**
 
 The Win32 API `GetLogicalProcessorInformationEx(RelationProcessorCore, ...)` returns one `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` record per physical core. The `EfficiencyClass` byte in each record tells you whether the core is a P-core (`EfficiencyClass > 0`) or an E-core (`EfficiencyClass = 0`). Accumulate a bitmask for each class, then call `SetProcessAffinityMask` if both classes are present.
 
@@ -217,10 +254,16 @@ Private Shared Sub SetPCoreAffinity()
                 offset += recordSize  ' advance to next record
             Loop
 
-            ' Step 3: only pin if this is actually a hybrid CPU
+            ' Step 3: only act if this is actually a hybrid CPU
             If pCoreMask <> 0L AndAlso eCoreMask <> 0L Then
-                SetProcessAffinityMask(GetCurrentProcess(), New IntPtr(pCoreMask))
-                ' Log: $"Hybrid CPU. P-core mask=0x{pCoreMask:X}  E-core mask=0x{eCoreMask:X}"
+                ' §247 (#48/#49): keep the PROCESS mask on ALL cores (P | E) — NOT a hard
+                ' lock to P.  The affinity watchdog (below) hard-pins the compute threads to
+                ' P-cores, while the otherwise-idle E-cores stay AVAILABLE for the §248/§249
+                ' I/O threads (serializers, prefetch) that pin themselves there.  A thread's
+                ' affinity mask cannot exceed the process mask, so E must remain in it.
+                SetProcessAffinityMask(GetCurrentProcess(), New IntPtr(pCoreMask Or eCoreMask))
+                _pCoreMask = pCoreMask   ' §106: saved for the watchdog
+                ' Log: $"Hybrid CPU. P=0x{pCoreMask:X} E=0x{eCoreMask:X}"
             Else
                 ' Uniform CPU — all cores same class, leave affinity unchanged
             End If
@@ -233,9 +276,10 @@ Private Shared Sub SetPCoreAffinity()
 End Sub
 ```
 
-**Call site — invoke once before the first `Parallel.For`:**
+**Call site — invoke once during startup, before Phase 1:**
 ```vb
-SetPCoreAffinity()
+SetPCoreAffinity()        ' set the process mask to P | E and record the P-core mask
+StartAffinityWatchdog()   ' §106: hard-pin compute threads to P throughout the run
 ThreadPool.SetMinThreads(Environment.ProcessorCount, Environment.ProcessorCount)
 ```
 
@@ -244,7 +288,7 @@ ThreadPool.SetMinThreads(Environment.ProcessorCount, Environment.ProcessorCount)
 - `Size` at offset +4 is the actual record length and must be used to advance the offset; do not assume a fixed struct size.
 - On a non-hybrid machine all records have the same `EfficiencyClass`, so `eCoreMask` stays 0 and the affinity mask is left unchanged — the function is safe to call unconditionally.
 - `GetCurrentProcess()` returns a pseudo-handle that is always valid; no `CloseHandle` required.
-- The affinity mask is inherited by all threads including thread pool workers, so one call from the UI/compute thread is sufficient.
+- The process mask is inherited by all threads; the **per-thread** P-core pinning is enforced continuously by the watchdog, and E-core I/O threads opt out of it (§247–§249).
 
 ### Automation
 
@@ -270,7 +314,39 @@ ThreadPool.SetMinThreads(Environment.ProcessorCount, Environment.ProcessorCount)
 .\Run-PiCompute.ps1 -ReportOnly ".\pi_trace_20260331_121017.nettrace"
 ```
 
-**P-core affinity + thread pool pre-warm (§66):** On hybrid CPUs (Intel P+E core), `GetLogicalProcessorInformationEx` is used to detect P-cores by `EfficiencyClass` and restrict the process affinity mask to those cores only. `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` pre-warms the thread pool before Phase 1 to eliminate first-task latency.
+**P-core affinity + thread pool pre-warm (§66, §247):** On hybrid CPUs (Intel P+E core), `GetLogicalProcessorInformationEx` detects P-cores by `EfficiencyClass`. The process affinity mask is kept on all cores (P | E); a watchdog (§106) hard-pins compute threads to the P-cores while the §248/§249 I/O threads use the E-cores. `ThreadPool.SetMinThreads(ProcessorCount, ProcessorCount)` pre-warms the thread pool before Phase 1 to eliminate first-task latency.
+
+---
+
+## Environment variables
+
+The application reads a number of `PI_*` environment variables to tune or override behaviour. They are read at process/operation start, so set them before launching (the `--test-*` ones only matter when running the corresponding self-test harness).
+
+**Production flags** (affect a real compute run):
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `PI_CONV_PARALLEL` | on (`0` = off) | Use the parallel recursive-halving decimal converter (§270/§226) at ≥ 1.5 B digits; `0` reverts to the §216 serial converter. |
+| `PI_CG_ADAPTIVE` | on (`0` = off) | Adaptive chunked-grid cell size (§267/§268); `0` restores the fixed 1.5 M-limb cell. |
+| `PI_CG_CELL_MAX` | `16000000` | Maximum chunked-grid cell size in limbs (clamped 1,500,000–16,700,000); keeps the cell below GMP's FFT limit. |
+| `PI_CG_DOP` | `ProcessorCount` (capped 16) | Degree of parallelism for chunked-grid cells. |
+| `PI_RECIP_SHORTMUL` | on (`0` = off) | Route the reciprocal-Newton capped-iteration multiplies through the chunked grid (§251/§254); `0` uses the §gen path. |
+| `PI_RECIP_SHORTMUL_MAXDOP` | `9` | DOP gate — engage the chunked reciprocal only when §gen's DOP ≤ this (the low-DOP 5 B regime). |
+| `PI_DIV_AR_SHORTMUL` | on (`0` = off) | Compute the divide's `a×r` as a chunked-grid **HIGH** product (§262). |
+| `PI_DIV_QB_CHUNKED` | on (`0` = off) | Compute the divide's `q×b` as a chunked-grid **full** product (§269). |
+| `PI_MEMBUDGET_HEADROOM_GB` | `5` | RAM headroom (GB) reserved by the memory-budget DOP planner; a large value forces a low-RAM downshift for testing. |
+
+**Diagnostic / test-only flags** (read only by the `--test-*` harnesses and probes — see [CLI options](#command-line-options)):
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `PI_RECIP_SHORTMUL_VERIFY` | off (`1` = on) | Cross-check each chunked `RecipMul` against §gen (slow correctness probe). |
+| `PI_TEST_DOPGATE` | off (`1` = on) | At startup, dump the would-be §gen DOP for the 1 B/5 B reciprocal sizes to `%TEMP%\dopgate_test.txt`. |
+| `PI_CG_ISOLATE` | off (`1` = on) | `--test-chunkedgrid`: run only the 68 M×52 M case. |
+| `PI_CELLSWEEP_GEN` | off (`1` = on) | `--test-cellsweep`: also run the §gen recursive baseline (RAM-heavy; may page). |
+| `PI_DOPSCAN_LIMBS` | `24000000` | `--test-dopscan` / `--test-gridscan` operand size in limbs (min 6,000,000). |
+| `PI_RECIPCONV_LIMBS` | `1000000` | `--test-recipconv` reciprocal operand size in limbs (min 1,000). |
+| `PI_RECIPCONV_KDIV` | `1` | `--test-recipconv`: `kBits = bBits + bBits/KDIV`; set `3` to mimic the real divide-reciprocal regime. |
 
 ---
 

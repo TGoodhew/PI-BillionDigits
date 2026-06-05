@@ -326,7 +326,7 @@ Partial Class Form1
             End Sub
         Try : System.IO.File.WriteAllText(outPath, $"[TestRecipConv] start {DateTime.Now}{vbCrLf}") : Catch : End Try
 
-        Dim nB As Integer = 1_000_000
+        Dim nB As Integer = 1_000_000   ' reciprocal operand size in limbs; override via PI_RECIPCONV_LIMBS (min 1,000)
         Dim envN As String = Environment.GetEnvironmentVariable("PI_RECIPCONV_LIMBS")
         Dim parsedN As Integer
         If envN IsNot Nothing AndAlso Integer.TryParse(envN, parsedN) AndAlso parsedN >= 1_000 Then nB = parsedN
