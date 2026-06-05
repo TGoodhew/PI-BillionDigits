@@ -56,6 +56,17 @@ Public Class Form1
     Private _displayChunkSize As Integer = 4096
     ' §81 scroll throttle: accumulates chars since last ScrollToCaret; scroll only every 10,000 chars.
     Private _displayScrollAccum As Integer = 0
+    ' §271 (#98): MOVABLE WINDOW over the full digit range.  Streaming a 1B/5B-digit string into a
+    ' RichTextBox is ~O(n²) (AppendText is O(current length)) and holds GB of text on top of the
+    ' native buffer.  Instead, show a bounded NAV_WINDOW_DIGITS-wide window read on demand from the
+    ' native buffer, and a TrackBar that scrubs the window across all the digits (O(1) per move,
+    ' constant memory).  Built lazily when a large native result is shown.
+    Private Const NAV_WINDOW_DIGITS As Integer = 250_000
+    Private Const NAV_TRACKBAR_STEPS As Integer = 10000   ' slider resolution (offset = value/steps × maxOffset)
+    Private _navTrackBar As System.Windows.Forms.TrackBar = Nothing
+    Private _navLabel As System.Windows.Forms.Label = Nothing
+    Private _navTotalDigits As Long = 0
+    Private _navOffset As Long = 0
     Private WithEvents displayTimer As New System.Windows.Forms.Timer()
     Private gmpC3Const As mpz_t = Nothing
 
@@ -8236,7 +8247,7 @@ Phase2:
         While work.Count > 0
             Dim d As Long = work.Dequeue()
             If d <= LEAF_THRESHOLD Then Continue While
-            Dim halfD As Long = d \ 2
+            Dim halfD As Long = ConvSplitLowDigits(d)
             Dim hiD As Long = d - halfD
             neededD.Add(halfD)
             If seen.Add(halfD) Then work.Enqueue(halfD)
@@ -8296,6 +8307,20 @@ Phase2:
         AppendLog($"[§226] Parallel decimal conversion complete: {actualDigits:N0} digits in {_totalElapsed:F2}s (powTable={_powElapsed:F1}s + convert={_convElapsed:F1}s){vbCrLf}", 1)   ' §252 (#95): final digit-count result → level 1
     End Sub
 
+    ' §270 (#90): 5B-safe split point for the §226 converter.  A half-split (digits/2) needs a
+    ' 10^(digits/2) divisor; at >1B digits that exceeds GMP's ~33.5M-limb FFT ceiling and the divisor
+    ' build / fdiv_qr crashes or falls off a cliff (#89).  So when digits is large, peel a FIXED
+    ' CONV_SAFE_PEEL-digit chunk from the low end instead (divisor 10^CONV_SAFE_PEEL ≈ 26M limbs,
+    ' safe) — sequential at the top, but each peeled ≤CONV_SAFE_PEEL slab still halves IN PARALLEL via
+    ' HalveBase10's Parallel.Invoke (the hi-recursion peels the next chunk while the lo-slab converts),
+    ' so parallelism is preserved while every divisor stays FFT-safe.  The split point does not change
+    ' the result, so the output is byte-identical to a pure half-split (and to §216).
+    Private Const CONV_SAFE_PEEL As Long = 500_000_000L   ' 10^500M ≈ 26M limbs < 33.5M FFT cap
+    Private Shared Function ConvSplitLowDigits(digits As Long) As Long
+        If digits > 2L * CONV_SAFE_PEEL Then Return CONV_SAFE_PEEL   ' peel a safe chunk; hi peels again
+        Return digits \ 2                                           ' small enough ⇒ halve in parallel
+    End Function
+
     ' §226 helper: recursive halving.  Writes exactly `digits` chars to outBuf[offset..],
     ' zero-padding if n's actual decimal length is < digits (low-half slots of parents).
     ' Thread-safe re-entrant: each call has its own hi/lo; powTable is read-only.
@@ -8321,7 +8346,7 @@ Phase2:
 
         ' Non-leaf: split via D = 10^halfDigits.  hi gets the top `hiDigits` chars (offset),
         ' lo gets the bottom `halfDigits` chars (offset + hiDigits).
-        Dim halfDigits As Long = digits \ 2
+        Dim halfDigits As Long = ConvSplitLowDigits(digits)
         Dim hiDigits As Long = digits - halfDigits
         Dim dPtr As IntPtr = powTable(halfDigits)
 
@@ -9346,8 +9371,16 @@ NumeratorDone:
                 ' against parallel fan-out gains).  Above 1.5B, §216 chunked path
                 ' remains as conservative fallback until §226 is 5B-validated.
                 If _piDigitsEstimate >= 1_500_000_000L Then
-                    WriteToLog($"[ComputePi§216] Routing to chunked decimal converter (digits~={_piDigitsEstimate:N0} >= 1.5B threshold){vbCrLf}")
-                    ChunkedMpzGetStr(gmpPi, _piDigitsEstimate)   ' sets _displayNativePtr, _displayNativeLen, _displayNativeBufSize
+                    ' §270 (#90): §226's safe-peel split rule makes the PARALLEL converter 5B-safe.
+                    ' VALIDATED at 5B (π SHA 2218ee06… bit-identical, ~15.6 min vs §216's ~47 min, RAM
+                    ' ~19 GB) ⇒ now the default; opt out with PI_CONV_PARALLEL=0 to use the §216 serial path.
+                    If Environment.GetEnvironmentVariable("PI_CONV_PARALLEL") <> "0" Then
+                        WriteToLog($"[ComputePi§270] Routing 5B to PARALLEL converter (§226 safe-peel, digits~={_piDigitsEstimate:N0}){vbCrLf}")
+                        ParallelMpzGetStr(gmpPi, _piDigitsEstimate)   ' sets _displayNative*
+                    Else
+                        WriteToLog($"[ComputePi§216] Routing to chunked decimal converter (digits~={_piDigitsEstimate:N0} >= 1.5B threshold){vbCrLf}")
+                        ChunkedMpzGetStr(gmpPi, _piDigitsEstimate)   ' sets _displayNativePtr, _displayNativeLen, _displayNativeBufSize
+                    End If
                     _usedChunkedPath = True
                 ElseIf _piDigitsEstimate >= 100_000_000L Then
                     WriteToLog($"[ComputePi§226] Routing to parallel decimal converter (digits~={_piDigitsEstimate:N0} >= 100M threshold){vbCrLf}")
@@ -9433,6 +9466,22 @@ NumeratorDone:
             Return
         End If
 
+        ' §271 (#98): large native result → MOVABLE WINDOW instead of streaming the whole thing into
+        ' the RichTextBox (~O(n²) + GB of text).  Write the file + verify immediately (the result is
+        ' ready), then show a bounded, slider-navigable window over the full digit range.
+        If _displayNativePtr <> IntPtr.Zero AndAlso (digitCount - 1L) > CLng(NAV_WINDOW_DIGITS) Then
+            displayTimer.Enabled = False
+            BtnCompute.Enabled = True
+            BtnPause.Enabled = False
+            Timer1.Stop()
+            WriteResultToFile(digitCount)
+            If ChkAutoVerify.Checked Then RunVerification()
+            SetupNavWindow(digitCount - 1L)   ' totalDigits = digitCount − 1 (exclude the null terminator)
+            LblStatus.Text = $"Done! {digitCount - 1L:N0} digits — drag the slider to navigate."
+            LstBoxPhases.Items.Add($"{stopWatch.Elapsed:hh\:mm\:ss\.ff} | Window ready ({digitCount - 1L:N0} digits)")
+            Return
+        End If
+
         displayTimer.Enabled = False
         RtbPiDigits.Clear()
         LblDigitsDisplayed.Text = "0"
@@ -9443,6 +9492,52 @@ NumeratorDone:
         _displayChunkSize = 4096       ' §81: reset adaptive chunk size for new stream
         _displayScrollAccum = 0        ' §81: reset scroll throttle counter
         displayTimer.Enabled = True
+    End Sub
+
+    ' §271 (#98): build (once) + show the movable digit-window UI for a large native result.
+    ' A TrackBar docked under RtbPiDigits scrubs a NAV_WINDOW_DIGITS-wide window over [0, totalDigits);
+    ' each move re-reads that slice from the native buffer (bounded memory, O(window) per move).  The
+    ' RichTextBox's own scrollbar scrolls within the current window.  Full output stays in pi_digits.txt.
+    Private Sub SetupNavWindow(totalDigits As Long)
+        _navTotalDigits = totalDigits
+        If _navTrackBar Is Nothing Then
+            _navLabel = New System.Windows.Forms.Label() With {
+                .Dock = DockStyle.Bottom, .Height = 22, .TextAlign = ContentAlignment.MiddleLeft,
+                .BackColor = Color.Black, .ForeColor = Color.Lime, .Font = New Font("Consolas", 9)}
+            _navTrackBar = New System.Windows.Forms.TrackBar() With {
+                .Dock = DockStyle.Bottom, .Minimum = 0, .Maximum = NAV_TRACKBAR_STEPS,
+                .TickStyle = System.Windows.Forms.TickStyle.None, .SmallChange = 1, .LargeChange = 100}
+            AddHandler _navTrackBar.Scroll, AddressOf NavWindowChanged
+            Dim _parent As Control = RtbPiDigits.Parent
+            _parent.Controls.Add(_navLabel)
+            _parent.Controls.Add(_navTrackBar)
+            _navLabel.BringToFront()
+            _navTrackBar.BringToFront()
+            RtbPiDigits.WordWrap = True
+        End If
+        _navTrackBar.Visible = True : _navLabel.Visible = True
+        _navTrackBar.Value = 0
+        _navTrackBar.Enabled = (totalDigits > NAV_WINDOW_DIGITS)
+        ShowNavWindow(0L)
+    End Sub
+
+    Private Sub NavWindowChanged(sender As Object, e As EventArgs)
+        Dim maxOffset As Long = System.Math.Max(0L, _navTotalDigits - NAV_WINDOW_DIGITS)
+        Dim off As Long = CLng(_navTrackBar.Value) * maxOffset \ CLng(NAV_TRACKBAR_STEPS)
+        ShowNavWindow(off)
+    End Sub
+
+    ' Re-fill RtbPiDigits with the NAV_WINDOW_DIGITS-wide slice of the native buffer at `offset`.
+    Private Sub ShowNavWindow(offset As Long)
+        If _displayNativePtr = IntPtr.Zero OrElse _navTotalDigits <= 0L Then Return
+        _navOffset = System.Math.Max(0L, System.Math.Min(offset, System.Math.Max(0L, _navTotalDigits - 1L)))
+        Dim count As Integer = CInt(System.Math.Min(CLng(NAV_WINDOW_DIGITS), _navTotalDigits - _navOffset))
+        If count <= 0 Then Return
+        Dim buf(count - 1) As Byte
+        Runtime.InteropServices.Marshal.Copy(New IntPtr(_displayNativePtr.ToInt64() + _navOffset), buf, 0, count)
+        RtbPiDigits.Text = System.Text.Encoding.ASCII.GetString(buf, 0, count)
+        _navLabel.Text = $"Digits {_navOffset + 1:N0}–{_navOffset + count:N0} of {_navTotalDigits:N0}   —   drag slider to move the window; full result in pi_digits.txt"
+        LblDigitsDisplayed.Text = $"{_navTotalDigits:N0}"
     End Sub
 
     ''' <summary>
