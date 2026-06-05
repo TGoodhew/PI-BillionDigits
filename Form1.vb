@@ -3072,14 +3072,33 @@ Public Class Form1
     '     short-mul, now parallel-ready and memory-light).  result must be DISTINCT from opA/opB.
     ' NOTE (pt1): cells run SERIALLY here; parallelisation of the cell mults is the pt2 perf step.
     Private Shared Sub SafeMpzMul_ChunkedGrid(result As mpz_t, opA As mpz_t, opB As mpz_t, keepLimbs As Long)
-        ' §265 (#88): cell size is normally 1.5M (≤3M limbs/cell → safe GMP FFT, §160).  The
-        ' --test-gridscan bandwidth experiment overrides it via _cgCellOverride to force a coarse
-        ' k×k grid (cell≈N/k) and compare split factors; 0 = production default.  CALLERS other than
-        ' the benchmark never set it, so production is unaffected.
-        Dim CHUNK As Integer = If(_cgCellOverride > 0, _cgCellOverride, 1_500_000)
         Const GUARD_LIMBS As Long = 8L
         Dim szA As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4))
         Dim szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(opB.Pointer, 4))
+        ' §267 (#88): CELL SIZE.  Production has always used a fixed 1.5M cell.  But per-cell overhead
+        ' (parallel-wave sync + serial accumulate) scales with cell COUNT, so a tiny cell is
+        ' catastrophic at 5B operand sizes — measured 260M² = 32.4 min at 1.5M (30,276 cells) vs
+        ' 3.8 min at 16M (289 cells), bit-identical (§266 --test-cellsweep).  ADAPTIVE mode
+        ' (PI_CG_ADAPTIVE=1; OPT-IN until 1B→5B π is validated bit-identical) sizes the cell ≈ maxSz/3
+        ' (the measured sweet spot) capped at the FFT-safe maximum (PI_CG_CELL_MAX, default 16M: a cell
+        ' product 2·16M = 32M < the 33,554,431-limb GMP-FFT size cap), floored at 1.5M.  §160's lower
+        ' "FFT accuracy" cap is a misdiagnosis (GMP uses INTEGER Schönhage–Strassen, not float; the
+        ' wrong products it chased were the §200/§201 Newton bug, lifted by §220).  _cgCellOverride>0
+        ' (the --test-gridscan/cellsweep benchmarks) still wins.  Flag OFF ⇒ exactly 1.5M as before.
+        Dim CHUNK As Integer
+        If _cgCellOverride > 0 Then
+            CHUNK = _cgCellOverride
+        ElseIf Environment.GetEnvironmentVariable("PI_CG_ADAPTIVE") = "1" Then
+            Dim cellMax As Long = 16_000_000L
+            Dim cmEnv As String = Environment.GetEnvironmentVariable("PI_CG_CELL_MAX")
+            Dim cmParsed As Integer
+            If cmEnv IsNot Nothing AndAlso Integer.TryParse(cmEnv, cmParsed) AndAlso cmParsed >= 1_500_000 AndAlso cmParsed <= 16_700_000 Then cellMax = CLng(cmParsed)
+            Dim adaptive As Long = (CLng(System.Math.Max(szA, szB)) + 2L) \ 3L
+            CHUNK = CInt(System.Math.Max(1_500_000L, System.Math.Min(cellMax, adaptive)))
+            If CHUNK <> 1_500_000 Then AppendLog($"[ChunkedGrid§267] adaptive cell={CHUNK:N0} (szA={szA:N0} szB={szB:N0} ⇒ {(CLng(szA) + CHUNK - 1L) \ CHUNK}×{(CLng(szB) + CHUNK - 1L) \ CHUNK} cells; keep={keepLimbs:N0}){vbCrLf}", 2)
+        Else
+            CHUNK = 1_500_000
+        End If
         Dim aD As Long = Runtime.InteropServices.Marshal.ReadInt64(opA.Pointer, 8)
         Dim bD As Long = Runtime.InteropServices.Marshal.ReadInt64(opB.Pointer, 8)
         Dim fullLimbs As Long = CLng(szA) + CLng(szB)
