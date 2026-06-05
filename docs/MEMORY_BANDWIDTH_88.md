@@ -189,3 +189,23 @@ routing it through the chunked grid (as §262 did for a×r) is the obvious follo
 ⇒ **`PI_CG_ADAPTIVE` now defaults ON** (§268; opt out `=0`). The chunked grid — the production path
 for the dominant 5B reciprocal (#70) + a×r (§262) — uses the FFT-safe-max cell. Validated 1B
 (~38% faster Phase 3) + 5B (bit-identical, ~30–40% faster divide), both SHA-matched.
+
+## §269 — q×b routed through the chunked grid (full mode) — 1B + 5B VALIDATED
+
+q×b was the divide's last §gen-recursive stage (~1h34m at 5B; §267/§268 only accelerated the
+reciprocal + a×r). §269 routes it through `SafeMpzMul_ChunkedGrid(qb, q, b, 0L)` — **full** mode
+(need all of q×b for `rem = a−q×b`), bit-exact, and with the §268 16M cell far faster than §gen.
+Gated like §262 (flag `PI_DIV_QB_CHUNKED` default ON + size + DOP, off under `_5b_verify`); qb's
+buffer lifecycle is unchanged (§gen finalize at 3562 == chunked at 3226, both swap a GmpNativeAlloc
+accumulator into qb).
+
+- **1B:** resume-from-snap_Phase3 (div_q/gmpPi deleted to force the divide) — `[§269] q×b chunked-full
+  szQ=51.9M szB=140.1M`, Division complete in seconds, **π SHA-256 = `b153e8d5…` bit-identical**.
+- **5B:** resume-from-snap_Phase3/gmpNumer — `[§269] q×b chunked-full szQ=259.5M szB=739M`, adj-up 0
+  iters (exact quotient), **`gmpPi.bin` SHA = `34f40cde…` bit-identical to the run-3 oracle binary**
+  (value-deterministic serialization ⇒ binary compare is sound, skips the irrelevant ~2–3h §216).
+  **Divide ran ~3h14m vs §268's 5h02m** — q×b's §gen ~1h34m became chunked minutes.
+
+⇒ **The whole 5B divide (reciprocal + a×r + q×b) is now on the chunked grid at the FFT-safe-max cell**,
+down from the ~7–8h §gen baseline to **~3h14m (~2.3×)**. Remaining divide cost is the reciprocal
+Newton; next slow stage is §216 conversion (#90).
