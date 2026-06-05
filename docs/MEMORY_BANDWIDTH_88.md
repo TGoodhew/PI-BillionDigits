@@ -95,17 +95,20 @@ Tests the idle-core hypothesis directly: drive the chunked-grid full product at 
   than 3×3 (9 cells), and 5×5/6×6 are progressively worse. More cores don't help — **fewer, bigger
   cells win** (better per-mul FFT efficiency, fewer accumulate passes, less bandwidth contention).
   This is the bandwidth-bound prediction confirmed, and kills the "use the idle cores" idea.
-- **Serendipitous lead — cell SIZE is the dominant knob.** The chunked flat-cell path looks ~6.7×
-  faster than §gen's recursive 3×3 (which re-splits each 8M sub-product down to ~0.9M with managed
-  shift/accumulate at every level). The production chunked grid's 1.5M cell is far finer than the
-  ~8M FFT-safe optimum at this size.
-- **CAVEAT (load-bearing): this is a Debug build.** §gen's recursion is managed-code-heavy (the
-  per-level shift/accumulate), which Debug penalizes hard; the chunked grid's accumulate is native
-  `mpn` (unaffected). So the **6.7× §gen-vs-chunked gap is Debug-inflated** — likely far smaller in
-  Release (consistent with #70 measuring chunked *1.4× slower* than §gen, albeit at 1.5M cells). The
-  *relative* chunked-vs-chunked ranking (3×3 < 4×4 < 5×5 < 6×6) IS Debug-robust (same native path).
-- At 5B the coarse cells overflow GMP's 33M-limb FFT, so the grid must stay fine (≤~16M cell) — the
-  cell-size advantage shrinks there, which is why this is a *lead to measure*, not a drop-in.
+- **Cell SIZE is the dominant knob — and the gap is REAL (Release-confirmed).** The chunked flat-cell
+  path is ~6.7× faster than §gen's recursive 3×3 (which re-splits each 8M sub-product down to ~0.9M,
+  doing a fresh GMP FFT + a native shift/accumulate at every level). The production chunked grid's
+  1.5M cell is far finer than the ~8M FFT-safe optimum at this size.
+- **Re-measured in Release (one-off, then reverted to Debug):** §gen 31,631 ms, chunked 3×3 4,728 ms
+  → **6.69×, identical to Debug.** The earlier "Debug penalises §gen's managed recursion" hypothesis
+  was **wrong** — the heavy work (GMP `mpz_mul`, native `mpn` shift/add) is all native, so build
+  config barely moves it. So the gap is genuine, not a Debug artifact. (#70's earlier "chunked 1.4×
+  *slower*" was measured at the fine 1.5M cell — cell size, not the grid itself, was the difference.)
+- **Why this isn't yet a production win:** at 5B the coarse 8M cell overflows GMP's 33M-limb FFT, so
+  the grid must use ≤~16M cells (260M operand ⇒ ~16×16 = 256 cells). The gridscan only proves
+  *coarser-beats-finer* at sizes where coarse cells are FFT-safe (N ≲ 48M). The open question is
+  whether **≤16M cells still beat §gen at 5B** — needs a dedicated cell-size sweep at large N (the
+  current k=3..6 grids FFT-overflow above ~48M).
 
 ## Conclusion / recommendation
 
@@ -114,10 +117,13 @@ Tests the idle-core hypothesis directly: drive the chunked-grid full product at 
   and the bigger limit is the 9-way structural cap leaving cores idle.
 - **The higher-order split (4×4) is tested and rejected** (§265) — more cells/cores lose to bigger,
   fewer cells under the bandwidth ceiling.
-- **The remaining lead is cell SIZE**, not core count: use the biggest FFT-safe cell rather than
-  1.5M. But the apparent 6.7× is Debug-inflated; **next step = re-measure `--test-gridscan` in a
-  Release build** (and validate §160's reason for the 1.5M cap) before any production change, then a
-  cell-size sweep at 5B-representative (FFT-safe-fine) sizes.
+- **The remaining lead is cell SIZE**, not core count: at 24M, chunked flat 8M-cells are ~6.7×
+  faster than §gen — **confirmed in Release** (so it is not a Debug artifact). The production chunked
+  grid's 1.5M cell is far below the FFT-safe optimum. **Next step = a cell-size sweep at large N**
+  (the k=3..6 grids FFT-overflow above ~48M, so a dedicated sweep over cells {1.5M, 4M, 8M, 16M} at
+  e.g. 100–260M operands is needed to see whether ≤16M cells still beat §gen at 5B), plus validating
+  §160's reason for the 1.5M cap. If it holds, routing §gen's large muls through a coarser-celled
+  chunked grid is a potentially large 5B win.
 - **Breaking the bandwidth portion is fundamentally a hardware change** (more channels). The Lane 4
   model says DDR5-7200 buys ~1.2×, quad-channel ~1.5–1.7×, 12-channel ~2.5–3×.
 
