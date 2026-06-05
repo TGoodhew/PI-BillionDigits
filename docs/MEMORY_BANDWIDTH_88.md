@@ -315,3 +315,16 @@ Net at this size: 29 → 21 iters, and the full-width (capped-prec) region shrin
 reciprocal lever — projected multi-hour divide saving. `PI_RECIP_SHORTMUL` etc. unaffected (the change
 is to the seed + loop-exit only). Validating 1B bit-identical (resume snap_Phase3, fresh divide
 reciprocal: nr_r/nr_raise/div_q/gmpPi deleted) vs reference π SHA b153e8d5… before any 5B claim.
+
+### §272 — 1B BIT-IDENTICAL ✓ (resume, fresh divide reciprocal)
+
+Resumed snap_Phase3 (gmpNumer+gmpSqrt+finalT kept; nr_r/nr_raise/div_q/gmpPi DELETED from NodeCache
+AND SnapshotStore to force a from-seed Newton — no §201-raise reuse), --auto-checkpoint --autoverify
+--threshold 200000. Real-divide reciprocal: rBits = 3,321,928,162, bBits ≈ 8.97e9 (bShift stays
+≈5.65e9 at the cap — never 0, confirming the gate had to be prec-cap not bShift==0). The §272 detector
+fired: **"converged at iter=27 (r==p fixed point) — 8 min-iter tail skipped"** (old min_nrIters would
+have been 35). adj-up 0 iters (the §171 correction made ZERO adjustments ⇒ the new-seed reciprocal is
+exactly the same converged value). Division phase 7m20s; §270 convert 86s; **π SHA-256 =
+b153e8d58b045fc65e86… BIT-IDENTICAL to the reference**, Verify OK (999999@762 / 777777777@24.66M /
+nine-9s@564.67M). Confirms seed (2→126 bits) + sound detector are value-preserving in the full
+pipeline. 5B run pending user go-ahead; projected ~8 full-width reciprocal iters saved.
