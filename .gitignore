@@ -61,3 +61,7 @@ _*.ps1
 # Local Claude Code session metadata
 sessions/
 PERF_SESSION_*.md
+
+# Claude auto-memory lives under ~/.claude — guard against a misdirected
+# relative-path write landing a memory/ dir in the repo working tree.
+/memory/
