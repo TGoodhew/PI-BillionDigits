@@ -80,6 +80,17 @@ Public Class Form1
     ' Set by --autostart (suppress all dialogs) and --autoverify (run verify +
     ' Application.Exit after computation completes).
     Private _headless As Boolean = False
+    ' §119 (#119): "Auto-OK dialogs" — suppress spontaneous run-blocking dialogs (info/error/global
+    ' unhandled-exception) the same way _headless does, for an UNATTENDED interactive run.  Shared so
+    ' the global handler in ApplicationEvents.vb can read it; set True whenever _headless is set so the
+    ' headless path never blocks on the global modal either.  Destructive Close/Cancel confirms are NOT
+    ' auto-answered (they are user-initiated; auto-answering would risk silent data loss).
+    Friend Shared _suppressDialogs As Boolean = False
+    ' §119 (#119): Windows Event Log source for last-resort crash preservation (used when the global
+    ' unhandled-exception handler's normal pi_phase_log.txt write fails).  Scanned at startup so a crash
+    ' whose file-log could not be written is surfaced into the next run's log instead of being lost.
+    Friend Const EVENTLOG_SOURCE As String = "PI-BillionDigits"
+    Private _priorCrashNote As String = ""
     ' §252 (#95): single integer logging scale.  Every log goes through AppendLog(msg, level);
     ' a message is written iff level <= _logLevel.  Strict superset ladder:
     '   0 = Silent (nothing)
@@ -1537,6 +1548,7 @@ Public Class Form1
                     End If
                 Case "--autostart"
                     _headless = True
+                    _suppressDialogs = True   ' §119: headless ⇒ the global handler must not block either
                 Case "--autoverify"
                     _autoVerify = True
                 Case "--verify-at"
@@ -1715,6 +1727,11 @@ Public Class Form1
         ' compute threads to P, leaving E-cores free for the §248/§249 I/O threads.
         SetPCoreAffinity()
         StartAffinityWatchdog()   ' §106: keep compute threads on P-cores throughout the run
+
+        ' §119 (#119): surface any prior crash records preserved in the Windows Event Log (runs whose
+        ' pi_phase_log.txt write had failed) — written into this run's log at compute start, plus a
+        ' dialog for an attended interactive run (never a blocking modal headless / Auto-OK).
+        ScanEventLogForPriorCrashes()
 
         ' Install VirtualAlloc/VirtualFree custom GMP allocator so large limb
         ' buffers are immediately decommitted on free, preventing commit-charge
@@ -2098,6 +2115,57 @@ Public Class Form1
         End Try
     End Function
 
+    ' §119 (#119): last-resort crash preservation.  Called by the global unhandled-exception handler
+    ' (ApplicationEvents.vb) only when the normal pi_phase_log.txt write fails, so the crash is not
+    ' lost.  Best-effort: registering the event source needs admin the FIRST time — if it can't be
+    ' created and doesn't already exist, this degrades silently (the clipboard copy is the last resort).
+    Friend Shared Sub WriteCrashToEventLog(text As String)
+        Try
+            If Not System.Diagnostics.EventLog.SourceExists(EVENTLOG_SOURCE) Then
+                System.Diagnostics.EventLog.CreateEventSource(EVENTLOG_SOURCE, "Application")
+            End If
+            ' Event Log messages are capped at ~32 KB.
+            Dim msg As String = If(text.Length > 30000, text.Substring(0, 30000) & "…(truncated)", text)
+            System.Diagnostics.EventLog.WriteEntry(EVENTLOG_SOURCE, msg, System.Diagnostics.EventLogEntryType.Error)
+        Catch
+        End Try
+    End Sub
+
+    ' §119 (#119): at startup, scan the Application event log for prior crash records written by
+    ' WriteCrashToEventLog (runs whose normal log write had failed).  Stores them in _priorCrashNote,
+    ' which BtnCompute_Click writes into THIS run's log.  For an attended interactive run a dialog is
+    ' also shown; headless / Auto-OK runs only get the log line (never a blocking modal).  Bounded scan.
+    Private Sub ScanEventLogForPriorCrashes()
+        Try
+            Dim found As New System.Collections.Generic.List(Of String)()
+            Using elog As New System.Diagnostics.EventLog("Application")
+                Dim entries = elog.Entries
+                Dim cutoff As DateTime = DateTime.Now.AddDays(-30)
+                Dim scanned As Integer = 0
+                For idx As Integer = entries.Count - 1 To 0 Step -1
+                    scanned += 1
+                    If scanned > 500 OrElse found.Count >= 10 Then Exit For
+                    Try
+                        Dim en As System.Diagnostics.EventLogEntry = entries(idx)
+                        If en.TimeGenerated < cutoff Then Exit For
+                        If String.Equals(en.Source, EVENTLOG_SOURCE) AndAlso en.EntryType = System.Diagnostics.EventLogEntryType.Error Then
+                            Dim m As String = en.Message
+                            found.Add($"  {en.TimeGenerated:yyyy-MM-dd HH:mm:ss}: {m.Substring(0, System.Math.Min(160, m.Length)).Replace(vbCrLf, " ").Replace(vbLf, " ")}")
+                        End If
+                    Catch
+                    End Try
+                Next
+            End Using
+            If found.Count = 0 Then Return
+            _priorCrashNote = $"[Startup§119] {found.Count} prior crash record(s) found in the Windows Event Log (source {EVENTLOG_SOURCE}) — runs whose pi_phase_log.txt write had failed. View full detail in Event Viewer → Windows Logs → Application:" & vbCrLf & String.Join(vbCrLf, found)
+            ' Attended interactive only: a dialog.  Headless / Auto-OK never block on a modal here.
+            If Not _headless AndAlso Not _suppressDialogs Then
+                Try : MessageBox.Show(_priorCrashNote, "Prior crash records found", MessageBoxButtons.OK, MessageBoxIcon.Warning) : Catch : End Try
+            End If
+        Catch
+        End Try
+    End Sub
+
     Private Sub BtnCompute_Click(sender As Object, e As EventArgs) Handles BtnCompute.Click
         ' Free any retained Pi buffer from the previous run before starting a new one.
         If _displayNativePtr <> IntPtr.Zero Then
@@ -2144,6 +2212,13 @@ Public Class Form1
                    ""))
         Catch
         End Try
+        ' §119 (#119): if startup found prior crash records in the Event Log, record them in THIS run's
+        ' log now (after the header is written so they survive the truncate).  Applies in every mode —
+        ' in particular headless / Auto-OK, where there was no startup dialog.
+        If _priorCrashNote <> "" Then
+            AppendLog(_priorCrashNote & vbCrLf, 1)
+            _priorCrashNote = ""   ' once per run; don't repeat if Compute is clicked again
+        End If
         ' §120 (#120): memory-contention pre-flight (after the log exists so the [WARN] is captured,
         ' before the compute thread starts).  Aborts cleanly if the user cancels the contention dialog.
         If Not MemPreflight_ShouldProceed(DIGITS) Then

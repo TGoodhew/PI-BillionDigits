@@ -52,7 +52,15 @@ Namespace My
                 System.IO.Directory.CreateDirectory(logDir)
                 logPath = System.IO.Path.Combine(logDir, "pi_phase_log.txt")
                 System.IO.File.AppendAllText(logPath, sb.ToString())
-            Catch
+            Catch logEx As Exception
+                ' §119 (#119): the normal log write failed — preserve the crash in the Windows Event
+                ' Log so it isn't lost, and so the NEXT launch surfaces it (Form1 scans on startup and
+                ' writes it into that run's log).  Best-effort; degrades silently if it also fails.
+                Try
+                    Global.PI_BillionDigits.Form1.WriteCrashToEventLog(
+                        sb.ToString() & vbCrLf & "(pi_phase_log.txt write failed: " & logEx.Message & ")")
+                Catch
+                End Try
             End Try
 
             ' Copy the full exception text to the clipboard so it can be pasted elsewhere.
@@ -64,6 +72,22 @@ Namespace My
             Dim logNote As String = If(logPath <> "",
                 $"{vbCrLf}{vbCrLf}Full details saved to:{vbCrLf}{logPath}{vbCrLf}(also copied to clipboard)",
                 $"{vbCrLf}{vbCrLf}(Exception text copied to clipboard)")
+
+            ' §119 (#119): never block on a modal in headless / "Auto-OK dialogs" mode — otherwise an
+            ' exception that escapes the compute try/catch freezes a multi-hour unattended run forever
+            ' (the original handler always showed the modal and kept the frozen app alive).  The full
+            ' exception text is already in the log + clipboard above, so exit cleanly instead of waiting
+            ' for a click.  Detect headless from the command line too, in case the flag wasn't set yet.
+            Dim _suppress As Boolean = False
+            Try
+                _suppress = Global.PI_BillionDigits.Form1._suppressDialogs OrElse
+                            (Array.IndexOf(Environment.GetCommandLineArgs(), "--autostart") >= 0)
+            Catch
+            End Try
+            If _suppress Then
+                e.ExitApplication = True   ' headless/unattended: log already written — exit, do not block
+                Return
+            End If
 
             MessageBox.Show(sb.ToString() & logNote,
                             "Unhandled Exception", MessageBoxButtons.OK, MessageBoxIcon.Error)

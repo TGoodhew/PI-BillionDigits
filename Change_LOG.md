@@ -6381,3 +6381,27 @@ digit count** and a rough size-based ETA (`~est Xm left`) derived from the known
 conservative §270 large-scale rate (~5 M digits/s). Honest about being an estimate; the digit count is
 genuinely new info (not redundant with the running-time label). `_piDigitsEstimate` was hoisted above
 the status timer so the closure can read it (no duplicate `mpz_sizeinbase`).
+
+## §119 — Global unhandled-exception handler: never block unattended + Event-Log crash preservation (2026-06-08, issue #119)
+
+The global handler (`ApplicationEvents.MyApplication_UnhandledException`) was **not** headless-aware: it
+always showed a modal and set `e.ExitApplication = False`, so an exception escaping the compute
+try/catch would **freeze a multi-hour unattended/headless run forever** waiting for a click. Now:
+
+- **Headless / Auto-OK ⇒ log then exit, don't block.** The full exception chain is still written to
+  `pi_phase_log.txt` + clipboard first (unchanged); then, when `_suppressDialogs` is set (set alongside
+  `_headless` on `--autostart`) or `--autostart` is on the command line, the handler sets
+  `e.ExitApplication = True` and returns instead of showing the modal. Interactive runs unchanged.
+- **Event-Log fallback when the log write itself fails.** The log-write `Catch` (previously a silent
+  swallow) now calls `Form1.WriteCrashToEventLog` (source `PI-BillionDigits`, Application log) so a
+  crash whose `pi_phase_log.txt` write failed is not lost. Best-effort (registering the source needs
+  admin once; degrades silently otherwise — the clipboard copy remains the final fallback).
+- **Startup scan + carry into the run log.** `ScanEventLogForPriorCrashes` (Form1_Load, bounded to the
+  last 500 entries / 30 days) finds those preserved records; `BtnCompute_Click` writes them into the
+  current run's log after the header (so they survive the truncate) — in **every** mode, in particular
+  headless / Auto-OK where there is no startup dialog. An attended interactive run also gets a dialog.
+
+Adds the `_suppressDialogs` shared flag (set by `--autostart`; the future "Auto-OK dialogs" UI checkbox
+will set it for unattended interactive runs). Destructive Close/Cancel confirms are deliberately NOT
+auto-answered. Build clean. (The Auto-OK checkbox UI control + wiring the info/error dialog guards
+`#1–#5` to `_suppressDialogs` remain as the UI half of #119, to land with #118's UI pass.)
