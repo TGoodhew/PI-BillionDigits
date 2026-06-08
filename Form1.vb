@@ -195,12 +195,20 @@ Public Class Form1
     ' OOMs above DOP=3 at 5B.  Chunked-grid cells are tiny (≤16M-limb ⇒ ≤256MB cell products) so
     ' it parallelises at PI_CG_DOP (default ProcessorCount, capped 16) at low RAM — the same reason
     ' it already won the divide (§262 a×r, §269 q×b).  Full product (keepLimbs=0) is bit-identical
-    ' to §gen (proven by --test-chunkedgrid); CombineMulCG adds the sign handling the alternating-
+    ' to §gen (proven by --test-chunkedgrid); SafeMpzMulCG adds the sign handling the alternating-
     ' series T merges need.  ON by default (opt-out PI_COMBINE_CG=0); engages only when numTerms ≥
     ' _combineCgMinTerms (default 250M — exactly the levels §231 pins to DOP=3), tunable via
     ' PI_COMBINE_CG_MINTERMS.
     Private Shared _combineChunkedGrid As Boolean = True
     Private Shared _combineCgMinTerms As Long = 250_000_000L
+    ' §274 (#121): the same routing for the divide's three numerator R-multiplies (r0/r1/r2 =
+    ' gmpNumer × Q_i — the §7/§46/§47 three-pass `gmpNumer *= finalQ`, computed via §233).  They
+    ' also run at the §233 DOP cap (3 of 24 cores at ≥250M terms) and cost ~4h27m at 5B (r0 ~62m,
+    ' r1 ~99m, r2 ~104m on the 2026-06-08 baseline).  Full products routed through SafeMpzMulCG.
+    ' ON by default (opt-out PI_NUMER_CG=0); same numTerms ≥ _numerCgMinTerms gate (default 250M,
+    ' tunable via PI_NUMER_CG_MINTERMS) — exactly the levels §233 pins to DOP=3.
+    Private Shared _numerChunkedGrid As Boolean = True
+    Private Shared _numerCgMinTerms As Long = 250_000_000L
 
     ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
     ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
@@ -3377,14 +3385,16 @@ Public Class Form1
         Runtime.InteropServices.Marshal.WriteInt64(result.Pointer, 8, accBuf.ToInt64())
     End Sub
 
-    ' §273 (#121/#122): sign-aware chunked-grid FULL multiply for the Phase-2 binary-split combine.
-    ' SafeMpzMul_ChunkedGrid computes the unsigned magnitude product — it reads Abs(_mp_size) and
-    ' writes a positive result, because the divide (§262/§269) only ever feeds it non-negative
-    ' operands.  The combine's T merges (tempA=leftT·rightQ, tempB=leftP·rightT) can be signed
-    ' (the Chudnovsky series alternates), so apply the product sign exactly as SafeMpzMul does
-    ' (negative iff exactly one operand is negative).  With that, CombineMulCG is bit-identical to
-    ' SafeMpzMul on every operand sign.
-    Private Shared Sub CombineMulCG(result As mpz_t, opA As mpz_t, opB As mpz_t)
+    ' §273/§274 (#121): sign-aware chunked-grid FULL multiply — a drop-in replacement for
+    ' SafeMpzMul on large operands that breaks the §231/§233 DOP cap (chunked-grid parallelises
+    ' cells at PI_CG_DOP, not _safeMulDop).  SafeMpzMul_ChunkedGrid itself computes only the
+    ' unsigned magnitude product — it reads Abs(_mp_size) and writes a positive result, because the
+    ' divide (§262/§269) only ever fed it non-negative operands.  The Phase-2 combine's T merges
+    ' (§273: tempA=leftT·rightQ, tempB=leftP·rightT) can be signed (the Chudnovsky series
+    ' alternates), so this applies the product sign exactly as SafeMpzMul does (negative iff exactly
+    ' one operand is negative).  With that, SafeMpzMulCG is bit-identical to SafeMpzMul on every
+    ' operand sign.  Used by §273 (combine merges) and §274 (numerator r0/r1/r2 = gmpNumer·Q_i).
+    Private Shared Sub SafeMpzMulCG(result As mpz_t, opA As mpz_t, opB As mpz_t)
         Dim sA As Integer = Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4)   ' signed _mp_size
         Dim sB As Integer = Runtime.InteropServices.Marshal.ReadInt32(opB.Pointer, 4)
         SafeMpzMul_ChunkedGrid(result, opA, opB, 0L)                                    ' |opA|·|opB|, positive
@@ -8056,8 +8066,8 @@ Phase2:
                         ' §273 (#121): each chunked-grid mul already saturates up to PI_CG_DOP
                         ' cores, so run the two sequentially (no Parallel.Invoke ⇒ no core
                         ' oversubscription, no doubled FFT scratch — same rationale as §91).
-                        CombineMulCG(newP, leftP, rightP)
-                        CombineMulCG(newQ, leftQ, rightQ)
+                        SafeMpzMulCG(newP, leftP, rightP)
+                        SafeMpzMulCG(newQ, leftQ, rightQ)
                     ElseIf pairCount >= 2L Then
                         System.Threading.Tasks.Parallel.Invoke(
                             Sub() SafeMpzMul(newP, leftP, rightP),
@@ -8081,8 +8091,8 @@ Phase2:
                     End If
                     If _useCgLevel Then
                         ' §273 (#121): T merges — sign-aware (leftT/rightT may be negative).
-                        CombineMulCG(tempA, leftT, rightQ)
-                        CombineMulCG(tempB, leftP, rightT)
+                        SafeMpzMulCG(tempA, leftT, rightQ)
+                        SafeMpzMulCG(tempB, leftP, rightT)
                     ElseIf pairCount >= 2L Then
                         System.Threading.Tasks.Parallel.Invoke(
                             Sub() SafeMpzMul(tempA, leftT, rightQ),
@@ -9287,10 +9297,21 @@ BeforeStep4:
                 End If
                 System.Threading.Volatile.Write(_safeMulDop, _chosenDop233)
                 WriteToLog($"[ComputePi§233] R0/R1/R2 pipeline: numTerms={numTerms:N0}, chosen DOP={_chosenDop233} (was hardcoded 1 in §210; SavePhase3Value backup is async via §232)")
+                ' §274 (#121): route the three numerator R-multiplies through the chunked grid
+                ' (parallel cells at PI_CG_DOP, low per-cell RAM) instead of §gen at the §233 DOP
+                ' cap above — the same lever as §273 for the combine, for the runs §233 pins to
+                ' DOP=3.  SafeMpzMulCG is bit-identical to SafeMpzMul (chunked-grid full product
+                ' proven by --test-chunkedgrid; sign-aware though r_i are positive here).
+                _numerChunkedGrid = (Environment.GetEnvironmentVariable("PI_NUMER_CG") <> "0")
+                Dim _ncgEnv As String = Environment.GetEnvironmentVariable("PI_NUMER_CG_MINTERMS")
+                Dim _ncgParsed As Long
+                If _ncgEnv IsNot Nothing AndAlso Long.TryParse(_ncgEnv, _ncgParsed) AndAlso _ncgParsed >= 0L Then _numerCgMinTerms = _ncgParsed
+                Dim _useCgNumer As Boolean = _numerChunkedGrid AndAlso numTerms >= _numerCgMinTerms
+                If _useCgNumer Then WriteToLog($"[ComputePi§274] numerator R-multiplies via chunked-grid (numTerms={numTerms:N0} >= {_numerCgMinTerms:N0}; §233 DOP={_chosenDop233} bypassed)")
                 If Not _r0Done Then
                     WriteToLog("[ComputePi§233] computing r0 = gmpNumer * Q0 (finalQ) at DOP=" & _chosenDop233 & "...")
                     Dim _t233R0 As Long = System.Diagnostics.Stopwatch.GetTimestamp()
-                    SafeMpzMul(mpR0, gmpNumer, finalQ)
+                    If _useCgNumer Then SafeMpzMulCG(mpR0, gmpNumer, finalQ) Else SafeMpzMul(mpR0, gmpNumer, finalQ)
                     Dim _t233R0Sec As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _t233R0) / System.Diagnostics.Stopwatch.Frequency
                     WriteToLog($"[ComputePi§233] r0 done in {_t233R0Sec:F1}s; saving mpR0 (size={Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer, 4):N0})")
                     SavePhase3Value("mpR0", mpR0, p3SnapDir)
@@ -9301,7 +9322,7 @@ BeforeStep4:
                 If Not _r1Done Then
                     WriteToLog("[ComputePi§233] computing r1 = gmpNumer * Q1 (mpQ1) at DOP=" & _chosenDop233 & "...")
                     Dim _t233R1 As Long = System.Diagnostics.Stopwatch.GetTimestamp()
-                    SafeMpzMul(mpR1, gmpNumer, mpQ1)
+                    If _useCgNumer Then SafeMpzMulCG(mpR1, gmpNumer, mpQ1) Else SafeMpzMul(mpR1, gmpNumer, mpQ1)
                     Dim _t233R1Sec As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _t233R1) / System.Diagnostics.Stopwatch.Frequency
                     WriteToLog($"[ComputePi§233] r1 done in {_t233R1Sec:F1}s; saving mpR1 (size={Runtime.InteropServices.Marshal.ReadInt32(mpR1.Pointer, 4):N0})")
                     SavePhase3Value("mpR1", mpR1, p3SnapDir)
@@ -9312,7 +9333,7 @@ BeforeStep4:
                 If Not _r2Done Then
                     WriteToLog("[ComputePi§233] computing r2 = gmpNumer * Q2 (mpQ2) at DOP=" & _chosenDop233 & "...")
                     Dim _t233R2 As Long = System.Diagnostics.Stopwatch.GetTimestamp()
-                    SafeMpzMul(mpR2, gmpNumer, mpQ2)
+                    If _useCgNumer Then SafeMpzMulCG(mpR2, gmpNumer, mpQ2) Else SafeMpzMul(mpR2, gmpNumer, mpQ2)
                     Dim _t233R2Sec As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _t233R2) / System.Diagnostics.Stopwatch.Frequency
                     WriteToLog($"[ComputePi§233] r2 done in {_t233R2Sec:F1}s; saving mpR2 (size={Runtime.InteropServices.Marshal.ReadInt32(mpR2.Pointer, 4):N0})")
                     SavePhase3Value("mpR2", mpR2, p3SnapDir)

@@ -6295,5 +6295,25 @@ itself is left in place — §273 routes the large combine merges around §gen e
 longer gates the dominant merges.
 
 **Validation:** `--test-chunkedgrid` OVERALL PASS (full product bit-identical to §gen, speedups to
-13.3× at 68M×52M). End-to-end correctness + 5B speedup gates in progress (1B forced-CG vs oracle
-`b153e8d5…`; `snap_L15` resume re-runs the L16 merge vs oracle `2218ee06…`).
+13.3× at 68M×52M). **1B forced-CG gate PASSED** (`PI_COMBINE_CG_MINTERMS=0`): `[Combine§273]`
+engaged L12–L14, π SHA `b153e8d5…` **bit-identical** to the oracle, spot-checks OK. 5B speedup gate
+(full from-scratch or `snap_L15` resume vs oracle `2218ee06…`) batched with §274.
+
+## §274 — Route the numerator R-multiplies through the chunked grid (2026-06-08, issue #121)
+
+The §273 lever applied to the divide's other DOP=3 bottleneck. The three-pass `gmpNumer *= finalQ`
+(§7/§46/§47) computes `r0/r1/r2 = gmpNumer × Q_i` (finalQ split into bit-thirds), and §233 runs them
+at the same scale-aware serial DOP cap as §231 — **DOP=3 at ≥250M terms**. On the 2026-06-08 5B
+baseline that Numerator stage was **~4h27m** (r0 ~62m, r1 ~99m, r2 ~104m), all at 3 of 24 cores.
+
+§274 routes the three full products through `SafeMpzMulCG` (the §273 sign-aware chunked-grid full
+multiply, generalised from `CombineMulCG`) when `numTerms ≥ PI_NUMER_CG_MINTERMS` (default 250M).
+Chunked-grid parallelises cells at `PI_CG_DOP` (≤16) with low per-cell RAM — and its peak (~8 GB for
+259M×246M) is *below* §gen's ~10–12 GB at DOP=3, so it's both faster and lighter. The pre-allocated
+`mpR_i` result buffers are freed and replaced by the chunked-grid accumulator exactly as in the divide
+(§262/§269). Bit-identical to §gen (`--test-chunkedgrid`); the operands are positive here, but the
+shared `SafeMpzMulCG` carries the sign handling regardless. ON by default (opt-out `PI_NUMER_CG=0`).
+
+Together §273 (combine ~17h) + §274 (numerator ~4h27m) attack the two remaining DOP=3 bottlenecks at
+5B — ~21.5h of the 26.5h baseline. **Validation:** Debug build clean; batched with §273 into one 5B
+run (full from-scratch or `snap_L15` resume), gated on π SHA `2218ee06…`.

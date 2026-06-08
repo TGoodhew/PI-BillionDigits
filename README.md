@@ -336,6 +336,8 @@ The application reads a number of `PI_*` environment variables to tune or overri
 | `PI_DIV_QB_CHUNKED` | on (`0` = off) | Compute the divide's `q×b` as a chunked-grid **full** product (§269). |
 | `PI_COMBINE_CG` | on (`0` = off) | Route the top binary-split **combine** merges (P, Q, T) through the chunked-grid full product (§273) instead of §gen at the §231 serial-path DOP cap; `0` reverts to §gen. |
 | `PI_COMBINE_CG_MINTERMS` | `250000000` | Minimum `numTerms` for §273 combine routing to engage (default 250 M = exactly the levels §231 pins to DOP=3 at ≥3.5 B digits). Lower it to engage at smaller scales (e.g. `0` forces it on for validation). |
+| `PI_NUMER_CG` | on (`0` = off) | Route the divide's three **numerator** R-multiplies (`r0/r1/r2 = gmpNumer × Q_i`, §233) through the chunked-grid full product (§274) instead of §gen at the §233 DOP cap; `0` reverts to §gen. |
+| `PI_NUMER_CG_MINTERMS` | `250000000` | Minimum `numTerms` for §274 numerator routing to engage (default 250 M = the levels §233 pins to DOP=3). `0` forces it on for validation. |
 | `PI_MEMBUDGET_HEADROOM_GB` | `5` | RAM headroom (GB) reserved by the memory-budget DOP planner; a large value forces a low-RAM downshift for testing. |
 
 **Diagnostic / test-only flags** (read only by the `--test-*` harnesses and probes — see [CLI options](#command-line-options)):
