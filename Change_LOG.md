@@ -6405,3 +6405,20 @@ Adds the `_suppressDialogs` shared flag (set by `--autostart`; the future "Auto-
 will set it for unattended interactive runs). Destructive Close/Cancel confirms are deliberately NOT
 auto-answered. Build clean. (The Auto-OK checkbox UI control + wiring the info/error dialog guards
 `#1–#5` to `_suppressDialogs` remain as the UI half of #119, to land with #118's UI pass.)
+
+## Wave C — quality cleanups (2026-06-08, issues #103/#110/#111/#112)
+
+Low-risk, no behaviour change to the computation:
+- **#103** — added `--help` / `-h` / `/?` (`PrintUsageAndExit`): the GUI app attaches to the parent
+  console (if launched from a terminal) to print the full 18-flag reference, and always drops it in
+  `%TEMP%\pi_usage.txt`. Also wired `--require-free-ram` as the CLI form of #120's `PI_REQUIRE_FREE_RAM`.
+  (The old "log-level default 1" doc mismatch was already corrected to 2.)
+- **#110** — `run_history.json` moved from Roaming → **Local** AppData (consistent with logs/exception
+  files; Roaming would sync machine-specific telemetry across profiles). One-time migration copies any
+  existing Roaming history to Local so the ETA-seeding history survives.
+- **#111** — named the GMP-FFT 32-bit limb cap as `GMP_FFT_LIMB_CAP = 33_554_431` (was three bare
+  literals in the reciprocal/divide/sqrt `SAFE` consts) and added `BYTES_PER_MB`. The blanket sweep of
+  the ~120 existing `\ 1048576L` sites is deferred (churny + merge-risky; out of the pre-5B batch).
+- **#112** — removed the dead `Telemetry_CompletedStages` (no callers; the run record is written
+  directly from `_telStages`).
+(#115 is tagged *nice-to-have*, not *enhancement* — deferred, outside the pre-5B mandate.)

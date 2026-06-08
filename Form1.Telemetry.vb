@@ -89,10 +89,8 @@ Partial Class Form1
         End Try
     End Sub
 
-    ''' <summary>Stages recorded so far this run (snapshot copy).</summary>
-    Friend Function Telemetry_CompletedStages() As List(Of RunStageRecord)
-        Return New List(Of RunStageRecord)(_telStages)
-    End Function
+    ' §112 (#112): removed dead Friend Function Telemetry_CompletedStages() — it had no callers
+    ' (the run record is written directly from _telStages in Telemetry_WriteRunHistory).
 
     ''' <summary>
     ''' Hardware fingerprint, cached.  Reuses the already-detected CpuTopology
@@ -166,11 +164,33 @@ Partial Class Form1
     End Sub
 
     ''' <summary>Path to the append-only run history.</summary>
+    Private Shared _historyMigrated As Boolean = False
     Friend Shared ReadOnly Property Telemetry_HistoryPath As String
         Get
-            Return System.IO.Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            ' §110 (#110): run_history.json lives under LOCAL AppData, consistent with the logs and
+            ' exception files (which already use LocalApplicationData) — Roaming was inconsistent and
+            ' would sync this machine-specific telemetry across profiles.  One-time migration: if a
+            ' Roaming copy exists and the Local one does not yet, copy it so accumulated history (which
+            ' seeds the ETA projector) survives the relocation.
+            Dim localPath As String = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "PI-BillionDigits", "run_history.json")
+            If Not _historyMigrated Then
+                _historyMigrated = True
+                Try
+                    If Not System.IO.File.Exists(localPath) Then
+                        Dim roamingPath As String = System.IO.Path.Combine(
+                            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                            "PI-BillionDigits", "run_history.json")
+                        If System.IO.File.Exists(roamingPath) Then
+                            System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(localPath))
+                            System.IO.File.Copy(roamingPath, localPath, False)
+                        End If
+                    End If
+                Catch
+                End Try
+            End If
+            Return localPath
         End Get
     End Property
 

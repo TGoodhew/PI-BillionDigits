@@ -327,6 +327,15 @@ Public Class Form1
     ' we never mix the CRT heap with Marshal.AllocHGlobal or VirtualAlloc for
     ' the same small block — heap mismatches corrupt GMP's internal state.
     Private Const GMP_LARGE_THRESHOLD As Long = 524288L   ' 512 KB
+    ' §111 (#111): GMP's Schönhage–Strassen FFT keeps internal sizes in a 32-bit mp_size_t on Windows;
+    ' a single operand must stay below 2^25−1 = 33,554,431 limbs or the FFT can return wrong products.
+    ' SafeMpzMul / the reciprocal / divide / sqrt all split below this cap.  Named here so the bound is
+    ' not three bare 33_554_431 literals.
+    Friend Const GMP_FFT_LIMB_CAP As Integer = 33_554_431
+    ' §111 (#111): bytes per MB, for readability where a size is divided/multiplied to report MB.  (Most
+    ' of the ~120 existing `\ 1048576L` sites are left as-is for now — a blanket sweep is a churny,
+    ' merge-risky change deferred out of the pre-5B batch; new code should prefer this constant.)
+    Friend Const BYTES_PER_MB As Long = 1048576L
 
     <DllImport("kernel32.dll", SetLastError:=True)>
     Private Shared Function VirtualAlloc(lpAddress As IntPtr,
@@ -1595,6 +1604,10 @@ Public Class Form1
                     End If
                 Case "--auto-checkpoint"
                     _autoCheckpoint = True
+                Case "--require-free-ram"
+                    Environment.SetEnvironmentVariable("PI_REQUIRE_FREE_RAM", "1")   ' §120 (#120): CLI form
+                Case "--help", "-h", "/?", "/help"
+                    PrintUsageAndExit()   ' §103 (#103): print all flags + exit
                 Case "--test-mulhigh"
                     _testMulHigh = True   ' §250 (#94): run SafeMpzMulHigh self-test after GMP init, then exit
                 Case "--test-chunkedgrid"
@@ -2049,6 +2062,49 @@ Public Class Form1
     ' ════════════════════════════════════════════════════════════════════════
     '  UI event handlers
     ' ════════════════════════════════════════════════════════════════════════
+
+    <DllImport("kernel32.dll")>
+    Private Shared Function AttachConsole(dwProcessId As Integer) As Boolean
+    End Function
+    Private Const ATTACH_PARENT_PROCESS As Integer = -1
+
+    ' §103 (#103): print the full CLI flag reference and exit.  The app is a WinForms GUI with no
+    ' console of its own, so attach to the parent terminal (if launched from one) to print there, and
+    ' always also drop the text in %TEMP%\pi_usage.txt as a fallback.
+    Private Shared Sub PrintUsageAndExit()
+        Dim u As String =
+            "PI-BillionDigits — Chudnovsky π computation (GMP).  CLI flags:" & vbCrLf &
+            "  --digits N                 Digit count (commas optional). Default 1,000,000." & vbCrLf &
+            "  --autostart                Suppress dialogs and auto-begin (headless)." & vbCrLf &
+            "  --autoverify               After compute, auto-run verify, then exit." & vbCrLf &
+            "  --verify-at ""D:P""          Assert digit string D occurs at position P (repeatable)." & vbCrLf &
+            "  --verify-contains ""D""      Assert digit string D occurs anywhere (repeatable)." & vbCrLf &
+            "  --threshold N              RAM/disk node threshold (high ⇒ stay in RAM)." & vbCrLf &
+            "  --log-level N              Logging 0–5 (default 2). 0 Silent · 1 Errors+result ·" & vbCrLf &
+            "                             2 Phase milestones · 3 Sub-phase · 4 Detailed · 5 Allocator." & vbCrLf &
+            "  --output-dir D             Output dir for digits, log, and node cache." & vbCrLf &
+            "  --auto-checkpoint          Snapshot each level; auto-resume next run." & vbCrLf &
+            "  --checkpoint-from-level N  Serialize nodes at level ≥ N to disk (for resume)." & vbCrLf &
+            "  --resume-from-level N      Skip Phase 1 + levels 1..N-1; load level-N checkpoint." & vbCrLf &
+            "  --require-free-ram         Headless: abort (exit 3) on memory contention (#120)." & vbCrLf &
+            "  --help | -h | /?           Show this help and exit." & vbCrLf &
+            "  Self-tests (run, then exit): --test-mulhigh --test-chunkedgrid --test-eta" & vbCrLf &
+            "    --test-advisor --test-dopscan --test-gridscan --test-cellsweep --test-recipconv" & vbCrLf &
+            "  See README.md (""Command-line options"") and docs/ for full detail."
+        Try
+            If AttachConsole(ATTACH_PARENT_PROCESS) Then
+                Console.Out.WriteLine()
+                Console.Out.WriteLine(u)
+                Console.Out.Flush()
+            End If
+        Catch
+        End Try
+        Try
+            System.IO.File.WriteAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "pi_usage.txt"), u)
+        Catch
+        End Try
+        Environment.Exit(0)
+    End Sub
 
     ' §120 (#120): memory-contention pre-flight.  Predicts whether the §70/§243 governor will throttle
     ' (availPhys < projected peak + headroom) BEFORE the run starts, so a starved many-hour run is
@@ -5099,7 +5155,7 @@ Public Class Form1
     ''' Convergence must be gated only on real r-stability, NEVER on the precision schedule (#93).
     ''' </remarks>
     Private Shared Sub SafeMpzReciprocal(r As mpz_t, b As mpz_t, kBits As Long)
-        Const SAFE As Integer = 33_554_431
+        Const SAFE As Integer = GMP_FFT_LIMB_CAP   ' §111 (#111): named GMP-FFT 32-bit limb cap
         ' §250 (#94): read the high-half short-product flags once per reciprocal call.
         ' §254 (#70): chunked-grid reciprocal is now ON BY DEFAULT (opt-out with PI_RECIP_SHORTMUL=0).
         ' Validated: 1B π bit-identical to oracle, 500M VERIFY all-OK incl bShift>0, 5B engages cleanly
@@ -5736,7 +5792,7 @@ Public Class Form1
     ''' bit-identical.
     ''' </remarks>
     Private Shared Sub SafeMpzDiv(q As mpz_t, a As mpz_t, b As mpz_t)
-        Const SAFE As Integer = 33_554_431
+        Const SAFE As Integer = GMP_FFT_LIMB_CAP   ' §111 (#111): named GMP-FFT 32-bit limb cap
         Const MAX_ADJ_ITERS As Integer = 10   ' Barrett should need ≤ 2; >10 means reciprocal is wrong
         ' §184c: Capture a.Pointer and b.Pointer as plain IntPtrs immediately on entry.
         ' Every SafeMpzMul call in this function (a×r and q×b) triggers the §78 side-effect,
@@ -7159,7 +7215,7 @@ PostShiftCheckpoint:
     ''' <param name="result">Receives floor(sqrt(n)).</param>
     ''' <param name="n">Radicand.</param>
     Private Shared Sub SafeMpzSqrt(result As mpz_t, n As mpz_t)
-        Const SAFE As Integer = 33_554_431
+        Const SAFE As Integer = GMP_FFT_LIMB_CAP   ' §111 (#111): named GMP-FFT 32-bit limb cap
         Dim szN As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(n.Pointer, 4))
         If CLng(szN) <= SAFE Then
             gmp_lib.mpz_sqrt(result, n)
