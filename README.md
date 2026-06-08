@@ -140,6 +140,8 @@ A high-level overview of everything that was changed from the original implement
 
 ### Memory management
 
+> **Troubleshooting a slow run?** If a run is *correct* but many× slower than expected, it is almost always **memory starvation** — the `MemoryBudget` governor trading speed for OOM-safety under RAM pressure (a silent slowdown, not a crash). See **[docs/MEMORY_STARVATION_PLAYBOOK.md](docs/MEMORY_STARVATION_PLAYBOOK.md)** to recognize, diagnose, and fix it; the §120 pre-flight (`PI_REQUIRE_FREE_RAM`) warns before the run starts.
+
 **Custom VirtualAlloc/VirtualFree allocator (§6):** GMP's internal CRT `malloc/free` retains freed pages in a free-list instead of releasing them to the OS. After repeated large allocate/free cycles (Level 17 combine, sqrt, three-pass multiply) the committed-but-idle pages accumulated, hitting the system commit limit (`RAM + page file`). The next large allocation then failed with `NULL` from `malloc` and GMP called `abort()`. Fix: GMP's `mp_set_memory_functions` API replaces the three allocator callbacks. Allocations ≥ 512 KB use `VirtualAlloc(MEM_COMMIT|MEM_RESERVE)` / `VirtualFree(MEM_RELEASE)`, which immediately returns pages to the OS on free. Smaller allocations stay on GMP's own CRT heap.
 
 **Pre-allocation pattern (§19, §21, §23, §37–§38, §47):** When GMP allocates a fresh result buffer via `GmpReallocFunc` (S→L transition), it calls `VirtualAlloc` and then immediately writes into the new pages. The page faults for that write cannot always be serviced in time, causing a silent access violation inside native GMP — a CLR FailFast with no managed handler reachable. The fix used throughout the code is to manually pre-allocate the result buffer with `VirtualAlloc` before the GMP call, then write the pointer and alloc count directly into the native `__mpz_struct`. `MPZ_REALLOC` then short-circuits (result already large enough) and `GmpReallocFunc` is never called.
@@ -341,6 +343,7 @@ The application reads a number of `PI_*` environment variables to tune or overri
 | `PI_SQRT_CG` | on (`0` = off) | Route `SafeMpzSqrt`'s final-adjustment squarings (`x²`, `(x+1)²`) through the chunked-grid product (§275) instead of §gen; `0` reverts to §gen. |
 | `PI_SQRT_CG_MINLIMBS` | `30000000` | Minimum squaring-operand size (limbs) for §275 sqrt routing to engage (default 30 M ≈ the ≥3.5 B-digit regime). `0` forces it on for validation. |
 | `PI_MEMBUDGET_HEADROOM_GB` | `5` | RAM headroom (GB) reserved by the memory-budget DOP planner; a large value forces a low-RAM downshift for testing. |
+| `PI_REQUIRE_FREE_RAM` | off (`1` = on) | §120 memory-contention pre-flight: on a headless run, **abort before start** (exit code 3) if `availPhys < projected peak + headroom`, instead of only logging the `[WARN]`. See [docs/MEMORY_STARVATION_PLAYBOOK.md](docs/MEMORY_STARVATION_PLAYBOOK.md). |
 
 **Diagnostic / test-only flags** (read only by the `--test-*` harnesses and probes — see [CLI options](#command-line-options)):
 

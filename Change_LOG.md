@@ -6335,4 +6335,29 @@ engages the two main squarings run **sequentially** (each already saturates `PI_
 
 With §273 (combine) + §274 (numerator) + §275 (sqrt), all three large-multiply stages outside the
 already-chunked divide now route through the chunked grid — together ~24h of the 26.5h 5B baseline.
-**Validation:** Debug build clean; batched into one 5B run gated on π SHA `2218ee06…`.
+**Validation:** 1B forced-all gate (`PI_COMBINE_CG_MINTERMS=0` + `PI_NUMER_CG_MINTERMS=0` +
+`PI_SQRT_CG_MINLIMBS=0`) PASSED — all three engaged, π SHA `b153e8d5…` bit-identical. Batched into one
+5B run gated on π SHA `2218ee06…`.
+
+## §117 — File-save failure no longer masked by the in-memory verify (2026-06-08, issue #117)
+
+On the completion path `WriteResultToFile` → `RunVerification` ran in sequence, but verify scans the
+**in-memory** native buffer, not the file — so a failed/partial `pi_digits.txt` write was overwritten
+by `Verify OK: …` and reported as success, with nothing logged. Fix: `WriteResultToFile` now (a) logs
+the save outcome at level 1 on both branches (bytes+path on success, the exception on failure), (b)
+**confirms the persisted file size** equals the expected length (`_displayNativeLen + 1`), catching a
+truncated write (disk full mid-stream) that the in-memory verify would miss, and (c) records a
+`_saveFailed` flag that `ComposeVerifyStatus` prepends to the terminal status
+(`File save FAILED: … | (in-memory) Verify OK: …`) so a save error can never be clobbered. No change to
+the computation or to what is written. Validatable on a 1M GUI run (point output at a read-only path).
+
+## §120 — Memory-contention pre-flight (2026-06-08, issue #120)
+
+A starved run is *correct* but many× slower (the §70/§243 governor serializes the hot path when
+`availPhys` nears the headroom — see docs/MEMORY_STARVATION_PLAYBOOK.md, #124). `MemPreflight_ShouldProceed`
+runs at `BtnCompute_Click` once the digit count is known: it compares `availPhys` against a
+telemetry-anchored projected peak (~5 GB @ 1B, ~45 GB @ 5B) + the same `PI_MEMBUDGET_HEADROOM_GB` the
+governor uses. On contention — **interactive:** a Proceed/Cancel dialog naming the top-3 RAM consumers;
+**headless:** a level-1 `[MemPreflight§120] WARNING …` line, plus an opt-in hard abort (exit 3) under
+`PI_REQUIRE_FREE_RAM=1`. Never blocks a run on its own error (any exception ⇒ proceed). Roomy/idle box ⇒
+silent. (When #119's auto-OK lands, the interactive dialog composes with it.)

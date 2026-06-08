@@ -43,6 +43,12 @@ Public Class Form1
     Private _displayNativePtr As IntPtr = IntPtr.Zero
     Private _displayNativeLen As Long = 0
     Private _displayNativeBufSize As Long = 0   ' GmpAllocFunc alloc size; >= GMP_LARGE_THRESHOLD → VirtualAlloc'd
+    ' §117 (#117): WriteResultToFile records the file-save outcome here so the terminal verify status
+    ' can compose it.  A save failure must NOT be clobbered by the in-memory verify (which reads the
+    ' native buffer, not the file on disk), or a broken/partial/missing pi_digits.txt reads as success.
+    ' False also covers "no save attempted" (Write-to-File off).
+    Private _saveFailed As Boolean = False
+    Private _saveErrorMsg As String = ""
     ' §74 (issue #74): chunked decimal converter progress.  Written by the compute thread
     ' inside ChunkedMpzGetStr, read by the _strConvTimer status-bar callback.  64-bit
     ' aligned ordinary longs — on x64 aligned 64-bit writes are atomic, so the timer never
@@ -2027,6 +2033,71 @@ Public Class Form1
     '  UI event handlers
     ' ════════════════════════════════════════════════════════════════════════
 
+    ' §120 (#120): memory-contention pre-flight.  Predicts whether the §70/§243 governor will throttle
+    ' (availPhys < projected peak + headroom) BEFORE the run starts, so a starved many-hour run is
+    ' caught up front rather than discovered hours in.  Interactive: a Proceed/Cancel dialog.  Headless:
+    ' a level-1 [WARN] log line (+ opt-in hard abort via PI_REQUIRE_FREE_RAM=1, exit code 3).  Uses the
+    ' same availPhys/headroom math as the governor so the warning predicts its real decision.  Returns
+    ' True to proceed.  Never blocks a run on its own error.  See docs/MEMORY_STARVATION_PLAYBOOK.md.
+    Private Function MemPreflight_ShouldProceed(digits As Long) As Boolean
+        Try
+            Dim availPhysGB As Double = MemBudget_AvailablePhysicalGB()
+            Dim availCommitGB As Double = MemBudget_AvailableCommitGB()
+            ' Telemetry-anchored peak estimate: ~5 GB @ 1B, ~45 GB @ 5B (observed top-combine/divide peaks).
+            Dim projPeakGB As Double = 5.0 + System.Math.Max(0.0, digits / 1.0E9 - 1.0) * 10.0
+            Dim headroomGB As Double = 5.0
+            Dim _env As String = Environment.GetEnvironmentVariable("PI_MEMBUDGET_HEADROOM_GB")
+            Dim _hp As Double
+            If _env IsNot Nothing AndAlso Double.TryParse(_env, _hp) AndAlso _hp >= 0.0 Then headroomGB = _hp
+            If availPhysGB >= projPeakGB + headroomGB Then Return True   ' roomy/idle box — no contention
+            Dim consumers As String = MemPreflight_TopConsumers()
+            Dim facts As String = $"availPhys {availPhysGB:F1}GB < projected peak ~{projPeakGB:F0}GB + {headroomGB:F0}GB headroom (availCommit {availCommitGB:F1}GB). Top memory consumers: {consumers}"
+            If _headless Then
+                AppendLog($"[MemPreflight§120] WARNING: {facts}. The governor will likely serialize the hot path (much slower run). See docs/MEMORY_STARVATION_PLAYBOOK.md.{vbCrLf}", 1)
+                If Environment.GetEnvironmentVariable("PI_REQUIRE_FREE_RAM") = "1" Then
+                    AppendLog($"[MemPreflight§120] PI_REQUIRE_FREE_RAM=1 — aborting before start (exit 3).{vbCrLf}", 1)
+                    Environment.Exit(3)
+                End If
+                Return True
+            Else
+                AppendLog($"[MemPreflight§120] {facts} — showing contention dialog.{vbCrLf}", 1)
+                Dim dlg As String = $"Memory contention detected." & vbCrLf & vbCrLf &
+                    $"This {digits:N0}-digit run is expected to peak ~{projPeakGB:F0} GB, but only {availPhysGB:F1} GB of physical RAM is free." & vbCrLf &
+                    $"Top memory consumers: {consumers}." & vbCrLf & vbCrLf &
+                    "Running now will likely force the memory governor to serialize the computation (much slower)." & vbCrLf &
+                    "Close other applications and retry for best performance." & vbCrLf & vbCrLf &
+                    "Proceed anyway?"
+                Return (MessageBox.Show(dlg, "Memory contention", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) = DialogResult.Yes)
+            End If
+        Catch
+            Return True   ' never block a run on a pre-flight error
+        End Try
+    End Function
+
+    ' §120 (#120): name the top-3 external processes by working set, to identify the RAM contender.
+    Private Function MemPreflight_TopConsumers() As String
+        Try
+            Dim selfId As Integer = Process.GetCurrentProcess().Id
+            Dim list As New System.Collections.Generic.List(Of ValueTuple(Of String, Long))()
+            For Each p As Process In Process.GetProcesses()
+                Try
+                    If p.Id = selfId Then Continue For
+                    list.Add((p.ProcessName, p.WorkingSet64))
+                Catch
+                End Try
+            Next
+            list.Sort(Function(a, b) b.Item2.CompareTo(a.Item2))
+            Dim sb As New System.Text.StringBuilder()
+            For i As Integer = 0 To System.Math.Min(2, list.Count - 1)
+                If i > 0 Then sb.Append(", ")
+                sb.Append($"{list(i).Item1} {list(i).Item2 / 1073741824.0:F1}GB")
+            Next
+            Return If(sb.Length > 0, sb.ToString(), "(none)")
+        Catch
+            Return "(unavailable)"
+        End Try
+    End Function
+
     Private Sub BtnCompute_Click(sender As Object, e As EventArgs) Handles BtnCompute.Click
         ' Free any retained Pi buffer from the previous run before starting a new one.
         If _displayNativePtr <> IntPtr.Zero Then
@@ -2073,6 +2144,16 @@ Public Class Form1
                    ""))
         Catch
         End Try
+        ' §120 (#120): memory-contention pre-flight (after the log exists so the [WARN] is captured,
+        ' before the compute thread starts).  Aborts cleanly if the user cancels the contention dialog.
+        If Not MemPreflight_ShouldProceed(DIGITS) Then
+            AppendLog($"[MemPreflight§120] run cancelled before start (memory contention).{vbCrLf}", 1)
+            LblStatus.Text = "Cancelled — memory contention (see log)."
+            BtnCompute.Enabled = True
+            BtnPause.Enabled = False
+            Timer1.Stop()
+            Return
+        End If
         RtbPiDigits.AppendText("Starting computation..." & vbCrLf)
         Dim computeThread As New System.Threading.Thread(
             Sub()
@@ -9896,6 +9977,7 @@ NumeratorDone:
                 If Not System.IO.Directory.Exists(System.IO.Path.GetDirectoryName(outputFile)) Then
                     System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(outputFile))
                 End If
+                Dim _expectedLen As Long
                 If _displayNativePtr <> IntPtr.Zero Then
                     ' Stream the native char buffer to file in 1 MB chunks.
                     ' Insert decimal point after the first digit ("3" → "3.").
@@ -9913,17 +9995,38 @@ NumeratorDone:
                             written += toWrite
                         End While
                     End Using
+                    _expectedLen = _displayNativeLen + 1L   ' leading digit + "." + (len−1) digits
                 Else
                     System.IO.File.WriteAllText(outputFile, displayStr)
+                    _expectedLen = CLng(displayStr.Length)
                 End If
+                ' §117 (#117): confirm the file actually persisted at the expected size.  The verify
+                ' step scans the in-memory buffer, so a truncated write (e.g. disk full mid-stream)
+                ' would otherwise pass verify while the on-disk pi_digits.txt is partial.
+                Dim _actualLen As Long = New System.IO.FileInfo(outputFile).Length
+                If _actualLen <> _expectedLen Then
+                    Throw New System.IO.IOException($"file size {_actualLen:N0} ≠ expected {_expectedLen:N0} bytes (truncated/partial write)")
+                End If
+                _saveFailed = False : _saveErrorMsg = ""
+                WriteToLog($"[WriteResultToFile] saved {_actualLen:N0} bytes to {outputFile}" & vbCrLf, 1)   ' §117
                 LblStatus.Text = $"Done! Saved to {outputFile}"
             Catch ex As Exception
+                _saveFailed = True : _saveErrorMsg = ex.Message                                              ' §117
+                WriteToLog($"[WriteResultToFile] SAVE FAILED: {ex.Message}" & vbCrLf, 1)                      ' §117
                 LblStatus.Text = "File save error: " & ex.Message
             End Try
         Else
+            _saveFailed = False : _saveErrorMsg = ""                                                         ' §117: no save attempted
             LblStatus.Text = $"Done! {digitCount:N0} digits computed."
         End If
     End Sub
+
+    ' §117 (#117): prepend any file-save failure to the verify status so the in-memory verify result
+    ' cannot clobber it.  Makes explicit that the verify ran against the in-memory buffer, not the file.
+    Private Function ComposeVerifyStatus(verifySummary As String) As String
+        If _saveFailed Then Return $"File save FAILED: {_saveErrorMsg} | (in-memory) {verifySummary}"
+        Return verifySummary
+    End Function
 
     Private Sub DisplayTimer_Tick(sender As Object, e As EventArgs) Handles displayTimer.Tick
         Dim useNative As Boolean = (_displayNativePtr <> IntPtr.Zero)
@@ -10100,7 +10203,7 @@ NumeratorDone:
                 parts.Add("nine-9s not checked (need 564M+ digits)")
             End If
 
-            Dim summary As String = If(allOk, "Verify OK: ", "Verify: ") & String.Join(" | ", parts)
+            Dim summary As String = ComposeVerifyStatus(If(allOk, "Verify OK: ", "Verify: ") & String.Join(" | ", parts))   ' §117
             LblStatus.Text = summary
             WriteToLog("[Verify] " & summary, 1)   ' §252 (#95): verify outcome = level 1 (result)
 
@@ -10145,7 +10248,7 @@ NumeratorDone:
             parts.Add("nine-9s not found (need 564M+ digits)")
         End If
 
-        Dim summary2 As String = If(allOk, "Verify OK: ", "Verify: ") & String.Join(" | ", parts)
+        Dim summary2 As String = ComposeVerifyStatus(If(allOk, "Verify OK: ", "Verify: ") & String.Join(" | ", parts))   ' §117
         LblStatus.Text = summary2
         WriteToLog("[Verify] " & summary2, 1)   ' §252 (#95): verify outcome = level 1 (result)
 
