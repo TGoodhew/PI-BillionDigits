@@ -188,4 +188,17 @@ Partial Class Form1
         End Try
     End Sub
 
+    ''' <summary>
+    ''' §116/§126 (#116/#126): set the window title to a terminal state at run completion, replacing
+    ''' the live ETA.  Without this the title froze on the last ETA refresh — a stale "&lt;1m" — through
+    ''' the file write, verify, and at exit, and never showed Done/Verified.  GUI-only (no-op headless).
+    ''' </summary>
+    Friend Sub Eta_Finalize(terminal As String)
+        If _headless Then Return
+        Try
+            If Not Me.IsDisposed Then Me.BeginInvoke(Sub() Me.Text = $"π {DIGITS:N0} — {terminal}")
+        Catch
+        End Try
+    End Sub
+
 End Class

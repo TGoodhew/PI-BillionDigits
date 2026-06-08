@@ -6361,3 +6361,23 @@ governor uses. On contention — **interactive:** a Proceed/Cancel dialog naming
 **headless:** a level-1 `[MemPreflight§120] WARNING …` line, plus an opt-in hard abort (exit 3) under
 `PI_REQUIRE_FREE_RAM=1`. Never blocks a run on its own error (any exception ⇒ proceed). Roomy/idle box ⇒
 silent. (When #119's auto-OK lands, the interactive dialog composes with it.)
+
+## §116/§126 — Window-title terminal state (2026-06-08, issues #116/#126)
+
+The title was only ever set by the live ETA refresh (`Eta_Refresh`), so it **froze on the last refresh
+— a stale `<1m` ETA — through the file write, verify, and at exit, never showing Done/Verify** (#116).
+`Eta_Finalize(terminal)` now sets the title to a terminal state at every completion path:
+`π {DIGITS} — Done {hh:mm:ss} — Verified ✓` (or `Verify FAIL ✗` / `SAVE FAILED ✗`, composing with the
+§117 save flag), and `Done {elapsed}` on the no-verify paths. Resolves #126 by choosing its "add a
+terminal state" option (the deeper intra-stage ETA coverage — the 17 h no-ETA gap during the combine —
+remains a possible follow-up). GUI-only (no-op headless).
+
+## §127 — Size-based ETA for the parallel decimal converter (2026-06-08, issue #127)
+
+The string-conversion status only showed an ETA on the §216 *chunked* path (which publishes
+`_chunkConvCurrent/Total`); the **default §226/§270 parallel converter** (every run ≥ 1.5 B) published
+no progress, so its status was a bare `… elapsed` with no estimate. Now that branch shows the **output
+digit count** and a rough size-based ETA (`~est Xm left`) derived from the known size and the
+conservative §270 large-scale rate (~5 M digits/s). Honest about being an estimate; the digit count is
+genuinely new info (not redundant with the running-time label). `_piDigitsEstimate` was hoisted above
+the status timer so the closure can read it (no duplicate `mpz_sizeinbase`).

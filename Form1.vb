@@ -9751,6 +9751,9 @@ NumeratorDone:
 
             If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_get_str: converting result to string")
             Dim _strConvStart As DateTime = DateTime.Now
+            ' §127 (#127): output digit count — known up front, so the parallel-converter status (which
+            ' publishes no per-chunk progress) can show a rough size-based ETA.  Also used for routing below.
+            Dim _piDigitsEstimate As Long = CLng(gmp_lib.mpz_sizeinbase(gmpPi, 10))
             Dim _strConvTimer As New System.Threading.Timer(
                 Sub(state As Object)
                     Dim elapsed As TimeSpan = DateTime.Now - _strConvStart
@@ -9773,7 +9776,17 @@ NumeratorDone:
                         End If
                         statusText = $"String conversion: chunk {current:N0} of {total:N0}, {elapsed:hh\:mm\:ss} elapsed{etaText}"
                     Else
-                        statusText = $"String conversion... {elapsed:mm\:ss} elapsed"
+                        ' §127 (#127): the parallel §226/§270 converter publishes no per-chunk progress,
+                        ' so derive a rough ETA from the known output size and the observed §270 rate
+                        ' (~5M digits/s at 5B — the conservative large-scale figure; smaller runs finish
+                        ' sooner than predicted).  Shows the digit count too (not redundant with the
+                        ' running-time label).  Labelled "~est" to flag it as a size-based estimate.
+                        Dim etaText As String = ""
+                        If _piDigitsEstimate > 0 Then
+                            Dim remSec As Double = System.Math.Max(0.0, _piDigitsEstimate / 5_000_000.0 - elapsed.TotalSeconds)
+                            etaText = If(remSec >= 3600.0, $", ~est {remSec / 3600.0:F1}h left", $", ~est {remSec / 60.0:F0}m left")
+                        End If
+                        statusText = $"String conversion ({_piDigitsEstimate:N0} digits)... {elapsed:hh\:mm\:ss} elapsed{etaText}"
                     End If
                     Me.BeginInvoke(Sub()
                                        LblStatus.Text = statusText
@@ -9784,7 +9797,7 @@ NumeratorDone:
             ' mpz_get_str's internal recursive divide-and-conquer.  Route large outputs to
             ' ChunkedMpzGetStr which extracts 300M-digit slabs via mpz_fdiv_qr / 10^300M and
             ' calls mpz_get_str on each (each chunk ≤ 300 MB output, well within safe range).
-            Dim _piDigitsEstimate As Long = CLng(gmp_lib.mpz_sizeinbase(gmpPi, 10))
+            ' (_piDigitsEstimate computed above, before the status timer — §127.)
             Dim _usedChunkedPath As Boolean = False
             Dim piCharPtr As char_ptr = char_ptr.Zero
             Dim _strConvSw As New Diagnostics.Stopwatch()
@@ -9887,7 +9900,7 @@ NumeratorDone:
             WriteResultToFile(digitCount)
             If _displayNativePtr = IntPtr.Zero Then displayStr = Nothing
             ' §82 auto-verify: run when display is off and checkbox is checked.
-            If ChkAutoVerify.Checked Then RunVerification()
+            If ChkAutoVerify.Checked Then RunVerification() Else Eta_Finalize($"Done {stopWatch.Elapsed:hh\:mm\:ss}")   ' §116/§126
             Return
         End If
 
@@ -9900,7 +9913,7 @@ NumeratorDone:
             BtnPause.Enabled = False
             Timer1.Stop()
             WriteResultToFile(digitCount)
-            If ChkAutoVerify.Checked Then RunVerification()
+            If ChkAutoVerify.Checked Then RunVerification() Else Eta_Finalize($"Done {stopWatch.Elapsed:hh\:mm\:ss}")   ' §116/§126
             SetupNavWindow(digitCount - 1L)   ' totalDigits = digitCount − 1 (exclude the null terminator)
             LblStatus.Text = $"Done! {digitCount - 1L:N0} digits — drag the slider to navigate."
             LstBoxPhases.Items.Add($"{stopWatch.Elapsed:hh\:mm\:ss\.ff} | Window ready ({digitCount - 1L:N0} digits)")
@@ -10206,6 +10219,7 @@ NumeratorDone:
             Dim summary As String = ComposeVerifyStatus(If(allOk, "Verify OK: ", "Verify: ") & String.Join(" | ", parts))   ' §117
             LblStatus.Text = summary
             WriteToLog("[Verify] " & summary, 1)   ' §252 (#95): verify outcome = level 1 (result)
+            Eta_Finalize($"Done {stopWatch.Elapsed:hh\:mm\:ss} — " & If(_saveFailed, "SAVE FAILED ✗", If(allOk, "Verified ✓", "Verify FAIL ✗")))   ' §116/§126
 
             If _verifyAt.Count > 0 OrElse _verifyContains.Count > 0 Then
                 RunCustomVerificationsNative(_displayNativePtr, totalLen)
@@ -10251,6 +10265,7 @@ NumeratorDone:
         Dim summary2 As String = ComposeVerifyStatus(If(allOk, "Verify OK: ", "Verify: ") & String.Join(" | ", parts))   ' §117
         LblStatus.Text = summary2
         WriteToLog("[Verify] " & summary2, 1)   ' §252 (#95): verify outcome = level 1 (result)
+        Eta_Finalize($"Done {stopWatch.Elapsed:hh\:mm\:ss} — " & If(_saveFailed, "SAVE FAILED ✗", If(allOk, "Verified ✓", "Verify FAIL ✗")))   ' §116/§126
 
         If _verifyAt.Count > 0 OrElse _verifyContains.Count > 0 Then
             RunCustomVerifications(piText)
