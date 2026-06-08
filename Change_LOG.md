@@ -6315,5 +6315,24 @@ Chunked-grid parallelises cells at `PI_CG_DOP` (≤16) with low per-cell RAM —
 shared `SafeMpzMulCG` carries the sign handling regardless. ON by default (opt-out `PI_NUMER_CG=0`).
 
 Together §273 (combine ~17h) + §274 (numerator ~4h27m) attack the two remaining DOP=3 bottlenecks at
-5B — ~21.5h of the 26.5h baseline. **Validation:** Debug build clean; batched with §273 into one 5B
-run (full from-scratch or `snap_L15` resume), gated on π SHA `2218ee06…`.
+5B — ~21.5h of the 26.5h baseline. **Validation:** 1B forced-both gate (`PI_COMBINE_CG_MINTERMS=0` +
+`PI_NUMER_CG_MINTERMS=0`) PASSED — both `[Combine§273]` and `[ComputePi§274]` engaged, π SHA
+`b153e8d5…` bit-identical, spot-checks OK. 5B speedup gate batched with §275.
+
+## §275 — Route the square-root final-adjustment squarings through the chunked grid (2026-06-08, issue #121)
+
+`SafeMpzSqrt`'s Newton loop already rides on `SafeMpzDiv` (chunked via §262/§269/§272), but its
+**final adjustment** (§228) squares the ~half-width root — `xSq = x²`, `x1Sq = (x+1)²`, plus the rare
+adj-down/adj-up squarings — via §gen `SafeMpzMul`. At 5B `x` is ~130M limbs and that block ("Step 4")
+was **~2h42m** on the 2026-06-08 baseline.
+
+§275 routes those squarings through `SafeMpzMulCG` (chunked-grid full product) when the operand
+`≥ PI_SQRT_CG_MINLIMBS` (default 30M limbs ≈ the ≥3.5B regime). Chunked-grid squaring is bit-exact
+(`--test-chunkedgrid` sq=True cases, `fullEq=True`) and 3.5–6.8× faster at these sizes; when it
+engages the two main squarings run **sequentially** (each already saturates `PI_CG_DOP` cores, so the
+§228 `Parallel.Invoke` would only oversubscribe). Gated on operand SIZE rather than `numTerms`
+(`SafeMpzSqrt` has no `numTerms` in scope). ON by default (opt-out `PI_SQRT_CG=0`).
+
+With §273 (combine) + §274 (numerator) + §275 (sqrt), all three large-multiply stages outside the
+already-chunked divide now route through the chunked grid — together ~24h of the 26.5h 5B baseline.
+**Validation:** Debug build clean; batched into one 5B run gated on π SHA `2218ee06…`.

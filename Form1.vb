@@ -209,6 +209,16 @@ Public Class Form1
     ' tunable via PI_NUMER_CG_MINTERMS) — exactly the levels §233 pins to DOP=3.
     Private Shared _numerChunkedGrid As Boolean = True
     Private Shared _numerCgMinTerms As Long = 250_000_000L
+    ' §275 (#121): route SafeMpzSqrt's final-adjustment squarings (xSq=x², x1Sq=(x+1)²) through the
+    ' chunked grid.  The sqrt-Newton loop already rides on SafeMpzDiv (chunked via §262/§269/§272),
+    ' but the final adjustment squares the ~half-width root via §gen SafeMpzMul — "Step 4" ≈ 2h42m at
+    ' 5B on the 2026-06-08 baseline.  Chunked-grid squaring is bit-exact (--test-chunkedgrid sq=True)
+    ' and 3.5–6.8× faster; when it engages the two squarings run sequentially (each already saturates
+    ' PI_CG_DOP cores, so no Parallel.Invoke oversubscription).  ON by default (opt-out PI_SQRT_CG=0);
+    ' engages when the squaring operand ≥ PI_SQRT_CG_MINLIMBS (default 30M limbs ≈ the ≥3.5B-digit
+    ' regime; smaller sqrt work is already fast).  Gated on operand SIZE (SafeMpzSqrt has no numTerms).
+    Private Shared _sqrtChunkedGrid As Boolean = True
+    Private Shared _sqrtCgMinLimbs As Long = 30_000_000L
 
     ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
     ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
@@ -7306,6 +7316,14 @@ PostShiftCheckpoint:
         ' avoid silent realloc inside Parallel.Invoke tasks.
         Dim _szX228 As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(x.Pointer, 4))
         AppendLog($"[SafeMpzSqrt§228] entering parallel final-adj: szX={_szX228:N0} limbs (currentDop={System.Threading.Volatile.Read(_safeMulDop)}){vbCrLf}")
+        ' §275 (#121): decide whether to route the final-adjustment squarings through the chunked
+        ' grid (parallel cells at PI_CG_DOP, low per-cell RAM) instead of §gen at the inherited DOP.
+        _sqrtChunkedGrid = (Environment.GetEnvironmentVariable("PI_SQRT_CG") <> "0")
+        Dim _scgEnv As String = Environment.GetEnvironmentVariable("PI_SQRT_CG_MINLIMBS")
+        Dim _scgParsed As Long
+        If _scgEnv IsNot Nothing AndAlso Long.TryParse(_scgEnv, _scgParsed) AndAlso _scgParsed >= 0L Then _sqrtCgMinLimbs = _scgParsed
+        Dim _useCgSqrt As Boolean = _sqrtChunkedGrid AndAlso CLng(_szX228) >= _sqrtCgMinLimbs
+        If _useCgSqrt Then AppendLog($"[SafeMpzSqrt§275] final-adj squarings via chunked-grid (szX={_szX228:N0} >= {_sqrtCgMinLimbs:N0}){vbCrLf}")
 
         ' Pre-compute x1 = x+1 before launching the parallel pair (cannot do this inside the
         ' Parallel.Invoke task without races on x).
@@ -7327,9 +7345,17 @@ PostShiftCheckpoint:
         ' §228: launch the two squarings concurrently.  Inner SafeMpzMul fans out per §220/§221.
         AppendLog($"[SafeMpzSqrt§228] Parallel.Invoke(xSq=x*x, x1Sq=x1*x1) starting{vbCrLf}")
         Dim _t228Ticks As Long = System.Diagnostics.Stopwatch.GetTimestamp()
-        System.Threading.Tasks.Parallel.Invoke(
-            Sub() SafeMpzMul(xSq, x, x),
-            Sub() SafeMpzMul(x1Sq, x1, x1))
+        If _useCgSqrt Then
+            ' §275: each chunked-grid squaring already saturates up to PI_CG_DOP cores, so run the
+            ' two sequentially (no Parallel.Invoke ⇒ no core oversubscription).  CG squaring is
+            ' bit-exact (--test-chunkedgrid sq=True) and far faster than §gen at these sizes.
+            SafeMpzMulCG(xSq, x, x)
+            SafeMpzMulCG(x1Sq, x1, x1)
+        Else
+            System.Threading.Tasks.Parallel.Invoke(
+                Sub() SafeMpzMul(xSq, x, x),
+                Sub() SafeMpzMul(x1Sq, x1, x1))
+        End If
         Dim _t228Elapsed As Double = (System.Diagnostics.Stopwatch.GetTimestamp() - _t228Ticks) / System.Diagnostics.Stopwatch.Frequency
         AppendLog($"[SafeMpzSqrt§228] Parallel.Invoke done; elapsed={_t228Elapsed:F2}s (szXSq={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(xSq.Pointer, 4)):N0} szX1Sq={System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(x1Sq.Pointer, 4)):N0}){vbCrLf}")
 
@@ -7341,11 +7367,11 @@ PostShiftCheckpoint:
             If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt§228] adj-down iter={_adjDownSqrt} (x²>n){vbCrLf}")
             gmp_lib.mpz_sub_ui(x, x, 1UI)
             gmp_lib.mpz_sub_ui(x1, x1, 1UI)
-            SafeMpzMul(xSq, x, x)
+            If _useCgSqrt Then SafeMpzMulCG(xSq, x, x) Else SafeMpzMul(xSq, x, x)   ' §275
         Loop
         If _adjDownSqrt > 0 Then
             AppendLog($"[SafeMpzSqrt§228] adj-down ran {_adjDownSqrt} iter(s); recomputing x1Sq for new x1{vbCrLf}")
-            SafeMpzMul(x1Sq, x1, x1)
+            If _useCgSqrt Then SafeMpzMulCG(x1Sq, x1, x1) Else SafeMpzMul(x1Sq, x1, x1)   ' §275
         Else
             If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt§228] adj-down done: 0 iter(s); x1Sq from parallel pair still valid{vbCrLf}")
         End If
@@ -7358,7 +7384,7 @@ PostShiftCheckpoint:
             If _logLevel >= 2 Then AppendLog($"[SafeMpzSqrt§228] adj-up iter={_adjUpSqrt} ((x+1)²≤n){vbCrLf}")
             GmpRaw_swap(x.Pointer, x1.Pointer)  ' §35
             gmp_lib.mpz_add_ui(x1, x, 1UI)
-            SafeMpzMul(x1Sq, x1, x1)
+            If _useCgSqrt Then SafeMpzMulCG(x1Sq, x1, x1) Else SafeMpzMul(x1Sq, x1, x1)   ' §275
         Loop
         AppendLog($"[SafeMpzSqrt§228] adj-up done: {_adjUpSqrt} iter(s); SafeMpzSqrt complete{vbCrLf}")
         gmp_lib.mpz_clear(x1)
