@@ -134,7 +134,7 @@ A high-level overview of everything that was changed from the original implement
 
 **Three-pass multiply (§7, §46, §47):** The final `gmpNumer *= finalQ` multiplication (~1.1 GB × ~1.1 GB) peaks at ~2.3 GB, exceeding available headroom after the other live buffers. `finalQ` is split into three equal bit-thirds (Q0, Q1, Q2) and multiplied separately; the three partial products are shifted and summed to reconstruct the full result. Peak per-pass is ~1.2 GB.
 
-**`SafeMpzMul` (§17–§45, §160):** GMP's internal FFT uses a 32-bit `mp_size_t` (signed `int` on Windows MSVC), and very large operands also push GMP's Schönhage-Strassen FFT past the range where it returns reliably. `SafeMpzMul` therefore splits whenever the **combined** operand size `szA + szB` exceeds `SAFE_LIMB_THRESHOLD = 5,000,000` limbs (the conservative cap set by §160). It is a schoolbook 3×3 split: each operand is divided into three equal thirds by bit position and the nine sub-products are computed separately with GMP's fast routines, which never see an operand large enough to trigger the problem. Recursive: sub-products that still exceed the threshold recurse. (At the very largest scales the dominant multiplies route instead through the chunked-grid path — see the Change Log, §251/§262/§267–§269.)
+**`SafeMpzMul` (§17–§45, §160):** GMP's internal FFT uses a 32-bit `mp_size_t` (signed `int` on Windows MSVC), and very large operands also push GMP's Schönhage-Strassen FFT past the range where it returns reliably. `SafeMpzMul` therefore splits whenever the **combined** operand size `szA + szB` exceeds `SAFE_LIMB_THRESHOLD = 5,000,000` limbs (the conservative cap set by §160). It is a schoolbook 3×3 split: each operand is divided into three equal thirds by bit position and the nine sub-products are computed separately with GMP's fast routines, which never see an operand large enough to trigger the problem. Recursive: sub-products that still exceed the threshold recurse. (At the very largest scales the dominant multiplies — both the divide and the top binary-split combine merges — route instead through the chunked-grid path — see the Change Log, §251/§262/§267–§269/§273.)
 
 ---
 
@@ -334,6 +334,8 @@ The application reads a number of `PI_*` environment variables to tune or overri
 | `PI_RECIP_SHORTMUL_MAXDOP` | `9` | DOP gate — engage the chunked reciprocal only when §gen's DOP ≤ this (the low-DOP 5 B regime). |
 | `PI_DIV_AR_SHORTMUL` | on (`0` = off) | Compute the divide's `a×r` as a chunked-grid **HIGH** product (§262). |
 | `PI_DIV_QB_CHUNKED` | on (`0` = off) | Compute the divide's `q×b` as a chunked-grid **full** product (§269). |
+| `PI_COMBINE_CG` | on (`0` = off) | Route the top binary-split **combine** merges (P, Q, T) through the chunked-grid full product (§273) instead of §gen at the §231 serial-path DOP cap; `0` reverts to §gen. |
+| `PI_COMBINE_CG_MINTERMS` | `250000000` | Minimum `numTerms` for §273 combine routing to engage (default 250 M = exactly the levels §231 pins to DOP=3 at ≥3.5 B digits). Lower it to engage at smaller scales (e.g. `0` forces it on for validation). |
 | `PI_MEMBUDGET_HEADROOM_GB` | `5` | RAM headroom (GB) reserved by the memory-budget DOP planner; a large value forces a low-RAM downshift for testing. |
 
 **Diagnostic / test-only flags** (read only by the `--test-*` harnesses and probes — see [CLI options](#command-line-options)):

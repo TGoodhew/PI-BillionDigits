@@ -189,6 +189,18 @@ Public Class Form1
     ' with the §268 adaptive 16M cell, far faster than §gen recursion.  ON by default (opt-out
     ' PI_DIV_QB_CHUNKED=0).
     Private Shared _divQbChunked As Boolean = True
+    ' §273 (#121/#122): route the top binary-split combine merges through the chunked-grid path
+    ' instead of §gen at the §231 serial-path DOP cap (3 of 24 cores at ≥250M terms).  The §231
+    ' cap is RAM-bound — §gen's recursive sub-products are GB-scale, so its DOP^3 buffer growth
+    ' OOMs above DOP=3 at 5B.  Chunked-grid cells are tiny (≤16M-limb ⇒ ≤256MB cell products) so
+    ' it parallelises at PI_CG_DOP (default ProcessorCount, capped 16) at low RAM — the same reason
+    ' it already won the divide (§262 a×r, §269 q×b).  Full product (keepLimbs=0) is bit-identical
+    ' to §gen (proven by --test-chunkedgrid); CombineMulCG adds the sign handling the alternating-
+    ' series T merges need.  ON by default (opt-out PI_COMBINE_CG=0); engages only when numTerms ≥
+    ' _combineCgMinTerms (default 250M — exactly the levels §231 pins to DOP=3), tunable via
+    ' PI_COMBINE_CG_MINTERMS.
+    Private Shared _combineChunkedGrid As Boolean = True
+    Private Shared _combineCgMinTerms As Long = 250_000_000L
 
     ' ── Thread-safe logging for GMP allocator callbacks ──────────────────────
     ' VirtualAlloc / VirtualFree / CRT malloc / CRT free are all intrinsically
@@ -3365,6 +3377,23 @@ Public Class Form1
         Runtime.InteropServices.Marshal.WriteInt64(result.Pointer, 8, accBuf.ToInt64())
     End Sub
 
+    ' §273 (#121/#122): sign-aware chunked-grid FULL multiply for the Phase-2 binary-split combine.
+    ' SafeMpzMul_ChunkedGrid computes the unsigned magnitude product — it reads Abs(_mp_size) and
+    ' writes a positive result, because the divide (§262/§269) only ever feeds it non-negative
+    ' operands.  The combine's T merges (tempA=leftT·rightQ, tempB=leftP·rightT) can be signed
+    ' (the Chudnovsky series alternates), so apply the product sign exactly as SafeMpzMul does
+    ' (negative iff exactly one operand is negative).  With that, CombineMulCG is bit-identical to
+    ' SafeMpzMul on every operand sign.
+    Private Shared Sub CombineMulCG(result As mpz_t, opA As mpz_t, opB As mpz_t)
+        Dim sA As Integer = Runtime.InteropServices.Marshal.ReadInt32(opA.Pointer, 4)   ' signed _mp_size
+        Dim sB As Integer = Runtime.InteropServices.Marshal.ReadInt32(opB.Pointer, 4)
+        SafeMpzMul_ChunkedGrid(result, opA, opB, 0L)                                    ' |opA|·|opB|, positive
+        If (sA < 0) <> (sB < 0) Then
+            Dim rs As Integer = Runtime.InteropServices.Marshal.ReadInt32(result.Pointer, 4)
+            If rs <> 0 Then Runtime.InteropServices.Marshal.WriteInt32(result.Pointer, 4, -rs)
+        End If
+    End Sub
+
     ' §250: fill m with nLimbs pseudo-random limbs (top limb forced nonzero), value positive.
     ' m must be a fresh mpz_t header (AllocHGlobal(16)).  Allocate by LIMBS via PreAllocMpzToLimbs
     ' (Long byte math) — NOT GmpRaw_init2(bits), whose mp_bitcnt_t is 32-bit on Windows and
@@ -4144,7 +4173,10 @@ Public Class Form1
             AppendLog($"[SafeMpzMul] shared shifted pre-alloc FAILED for {_maxShiftedLimbs * 8L \ 1048576L:N0} MB — throwing OOM{vbCrLf}", 1)   ' §252 (#95): OOM → level 1
             Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shared shifted ({_maxShiftedLimbs * 8L \ 1048576L} MB)")
         End If
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzMul§accum] shifted buffer OK ({_maxShiftedLimbs * 8L \ 1048576L:N0} MB); starting accumulation (§39={mA = mB AndAlso CLng(mA) + CLng(mB) <= 100_000_000L}){vbCrLf}")
+        ' §122 (#122): the real §39 decision (symmetric + ≤50M total + all 6 pieces dense) is made
+        ' below and logged there — this line previously printed a premature "§39=" using the wrong
+        ' 100M threshold and ignoring the dense check, which did not reflect what the code did.
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzMul§accum] shifted buffer OK ({_maxShiftedLimbs * 8L \ 1048576L:N0} MB); starting accumulation{vbCrLf}")
         ' §25: raw init for shifted — struct header via Marshal.AllocHGlobal, limb buffer via GmpRaw_init.
         Dim shifted As New mpz_t()
         shifted.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
@@ -4185,11 +4217,17 @@ Public Class Form1
           ' = True to force every symmetric SafeMpzMul to go through §gen.  If §171 stops
           ' throwing with §39 disabled, the bug is in §39's accumulation logic.
           Const _OPT_G_DISABLE_S39 As Boolean = False  ' Reverted after run 16 ruled out §39
-          If Not _OPT_G_DISABLE_S39 AndAlso
+          ' §122 (#122): authoritative §39 gate — symmetric (mA=mB), ≤50M total limbs, and all 6
+          ' split pieces dense (non-zero).  Captured into a boolean so the log reflects the real
+          ' decision (the earlier shifted-buffer log used a wrong 100M threshold + no dense check).
+          Dim _s39Dense As Boolean = (_A0_szT > 0 AndAlso _A1_szT > 0 AndAlso _A2_szT > 0 AndAlso
+                                      _B0_szT > 0 AndAlso _B1_szT > 0 AndAlso _B2_szT > 0)
+          Dim _s39Engaged As Boolean = (Not _OPT_G_DISABLE_S39) AndAlso
               mA = mB AndAlso
               CLng(mA) + CLng(mB) <= 50_000_000L AndAlso
-              _A0_szT > 0 AndAlso _A1_szT > 0 AndAlso _A2_szT > 0 AndAlso
-              _B0_szT > 0 AndAlso _B1_szT > 0 AndAlso _B2_szT > 0 Then
+              _s39Dense
+          If _logLevel >= 2 Then AppendLog($"[SafeMpzMul§accum] §39={_s39Engaged} (mA={mA:N0} mB={mB:N0} sum={CLng(mA) + CLng(mB):N0} cap=50,000,000 dense={_s39Dense}){vbCrLf}")
+          If _s39Engaged Then
             If _logLevel >= 4 Then AppendLog($"[SafeMpzMul] §39 column-group fast path (mA=mB={mA:N0}){vbCrLf}")
             ' Per-column: base product index and list of additional product indices to add first
             Dim _col_base As Integer() = {0, 1, 2, 5, 8}
@@ -7895,6 +7933,17 @@ Phase2:
                 End If
                 System.Threading.Volatile.Write(_safeMulDop, _chosenDop231)  ' §231 (was hardcoded 3 in §95)
                 AppendLog($"[BinarySplit§231] serial-path DOP at level={level}: numTerms={numTerms:N0}, pairCount={pairCount}, chosen DOP={_chosenDop231}{vbCrLf}")
+                ' §273 (#121/#122): route THIS level's large merges through the chunked-grid path
+                ' (parallel cells at PI_CG_DOP, low per-cell RAM) instead of §gen at the §231 cap
+                ' above.  Engages only for the high-term runs §231 pins to DOP=3 (≥250M terms),
+                ' where chunked-grid's cell parallelism is the proven win (§262/§269 in the divide).
+                ' Read the opt-out/threshold env each serial level (cheap; a handful of times/run).
+                _combineChunkedGrid = (Environment.GetEnvironmentVariable("PI_COMBINE_CG") <> "0")
+                Dim _cgMtEnv As String = Environment.GetEnvironmentVariable("PI_COMBINE_CG_MINTERMS")
+                Dim _cgMtParsed As Long
+                If _cgMtEnv IsNot Nothing AndAlso Long.TryParse(_cgMtEnv, _cgMtParsed) AndAlso _cgMtParsed >= 0L Then _combineCgMinTerms = _cgMtParsed
+                Dim _useCgLevel As Boolean = _combineChunkedGrid AndAlso numTerms >= _combineCgMinTerms
+                If _useCgLevel Then AppendLog($"[Combine§273] level={level}: merges via chunked-grid (numTerms={numTerms:N0} ≥ {_combineCgMinTerms:N0}; §231 DOP={_chosenDop231} bypassed){vbCrLf}")
                 Dim nodeIdx As Long = 0
                 ' §249 (issue #49, Opportunity B): prefetch the NEXT pair's disk nodes on an
                 ' E-core while the current pair combines, hiding the read I/O behind the
@@ -8003,7 +8052,13 @@ Phase2:
                         Dim _szRQ As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightQ.Pointer, 4)
                         WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul newQ  leftQ={System.Math.Abs(_szLQ):N0} rightQ={System.Math.Abs(_szRQ):N0} limbs")
                     End If
-                    If pairCount >= 2L Then
+                    If _useCgLevel Then
+                        ' §273 (#121): each chunked-grid mul already saturates up to PI_CG_DOP
+                        ' cores, so run the two sequentially (no Parallel.Invoke ⇒ no core
+                        ' oversubscription, no doubled FFT scratch — same rationale as §91).
+                        CombineMulCG(newP, leftP, rightP)
+                        CombineMulCG(newQ, leftQ, rightQ)
+                    ElseIf pairCount >= 2L Then
                         System.Threading.Tasks.Parallel.Invoke(
                             Sub() SafeMpzMul(newP, leftP, rightP),
                             Sub() SafeMpzMul(newQ, leftQ, rightQ))
@@ -8024,7 +8079,11 @@ Phase2:
                         Dim _szRT As Integer = Runtime.InteropServices.Marshal.ReadInt32(rightT.Pointer, 4)
                         WriteToLog($"[Combine] L{level} N{nodeIdx\2}: mul tempB  leftP={System.Math.Abs(_szLP2):N0} rightT={System.Math.Abs(_szRT):N0} limbs")
                     End If
-                    If pairCount >= 2L Then
+                    If _useCgLevel Then
+                        ' §273 (#121): T merges — sign-aware (leftT/rightT may be negative).
+                        CombineMulCG(tempA, leftT, rightQ)
+                        CombineMulCG(tempB, leftP, rightT)
+                    ElseIf pairCount >= 2L Then
                         System.Threading.Tasks.Parallel.Invoke(
                             Sub() SafeMpzMul(tempA, leftT, rightQ),
                             Sub() SafeMpzMul(tempB, leftP, rightT))

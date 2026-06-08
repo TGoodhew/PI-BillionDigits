@@ -6266,3 +6266,34 @@ bit-identical, division 7m20s. **5B:** from-seed Newton (no §201-raise reuse), 
 `bShift = 47.3e9 ≫ 0` (the prec-cap branch), converged iter 29, 8 tail iters skipped, adj-up 0;
 whole divide **55m28s** (reciprocal ~41m) vs §269's ~3h14m; `gmpPi.bin` SHA `34f40cde…`
 bit-identical to the run-3 oracle. #88's last lever closed.
+
+## §273 — Route top binary-split combine merges through the chunked grid (2026-06-08, issues #121/#122)
+
+With the divide now ~57m at 5B (§262/§269/§272), the **Phase-2 combine** is the dominant remaining
+cost — the first clean from-scratch 5B baseline (2026-06-08) spent **~17h of a 26.5h run** in the
+binary-split combine, with the top levels (L14–L16) pinned at **DOP=3 (3 of 24 cores)** by §231.
+That cap is RAM-bound, not a policy whim: §gen's recursive sub-products are GB-scale, so its
+`DOP³ × per-task-buffer` growth OOMs above DOP=3 at 5B (DOP4 ≈ 32 GB, DOP6 ≈ 108 GB on a 64 GB box).
+
+§273 routes the four top-level combine merges (`newP=leftP·rightP`, `newQ=leftQ·rightQ`,
+`tempA=leftT·rightQ`, `tempB=leftP·rightT`) through `SafeMpzMul_ChunkedGrid` (full mode, `keepLimbs=0`)
+— the same path that already won the divide. Chunked-grid cells are tiny (≤16M-limb ⇒ ≤256 MB cell
+products), so it parallelises at `PI_CG_DOP` (default ProcessorCount, capped 16) at low RAM, breaking
+the DOP³ wall instead of fighting it. Chunked-full is bit-identical to §gen (proven by
+`--test-chunkedgrid`, `fullEq=True` to 68M×52M); a thin sign-aware wrapper `CombineMulCG` applies the
+product sign the magnitude-only chunked-grid omits, because the combine's **T** merges can be negative
+(alternating Chudnovsky series) whereas the divide only ever fed it non-negative operands. When a level
+routes via chunked-grid the two merges run **sequentially** (each already saturates up to 16 cores —
+no `Parallel.Invoke` oversubscription, same rationale as §91).
+
+Gated by flag (`PI_COMBINE_CG`, default ON) + `numTerms ≥ PI_COMBINE_CG_MINTERMS` (default 250 M =
+exactly the levels §231 pins to DOP=3 at ≥3.5 B digits), so 1B and the parallel-path lower levels are
+untouched by default. Also fixes the **#122 logging bug**: the `[SafeMpzMul§accum]` line printed
+`§39=` using a wrong 100M threshold (real gate is ≤50M total **and** all 6 split pieces dense); the
+decision is now captured into `_s39Engaged` and logged accurately at the actual gate. The §39 size cap
+itself is left in place — §273 routes the large combine merges around §gen entirely, so the cap no
+longer gates the dominant merges.
+
+**Validation:** `--test-chunkedgrid` OVERALL PASS (full product bit-identical to §gen, speedups to
+13.3× at 68M×52M). End-to-end correctness + 5B speedup gates in progress (1B forced-CG vs oracle
+`b153e8d5…`; `snap_L15` resume re-runs the L16 merge vs oracle `2218ee06…`).
