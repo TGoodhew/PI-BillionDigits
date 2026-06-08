@@ -175,6 +175,13 @@ Public Class Form1
     Private Shared _testGridScan As Boolean = False  ' §265 (#88): split-factor (k×k) experiment
     Private Shared _testCellSweep As Boolean = False ' §266 (#88): cell-size sweep at 5B operand sizes
     Private Shared _testRecipConv As Boolean = False ' §272 (#88): reciprocal-Newton convergence probe
+    ' §276 (#125): how often the reciprocal-Newton loop writes its mid-iteration resume checkpoint
+    ' (nr_r.bin).  It was written EVERY iteration — a full-width ~2 GB serialize on the compute thread
+    ' (~33×2 GB ≈ 66 GB at 5B) that saturated the disk and stalled compute under low availPhys (#125).
+    ' nr_r.bin is purely a resume point (the result + snap_Phase3 are independent), so saving every Nth
+    ' iteration cuts the I/O ~N× and cannot change the computed π; a crash loses ≤ N−1 (~1–2 min each)
+    ' iterations of recompute.  Default 4; PI_NR_CKPT_EVERY overrides (1 = old every-iteration behavior).
+    Private Shared _nrCkptEvery As Integer = 4
     ' §272 (#88): when set (only by --test-recipconv), SafeMpzReciprocal logs correct-bits per
     ' Newton iter against this reference R_ref = floor(2^kBits / b).  Reveals whether the seed
     ' delivers ~62 correct bits (⇒ the §200 forced tail iters are wasted, recoverable by an
@@ -5182,6 +5189,10 @@ Public Class Form1
         If _rsmDopEnv IsNot Nothing AndAlso Integer.TryParse(_rsmDopEnv, _rsmDopParsed) AndAlso _rsmDopParsed >= 1 Then _recipShortMulMaxDop = _rsmDopParsed Else _recipShortMulMaxDop = 9
         _divArShortMul = (Environment.GetEnvironmentVariable("PI_DIV_AR_SHORTMUL") <> "0")   ' §262 (#42): chunked-HIGH a×r, opt-out
         _divQbChunked = (Environment.GetEnvironmentVariable("PI_DIV_QB_CHUNKED") <> "0")      ' §269 (#88): chunked-full q×b, opt-out
+        ' §276 (#125): reciprocal-checkpoint cadence (default every 4 iters; 1 = every iteration).
+        Dim _nrceEnv As String = Environment.GetEnvironmentVariable("PI_NR_CKPT_EVERY")
+        Dim _nrceParsed As Integer
+        If _nrceEnv IsNot Nothing AndAlso Integer.TryParse(_nrceEnv, _nrceParsed) AndAlso _nrceParsed >= 1 Then _nrCkptEvery = _nrceParsed Else _nrCkptEvery = 4
         ' §174-fix: mpz_sizeinbase returns UInt32 — overflows when bBits > 2^31 (szB > 33M limbs).
         ' Compute exact bBits from top limb via CLZ; avoids any overflow and is always precise.
         Dim _szB As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
@@ -5672,10 +5683,14 @@ Public Class Form1
                 AppendLog($"[NR] iter={_nrIter} prec={prec:N0} bShift={bShift:N0} kBitsMinusBShift={kBits - bShift:N0} szP={_szP:N0} szR_after={_szR_after:N0}{vbCrLf}")
             End If
 
-            ' §NR-ckpt: Save r and prec after each Newton iteration so a crash during
-            ' the NEXT iteration's SafeMpzMul can resume from here rather than the seed.
-            ' r.Pointer is valid here — no managed GMP call since the GmpRaw_sub above.
-            If _autoCheckpoint Then
+            ' §NR-ckpt: Save r and prec after a Newton iteration so a crash during the NEXT iteration's
+            ' SafeMpzMul can resume from here rather than the seed.  r.Pointer is valid here — no managed
+            ' GMP call since the GmpRaw_sub above.
+            ' §276 (#125): save only every _nrCkptEvery-th iteration (default 4) instead of every one —
+            ' this ~2 GB full-width serialize on the compute thread was saturating the disk (~66 GB at
+            ' 5B) and stalling compute under low availPhys.  Purely a resume point, so this cannot change
+            ' the computed π; a crash loses ≤ _nrCkptEvery−1 iterations of recompute.  iter 0 always saves.
+            If _autoCheckpoint AndAlso (_nrIter Mod _nrCkptEvery = 0) Then
                 Try
                     If Not System.IO.Directory.Exists(_nrSnapDir) Then
                         System.IO.Directory.CreateDirectory(_nrSnapDir)

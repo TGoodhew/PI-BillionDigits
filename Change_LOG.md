@@ -6432,3 +6432,14 @@ Write-to-File + AutoCheckpoint and turns Display off, logging exactly what was f
 Headless runs (script/flags already set these) are untouched. This is the safety core of #118; the UI
 ergonomics (log-level dropdown, AutoCheckpoint/Auto-OK checkboxes, output-dir field) are the remaining
 Designer half, tracked with #119's Auto-OK checkbox.
+
+## §276 — Reciprocal checkpoint cadence (2026-06-08, issue #125)
+
+The reciprocal-Newton loop wrote its mid-iteration resume checkpoint (`nr_r.bin`) **every** iteration —
+a full-width ~2 GB serialize on the compute thread, ~33×2 GB ≈ **66 GB at 5B**, which saturated the
+disk and stalled compute under low `availPhys` (the disk-at-100% observed during the divide). `nr_r.bin`
+is purely a resume point — the computed result and `snap_Phase3` are independent of it — so §276 saves
+only every `_nrCkptEvery`-th iteration (default **4**, `PI_NR_CKPT_EVERY` overrides; 1 = old behavior).
+Cuts the reciprocal checkpoint I/O ~4× (66 GB → ~16 GB at 5B) and **cannot change π**; a crash loses
+≤ 3 (~1–2 min each) iterations of recompute. The snap_Phase3 backup was already async (§232). Confirmed
+by the final 1B SHA gate (result unchanged; fewer `§NR-ckpt saved` lines).
