@@ -2275,6 +2275,20 @@ Public Class Form1
             AppendLog(_priorCrashNote & vbCrLf, 1)
             _priorCrashNote = ""   ' once per run; don't repeat if Compute is clicked again
         End If
+        ' §118 (#118): large-run safety guard.  A pure-UI direct launch defaults to no file + no
+        ' checkpoint + Display on — so a multi-hour large run could finish with nothing saved, no resume
+        ' point, and (per #117) still report Verify OK against the in-memory buffer.  For a large
+        ' interactive run, auto-enable Write-to-File + AutoCheckpoint and turn Display off, logging what
+        ' was forced.  Headless runs already set these via the script/flags, so they are left untouched.
+        If Not _headless AndAlso DIGITS >= 100_000_000L Then
+            Dim _forced As New System.Collections.Generic.List(Of String)()
+            If Not ChkboxWriteToFile.Checked Then ChkboxWriteToFile.Checked = True : _forced.Add("Write-to-File ON")
+            If Not _autoCheckpoint Then _autoCheckpoint = True : _forced.Add("AutoCheckpoint ON")
+            If ChkboxDisplay.Checked Then ChkboxDisplay.Checked = False : _forced.Add("Display OFF")
+            If _forced.Count > 0 Then
+                AppendLog($"[LargeRun§118] {DIGITS:N0} digits ≥ 100M — auto-enabled for safety: {String.Join(", ", _forced)} (a large run must not finish with no file / no resume point).{vbCrLf}", 1)
+            End If
+        End If
         ' §120 (#120): memory-contention pre-flight (after the log exists so the [WARN] is captured,
         ' before the compute thread starts).  Aborts cleanly if the user cancels the contention dialog.
         If Not MemPreflight_ShouldProceed(DIGITS) Then

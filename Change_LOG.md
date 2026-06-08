@@ -6422,3 +6422,13 @@ Low-risk, no behaviour change to the computation:
 - **#112** — removed the dead `Telemetry_CompletedStages` (no callers; the run record is written
   directly from `_telStages`).
 (#115 is tagged *nice-to-have*, not *enhancement* — deferred, outside the pre-5B mandate.)
+
+## §118 — Large-run safety guard (2026-06-08, issue #118, partial)
+
+A pure-UI direct launch defaults to **no file + no checkpoint + Display on**, so a multi-hour large run
+could finish having saved nothing, with no resume point, and (per #117) still report `Verify OK` from
+the in-memory buffer. `BtnCompute_Click` now, for a **non-headless run ≥ 100 M digits**, auto-enables
+Write-to-File + AutoCheckpoint and turns Display off, logging exactly what was forced at level 1.
+Headless runs (script/flags already set these) are untouched. This is the safety core of #118; the UI
+ergonomics (log-level dropdown, AutoCheckpoint/Auto-OK checkboxes, output-dir field) are the remaining
+Designer half, tracked with #119's Auto-OK checkbox.
