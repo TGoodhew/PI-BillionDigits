@@ -4369,6 +4369,79 @@ Public Class Form1
             LogPhase("String conversion complete")
     End Sub
 
+    ''' <summary>
+    ''' §280 (#113): the in-memory final combine, lifted VERBATIM out of ComputePiGMP (orchestration
+    ''' extraction — no logic change).  Reduces the node list to a single root (P,Q,T) by pairwise
+    ''' P=lP·rP, Q=lQ·rQ, T=lT·rQ+lP·rT with early frees; usually a no-op (BinarySplitGMP returns 1).
+    ''' </summary>
+    Private Function FinalCombineNodes(nodes As List(Of Result)) As List(Of Result)
+            ' ── Final in-memory combine (usually already 1 node from BinarySplitGMP) ─
+            ' Issue #6: uses Result struct instead of Tuple(Of mpz_t,mpz_t,mpz_t).
+            LogPhase($"Starting final combine of {nodes.Count} nodes...")
+            Dim combineIteration As Integer = 0
+
+            While nodes.Count > 1
+                combineIteration += 1
+                Dim memDuringCombine As Long = Process.GetCurrentProcess().WorkingSet64 \ BYTES_PER_MB
+                LogPhase($"Final combine iteration {combineIteration}: {nodes.Count} nodes → {(nodes.Count + 1) \ 2} nodes (RAM: {memDuringCombine:N0}MB)")
+
+                Dim nextNodes As New List(Of Result)()
+                Dim i As Integer = 0
+                While i < nodes.Count - 1
+                    If combineIteration <= 2 Then
+                        LogPhase($"  Combining nodes {i} and {i + 1}...")
+                    End If
+
+                    Dim left As Result = nodes(i)
+                    Dim right As Result = nodes(i + 1)
+
+                    Dim newP As New mpz_t()
+                    Dim newQ As New mpz_t()
+                    Dim tA As New mpz_t()
+                    Dim tB As New mpz_t()
+                    gmp_lib.mpz_inits(newP, newQ, tA, tB, Nothing)
+
+                    Try
+                        If combineIteration <= 2 Then
+                            Dim leftPSize As Long = CLng(gmp_lib.mpz_sizeinbase(left.P, 10))
+                            Dim rightPSize As Long = CLng(gmp_lib.mpz_sizeinbase(right.P, 10))
+                            LogPhase($"  P sizes: {leftPSize:N0} × {rightPSize:N0} digits")
+                        End If
+                    Catch
+                    End Try
+
+                    ' Same early-free + in-place-add pattern as the BinarySplitGMP combine loop.
+                    ' §108: GmpRaw_* bypasses wrapper dispatch
+                    GmpRaw_mul(newP.Pointer, left.P.Pointer, right.P.Pointer)
+                    gmp_lib.mpz_clears(right.P, Nothing)
+
+                    GmpRaw_mul(newQ.Pointer, left.Q.Pointer, right.Q.Pointer)
+                    gmp_lib.mpz_clears(left.Q, Nothing)
+
+                    GmpRaw_mul(tA.Pointer, left.T.Pointer, right.Q.Pointer)
+                    gmp_lib.mpz_clears(left.T, right.Q, Nothing)
+
+                    GmpRaw_mul(tB.Pointer, left.P.Pointer, right.T.Pointer)
+                    gmp_lib.mpz_clears(left.P, right.T, Nothing)
+
+                    GmpRaw_add(tA.Pointer, tA.Pointer, tB.Pointer)  ' in-place: T result in tA's buffer
+                    gmp_lib.mpz_clears(tB, Nothing) ' tA IS newT
+
+                    nextNodes.Add(New Result With {.P = newP, .Q = newQ, .T = tA})
+                    i += 2
+                End While
+
+                If nodes.Count Mod 2 = 1 Then
+                    nextNodes.Add(nodes(nodes.Count - 1))
+                End If
+
+                nodes = nextNodes
+            End While
+
+            LogPhase("Final combine complete - 1 node remaining")
+        Return nodes
+    End Function
+
     Private Function ComputePiGMP(digits As Long, token As CancellationToken) As String
 
         ' §224 (issue #41): trigger CpuTopology detection + logging on first run.
@@ -4480,70 +4553,7 @@ Public Class Form1
 
             If token.IsCancellationRequested Then Return ""
 
-            ' ── Final in-memory combine (usually already 1 node from BinarySplitGMP) ─
-            ' Issue #6: uses Result struct instead of Tuple(Of mpz_t,mpz_t,mpz_t).
-            LogPhase($"Starting final combine of {nodes.Count} nodes...")
-            Dim combineIteration As Integer = 0
-
-            While nodes.Count > 1
-                combineIteration += 1
-                Dim memDuringCombine As Long = Process.GetCurrentProcess().WorkingSet64 \ BYTES_PER_MB
-                LogPhase($"Final combine iteration {combineIteration}: {nodes.Count} nodes → {(nodes.Count + 1) \ 2} nodes (RAM: {memDuringCombine:N0}MB)")
-
-                Dim nextNodes As New List(Of Result)()
-                Dim i As Integer = 0
-                While i < nodes.Count - 1
-                    If combineIteration <= 2 Then
-                        LogPhase($"  Combining nodes {i} and {i + 1}...")
-                    End If
-
-                    Dim left As Result = nodes(i)
-                    Dim right As Result = nodes(i + 1)
-
-                    Dim newP As New mpz_t()
-                    Dim newQ As New mpz_t()
-                    Dim tA As New mpz_t()
-                    Dim tB As New mpz_t()
-                    gmp_lib.mpz_inits(newP, newQ, tA, tB, Nothing)
-
-                    Try
-                        If combineIteration <= 2 Then
-                            Dim leftPSize As Long = CLng(gmp_lib.mpz_sizeinbase(left.P, 10))
-                            Dim rightPSize As Long = CLng(gmp_lib.mpz_sizeinbase(right.P, 10))
-                            LogPhase($"  P sizes: {leftPSize:N0} × {rightPSize:N0} digits")
-                        End If
-                    Catch
-                    End Try
-
-                    ' Same early-free + in-place-add pattern as the BinarySplitGMP combine loop.
-                    ' §108: GmpRaw_* bypasses wrapper dispatch
-                    GmpRaw_mul(newP.Pointer, left.P.Pointer, right.P.Pointer)
-                    gmp_lib.mpz_clears(right.P, Nothing)
-
-                    GmpRaw_mul(newQ.Pointer, left.Q.Pointer, right.Q.Pointer)
-                    gmp_lib.mpz_clears(left.Q, Nothing)
-
-                    GmpRaw_mul(tA.Pointer, left.T.Pointer, right.Q.Pointer)
-                    gmp_lib.mpz_clears(left.T, right.Q, Nothing)
-
-                    GmpRaw_mul(tB.Pointer, left.P.Pointer, right.T.Pointer)
-                    gmp_lib.mpz_clears(left.P, right.T, Nothing)
-
-                    GmpRaw_add(tA.Pointer, tA.Pointer, tB.Pointer)  ' in-place: T result in tA's buffer
-                    gmp_lib.mpz_clears(tB, Nothing) ' tA IS newT
-
-                    nextNodes.Add(New Result With {.P = newP, .Q = newQ, .T = tA})
-                    i += 2
-                End While
-
-                If nodes.Count Mod 2 = 1 Then
-                    nextNodes.Add(nodes(nodes.Count - 1))
-                End If
-
-                nodes = nextNodes
-            End While
-
-            LogPhase("Final combine complete - 1 node remaining")
+            nodes = FinalCombineNodes(nodes)
 
             finalP = nodes(0).P
             finalQ = nodes(0).Q

@@ -6509,3 +6509,19 @@ it only sets instance fields and clears gmpPi, nothing the caller needs after.  
 **Validated: 1B from-scratch π SHA `b153e8d5…` bit-identical** ("String conversion complete" ran from the
 extracted method).  Build clean.  ComputePiGMP has now shed ~200 lines across two whole stages (numerator
 §280-ext2 + conversion §280-ext3), each now a single readable call.
+
+## §280 (cont.) — Decompose: lift FinalCombineNodes out of ComputePiGMP (2026-06-09, issue #113, extraction 4)
+
+The in-memory final-combine loop (reduces the node list to the root P/Q/T) is lifted VERBATIM out of
+ComputePiGMP into `FinalCombineNodes(nodes) As List(Of Result)`.  Clean single in/out (the node list).
+No logic change.  **Validated: 1B from-scratch π SHA `b153e8d5…` bit-identical.**
+
+### #113 done — summary
+Four cleanly-separable stages extracted + each individually 1B-validated bit-identical:
+ComputeReciprocalSeed (§272 seed leaf, out of SafeMpzReciprocal), and three ComputePiGMP stage-lifts —
+FinalCombineNodes, ComputeNumeratorRMultiplies, ConvertResultToDecimal.  ComputePiGMP shed ~265 lines
+(four stages now single calls) and the seed is a testable leaf.  The remaining giant blocks are
+INTENTIONALLY LEFT INTACT per the issue's "first, do no harm": the sqrt-prep Steps 1–5 + three-pass +
+divide are saturated with §78 pointer-dance workarounds (capture raw pointers before mpz_inits) and ~8
+interleaved mpz handles, and SafeMpzDiv's §171/§218 Barrett/Knuth adjust is explicit 5B-crash-fix code —
+relocating any of them risks the bit-verified π math for little structural gain.
