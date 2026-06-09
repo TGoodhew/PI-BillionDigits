@@ -153,9 +153,9 @@ Public Class Form1
     ' 0 = production default (1.5M).  Only the benchmark ever writes it.
     Private Shared _cgCellOverride As Integer = 0
     ' §281 (#123): chunked-grid cell DOP override for the --test-cgdopscan core-headroom probe.
-    ' 0 = production default (env PI_CG_DOP, capped 16).  >0 BYPASSES the 16-cap so the probe can
-    ' measure whether cells 17–24 still buy throughput (core-bound) or saturate (bandwidth-bound).
-    ' Only the benchmark ever writes it; the production cap stays 16.
+    ' 0 = production default (env PI_CG_DOP, §282 capped at ProcessorCount + wave-balanced).  >0 sets
+    ' an EXACT raw DOP and bypasses §282 wave-balancing, so the probe can measure each DOP cleanly.
+    ' Only the benchmark ever writes it.
     Private Shared _cgDopOverride As Integer = 0
 
     ' §238 (issue #87, 2026-05-28): thread-local nesting cap.  Set True inside the
@@ -223,7 +223,7 @@ Public Class Form1
     ' instead of §gen at the §231 serial-path DOP cap (3 of 24 cores at ≥250M terms).  The §231
     ' cap is RAM-bound — §gen's recursive sub-products are GB-scale, so its DOP^3 buffer growth
     ' OOMs above DOP=3 at 5B.  Chunked-grid cells are tiny (≤16M-limb ⇒ ≤256MB cell products) so
-    ' it parallelises at PI_CG_DOP (default ProcessorCount, capped 16) at low RAM — the same reason
+    ' it parallelises at PI_CG_DOP (§282: default ProcessorCount, wave-balanced) at low RAM — same reason
     ' it already won the divide (§262 a×r, §269 q×b).  Full product (keepLimbs=0) is bit-identical
     ' to §gen (proven by --test-chunkedgrid); SafeMpzMulCG adds the sign handling the alternating-
     ' series T merges need.  ON by default (opt-out PI_COMBINE_CG=0); engages only when numTerms ≥
@@ -3637,16 +3637,33 @@ Public Class Form1
 
         ' §251 pt2: cells are tiny (≤3M-limb products ≈ 24MB), so high DOP fits in RAM even when
         ' §gen's GB-scale sub-products force MemoryBudget to floor §gen's DOP — this is why parallel
-        ' chunked beats §gen at 5B.  DOP from env PI_CG_DOP, default ProcessorCount (capped 16).
+        ' chunked beats §gen at 5B.  DOP from env PI_CG_DOP, default ProcessorCount (§282: capped at
+        ' ProcessorCount, then wave-balanced below — was a flat 16).
         Dim _cgDop As Integer = Environment.ProcessorCount
         Dim _cgEnv As String = Environment.GetEnvironmentVariable("PI_CG_DOP")
         Dim _cgParsed As Integer
         If _cgEnv IsNot Nothing AndAlso Integer.TryParse(_cgEnv, _cgParsed) AndAlso _cgParsed >= 1 Then _cgDop = _cgParsed
-        _cgDop = System.Math.Max(1, System.Math.Min(_cgDop, 16))
-        ' §281 (#123): the cgdopscan probe overrides DOP past the production 16-cap to measure
-        ' core headroom vs bandwidth saturation.  Never set on the production path (override = 0).
+        ' §282 (#123 follow-up): cap at the host's core count (was a flat 16 — arbitrary, and on a
+        ' 24-core box it left cells under-parallelised).  The §281 probe showed real throughput past
+        ' DOP 16; wave-balancing just below trims a high cap to the fewest EVEN waves so it never
+        ' creates a wasteful short tail wave.  Adapts to the host (scales with ProcessorCount).
+        _cgDop = System.Math.Max(1, System.Math.Min(_cgDop, Environment.ProcessorCount))
+        ' §281 (#123): the cgdopscan probe overrides DOP (and bypasses §282 balancing) to measure
+        ' each RAW DOP cleanly.  Never set on the production path (override = 0).
         If _cgDopOverride > 0 Then _cgDop = _cgDopOverride
         Dim nCells As Integer = cOff.Count
+        ' §282: balance waves.  The grid runs cells in waves of _cgDop with a SERIAL accumulate
+        ' barrier between waves, so wall-time tracks the WAVE COUNT, not just core count.  Greedy
+        ' cap-sized waves leave a ragged tail (36 cells @ 16 ⇒ waves 16,16,4: 20 idle cores in the
+        ' tail AND the same 3 barriers as DOP 12 — measured SLOWER than 12).  Packing into
+        ' ceil(nCells/cap) EVEN waves removes the idle tail and minimises barriers (36 cells @ cap 24
+        ' ⇒ 2 waves of 18, ~14% faster than ragged DOP-16 at the §281 benchmark).  Purely a
+        ' scheduling change — the product is independent of _cgDop, so it stays bit-identical.
+        ' Opt out via PI_CG_BALANCE=0.
+        If nCells > 0 AndAlso _cgDopOverride = 0 AndAlso Environment.GetEnvironmentVariable("PI_CG_BALANCE") <> "0" Then
+            Dim _nWaves As Integer = System.Math.Max(1, CInt(System.Math.Ceiling(nCells / CDbl(_cgDop))))
+            _cgDop = System.Math.Max(1, CInt(System.Math.Ceiling(nCells / CDbl(_nWaves))))
+        End If
         Dim prods(_cgDop - 1) As mpz_t
         Dim ckAh(_cgDop - 1) As IntPtr, ckBh(_cgDop - 1) As IntPtr
         For w As Integer = 0 To _cgDop - 1

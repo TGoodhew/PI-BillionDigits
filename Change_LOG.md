@@ -6551,6 +6551,29 @@ bit-identical. Throughput **plateaus around DOP 12–16 and goes noisy past it**
 
 **Verdict for #123:** (1) **disk-backing is a definitive no-go** — cells already fit RAM, there is nothing
 to spill; the hybrid-RAM/disk mechanism the issue proposed addresses a constraint that no longer exists.
-(2) A **small residual core-headroom** exists (DOP 16→~20 ≈ 10% on this size) but the lever is a **one-line
-`PI_CG_DOP` cap bump, not disk-backing**, and it is marginal + bandwidth-limited (par-eff 0.38). Recorded as
-the go/no-go evidence the issue's acceptance criteria asked for.
+(2) A **small residual core-headroom** exists (DOP 16→~20 ≈ 10% on this size) but the lever is a
+`PI_CG_DOP` cap raise + wave-balancing (§282 below), **not disk-backing**. #123 closed not-planned
+(superseded); the cap work continues on `HybridRAM`.
+
+## §282 — Chunked-grid cap raised to host cores + wave-balancing (2026-06-09, #123 follow-up, branch HybridRAM)
+
+Acts on the §281 finding. `SafeMpzMul_ChunkedGrid` ran cells in **waves of `_cgDop`** (hard-capped 16) with
+a **serial accumulate barrier between waves**, so wall-time tracks the **wave count**, not just core count.
+The best-of-3 `--test-cgdopscan` showed this directly: at 36 cells, **DOP 16 was *slower* than DOP 12**
+(16,16,**4** = a ragged tail wave: 20 idle cores + the same 3 barriers as 12), while DOP 20/24 jumped ahead
+purely by collapsing to **2 waves**. So the lever is **fewer, evenly-filled waves**, not more raw threads —
+and a flat cap (16 *or* 20) is wrong because the optimum depends on the cell count, which varies with size.
+
+**Change (two parts, both in the one `_cgDop` block):** (a) **cap raised from a flat 16 to
+`ProcessorCount`** — adapts to the host (the 16 was arbitrary and left a 24-core box under-parallelised);
+(b) **wave-balancing** — instead of greedy `cap`-sized waves, run `nWaves = ceil(nCells/cap)` then
+`dop = ceil(nCells/nWaves)`, packing cells into the **fewest EVEN waves** (36 cells @ cap 24 ⇒ 2 waves of
+18, no ragged tail; 81 cells @ 5B ⇒ 4 waves of ~21 vs the old 6 waves of 16). Opt-out `PI_CG_BALANCE=0`;
+`PI_CG_DOP` still overrides the cap; the §281 probe's `_cgDopOverride` bypasses balancing to measure raw DOP.
+
+**Correctness:** DOP only changes cell *grouping* — the product is independent of it — so this is
+**bit-identical by construction**. Confirmed two ways: (1) `--test-chunkedgrid` **OVERALL PASS** (all 5
+cases `fullEq=True` incl. the multi-wave 68M×52M at 11.4× vs §gen); (2) **1B from-scratch forced-CG
+(`PI_COMBINE_CG_MINTERMS=0`) π SHA `B153E8D5…` — BIT-IDENTICAL to the 1B oracle** (exercised §282 in the
+combine end-to-end). 5B perf validation to be folded into the next full 5B run (no dedicated run — the gain
+is a modest combine-only wave-count reduction).

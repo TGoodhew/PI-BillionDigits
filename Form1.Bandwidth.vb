@@ -161,6 +161,14 @@ Partial Class Form1
         Dim rRef As New mpz_t() : rRef.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(rRef.Pointer)
         Dim rTest As New mpz_t() : rTest.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(rTest.Pointer)
 
+        ' §281: best-of-REPS per DOP — single-rep timing at these sizes is noisy enough that a DOP can
+        ' read SLOWER than a lower one (observed DOP 16 < DOP 12 on the first run), which corrupts the
+        ' knee.  Best-of-N (min wall) suppresses transient contention.  Reps via PI_CGDOP_REPS (default 3).
+        Dim reps As Integer = 3
+        Dim envR As String = Environment.GetEnvironmentVariable("PI_CGDOP_REPS")
+        Dim parsedR As Integer
+        If envR IsNot Nothing AndAlso Integer.TryParse(envR, parsedR) AndAlso parsedR >= 1 Then reps = parsedR
+
         Dim oneShot As Func(Of mpz_t, Integer, Double) =
             Function(dst, dop)
                 _cgCellOverride = cell
@@ -172,11 +180,20 @@ Partial Class Form1
                 _cgDopOverride = 0 : _cgCellOverride = 0
                 Return sw.Elapsed.TotalMilliseconds
             End Function
+        Dim bestOf As Func(Of mpz_t, Integer, Double) =
+            Function(dst, dop)
+                Dim best As Double = Double.MaxValue
+                For rep As Integer = 1 To reps
+                    best = System.Math.Min(best, oneShot(dst, dop))
+                Next
+                Return best
+            End Function
 
         ' Warm up + reference at DOP 1 (page-in, pool, JIT; DOP must not change the product).
+        log($"timing = best-of-{reps} per DOP (PI_CGDOP_REPS)")
         If _statusHook IsNot Nothing Then _statusHook("CgDopScan: warmup + DOP-1 reference…")
         oneShot(rRef, 1) : log($"[{DateTime.Now:HH:mm:ss}] warmup done")
-        Dim baseMs As Double = oneShot(rRef, 1)
+        Dim baseMs As Double = bestOf(rRef, 1)
 
         Dim dops() As Integer = {1, 3, 6, 9, 12, 16, 20, 24}
         Dim ms(dops.Length - 1) As Double
@@ -187,8 +204,8 @@ Partial Class Form1
         For i As Integer = 0 To dops.Length - 1
             Dim dop As Integer = dops(i)
             If CLng(dop) > nCells Then Continue For                     ' can't use more slots than cells
-            If _statusHook IsNot Nothing Then _statusHook($"CgDopScan: DOP {dop} ({i + 1}/{dops.Length}) on {n:N0}² chunked…")
-            Dim mms As Double = oneShot(rTest, dop)
+            If _statusHook IsNot Nothing Then _statusHook($"CgDopScan: DOP {dop} ({i + 1}/{dops.Length}) on {n:N0}² chunked, best-of-{reps}…")
+            Dim mms As Double = bestOf(rTest, dop)
             ms(i) = mms
             Dim match As Boolean = (dop = 1) OrElse (GmpRaw_cmp(rTest.Pointer, rRef.Pointer) = 0)
             If Not match Then allMatch = False
