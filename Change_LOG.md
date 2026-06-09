@@ -6479,3 +6479,13 @@ decimal converters). Each block was extracted on verified method boundaries (4-s
 so no member was dropped, duplicated, or split. Compiles identically (Debug build clean; `--test-chunkedgrid`
 fullEq=True exercises the moved SafeMpzMul); behaviour confirmed by the post-split 5B run. The remaining
 candidates (GmpRaw wrappers, chunked-grid, mpz helpers) are a possible follow-up.
+
+## §279 — Decompose: extract ComputeReciprocalSeed leaf (2026-06-09, issue #113, extraction 1)
+
+First step of #113, done the prescribed way — a single pure-leaf extraction, validated, one commit. The
+§272 reciprocal seed (~30-line inline block in SafeMpzReciprocal) is lifted VERBATIM into
+`ComputeReciprocalSeed(r, b, bBits, kBits)` — a pure leaf reading only b/bBits/kBits and writing only r
+(every other variable was already block-local). The call site is now `If Not _raiseUsed Then
+ComputeReciprocalSeed(...)`. No math change. **Validated: 1B from-scratch π SHA `b153e8d5…` bit-identical**
+(exercises the seed in both the sqrt-internal divides and the final divide). Build clean. Further #113
+leaves (§171/§218 adjust, §216/§270 chunk loop, the Newton step) remain, each its own validated commit.

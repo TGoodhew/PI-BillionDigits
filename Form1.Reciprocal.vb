@@ -11,6 +11,50 @@ Imports System.Security.Cryptography
 ' §277 (#114): split out of Form1.vb (pure file-move, no logic change).
 Partial Class Form1
 
+    ''' <summary>
+    ''' §113 (#113): the §272 reciprocal SEED, extracted VERBATIM from SafeMpzReciprocal as a pure leaf
+    ''' — reads b/bBits/kBits, writes only r.  Computes a ~SEED_PREC-bit r ≈ 2^kBits / b from the top
+    ''' SEED_BBITS bits of b.
+    ''' §272 (#88): the old seed used numerator 2^64 against the top 64 bits of b (bHi ≈ 2^63), so
+    ''' floor(2^64 / bHi) ≈ 2 — a 1–2-BIT quotient, not the ~62-bit reciprocal the prec schedule (which
+    ''' starts at 62) was designed for.  A P-bit quotient needs numerator 2^(bitlen(bHi)+P): keep the top
+    ''' SEED_BBITS=128 bits of b and divide 2^(SEED_BBITS+SEED_PREC) by bHi for a genuine ~126-bit seed.
+    ''' The underestimate invariant holds for ANY numerator: bHi = ceil(b/2^bHiShift) ≥ b/2^bHiShift ⟹
+    ''' floor(2^N/bHi) ≤ 2^N·2^bHiShift/b ⟹ r ≤ 2^kBits/b after scaling (the §107 contract).
+    ''' </summary>
+    Private Shared Sub ComputeReciprocalSeed(r As mpz_t, b As mpz_t, bBits As Long, kBits As Long)
+        Const SEED_BBITS As Long = 128L   ' bits of b retained in bHi
+        Const SEED_PREC As Long = 126L    ' target correct bits in the seed (≤ SEED_BBITS−2)
+        Dim bHiShift As Long = System.Math.Max(0L, bBits - SEED_BBITS)
+        Dim bHi As New mpz_t()
+        gmp_lib.mpz_init(bHi)
+        If bHiShift > 0L Then
+            BigShiftRight(bHi, b, bHiShift)
+            gmp_lib.mpz_add_ui(bHi, bHi, 1UI)   ' ceiling → underestimate of reciprocal guaranteed
+        Else
+            GmpRaw_set(bHi.Pointer, b.Pointer)  ' §35
+        End If
+        ' rSeed = floor(2^(SEED_BBITS+SEED_PREC) / bHi)  [both operands ≤ ~256 bits ⇒ tiny/fast]
+        Dim rSeed As New mpz_t()
+        gmp_lib.mpz_init(rSeed)
+        gmp_lib.mpz_set_ui(rSeed, 1UI)
+        gmp_lib.mpz_mul_2exp(rSeed, rSeed, New mp_bitcnt_t(CUInt(SEED_BBITS + SEED_PREC)))
+        GmpRaw_tdiv_q(rSeed.Pointer, rSeed.Pointer, bHi.Pointer)  ' §35
+        gmp_lib.mpz_clear(bHi)
+        ' Scale to r's domain: rSeed * 2^(kBits-(SEED_BBITS+SEED_PREC)-bHiShift) ≈ 2^kBits / b
+        Dim seedScale As Long = kBits - (SEED_BBITS + SEED_PREC) - bHiShift
+        If seedScale > 0L Then
+            BigShiftLeft(rSeed, rSeed, seedScale)
+        ElseIf seedScale < 0L Then
+            BigShiftRight(rSeed, rSeed, -seedScale)
+        End If
+        ' §35: mpz_sgn is a GMP macro — read _mp_size field (offset +4) directly.
+        If System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(rSeed.Pointer, 4)) > 0 Then gmp_lib.mpz_sub_ui(rSeed, rSeed, 2UI)
+        If System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(rSeed.Pointer, 4)) <= 0 Then gmp_lib.mpz_set_ui(rSeed, 1UI)
+        GmpRaw_swap(r.Pointer, rSeed.Pointer)  ' §35
+        gmp_lib.mpz_clear(rSeed)
+    End Sub
+
     ' Compute r = floor(2^kBits / b) for b > 0, kBits > sizeinbase(b,2).
     ' Newton iteration with progressive precision; r is always an underestimate.
     ' All large multiplications use SafeMpzMul — no direct mpn_mul_fft calls.
@@ -183,38 +227,11 @@ Partial Class Form1
         ' b/2^bHiShift ⟹ floor(2^N/bHi) ≤ 2^N·2^bHiShift/b ⟹ r ≤ 2^kBits/b after scaling.  With
         ' accuracy now ~126 ≥ the prec-schedule's 62, accuracy tracks prec and the Newton loop
         ' converges ~9 iters sooner (the §272 detector below exits on real r-stability).
-        If Not _raiseUsed Then
-            Const SEED_BBITS As Long = 128L   ' bits of b retained in bHi
-            Const SEED_PREC As Long = 126L    ' target correct bits in the seed (≤ SEED_BBITS−2)
-            Dim bHiShift As Long = System.Math.Max(0L, bBits - SEED_BBITS)
-            Dim bHi As New mpz_t()
-            gmp_lib.mpz_init(bHi)
-            If bHiShift > 0L Then
-                BigShiftRight(bHi, b, bHiShift)
-                gmp_lib.mpz_add_ui(bHi, bHi, 1UI)   ' ceiling → underestimate of reciprocal guaranteed
-            Else
-                GmpRaw_set(bHi.Pointer, b.Pointer)  ' §35
-            End If
-            ' rSeed = floor(2^(SEED_BBITS+SEED_PREC) / bHi)  [both operands ≤ ~256 bits ⇒ tiny/fast]
-            Dim rSeed As New mpz_t()
-            gmp_lib.mpz_init(rSeed)
-            gmp_lib.mpz_set_ui(rSeed, 1UI)
-            gmp_lib.mpz_mul_2exp(rSeed, rSeed, New mp_bitcnt_t(CUInt(SEED_BBITS + SEED_PREC)))
-            GmpRaw_tdiv_q(rSeed.Pointer, rSeed.Pointer, bHi.Pointer)  ' §35
-            gmp_lib.mpz_clear(bHi)
-            ' Scale to r's domain: rSeed * 2^(kBits-(SEED_BBITS+SEED_PREC)-bHiShift) ≈ 2^kBits / b
-            Dim seedScale As Long = kBits - (SEED_BBITS + SEED_PREC) - bHiShift
-            If seedScale > 0L Then
-                BigShiftLeft(rSeed, rSeed, seedScale)
-            ElseIf seedScale < 0L Then
-                BigShiftRight(rSeed, rSeed, -seedScale)
-            End If
-            ' §35: mpz_sgn is a GMP macro — read _mp_size field (offset +4) directly.
-            If System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(rSeed.Pointer, 4)) > 0 Then gmp_lib.mpz_sub_ui(rSeed, rSeed, 2UI)
-            If System.Math.Sign(Runtime.InteropServices.Marshal.ReadInt32(rSeed.Pointer, 4)) <= 0 Then gmp_lib.mpz_set_ui(rSeed, 1UI)
-            GmpRaw_swap(r.Pointer, rSeed.Pointer)  ' §35
-            gmp_lib.mpz_clear(rSeed)
-        End If
+        ' §113 (#113): seed computation extracted verbatim to the pure-leaf ComputeReciprocalSeed
+        ' (see its doc for the §272 derivation).  With accuracy ~126 ≥ the prec-schedule's 62, accuracy
+        ' tracks prec and the Newton loop converges ~9 iters sooner (the §272 detector below exits on
+        ' real r-stability).
+        If Not _raiseUsed Then ComputeReciprocalSeed(r, b, bBits, kBits)
 
         ' §NR-ckpt: Resume from a mid-NR checkpoint if one exists for this exact kBits/bBits.
         ' Saves r (the reciprocal estimate) and prec so a crash during a later NR iteration
