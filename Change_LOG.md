@@ -6489,3 +6489,13 @@ First step of #113, done the prescribed way — a single pure-leaf extraction, v
 ComputeReciprocalSeed(...)`. No math change. **Validated: 1B from-scratch π SHA `b153e8d5…` bit-identical**
 (exercises the seed in both the sqrt-internal divides and the final divide). Build clean. Further #113
 leaves (§171/§218 adjust, §216/§270 chunk loop, the Newton step) remain, each its own validated commit.
+
+## §280 — Decompose: lift ComputeNumeratorRMultiplies out of ComputePiGMP (2026-06-09, issue #113, extraction 2)
+
+The §233 numerator R-multiply pipeline (~90-line block: load-or-compute r0/r1/r2 = gmpNumer·Q_i at the
+scale-aware DOP / §274 chunked grid, with checkpoint load+save) is lifted VERBATIM out of ComputePiGMP
+into `ComputeNumeratorRMultiplies(mpR0, mpR1, mpR2, gmpNumer, finalQ, mpQ1, mpQ2, p3SnapDir, numTerms)`.
+The numerator stage in ComputePiGMP is now a single call.  Clean 9-value boundary; every loop variable
+was already block-local; mpz results propagate through the shared .Pointer.  No logic change.
+**Validated: 1B from-scratch π SHA `b153e8d5…` bit-identical** (r0/r1/r2 ran from the extracted helper).
+Build clean.  This is the issue's headline target (ComputePiGMP ~1000 lines) — first orchestration lift.
