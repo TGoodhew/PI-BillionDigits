@@ -152,6 +152,11 @@ Public Class Form1
     ' §265 (#88): chunked-grid cell-size override for the --test-gridscan split-factor experiment.
     ' 0 = production default (1.5M).  Only the benchmark ever writes it.
     Private Shared _cgCellOverride As Integer = 0
+    ' §281 (#123): chunked-grid cell DOP override for the --test-cgdopscan core-headroom probe.
+    ' 0 = production default (env PI_CG_DOP, capped 16).  >0 BYPASSES the 16-cap so the probe can
+    ' measure whether cells 17–24 still buy throughput (core-bound) or saturate (bandwidth-bound).
+    ' Only the benchmark ever writes it; the production cap stays 16.
+    Private Shared _cgDopOverride As Integer = 0
 
     ' §238 (issue #87, 2026-05-28): thread-local nesting cap.  Set True inside the
     ' Parallel.For sub-product lambda in SafeMpzMul; any recursive SafeMpzMul that
@@ -172,6 +177,7 @@ Public Class Form1
     Private Shared _testEta As Boolean = False
     Private Shared _testAdvisor As Boolean = False
     Private Shared _testDopScan As Boolean = False   ' §263 (#88): DOP/bandwidth-saturation microbenchmark
+    Private Shared _testCgDopScan As Boolean = False ' §281 (#123): chunked-grid DOP-headroom sweep
     Private Shared _testGridScan As Boolean = False  ' §265 (#88): split-factor (k×k) experiment
     Private Shared _testCellSweep As Boolean = False ' §266 (#88): cell-size sweep at 5B operand sizes
     Private Shared _testRecipConv As Boolean = False ' §272 (#88): reciprocal-Newton convergence probe
@@ -1626,6 +1632,8 @@ Public Class Form1
                     _testAdvisor = True       ' §260 (#63): run performance-advisor self-test, then exit
                 Case "--test-dopscan"
                     _testDopScan = True       ' §263 (#88): run DOP/bandwidth-saturation sweep, then exit
+                Case "--test-cgdopscan"
+                    _testCgDopScan = True     ' §281 (#123): chunked-grid DOP-headroom sweep, then exit
                 Case "--test-gridscan"
                     _testGridScan = True      ' §265 (#88): run split-factor (k×k) comparison, then exit
                 Case "--test-cellsweep"
@@ -1770,7 +1778,7 @@ Public Class Form1
         ' never pumped WM_PAINT ⇒ the window never painted.  On a worker thread Form1_Load returns,
         ' the loop runs, the window paints, and the harness pushes live status via _statusHook
         ' (already wired above).  Each harness still Environment.Exit(0/1) — now from the worker.
-        If _testMulHigh OrElse _testChunkedGrid OrElse _testEta OrElse _testAdvisor OrElse _testDopScan OrElse _testGridScan OrElse _testCellSweep OrElse _testRecipConv Then
+        If _testMulHigh OrElse _testChunkedGrid OrElse _testEta OrElse _testAdvisor OrElse _testDopScan OrElse _testCgDopScan OrElse _testGridScan OrElse _testCellSweep OrElse _testRecipConv Then
             Dim _testThread As New System.Threading.Thread(
                 Sub()
                     Dim ok As Boolean = True, tag As String = "Test"
@@ -1790,6 +1798,9 @@ Public Class Form1
                         ElseIf _testDopScan Then
                             tag = "TestDopScan" : If _statusHook IsNot Nothing Then _statusHook("Running --test-dopscan…")
                             ok = TestDopScan()                          ' §263 (#88)
+                        ElseIf _testCgDopScan Then
+                            tag = "TestCgDopScan" : If _statusHook IsNot Nothing Then _statusHook("Running --test-cgdopscan…")
+                            ok = TestCgDopScan()                        ' §281 (#123)
                         ElseIf _testGridScan Then
                             tag = "TestGridScan" : If _statusHook IsNot Nothing Then _statusHook("Running --test-gridscan…")
                             ok = TestGridScan()                         ' §265 (#88)
@@ -2101,7 +2112,7 @@ Public Class Form1
             "  --require-free-ram         Headless: abort (exit 3) on memory contention (#120)." & vbCrLf &
             "  --help | -h | /?           Show this help and exit." & vbCrLf &
             "  Self-tests (run, then exit): --test-mulhigh --test-chunkedgrid --test-eta" & vbCrLf &
-            "    --test-advisor --test-dopscan --test-gridscan --test-cellsweep --test-recipconv" & vbCrLf &
+            "    --test-advisor --test-dopscan --test-cgdopscan --test-gridscan --test-cellsweep --test-recipconv" & vbCrLf &
             "  See README.md (""Command-line options"") and docs/ for full detail."
         Try
             If AttachConsole(ATTACH_PARENT_PROCESS) Then
@@ -3632,6 +3643,9 @@ Public Class Form1
         Dim _cgParsed As Integer
         If _cgEnv IsNot Nothing AndAlso Integer.TryParse(_cgEnv, _cgParsed) AndAlso _cgParsed >= 1 Then _cgDop = _cgParsed
         _cgDop = System.Math.Max(1, System.Math.Min(_cgDop, 16))
+        ' §281 (#123): the cgdopscan probe overrides DOP past the production 16-cap to measure
+        ' core headroom vs bandwidth saturation.  Never set on the production path (override = 0).
+        If _cgDopOverride > 0 Then _cgDop = _cgDopOverride
         Dim nCells As Integer = cOff.Count
         Dim prods(_cgDop - 1) As mpz_t
         Dim ckAh(_cgDop - 1) As IntPtr, ckBh(_cgDop - 1) As IntPtr

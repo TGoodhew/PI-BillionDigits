@@ -6525,3 +6525,32 @@ INTENTIONALLY LEFT INTACT per the issue's "first, do no harm": the sqrt-prep Ste
 divide are saturated with §78 pointer-dance workarounds (capture raw pointers before mpz_inits) and ~8
 interleaved mpz handles, and SafeMpzDiv's §171/§218 Barrett/Knuth adjust is explicit 5B-crash-fix code —
 relocating any of them risks the bit-verified π math for little structural gain.
+
+## §281 — Chunked-grid DOP-headroom probe (`--test-cgdopscan`) + #123 re-scope (2026-06-09, issue #123, branch HybridRAM)
+
+`#123` asked to investigate **hybrid RAM+disk buffering** to break a **DOP=3** cap on the top combine
+levels — a cap that, when the issue was filed, came from §gen's `DOP³ × GB-buffer` RAM wall. **That premise
+no longer holds:** §273/§274/§275 (+§262/§269) route the combine through `SafeMpzMul_ChunkedGrid`, whose
+cells are small enough to fit RAM and parallelise at `PI_CG_DOP` (**hard-capped at 16**, [Form1.vb:3634]).
+So the live question is no longer "RAM-bound at 3?" but "is the chunked combine **core-bound** past 16
+(then raising the cap — *or* #123's disk-backing — helps) or **bandwidth-bound** at 16 (more concurrency is
+net-zero ⇒ #123 is a no-go)?". `--test-dopscan` (§263) only answered this for the **retired** §gen path.
+
+**New probe `--test-cgdopscan` (`TestCgDopScan`, pure measurement, no math-path change):** times
+`SafeMpzMul_ChunkedGrid` at a fixed cell + operand, sweeping cell-DOP `{1,3,6,9,12,16,20,24}` via the new
+`_cgDopOverride` field — which **bypasses the production 16-cap** so DOP 17–24 can be measured (the
+production path never sets it; cap stays 16). Prints ms / speedup / par-efficiency / saturation-knee and
+bit-checks every DOP against DOP-1. Size via `PI_DOPSCAN_LIMBS` (default 48M limbs = 366 MB, ~12× L3),
+cell via `PI_CGDOP_CELL` (default 8M ⇒ 61 MB cells, the 5B-combine shape; 36 cells feed DOP to 24).
+
+**Result (48M×48M limbs, 8M cells, 24-core box, 2026-06-09):** speedup 1.01× → 2.70 → 4.69 → 5.98 → **6.77
+(DOP 12)** → 6.45 (16, noise) → **7.66 (20)** → 7.31 (24); par-efficiency falls 0.90 → **0.30**; all DOP
+bit-identical. Throughput **plateaus around DOP 12–16 and goes noisy past it** (Δ/thread negative at 16 &
+24) — the box is at the **#88 DDR5 ceiling (~6.5–7.5×)**, not core-starved. Crucially **`availPhys` stayed
+40.9 GB and process RAM 5.9 GB even at DOP 24** ⇒ **zero RAM-capacity pressure**.
+
+**Verdict for #123:** (1) **disk-backing is a definitive no-go** — cells already fit RAM, there is nothing
+to spill; the hybrid-RAM/disk mechanism the issue proposed addresses a constraint that no longer exists.
+(2) A **small residual core-headroom** exists (DOP 16→~20 ≈ 10% on this size) but the lever is a **one-line
+`PI_CG_DOP` cap bump, not disk-backing**, and it is marginal + bandwidth-limited (par-eff 0.38). Recorded as
+the go/no-go evidence the issue's acceptance criteria asked for.

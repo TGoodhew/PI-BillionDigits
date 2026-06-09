@@ -109,6 +109,128 @@ Partial Class Form1
     End Function
 
     ' ════════════════════════════════════════════════════════════════════════
+    '  §281 (issue #123): CHUNKED-GRID DOP-headroom scan — the re-scoped #123 go/no-go.
+    '
+    '  #123 originally targeted the §gen combine forced to DOP=3 by RAM (DOP³ buffer wall).
+    '  §273/§274/§275 retired that: the combine now runs through SafeMpzMul_ChunkedGrid, whose
+    '  cells are tiny (fit RAM) and parallelise at PI_CG_DOP — but that is HARD-CAPPED at 16, so
+    '  on a 24-core box ~8 cores still sit idle.  The live question is no longer "RAM-bound at 3?"
+    '  but "is the chunked combine CORE-bound (raising the cap / disk-backing marginal cells would
+    '  help) or BANDWIDTH-bound at 16 (more concurrency is net-zero — #123 is a no-go)?"
+    '
+    '  --test-dopscan answers this for the RETIRED §gen path; this answers it for the PRODUCTION
+    '  chunked-grid path.  It times SafeMpzMul_ChunkedGrid at a fixed cell + operand, sweeping the
+    '  cell DOP {1,3,6,9,12,16,20,24} via _cgDopOverride (which BYPASSES the production 16-cap), and
+    '  prints ms / speedup / par-eff / knee — exactly the bandwidth-saturation gate the issue asks
+    '  for.  Operand size via PI_DOPSCAN_LIMBS (default 48M limbs = 384 MB, ~13× L3 ⇒ bandwidth
+    '  regime); cell via PI_CGDOP_CELL (default 8M ⇒ 128 MB cell products, the 5B-combine shape;
+    '  36 cells at the default size feed DOP up to 24).  Every DOP is bit-checked against DOP 1.
+    '  Pure measurement — no math-path change.
+    ' ════════════════════════════════════════════════════════════════════════
+    Friend Shared Function TestCgDopScan() As Boolean
+        Dim outPath As String = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cgdopscan_test.txt")
+        Dim log As Action(Of String) =
+            Sub(s)
+                Try : System.IO.File.AppendAllText(outPath, s & vbCrLf) : Catch : End Try
+                AppendLog($"[CgDopScan§281] {s}{vbCrLf}", 1)
+            End Sub
+        Try : System.IO.File.WriteAllText(outPath, $"[TestCgDopScan] start {DateTime.Now}{vbCrLf}") : Catch : End Try
+
+        Dim n As Integer = 48_000_000
+        Dim envN As String = Environment.GetEnvironmentVariable("PI_DOPSCAN_LIMBS")
+        Dim parsedN As Integer
+        If envN IsNot Nothing AndAlso Integer.TryParse(envN, parsedN) AndAlso parsedN >= 6_000_000 Then n = parsedN
+
+        Dim cell As Integer = 8_000_000
+        Dim envC As String = Environment.GetEnvironmentVariable("PI_CGDOP_CELL")
+        Dim parsedC As Integer
+        If envC IsNot Nothing AndAlso Integer.TryParse(envC, parsedC) AndAlso parsedC >= 1_000_000 Then cell = parsedC
+        If CLng(cell) * 2L > 33_000_000L Then cell = 16_000_000        ' keep cell·cell FFT-safe
+        Dim nPerSide As Long = (CLng(n) + cell - 1L) \ CLng(cell)
+        Dim nCells As Long = nPerSide * nPerSide
+
+        log($"operands: {n:N0} × {n:N0} limbs ({CLng(n) * 8L \ BYTES_PER_MB:N0} MB each); L3≈30 MB ⇒ ~{CLng(n) * 8L \ BYTES_PER_MB \ 30L}× overflow")
+        log($"cell = {cell:N0} limbs ({CLng(cell) * 8L \ BYTES_PER_MB} MB) ⇒ {nPerSide}×{nPerSide} = {nCells} cells; cores={Environment.ProcessorCount}")
+        log($"  availPhys={MemBudget_AvailablePhysicalGB():F1}GB availCommit={MemBudget_AvailableCommitGB():F1}GB")
+        If nCells < 24 Then log($"  WARNING: only {nCells} cells — DOP > {nCells} cannot be exercised; raise PI_DOPSCAN_LIMBS or lower PI_CGDOP_CELL.")
+
+        If _statusHook IsNot Nothing Then _statusHook($"CgDopScan: filling 2×{n:N0}-limb operands…")
+        Dim rng As New Random(20260609)
+        Dim a As New mpz_t() : a.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : FillRandomMpz(a, n, rng)
+        Dim b As New mpz_t() : b.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : FillRandomMpz(b, n, rng)
+        Dim rRef As New mpz_t() : rRef.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(rRef.Pointer)
+        Dim rTest As New mpz_t() : rTest.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : GmpRaw_init(rTest.Pointer)
+
+        Dim oneShot As Func(Of mpz_t, Integer, Double) =
+            Function(dst, dop)
+                _cgCellOverride = cell
+                _cgDopOverride = dop
+                GC.Collect() : GC.WaitForPendingFinalizers()
+                Dim sw As Stopwatch = Stopwatch.StartNew()
+                SafeMpzMul_ChunkedGrid(dst, a, b, 0L)
+                sw.Stop()
+                _cgDopOverride = 0 : _cgCellOverride = 0
+                Return sw.Elapsed.TotalMilliseconds
+            End Function
+
+        ' Warm up + reference at DOP 1 (page-in, pool, JIT; DOP must not change the product).
+        If _statusHook IsNot Nothing Then _statusHook("CgDopScan: warmup + DOP-1 reference…")
+        oneShot(rRef, 1) : log($"[{DateTime.Now:HH:mm:ss}] warmup done")
+        Dim baseMs As Double = oneShot(rRef, 1)
+
+        Dim dops() As Integer = {1, 3, 6, 9, 12, 16, 20, 24}
+        Dim ms(dops.Length - 1) As Double
+        Dim allMatch As Boolean = True
+        log("  DOP |    ms    | speedup | par-eff | Δ-thru/thread | bit-exact")
+        log("  ----+----------+---------+---------+---------------+----------")
+        Dim prevSpeedup As Double = 0.0, prevDop As Integer = 0
+        For i As Integer = 0 To dops.Length - 1
+            Dim dop As Integer = dops(i)
+            If CLng(dop) > nCells Then Continue For                     ' can't use more slots than cells
+            If _statusHook IsNot Nothing Then _statusHook($"CgDopScan: DOP {dop} ({i + 1}/{dops.Length}) on {n:N0}² chunked…")
+            Dim mms As Double = oneShot(rTest, dop)
+            ms(i) = mms
+            Dim match As Boolean = (dop = 1) OrElse (GmpRaw_cmp(rTest.Pointer, rRef.Pointer) = 0)
+            If Not match Then allMatch = False
+            If dop = 1 AndAlso baseMs <= 0.0 Then baseMs = mms
+            Dim speedup As Double = If(mms > 0.0, baseMs / mms, 0.0)
+            Dim eff As Double = speedup / dop
+            Dim margin As Double = If(dop > prevDop, (speedup - prevSpeedup) / CDbl(dop - prevDop), 0.0)
+            log($"  {dop,3} | {mms,8:F0} | {speedup,6:F2}× | {eff,6:F2} | {If(dop = 1, "      (base)", margin.ToString("F2") & "×/thr"),13} | {If(dop = 1, "(ref)", If(match, "yes", "NO ***"))}")
+            prevSpeedup = speedup : prevDop = dop
+        Next
+
+        ' Knee = highest DOP whose marginal throughput per added thread is still ≥ 0.10× (≥10% of a
+        ' core's ideal work).  Beyond the knee, more concurrency = ~0 throughput (bandwidth-saturated).
+        Dim knee As Integer = 1, prevS As Double = 1.0, prevD As Integer = 1
+        For i As Integer = 1 To dops.Length - 1
+            If ms(i) <= 0.0 Then Continue For
+            Dim s As Double = baseMs / ms(i)
+            Dim m As Double = (s - prevS) / CDbl(dops(i) - prevD)
+            If m >= 0.10 Then knee = dops(i)
+            prevS = s : prevD = dops(i)
+        Next
+        Dim lastIdx As Integer = dops.Length - 1
+        While lastIdx > 0 AndAlso ms(lastIdx) <= 0.0 : lastIdx -= 1 : End While
+        Dim full As Double = If(ms(lastIdx) > 0.0, baseMs / ms(lastIdx), 0.0)
+        log($"SATURATION KNEE ≈ DOP {knee} (best {full:F2}× at DOP {dops(lastIdx)}); production chunked-grid caps at 16.")
+        If knee <= 16 Then
+            log($"⇒ chunked combine is SATURATED at/below the 16-cap (knee {knee}). Raising PI_CG_DOP or disk-backing")
+            log($"  marginal cells (#123's mechanism) would add ~0 throughput — confirms #123 NO-GO on this hardware.")
+        Else
+            log($"⇒ chunked combine still SCALES past 16 (knee {knee} > 16): ~{knee - 16} idle cores are usable.")
+            log($"  Lever = RAISE the PI_CG_DOP cap toward {knee} (cells already fit RAM — NO disk-backing needed).")
+        End If
+        log($"Bit-exact across DOP (vs DOP-1): {If(allMatch, "ALL match", "MISMATCH — see *** above")}.")
+
+        ' No explicit mpz_clear — SafeMpzMul_ChunkedGrid swaps a raw GmpNativeAlloc block into the dst,
+        ' which GMP's free-fn does not match (teardown AV).  The dispatcher Environment.Exit's right
+        ' after, so the OS reclaims everything (same rationale as TestCellSweep/TestGridScan).
+        log($"[TestCgDopScan] done {DateTime.Now}")
+        Return allMatch
+    End Function
+
+    ' ════════════════════════════════════════════════════════════════════════
     '  §265 (#88): split-factor experiment.  §gen uses a 3×3 split = 9 sub-products
     '  ⇒ only 9 cores; 15 of 24 idle by design.  This compares the production §gen
     '  3×3 against the chunked-grid full product driven at coarser k×k grids (cell ≈
