@@ -30,12 +30,22 @@ Partial Class Form1
         Public Hybrid As Boolean
     End Structure
 
+    ' §115 (#115): authoritative confidence ordering — the enum's DECLARATION ORDER is the sort rank
+    ' (High strongest → Info weakest).  Replaces the old `Confidence As String` + ad-hoc rank lambda,
+    ' where a typo would silently sort as "info" and string-equality re-tests could drift.
+    Friend Enum AdvisorConfidence
+        High        ' 0 — strongest
+        Medium      ' 1
+        Low         ' 2
+        Info        ' 3 — informational; no saving
+    End Enum
+
     Friend Structure AdvisorRecommendation
         Public Title As String
         Public IssueRef As String               ' "" when it is a hardware/BIOS action, not a code issue
         Public SaveLowHours As Double
         Public SaveHighHours As Double
-        Public Confidence As String             ' high | medium | low | info
+        Public Confidence As AdvisorConfidence
         Public Why As String
     End Structure
 
@@ -45,9 +55,13 @@ Partial Class Form1
         Return sid = RunStageId.Divide OrElse sid = RunStageId.Numerator OrElse sid = RunStageId.Sqrt
     End Function
 
+    ' §115 (#115): named Advisor_Scale tuning constants (were bare 0.2 / 1.0E+9 literals).
+    Private Const MIN_SCALE_FACTOR As Double = 0.2     ' floor: a sub-1B run still shows a non-trivial saving
+    Private Const BASELINE_DIGITS As Double = 1.0E+9   ' audit savings are quoted at 1 B digits
+
     ' Linear scale of an audit saving (given at 1 B) by run length.
     Private Shared Function Advisor_Scale(save1B As Double, digits As Long) As Double
-        Return save1B * System.Math.Max(0.2, CDbl(digits) / 1.0E+9)
+        Return save1B * System.Math.Max(MIN_SCALE_FACTOR, CDbl(digits) / BASELINE_DIGITS)
     End Function
 
     ''' <summary>
@@ -62,7 +76,7 @@ Partial Class Form1
             Dim gainPct As Double = (CDbl(m.MemSpeedMts) / m.MemSpeedConfigured - 1.0) * 100.0
             recs.Add(New AdvisorRecommendation With {
                 .Title = $"Enable XMP/EXPO — running {m.MemSpeedConfigured} MT/s vs rated {m.MemSpeedMts} MT/s",
-                .IssueRef = "", .Confidence = "high",
+                .IssueRef = "", .Confidence = AdvisorConfidence.High,
                 .SaveLowHours = Advisor_Scale(1.5, digits), .SaveHighHours = Advisor_Scale(2.5, digits),
                 .Why = $"Memory-bound stages scale with bandwidth; enabling the rated profile adds ~{gainPct:F0}% bandwidth at zero cost."})
         End If
@@ -71,7 +85,7 @@ Partial Class Form1
         If m.MemModules = 1 Then
             recs.Add(New AdvisorRecommendation With {
                 .Title = "Populate a 2nd matched DIMM — currently single-channel",
-                .IssueRef = "", .Confidence = "high",
+                .IssueRef = "", .Confidence = AdvisorConfidence.High,
                 .SaveLowHours = Advisor_Scale(3.0, digits), .SaveHighHours = Advisor_Scale(6.0, digits),
                 .Why = "A single DIMM runs single-channel; a matched pair ~doubles DRAM bandwidth, the binding limit for the big multiplies."})
         End If
@@ -82,7 +96,7 @@ Partial Class Form1
             If atRated Then
                 recs.Add(New AdvisorRecommendation With {
                     .Title = "Memory-bandwidth limited — faster DRAM (e.g. DDR5-7200 CL34) would help most",
-                    .IssueRef = "#88", .Confidence = "medium",
+                    .IssueRef = "#88", .Confidence = AdvisorConfidence.Medium,
                     .SaveLowHours = Advisor_Scale(1.5, digits), .SaveHighHours = Advisor_Scale(2.5, digits),
                     .Why = $"{m.CoresActive:F0} cores busy during {m.CurrentStage} at rated speed: more threads won't help (bandwidth-bound). Upgrading DRAM speed is the lever (#88)."})
             End If
@@ -92,7 +106,7 @@ Partial Class Form1
         If m.CoresActive > 0.0 AndAlso m.CoresActive < 4.0 AndAlso Advisor_IsBandwidthStage(m.CurrentStage) Then
             recs.Add(New AdvisorRecommendation With {
                 .Title = "Low core utilisation in a compute stage — review DOP / pipelining",
-                .IssueRef = "#42", .Confidence = "low",
+                .IssueRef = "#42", .Confidence = AdvisorConfidence.Low,
                 .SaveLowHours = Advisor_Scale(1.0, digits), .SaveHighHours = Advisor_Scale(3.0, digits),
                 .Why = $"Only {m.CoresActive:F1} cores busy during {m.CurrentStage}. If not RAM-capped, pipelining a×r‖q×b (#42) or a higher DOP could fill idle cores."})
         End If
@@ -101,15 +115,14 @@ Partial Class Form1
         If m.MemSpeedMts = 0 AndAlso m.MemModules = 0 Then
             recs.Add(New AdvisorRecommendation With {
                 .Title = "Memory topology unknown — XMP/channel advice withheld",
-                .IssueRef = "", .Confidence = "info",
+                .IssueRef = "", .Confidence = AdvisorConfidence.Info,
                 .SaveLowHours = 0.0, .SaveHighHours = 0.0,
                 .Why = "Win32_PhysicalMemory query returned no data (CIM blocked/slow). Hardware recommendations need DRAM speed + DIMM count."})
         End If
 
-        ' Rank: high → medium → low → info, then by mid-saving descending.
-        Dim rank As Func(Of String, Integer) = Function(c) If(c = "high", 0, If(c = "medium", 1, If(c = "low", 2, 3)))
+        ' §115: rank by confidence (High→Info is the enum's own order), then by mid-saving descending.
         recs.Sort(Function(a, b)
-                      Dim byConf As Integer = rank(a.Confidence).CompareTo(rank(b.Confidence))
+                      Dim byConf As Integer = a.Confidence.CompareTo(b.Confidence)
                       If byConf <> 0 Then Return byConf
                       Return (b.SaveLowHours + b.SaveHighHours).CompareTo(a.SaveLowHours + a.SaveHighHours)
                   End Function)
@@ -124,7 +137,7 @@ Partial Class Form1
             For Each r As AdvisorRecommendation In recs
                 Dim save As String = If(r.SaveHighHours > 0.0, $"  est ~{r.SaveLowHours:F1}–{r.SaveHighHours:F1}h", "")
                 Dim iss As String = If(r.IssueRef <> "", $" [{r.IssueRef}]", "")
-                AppendLog($"[Advisor§260]  • ({r.Confidence}){iss} {r.Title}{save}{vbCrLf}    {r.Why}{vbCrLf}", 2)
+                AppendLog($"[Advisor§260]  • ({r.Confidence.ToString().ToLowerInvariant()}){iss} {r.Title}{save}{vbCrLf}    {r.Why}{vbCrLf}", 2)
             Next
         Catch
         End Try

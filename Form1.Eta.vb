@@ -39,10 +39,14 @@ Partial Class Form1
         End Select
     End Function
 
+    ' §115 (#115): named super-linear scaling exponents (cost ≈ cost1B · (digits/1B)^exp).  The
+    ' bandwidth-bound stages (Sqrt, Divide) scale a touch worse than the near-linear ones.
+    Private Const ETA_EXP_NEAR_LINEAR As Double = 1.05   ' Phase1/Phase2/Numerator/Output
+    Private Const ETA_EXP_SUPERLINEAR As Double = 1.10   ' Sqrt/Divide (bandwidth-bound)
     Private Shared Function Eta_Exponent(sid As RunStageId) As Double
         Select Case sid
-            Case RunStageId.Phase1, RunStageId.Phase2, RunStageId.Numerator, RunStageId.Output : Return 1.05
-            Case Else : Return 1.10          ' Sqrt, Divide
+            Case RunStageId.Phase1, RunStageId.Phase2, RunStageId.Numerator, RunStageId.Output : Return ETA_EXP_NEAR_LINEAR
+            Case Else : Return ETA_EXP_SUPERLINEAR          ' Sqrt, Divide
         End Select
     End Function
 
