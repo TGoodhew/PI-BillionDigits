@@ -1754,6 +1754,10 @@ Public Class Form1
         ' dialog for an attended interactive run (never a blocking modal headless / Auto-OK).
         ScanEventLogForPriorCrashes()
 
+        ' §118/§119 (#118/#119): add the large-run UI controls (log-level dropdown, AutoCheckpoint +
+        ' Auto-OK checkboxes, output-dir field).  Interactive only; no-op headless.
+        BuildLargeRunControls()
+
         ' Install VirtualAlloc/VirtualFree custom GMP allocator so large limb
         ' buffers are immediately decommitted on free, preventing commit-charge
         ' accumulation that caused abort() in multi-pass multiply.
@@ -1841,7 +1845,7 @@ Public Class Form1
                 System.IO.Directory.CreateDirectory(DISK_CACHE_DIR)
             End If
         Catch ex As Exception
-            If Not _headless Then
+            If Not _headless AndAlso Not _suppressDialogs Then   ' §119
                 MessageBox.Show("Warning: Could not create output directory: " & ex.Message)
             Else
                 WriteToLog("[DIALOG] Warning: Could not create output directory: " & ex.Message)
@@ -1866,7 +1870,7 @@ Public Class Form1
             "Available RAM: " & (GC.GetGCMemoryInfo().TotalAvailableMemoryBytes \ BYTES_PER_MB).ToString() & "MB" & vbCrLf &
             "GMP DLL: " & gmpDllPath & vbCrLf &
             "GMP Memory: System allocator (default)"
-        If Not _headless Then
+        If Not _headless AndAlso Not _suppressDialogs Then   ' §119
             MessageBox.Show(processInfoMsg, "Process Info")
         Else
             WriteToLog("[DIALOG] Process Info: " & processInfoMsg.Replace(vbCrLf, " | "))
@@ -2230,6 +2234,68 @@ Public Class Form1
         End Try
     End Sub
 
+    ' §118/§119 (#118/#119): build the large-run UI controls programmatically (kept out of the fragile
+    ' auto-generated Designer).  Opens a 4th panel row with: a DESCRIBED log-level dropdown (replacing
+    ' the opaque 0–5 spinner, and reconciling the interactive default to 2), an AutoCheckpoint checkbox
+    ' (was CLI-only — a UI user could not enable crash-resume), an "Auto-OK dialogs" checkbox (#119),
+    ' and an output-directory field + Browse.  Interactive only — headless runs drive these via flags,
+    ' and creating/driving the controls headlessly could clobber CLI-set values.
+    Private Sub BuildLargeRunControls()
+        If _headless Then Return
+        Try
+            Dim f As New Font("Segoe UI", 14.0F, FontStyle.Regular, GraphicsUnit.Point, CByte(0))
+            Const rowY As Integer = 212
+            Panel1.Height = System.Math.Max(Panel1.Height, 275)   ' RtbPiDigits (Dock=Fill) reflows automatically
+
+            ' Log-level dropdown — replaces the opaque NudLogLevel spinner.  It writes back into
+            ' NudLogLevel.Value, which BtnCompute_Click still reads, so no other code changes.  Default 2
+            ' (fixes the latent Designer=1 vs runtime=2 mismatch).
+            LblLogLevel.Visible = False : NudLogLevel.Visible = False
+            Dim lblLL As New Label() With {.AutoSize = True, .Font = f, .Location = New Point(25, rowY + 4), .Text = "Log level:"}
+            Dim cmbLL As New ComboBox() With {.Font = f, .Location = New Point(190, rowY), .Size = New Size(560, 40),
+                                              .DropDownStyle = ComboBoxStyle.DropDownList, .Name = "CmbLogLevel"}
+            cmbLL.Items.AddRange(New Object() {
+                "0 — Silent (errors + crashes only)", "1 — Errors + result", "2 — Phase milestones (default)",
+                "3 — Sub-phase trace", "4 — Detailed (mul diagnostics)", "5 — Allocator/affinity (very large)"})
+            cmbLL.SelectedIndex = 2 : NudLogLevel.Value = 2D
+            AddHandler cmbLL.SelectedIndexChanged, Sub(s, ev) NudLogLevel.Value = CDec(cmbLL.SelectedIndex)
+            Panel1.Controls.Add(lblLL) : Panel1.Controls.Add(cmbLL)
+
+            ' AutoCheckpoint checkbox — was CLI-only (no UI control existed).
+            Dim chkAC As New CheckBox() With {.AutoSize = True, .Font = f, .Location = New Point(800, rowY + 2),
+                                              .Text = "Auto-checkpoint (resume)", .Checked = _autoCheckpoint, .UseVisualStyleBackColor = True}
+            AddHandler chkAC.CheckedChanged, Sub(s, ev) _autoCheckpoint = chkAC.Checked
+            TipMain.SetToolTip(chkAC, "Snapshot each combine level; an interrupted run auto-resumes from the last level next time. (Auto-enabled for runs ≥ 100M digits.)")
+            Panel1.Controls.Add(chkAC)
+
+            ' §119: Auto-OK dialogs — log + auto-dismiss spontaneous info/error modals so an unattended
+            ' interactive run never blocks (sets the same _suppressDialogs the global handler honours).
+            Dim chkOK As New CheckBox() With {.AutoSize = True, .Font = f, .Location = New Point(1230, rowY + 2),
+                                              .Text = "Auto-OK dialogs (unattended)", .Checked = _suppressDialogs, .UseVisualStyleBackColor = True}
+            AddHandler chkOK.CheckedChanged, Sub(s, ev) _suppressDialogs = chkOK.Checked
+            TipMain.SetToolTip(chkOK, "Log + auto-dismiss spontaneous info/error dialogs (incl. mid-run OOM and the global unhandled-exception modal) so an unattended run never blocks. Close/Cancel confirmations still prompt — never auto-confirmed.")
+            Panel1.Controls.Add(chkOK)
+
+            ' Output directory field + Browse (was CLI-only).
+            Dim lblOut As New Label() With {.AutoSize = True, .Font = f, .Location = New Point(1700, rowY + 4), .Text = "Output:"}
+            Dim txtOut As New TextBox() With {.Font = f, .Location = New Point(1820, rowY), .Size = New Size(820, 39), .Text = _outputDir, .Name = "TxtOutputDir"}
+            AddHandler txtOut.TextChanged, Sub(s, ev) If txtOut.Text.Trim().Length > 0 Then _outputDir = txtOut.Text.Trim()
+            Dim btnBrowse As New Button() With {.Font = f, .Location = New Point(2655, rowY - 2), .Size = New Size(130, 44), .Text = "Browse", .UseVisualStyleBackColor = True}
+            AddHandler btnBrowse.Click, Sub(s, ev)
+                                            Try
+                                                Using fb As New FolderBrowserDialog()
+                                                    fb.SelectedPath = _outputDir
+                                                    If fb.ShowDialog() = DialogResult.OK AndAlso fb.SelectedPath.Length > 0 Then txtOut.Text = fb.SelectedPath
+                                                End Using
+                                            Catch
+                                            End Try
+                                        End Sub
+            Panel1.Controls.Add(lblOut) : Panel1.Controls.Add(txtOut) : Panel1.Controls.Add(btnBrowse)
+        Catch
+            ' UI is best-effort — never block a run on control setup.
+        End Try
+    End Sub
+
     Private Sub BtnCompute_Click(sender As Object, e As EventArgs) Handles BtnCompute.Click
         ' Free any retained Pi buffer from the previous run before starting a new one.
         If _displayNativePtr <> IntPtr.Zero Then
@@ -2339,7 +2405,7 @@ Public Class Form1
                 Catch oex As OutOfMemoryException
                     WriteExceptionToLog("ComputeThread/OutOfMemoryException", oex)
                     Me.Invoke(Sub()
-                                  If Not _headless Then
+                                  If Not _headless AndAlso Not _suppressDialogs Then   ' §119: Auto-OK ⇒ log + exit (Else)
                                       MessageBox.Show("OUT OF MEMORY!" & vbCrLf & oex.Message & vbCrLf & oex.StackTrace)
                                   Else
                                       ' §76 (issue #76): headless must exit on exception, otherwise the
@@ -2357,7 +2423,7 @@ Public Class Form1
                 Catch ovex As OverflowException
                     WriteExceptionToLog("ComputeThread/OverflowException", ovex)
                     Me.Invoke(Sub()
-                                  If Not _headless Then
+                                  If Not _headless AndAlso Not _suppressDialogs Then   ' §119: Auto-OK ⇒ log + exit (Else)
                                       MessageBox.Show("OVERFLOW!" & vbCrLf & ovex.Message & vbCrLf & ovex.StackTrace)
                                   Else
                                       ' §76 (issue #76): headless must exit on exception.
@@ -2373,7 +2439,7 @@ Public Class Form1
                 Catch ex As Exception
                     WriteExceptionToLog("ComputeThread", ex)
                     Me.Invoke(Sub()
-                                  If Not _headless Then
+                                  If Not _headless AndAlso Not _suppressDialogs Then   ' §119: Auto-OK ⇒ log + exit (Else)
                                       MessageBox.Show("EXCEPTION: " & ex.GetType().Name & vbCrLf & ex.Message & vbCrLf & ex.StackTrace)
                                   Else
                                       ' §76 (issue #76): headless must exit on exception.
@@ -7895,11 +7961,16 @@ PostShiftCheckpoint:
         ' independent of thread-pool saturation.
         Dim phase1PollThread As New System.Threading.Thread(
             Sub()
+                Dim _etaTick As Integer = 0
                 While Interlocked.Read(completedChunks) < numChunks
                     Dim snap As Long = Interlocked.Read(completedChunks)
                     Me.BeginInvoke(Sub()
                                        LblStatus.Text = $"Phase 1: {snap:N0} / {numChunks:N0} chunks ({snap * 100L \ numChunks:N0}%)"
                                    End Sub)
+                    ' §126 (#126): Phase 1 has a TRUE progress ratio (chunks done / total) — feed it as a
+                    ' sound live ETA fraction (throttled ~20 s to keep the [ETA§259] log readable).
+                    If _etaTick Mod 40 = 0 AndAlso numChunks > 0 Then Try : Eta_Refresh(RunStageId.Phase1, System.Math.Min(1.0, CDbl(snap) / CDbl(numChunks))) : Catch : End Try
+                    _etaTick += 1
                     System.Threading.Thread.Sleep(500)
                 End While
             End Sub)
@@ -8054,11 +8125,17 @@ Phase2:
                 Dim completedPairs As Long = 0L
                 Dim phase2PollThread As New System.Threading.Thread(
                     Sub()
+                        Dim _etaTick As Integer = 0
                         While Interlocked.Read(completedPairs) < pairCount
                             Dim snap As Long = Interlocked.Read(completedPairs)
                             Me.BeginInvoke(Sub()
                                 LblStatus.Text = $"Phase 2 Level {level}: {snap:N0} / {pairCount:N0} pairs"
                             End Sub)
+                            ' §126 (#126): give the combine a declining window-title ETA (was a multi-hour
+                            ' no-ETA gap).  Throttled to ~20 s so the [ETA§259] log isn't spammed; the
+                            ' projector uses the Phase-2 stage cost (history, else scaled default) − elapsed.
+                            If _etaTick Mod 40 = 0 Then Try : Eta_Refresh(Eta_NextStage(), 0.0) : Catch : End Try
+                            _etaTick += 1
                             System.Threading.Thread.Sleep(500)
                         End While
                     End Sub)

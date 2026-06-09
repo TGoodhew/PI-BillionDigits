@@ -6443,3 +6443,28 @@ only every `_nrCkptEvery`-th iteration (default **4**, `PI_NR_CKPT_EVERY` overri
 Cuts the reciprocal checkpoint I/O ~4× (66 GB → ~16 GB at 5B) and **cannot change π**; a crash loses
 ≤ 3 (~1–2 min each) iterations of recompute. The snap_Phase3 backup was already async (§232). Confirmed
 by the final 1B SHA gate (result unchanged; fewer `§NR-ckpt saved` lines).
+
+## §277 — Large-run UI controls + Auto-OK dialog wiring + whole-run ETA (2026-06-08, issues #118/#119/#126)
+
+Completes the UI halves deferred from the pre-5B batch (the safety cores landed in §118/§119 earlier).
+
+**#118/#119 UI controls (`BuildLargeRunControls`, interactive-only, built programmatically to stay out
+of the fragile auto-generated Designer):** a 4th panel row (the panel grows; the `Dock=Fill` digit box
+reflows) with — a **described log-level dropdown** (`0–5` with text, replacing the opaque spinner;
+defaults to **2**, fixing the latent Designer=1 vs runtime=2 mismatch; writes back to `NudLogLevel.Value`
+so `BtnCompute_Click` is unchanged); an **AutoCheckpoint checkbox** (was CLI-only — a UI user could not
+enable crash-resume); the **#119 "Auto-OK dialogs" checkbox** (sets `_suppressDialogs`); and an
+**output-directory field + Browse**. Verified by a GUI smoke-launch (controls render in a clean row, form
+loads without crash).
+
+**#119 dialog wiring:** the five spontaneous info/error dialogs (output-dir-fail, Process-Info, mid-run
+OOM/Overflow/generic) now gate on `Not _headless AndAlso Not _suppressDialogs`, so Auto-OK routes them
+to the existing `[DIALOG]` log + (for the mid-run errors) the log-then-`Application.Exit` path — an
+unattended interactive run never blocks. Destructive Close/Cancel confirms are deliberately untouched.
+
+**#126 whole-run ETA:** (a) `Eta_OnReciprocalProgress` no longer mislabels a **sqrt-internal** reciprocal
+as "Divide 80%" — it only claims Divide-stage progress when Divide is actually the current stage, else it
+refreshes the real current stage (observed wrong in the 5B run). (b) The combine now has a **declining
+title ETA** (was a multi-hour no-ETA gap): the Phase-1 poll feeds a *true* progress fraction
+(chunks done / total), the Phase-2 poll a cost-based refresh, both throttled to ~20 s so `[ETA§259]`
+isn't spammed. Together with the §116/§126 terminal state, this closes #126's "cover all stages" option.

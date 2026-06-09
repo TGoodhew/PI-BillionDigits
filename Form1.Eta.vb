@@ -164,13 +164,22 @@ Partial Class Form1
     End Function
 
     ''' <summary>
-    ''' Per-iteration reciprocal refinement (the dominant Divide stage).  Called
-    ''' from the SafeMpzReciprocal Newton loop with the §200 fixed iteration
-    ''' schedule, so fraction = iterDone / minIters is a true progress ratio.
+    ''' Per-iteration reciprocal refinement.  Called from the SafeMpzReciprocal Newton loop, whose
+    ''' fraction = iterDone / minIters is a true progress ratio for the DOMINANT Divide stage.
+    ''' §126 (#126): but SafeMpzReciprocal also runs INSIDE SafeMpzSqrt (and the numerator's divides),
+    ''' so this hook fires while the real stage is Sqrt/Numerator.  Only treat it as Divide-stage
+    ''' progress when Divide is actually the current stage — otherwise the title would mislabel a
+    ''' sqrt-internal reciprocal as "Divide 80%" (observed in the 5B run).  When it is internal, refresh
+    ''' the ACTUAL current stage (fraction 0 ⇒ its cost comes from history) so the ETA stays sound.
     ''' </summary>
     Friend Sub Eta_OnReciprocalProgress(iterDone As Integer, minIters As Integer)
         If minIters <= 0 Then Return
-        Eta_Refresh(RunStageId.Divide, System.Math.Min(1.0, CDbl(iterDone) / CDbl(minIters)))
+        Dim cur As RunStageId = Eta_NextStage()
+        If cur = RunStageId.Divide Then
+            Eta_Refresh(RunStageId.Divide, System.Math.Min(1.0, CDbl(iterDone) / CDbl(minIters)))
+        Else
+            Eta_Refresh(cur, 0.0)   ' sqrt-internal / numerator-internal reciprocal — don't claim Divide
+        End If
     End Sub
 
     Private Sub Eta_Refresh(curStage As RunStageId, curStageFraction As Double)
