@@ -80,7 +80,7 @@ Partial Class Form1
                 _telStages.Add(New RunStageRecord With {
                     .Id = sid,
                     .WallSeconds = System.Math.Max(0.0, nowSec - _telCurStageStartSec),
-                    .PeakWsMb = Process.GetCurrentProcess().PeakWorkingSet64 \ 1048576L})
+                    .PeakWsMb = Process.GetCurrentProcess().PeakWorkingSet64 \ BYTES_PER_MB})
                 _telCurStageStartSec = nowSec
                 Eta_OnStageComplete(sid)   ' refine the live ETA (Form1.Eta.vb)
             End If

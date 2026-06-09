@@ -339,9 +339,10 @@ Public Class Form1
     ' SafeMpzMul / the reciprocal / divide / sqrt all split below this cap.  Named here so the bound is
     ' not three bare 33_554_431 literals.
     Friend Const GMP_FFT_LIMB_CAP As Integer = 33_554_431
-    ' §111 (#111): bytes per MB, for readability where a size is divided/multiplied to report MB.  (Most
-    ' of the ~120 existing `\ 1048576L` sites are left as-is for now — a blanket sweep is a churny,
-    ' merge-risky change deferred out of the pre-5B batch; new code should prefer this constant.)
+    ' §111 (#111): bytes per MB, for readability where a size is divided to report MB.  All ~57 former
+    ' `\ 1048576[L]` / `/ 1048576[.0|L]` MB-conversion sites and the 1 MB pool-trim threshold args now
+    ' use this constant.  (The few `N * 1024 * 1024` buffer-SIZE constants are intentionally left as the
+    ' explicit multiplication — they are `As Integer` and reading "16 * 1024 * 1024" as 16 MB is clear.)
     Friend Const BYTES_PER_MB As Long = 1048576L
 
     <DllImport("kernel32.dll", SetLastError:=True)>
@@ -1287,7 +1288,7 @@ Public Class Form1
             Dim freedBytes As ULong = 0UL
             GmpNativeAlloc_Trim(minBytes, freedBuffers, freedBytes)
             Dim wsAfter As Long = Process.GetCurrentProcess().WorkingSet64
-            AppendLog($"[Trim§241 ctx={ctx}] pooled-before={pooledBefore / 1048576.0:N0} MB ({blocksBefore:N0} blks) | freed {freedBuffers:N0} blks {freedBytes / 1073741824.0:N3} GB (minBucket={minBytes / 1048576.0:N0} MB) | WS {wsBefore \ 1048576L:N0} -> {wsAfter \ 1048576L:N0} MB{vbCrLf}")
+            AppendLog($"[Trim§241 ctx={ctx}] pooled-before={pooledBefore / BYTES_PER_MB:N0} MB ({blocksBefore:N0} blks) | freed {freedBuffers:N0} blks {freedBytes / 1073741824.0:N3} GB (minBucket={minBytes / BYTES_PER_MB:N0} MB) | WS {wsBefore \ BYTES_PER_MB:N0} -> {wsAfter \ BYTES_PER_MB:N0} MB{vbCrLf}")
         Catch _ex As Exception
             AppendLog($"[Trim§241 ctx={ctx}] FAILED: {_ex.Message}{vbCrLf}")
         End Try
@@ -1396,7 +1397,7 @@ Public Class Form1
         If MemBudget_AvailableCommitGB() >= triggerGB Then Return False
         Try
             Dim _freed As UInteger = 0UI, _bytes As ULong = 0UL
-            GmpNativeAlloc_Trim(1048576UL, _freed, _bytes)
+            GmpNativeAlloc_Trim(CULng(BYTES_PER_MB), _freed, _bytes)
             If _logLevel >= 2 Then AppendLog($"[MemoryBudget§243] pressure trim (commit {MemBudget_AvailableCommitGB():F1}GB < {triggerGB:F0}GB): freed {_freed:N0} blks {_bytes / 1073741824.0:N2} GB{vbCrLf}")
             Return True
         Catch _ex As Exception
@@ -1862,7 +1863,7 @@ Public Class Form1
         Dim processInfoMsg As String =
             "64-bit process: " & Environment.Is64BitProcess.ToString() & vbCrLf &
             "IntPtr.Size: " & IntPtr.Size.ToString() & " (must be 8)" & vbCrLf &
-            "Available RAM: " & (GC.GetGCMemoryInfo().TotalAvailableMemoryBytes \ 1048576).ToString() & "MB" & vbCrLf &
+            "Available RAM: " & (GC.GetGCMemoryInfo().TotalAvailableMemoryBytes \ BYTES_PER_MB).ToString() & "MB" & vbCrLf &
             "GMP DLL: " & gmpDllPath & vbCrLf &
             "GMP Memory: System allocator (default)"
         If Not _headless Then
@@ -2019,7 +2020,7 @@ Public Class Form1
         Try
             Dim elapsed As TimeSpan = stopWatch.Elapsed
             Dim threadId As Integer = Thread.CurrentThread.ManagedThreadId
-            Dim procMem As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+            Dim procMem As Long = Process.GetCurrentProcess().WorkingSet64 \ BYTES_PER_MB
             AppendLog($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} | T{threadId} | {elapsed:hh\:mm\:ss\.fff} | RAM:{procMem:N0}MB | {message}" & vbCrLf, level)
         Catch
         End Try
@@ -2055,8 +2056,8 @@ Public Class Form1
         Dim elapsed As TimeSpan = stopWatch.Elapsed
         Dim phaseTime As TimeSpan = phaseStopWatch.Elapsed
         phaseStopWatch.Restart()
-        Dim procMem As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
-        Dim virtMem As Long = Process.GetCurrentProcess().VirtualMemorySize64 \ 1048576
+        Dim procMem As Long = Process.GetCurrentProcess().WorkingSet64 \ BYTES_PER_MB
+        Dim virtMem As Long = Process.GetCurrentProcess().VirtualMemorySize64 \ BYTES_PER_MB
         Dim entry As String = $"{elapsed:hh\:mm\:ss\.ff} | +{phaseTime:mm\:ss\.ff} | RAM:{procMem:N0}MB | VIRT:{virtMem:N0}MB | {phaseName}"
         WriteToLog($"[PHASE] {phaseName}")
         Me.BeginInvoke(Sub()
@@ -3519,7 +3520,7 @@ Public Class Form1
         ' Zeroed, pool-managed accumulator (becomes result's buffer at the end).
         Dim accBytes As Long = maxLimbs * 8L
         Dim accBuf As IntPtr = GmpNativeAlloc_PoolGet(accBytes)
-        If accBuf = IntPtr.Zero Then Throw New OutOfMemoryException($"SafeMpzMul_ChunkedGrid: PoolGet {accBytes \ 1048576L} MB failed")
+        If accBuf = IntPtr.Zero Then Throw New OutOfMemoryException($"SafeMpzMul_ChunkedGrid: PoolGet {accBytes \ BYTES_PER_MB} MB failed")
         ZeroMemory(accBuf, New UIntPtr(CULng(accBytes)))
 
         Dim numA As Integer = (szA + CHUNK - 1) \ CHUNK
@@ -3970,8 +3971,8 @@ Public Class Form1
         Dim accumBuf As IntPtr = GmpNativeAlloc_PoolGet(_resultBytes)
         If accumBuf = IntPtr.Zero Then
             AppendLog(
-                $"[SafeMpzMul] accum pre-alloc FAILED for {_resultBytes \ 1048576L:N0} MB — throwing OOM{vbCrLf}", 1)   ' §252 (#95): OOM → level 1
-            Throw New OutOfMemoryException($"SafeMpzMul: GmpNativeAlloc_PoolGet failed for accum buffer ({_resultBytes \ 1048576L} MB)")
+                $"[SafeMpzMul] accum pre-alloc FAILED for {_resultBytes \ BYTES_PER_MB:N0} MB — throwing OOM{vbCrLf}", 1)   ' §252 (#95): OOM → level 1
+            Throw New OutOfMemoryException($"SafeMpzMul: GmpNativeAlloc_PoolGet failed for accum buffer ({_resultBytes \ BYTES_PER_MB} MB)")
         End If
         Dim accumPtr As IntPtr = Runtime.InteropServices.Marshal.AllocHGlobal(16)
         Runtime.InteropServices.Marshal.WriteInt32(accumPtr, 0, CInt(_resultLimbs)) ' _mp_alloc
@@ -3982,7 +3983,7 @@ Public Class Form1
         ' This slot survives all native GMP calls and managed-stack corruption.
         Runtime.InteropServices.Marshal.WriteInt64(savedResultPtr, 8, accumPtr.ToInt64())
         If _logLevel >= 4 Then AppendLog(
-            $"[SafeMpzMul] accum pre-alloc OK: {_resultLimbs:N0} limbs ({_resultBytes \ 1048576L:N0} MB){vbCrLf}")
+            $"[SafeMpzMul] accum pre-alloc OK: {_resultLimbs:N0} limbs ({_resultBytes \ BYTES_PER_MB:N0} MB){vbCrLf}")
 
         ' Split opB into three pieces upfront: opB is small so all three pieces coexist cheaply.
         ' opA and opB are Q/P values from Chudnovsky binary split, always non-negative.
@@ -4222,7 +4223,7 @@ Public Class Form1
             ' Max final/intermediate buffer size: prods(7|8) = ≤ 87.5M limbs; pad to 90M for safety.
             Const _E_MAX_LIMBS As Integer = 90_000_000
             Dim _E_MAX_BYTES As Long = CLng(_E_MAX_LIMBS) * 8L
-            AppendLog($"[SafeMpzMul§5B-e] starting chunked-grid reference (chunk={_CHUNK_E:N0}, prealloc={_E_MAX_LIMBS:N0} limbs/buf, {_E_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}", 5)   ' §252 (#95)
+            AppendLog($"[SafeMpzMul§5B-e] starting chunked-grid reference (chunk={_CHUNK_E:N0}, prealloc={_E_MAX_LIMBS:N0} limbs/buf, {_E_MAX_BYTES \ BYTES_PER_MB:N0} MB){vbCrLf}", 5)   ' §252 (#95)
             For Each _refIdx As Integer In New Integer() {7, 8}
                 Dim _refTargetIdx As Long = If(_refIdx = 7, 72916666L, 43749999L)
                 Dim _ref_A_d As Long = Runtime.InteropServices.Marshal.ReadInt64(A_parts(2).Pointer, 8)
@@ -4423,13 +4424,13 @@ Public Class Form1
         If _sharedSjBuf = IntPtr.Zero Then
             GmpNativeAlloc_FreeRaw(accumBuf, _resultBytes)   ' §30 fix: match PoolGet allocation above
             Runtime.InteropServices.Marshal.FreeHGlobal(accumPtr)
-            AppendLog($"[SafeMpzMul] shared shifted pre-alloc FAILED for {_maxShiftedLimbs * 8L \ 1048576L:N0} MB — throwing OOM{vbCrLf}", 1)   ' §252 (#95): OOM → level 1
-            Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shared shifted ({_maxShiftedLimbs * 8L \ 1048576L} MB)")
+            AppendLog($"[SafeMpzMul] shared shifted pre-alloc FAILED for {_maxShiftedLimbs * 8L \ BYTES_PER_MB:N0} MB — throwing OOM{vbCrLf}", 1)   ' §252 (#95): OOM → level 1
+            Throw New OutOfMemoryException($"SafeMpzMul: VirtualAlloc failed for shared shifted ({_maxShiftedLimbs * 8L \ BYTES_PER_MB} MB)")
         End If
         ' §122 (#122): the real §39 decision (symmetric + ≤50M total + all 6 pieces dense) is made
         ' below and logged there — this line previously printed a premature "§39=" using the wrong
         ' 100M threshold and ignoring the dense check, which did not reflect what the code did.
-        If _logLevel >= 2 Then AppendLog($"[SafeMpzMul§accum] shifted buffer OK ({_maxShiftedLimbs * 8L \ 1048576L:N0} MB); starting accumulation{vbCrLf}")
+        If _logLevel >= 2 Then AppendLog($"[SafeMpzMul§accum] shifted buffer OK ({_maxShiftedLimbs * 8L \ BYTES_PER_MB:N0} MB); starting accumulation{vbCrLf}")
         ' §25: raw init for shifted — struct header via Marshal.AllocHGlobal, limb buffer via GmpRaw_init.
         Dim shifted As New mpz_t()
         shifted.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16)
@@ -4515,7 +4516,7 @@ Public Class Form1
                             Dim _newBytes As Long = CLng(_needed) * 8L
                             Dim _newBuf As IntPtr = GmpNativeAlloc_PoolGet(_newBytes)
                             If _newBuf = IntPtr.Zero Then
-                                Throw New OutOfMemoryException($"SafeMpzMul §39 pre-grow: GmpNativeAlloc_PoolGet failed ({_newBytes \ 1048576L} MB)")
+                                Throw New OutOfMemoryException($"SafeMpzMul §39 pre-grow: GmpNativeAlloc_PoolGet failed ({_newBytes \ BYTES_PER_MB} MB)")
                             End If
                             CopyMemory(_newBuf, _oldBuf, New UIntPtr(CULng(_bk_sz) * 8UL))
                             GmpNativeAlloc_FreeRaw(_oldBuf, _oldBytes)
@@ -4838,7 +4839,7 @@ Public Class Form1
                         Dim _212priv As Long = _212proc.PrivateMemorySize64
                         Dim _212accSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 4))
                         Dim _212accAlloc As Integer = Runtime.InteropServices.Marshal.ReadInt32(accumPtr, 0)
-                        AppendLog($"[SafeMpzMul§212] depth-0 k={k} END  szA={szA:N0} szB={szB:N0} WS={_212ws \ 1048576L:N0}MB Priv={_212priv \ 1048576L:N0}MB accumSz={_212accSz:N0} accumAlloc={_212accAlloc:N0}{vbCrLf}", 5)   ' §252 (#95)
+                        AppendLog($"[SafeMpzMul§212] depth-0 k={k} END  szA={szA:N0} szB={szB:N0} WS={_212ws \ BYTES_PER_MB:N0}MB Priv={_212priv \ BYTES_PER_MB:N0}MB accumSz={_212accSz:N0} accumAlloc={_212accAlloc:N0}{vbCrLf}", 5)   ' §252 (#95)
                     Catch _212ex As Exception
                         AppendLog($"[SafeMpzMul§212] depth-0 k={k} diag failed: {_212ex.Message}{vbCrLf}", 5)   ' §252 (#95)
                     End Try
@@ -4964,7 +4965,7 @@ Public Class Form1
 
         Runtime.InteropServices.Marshal.WriteInt32(m.Pointer, 0, CInt(neededLimbs))
         Runtime.InteropServices.Marshal.WriteInt64(m.Pointer, 8, newBuf.ToInt64())
-        AppendLog($"[PreAlloc] {neededLimbs:N0} limbs ({neededBytes \ 1048576L:N0} MB) OK{vbCrLf}")
+        AppendLog($"[PreAlloc] {neededLimbs:N0} limbs ({neededBytes \ BYTES_PER_MB:N0} MB) OK{vbCrLf}")
     End Sub
 
     ' Compute floor(op / 2^bits) → rop.  Handles bits > UInt32.Max.  rop may alias op.
@@ -6104,12 +6105,12 @@ Public Class Form1
         ' becomes conditional on _5b_verify so 1B-scale runs still defer.
         If Not _5b_verify Then
             gmp_lib.mpz_clear(r)
-            If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§213] r cleared eagerly (_5b_verify=False, ~{CLng(szR) * 8L \ 1048576L:N0} MB freed){vbCrLf}")
+            If _logLevel >= 2 Then AppendLog($"[SafeMpzDiv§213] r cleared eagerly (_5b_verify=False, ~{CLng(szR) * 8L \ BYTES_PER_MB:N0} MB freed){vbCrLf}")
         End If
 
         ' §241 (issue #69): trim pooled FFT temporaries left over from a×r before q×b
         ' allocates fresh. Measures pool retention at this boundary (census-before).
-        TrimPoolAtBoundary("post-axr", 1048576UL)
+        TrimPoolAtBoundary("post-axr", CULng(BYTES_PER_MB))
 
         ' §5B-investigate (post-mul): verify ar boundary limbs against pre-mul a, r values.
         ' Bottom: ar[0] = (a[0]*r[0]) mod 2^64 — EXACT relation, mismatch ⇒ SafeMpzMul bug.
@@ -6182,7 +6183,7 @@ Public Class Form1
             Dim _F1_aSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(a.Pointer, 4))
             Dim _F1_rD As Long = Runtime.InteropServices.Marshal.ReadInt64(r.Pointer, 8)
             Dim _F1_rSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(r.Pointer, 4))
-            AppendLog($"[SafeMpzDiv§5B-f1] starting chunked-grid a × r reference (chunk={_F1_CHUNK:N0}, prealloc={_F1_MAX_LIMBS:N0} limbs/buf, {_F1_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}", 5)   ' §252 (#95)
+            AppendLog($"[SafeMpzDiv§5B-f1] starting chunked-grid a × r reference (chunk={_F1_CHUNK:N0}, prealloc={_F1_MAX_LIMBS:N0} limbs/buf, {_F1_MAX_BYTES \ BYTES_PER_MB:N0} MB){vbCrLf}", 5)   ' §252 (#95)
             AppendLog($"[SafeMpzDiv§5B-f1] a sz={_F1_aSz:N0} r sz={_F1_rSz:N0}{vbCrLf}", 5)   ' §252 (#95)
             Dim _F1_eAccBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F1_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             Dim _F1_eShiftBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F1_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
@@ -6312,7 +6313,7 @@ Public Class Form1
             Dim _F2_bSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(b.Pointer, 4))
             Dim _F2_kLimb As Long = kBits \ 64L
             Dim _F2_kRem As Integer = CInt(kBits Mod 64L)
-            AppendLog($"[SafeMpzDiv§5B-f2] starting r×b chunked-grid reference (chunk={_F2_CHUNK:N0}, prealloc={_F2_MAX_LIMBS:N0} limbs/buf, {_F2_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}", 5)   ' §252 (#95)
+            AppendLog($"[SafeMpzDiv§5B-f2] starting r×b chunked-grid reference (chunk={_F2_CHUNK:N0}, prealloc={_F2_MAX_LIMBS:N0} limbs/buf, {_F2_MAX_BYTES \ BYTES_PER_MB:N0} MB){vbCrLf}", 5)   ' §252 (#95)
             AppendLog($"[SafeMpzDiv§5B-f2] r sz={_F2_rSz:N0} b sz={_F2_bSz:N0} kBits={kBits:N0} kLimb={_F2_kLimb:N0} kRem={_F2_kRem}{vbCrLf}", 5)   ' §252 (#95)
             Dim _F2_eAccBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F2_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             Dim _F2_eShiftBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F2_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
@@ -6791,7 +6792,7 @@ PostShiftCheckpoint:
 
         ' §241 (issue #69): trim pooled temporaries left over from q×b. Census-before
         ' here captures the post-q×b retention (the highest-RAM point in the divide).
-        TrimPoolAtBoundary("post-qxb", 1048576UL)
+        TrimPoolAtBoundary("post-qxb", CULng(BYTES_PER_MB))
 
         ' §5B-f4: Cheap qb sanity checks (post-SafeMpzMul(qb, q, b), pre-subtract).
         ' Mathematically q ≈ q_true (within ±1 by Barrett), so q × b ≈ a (within b).
@@ -6876,7 +6877,7 @@ PostShiftCheckpoint:
             Dim _F5_qSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_qPtr, 4))
             Dim _F5_bD As Long = Runtime.InteropServices.Marshal.ReadInt64(_bPtr, 8)
             Dim _F5_bSz As Integer = System.Math.Abs(Runtime.InteropServices.Marshal.ReadInt32(_bPtr, 4))
-            AppendLog($"[SafeMpzDiv§5B-f5] starting q×b chunked-grid reference (chunk={_F5_CHUNK:N0}, prealloc={_F5_MAX_LIMBS:N0} limbs/buf, {_F5_MAX_BYTES \ 1048576L:N0} MB){vbCrLf}", 5)   ' §252 (#95)
+            AppendLog($"[SafeMpzDiv§5B-f5] starting q×b chunked-grid reference (chunk={_F5_CHUNK:N0}, prealloc={_F5_MAX_LIMBS:N0} limbs/buf, {_F5_MAX_BYTES \ BYTES_PER_MB:N0} MB){vbCrLf}", 5)   ' §252 (#95)
             AppendLog($"[SafeMpzDiv§5B-f5] q sz={_F5_qSz:N0} b sz={_F5_bSz:N0}{vbCrLf}", 5)   ' §252 (#95)
             Dim _F5_eAccBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F5_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
             Dim _F5_eShiftBuf As IntPtr = VirtualAlloc(IntPtr.Zero, New UIntPtr(CULng(_F5_MAX_BYTES)), MEM_COMMIT_RESERVE, VA_PAGE_READWRITE)
@@ -8459,7 +8460,7 @@ Phase2:
                 End If
             End If
 
-            Dim memNow As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+            Dim memNow As Long = Process.GetCurrentProcess().WorkingSet64 \ BYTES_PER_MB
             LogPhase($"Combine level {level}: {currentSize:N0} nodes remaining (RAM: {memNow:N0}MB)")
         End While
 
@@ -8853,7 +8854,7 @@ Phase2:
         gmp_lib.mpz_set(piCopy, pi)
         gmp_lib.mpz_clear(pi)
         gmp_lib.mpz_init(pi)
-        AppendLog($"[§226] piCopy made ({(_piSrcSize * 8L / 1048576L):N0} MB); caller pi freed{vbCrLf}")
+        AppendLog($"[§226] piCopy made ({(_piSrcSize * 8L / BYTES_PER_MB):N0} MB); caller pi freed{vbCrLf}")
 
         ' Recursive halving — writes exactly actualDigits chars at outBuf[0..actualDigits].
         Dim _convStart As DateTime = DateTime.Now
@@ -8971,7 +8972,7 @@ Phase2:
             phaseStopWatch.Restart()
             LogPhase($"Starting: {digits:N0} digits, {numTerms:N0} terms")
 
-            Dim memBefore As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+            Dim memBefore As Long = Process.GetCurrentProcess().WorkingSet64 \ BYTES_PER_MB
             LogPhase($"Memory before computation: {memBefore:N0}MB")
 
             If token.IsCancellationRequested Then Return ""
@@ -9044,7 +9045,7 @@ Phase2:
 
             LogPhase($"Binary Splitting complete ({nodes.Count} nodes)")
 
-            Dim memAfterSplit As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+            Dim memAfterSplit As Long = Process.GetCurrentProcess().WorkingSet64 \ BYTES_PER_MB
             LogPhase($"Memory after split: {memAfterSplit:N0}MB")
 
             If _logLevel >= 2 Then
@@ -9070,7 +9071,7 @@ Phase2:
 
             While nodes.Count > 1
                 combineIteration += 1
-                Dim memDuringCombine As Long = Process.GetCurrentProcess().WorkingSet64 \ 1048576
+                Dim memDuringCombine As Long = Process.GetCurrentProcess().WorkingSet64 \ BYTES_PER_MB
                 LogPhase($"Final combine iteration {combineIteration}: {nodes.Count} nodes → {(nodes.Count + 1) \ 2} nodes (RAM: {memDuringCombine:N0}MB)")
 
                 Dim nextNodes As New List(Of Result)()
@@ -9224,10 +9225,10 @@ Phase3Start:
                 If _fpSz > 1 Then
                     gmp_lib.mpz_clear(finalP)
                     gmp_lib.mpz_init(finalP)   ' 0-stub: later mpz_clears(gmpSqrt, finalP) stays safe
-                    LogPhase($"[ComputePi§244] freed finalP early (~{_fpSz * 8L \ 1048576L:N0} MB) — dead from Step 1 on; headroom for parallel Step 1/2")
+                    LogPhase($"[ComputePi§244] freed finalP early (~{_fpSz * 8L \ BYTES_PER_MB:N0} MB) — dead from Step 1 on; headroom for parallel Step 1/2")
                 End If
             End If
-            TrimPoolAtBoundary("pre-step1", 1048576UL)   ' §69/§243: max headroom before the floor decides DOP
+            TrimPoolAtBoundary("pre-step1", CULng(BYTES_PER_MB))   ' §69/§243: max headroom before the floor decides DOP
 
             ' §83 Option A: 10^digits is a deterministic constant for this digit count.
             ' Checkpoint it after Step 1 and skip Step 1 on resume — closes the snap_Phase3 →
@@ -9507,8 +9508,8 @@ BeforeStep4:
 
             If _logLevel >= 3 Then
                 Dim _procP_pre = Process.GetCurrentProcess()
-                Dim _ramP_pre As Long = _procP_pre.WorkingSet64 \ 1048576
-                Dim _vmP_pre As Long = _procP_pre.PrivateMemorySize64 \ 1048576
+                Dim _ramP_pre As Long = _procP_pre.WorkingSet64 \ BYTES_PER_MB
+                Dim _vmP_pre As Long = _procP_pre.PrivateMemorySize64 \ BYTES_PER_MB
                 WriteToLog($"[ComputePi] §61 serial multiply start: r0=N*Q0, r1=N*Q1, r2=N*Q2  RAM:{_ramP_pre:N0}MB  Committed:{_vmP_pre:N0}MB")
             End If
             WriteToLog($"[ComputePi] §61 r0 DIAG: rop.Ptr={mpR0.Pointer:X} rop_alloc={Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer,0):N0} rop_sz={Runtime.InteropServices.Marshal.ReadInt32(mpR0.Pointer,4):N0} rop_d={Runtime.InteropServices.Marshal.ReadInt64(mpR0.Pointer,8):X}")
@@ -9621,8 +9622,8 @@ BeforeStep4:
             WriteToLog("[ComputePi] §61 clear r2 done")
             If _logLevel >= 3 Then
                 Dim _procP_post = Process.GetCurrentProcess()
-                Dim _ramP_post As Long = _procP_post.WorkingSet64 \ 1048576
-                Dim _vmP_post As Long = _procP_post.PrivateMemorySize64 \ 1048576
+                Dim _ramP_post As Long = _procP_post.WorkingSet64 \ BYTES_PER_MB
+                Dim _vmP_post As Long = _procP_post.PrivateMemorySize64 \ BYTES_PER_MB
                 WriteToLog($"[ComputePi] §61 parallel multiply done; entering Combine  RAM:{_ramP_post:N0}MB  Committed:{_vmP_post:N0}MB")
             End If
             If _logLevel >= 4 Then WriteToLog($"[ComputePi] r2 (= gmpNumer after swap) = {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
@@ -9691,8 +9692,8 @@ BeforeStep4:
             gmp_lib.mpz_clear(mpShiftA)     ' frees the old ~390 MB limb buffer
             If _logLevel >= 3 Then
                 Dim _procCA = Process.GetCurrentProcess()
-                Dim _ramCombA As Long = _procCA.WorkingSet64 \ 1048576
-                Dim _vmCombA As Long = _procCA.PrivateMemorySize64 \ 1048576
+                Dim _ramCombA As Long = _procCA.WorkingSet64 \ BYTES_PER_MB
+                Dim _vmCombA As Long = _procCA.PrivateMemorySize64 \ BYTES_PER_MB
                 WriteToLog($"[ComputePi] Combine A done (r2<<k)  RAM:{_ramCombA:N0}MB  Committed:{_vmCombA:N0}MB")
             End If
             If _logLevel >= 4 Then WriteToLog($"[ComputePi] Combine A result: {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
@@ -9703,8 +9704,8 @@ BeforeStep4:
             If _logLevel >= 4 Then WriteToLog($"[ComputePi] Combine B: add gmpNumer ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) + r1 ({CLng(gmp_lib.mpz_sizeinbase(mpR1, 2)):N0} bits)")
             If _logLevel >= 3 Then
                 Dim _procCBpre = Process.GetCurrentProcess()
-                Dim _ramCombBpre As Long = _procCBpre.WorkingSet64 \ 1048576
-                Dim _vmCombBpre As Long = _procCBpre.PrivateMemorySize64 \ 1048576
+                Dim _ramCombBpre As Long = _procCBpre.WorkingSet64 \ BYTES_PER_MB
+                Dim _vmCombBpre As Long = _procCBpre.PrivateMemorySize64 \ BYTES_PER_MB
                 WriteToLog($"[ComputePi] Combine B r1 in RAM  RAM:{_ramCombBpre:N0}MB  Committed:{_vmCombBpre:N0}MB")
             End If
             Dim mpAddB As New mpz_t()
@@ -9726,8 +9727,8 @@ BeforeStep4:
             gmp_lib.mpz_clear(mpR1)
             If _logLevel >= 3 Then
                 Dim _procCB = Process.GetCurrentProcess()
-                Dim _ramCombB As Long = _procCB.WorkingSet64 \ 1048576
-                Dim _vmCombB As Long = _procCB.PrivateMemorySize64 \ 1048576
+                Dim _ramCombB As Long = _procCB.WorkingSet64 \ BYTES_PER_MB
+                Dim _vmCombB As Long = _procCB.PrivateMemorySize64 \ BYTES_PER_MB
                 WriteToLog($"[ComputePi] Combine B done (+r1)  RAM:{_ramCombB:N0}MB  Committed:{_vmCombB:N0}MB")
             End If
             If _logLevel >= 4 Then WriteToLog($"[ComputePi] Combine B result: {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
@@ -9753,8 +9754,8 @@ BeforeStep4:
             gmp_lib.mpz_clear(mpShiftC)
             If _logLevel >= 3 Then
                 Dim _procCC = Process.GetCurrentProcess()
-                Dim _ramCombC As Long = _procCC.WorkingSet64 \ 1048576
-                Dim _vmCombC As Long = _procCC.PrivateMemorySize64 \ 1048576
+                Dim _ramCombC As Long = _procCC.WorkingSet64 \ BYTES_PER_MB
+                Dim _vmCombC As Long = _procCC.PrivateMemorySize64 \ BYTES_PER_MB
                 WriteToLog($"[ComputePi] Combine C done ((r2<<k+r1)<<k)  RAM:{_ramCombC:N0}MB  Committed:{_vmCombC:N0}MB")
             End If
             If _logLevel >= 4 Then WriteToLog($"[ComputePi] Combine C result: {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
@@ -9765,8 +9766,8 @@ BeforeStep4:
             If _logLevel >= 4 Then WriteToLog($"[ComputePi] Combine D: add gmpNumer ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits) + r0 ({CLng(gmp_lib.mpz_sizeinbase(mpR0, 2)):N0} bits)")
             If _logLevel >= 3 Then
                 Dim _procCDpre = Process.GetCurrentProcess()
-                Dim _ramCombDpre As Long = _procCDpre.WorkingSet64 \ 1048576
-                Dim _vmCombDpre As Long = _procCDpre.PrivateMemorySize64 \ 1048576
+                Dim _ramCombDpre As Long = _procCDpre.WorkingSet64 \ BYTES_PER_MB
+                Dim _vmCombDpre As Long = _procCDpre.PrivateMemorySize64 \ BYTES_PER_MB
                 WriteToLog($"[ComputePi] Combine D r0 in RAM  RAM:{_ramCombDpre:N0}MB  Committed:{_vmCombDpre:N0}MB")
             End If
             Dim mpAddD As New mpz_t()
@@ -9788,8 +9789,8 @@ BeforeStep4:
             gmp_lib.mpz_clear(mpR0)
             If _logLevel >= 3 Then
                 Dim _procCD = Process.GetCurrentProcess()
-                Dim _ramCombD As Long = _procCD.WorkingSet64 \ 1048576
-                Dim _vmCombD As Long = _procCD.PrivateMemorySize64 \ 1048576
+                Dim _ramCombD As Long = _procCD.WorkingSet64 \ BYTES_PER_MB
+                Dim _vmCombD As Long = _procCD.PrivateMemorySize64 \ BYTES_PER_MB
                 WriteToLog($"[ComputePi] Combine D done (+r0)  RAM:{_ramCombD:N0}MB  Committed:{_vmCombD:N0}MB")
             End If
             If _logLevel >= 4 Then WriteToLog($"[ComputePi] Combine D result (final gmpNumer): {CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)):N0} bits ({CLng(gmp_lib.mpz_sizeinbase(gmpNumer, 2)) \ 8388608:N0} MB)")
@@ -9905,7 +9906,7 @@ NumeratorDone:
             ' §241 (issue #69): trim pooled temporaries accumulated across the whole
             ' final divide before the decimal conversion allocates its big output buffer.
             ' Census-before here is the post-divide pool watermark.
-            TrimPoolAtBoundary("pre-conversion", 1048576UL)
+            TrimPoolAtBoundary("pre-conversion", CULng(BYTES_PER_MB))
 
             If token.IsCancellationRequested Then Return ""
 

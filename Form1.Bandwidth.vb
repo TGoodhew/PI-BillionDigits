@@ -40,7 +40,7 @@ Partial Class Form1
         Dim parsedN As Integer
         If envN IsNot Nothing AndAlso Integer.TryParse(envN, parsedN) AndAlso parsedN >= 6_000_000 Then n = parsedN
 
-        log($"operands: {n:N0} × {n:N0} limbs ({CLng(n) * 8L \ 1048576L:N0} MB each); L3≈30 MB ⇒ ~{CLng(n) * 8L \ 1048576L \ 30L}× overflow")
+        log($"operands: {n:N0} × {n:N0} limbs ({CLng(n) * 8L \ BYTES_PER_MB:N0} MB each); L3≈30 MB ⇒ ~{CLng(n) * 8L \ BYTES_PER_MB \ 30L}× overflow")
         Dim rng As New Random(20260604)
         Dim a As New mpz_t() : a.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : FillRandomMpz(a, n, rng)
         Dim b As New mpz_t() : b.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : FillRandomMpz(b, n, rng)
@@ -134,7 +134,7 @@ Partial Class Form1
         Dim parsedN As Integer
         If envN IsNot Nothing AndAlso Integer.TryParse(envN, parsedN) AndAlso parsedN >= 6_000_000 Then n = parsedN
 
-        log($"operands: {n:N0} × {n:N0} limbs ({CLng(n) * 8L \ 1048576L:N0} MB each); cores={Environment.ProcessorCount}")
+        log($"operands: {n:N0} × {n:N0} limbs ({CLng(n) * 8L \ BYTES_PER_MB:N0} MB each); cores={Environment.ProcessorCount}")
         Dim rng As New Random(20260604)
         Dim a As New mpz_t() : a.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : FillRandomMpz(a, n, rng)
         Dim b As New mpz_t() : b.Pointer = Runtime.InteropServices.Marshal.AllocHGlobal(16) : FillRandomMpz(b, n, rng)
@@ -215,7 +215,7 @@ Partial Class Form1
         Dim parsedN As Integer
         If envN IsNot Nothing AndAlso Integer.TryParse(envN, parsedN) AndAlso parsedN >= 6_000_000 Then n = parsedN
 
-        log($"operands: {n:N0} × {n:N0} limbs ({CLng(n) * 8L \ 1048576L:N0} MB each); cores={Environment.ProcessorCount}")
+        log($"operands: {n:N0} × {n:N0} limbs ({CLng(n) * 8L \ BYTES_PER_MB:N0} MB each); cores={Environment.ProcessorCount}")
         log($"  availPhys={MemBudget_AvailablePhysicalGB():F1}GB availCommit={MemBudget_AvailableCommitGB():F1}GB")
         If _statusHook IsNot Nothing Then _statusHook($"CellSweep: filling 2×{n:N0}-limb operands…")
         Dim rng As New Random(20260604)
