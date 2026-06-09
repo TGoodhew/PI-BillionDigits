@@ -4249,6 +4249,126 @@ Public Class Form1
     '  Main computation entry point
     ' ════════════════════════════════════════════════════════════════════════
 
+    ''' <summary>
+    ''' §280 (#113): the final decimal-conversion stage, lifted VERBATIM out of ComputePiGMP
+    ''' (orchestration extraction — no logic change).  Size-routes gmpPi through the §270 parallel /
+    ''' §216 chunked / mpz_get_str converter, drives the status timer + §127 size-ETA, sets the
+    ''' _displayNative* fields, and frees gmpPi (reinit'd to a 1-limb stub for the caller's Finally).
+    ''' </summary>
+    Private Sub ConvertResultToDecimal(gmpPi As mpz_t)
+            If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_get_str: converting result to string")
+            Dim _strConvStart As DateTime = DateTime.Now
+            ' §127 (#127): output digit count — known up front, so the parallel-converter status (which
+            ' publishes no per-chunk progress) can show a rough size-based ETA.  Also used for routing below.
+            Dim _piDigitsEstimate As Long = CLng(gmp_lib.mpz_sizeinbase(gmpPi, 10))
+            Dim _strConvTimer As New System.Threading.Timer(
+                Sub(state As Object)
+                    Dim elapsed As TimeSpan = DateTime.Now - _strConvStart
+                    ' §74 (issue #74): when ChunkedMpzGetStr is running it publishes (current,total)
+                    ' so a 2-hour conversion shows visible chunk progress every ~minute instead of
+                    ' a single mm:ss timer that's indistinguishable from a hang.  Snapshot both
+                    ' fields locally to avoid a torn read across the conditional and the format.
+                    Dim total As Long = _chunkConvTotal
+                    Dim current As Long = _chunkConvCurrent
+                    Dim statusText As String
+                    If total > 0 Then
+                        Dim etaText As String = ""
+                        If current > 0 AndAlso current < total Then
+                            Dim etaMinutes As Double = elapsed.TotalMinutes * CDbl(total - current) / CDbl(current)
+                            If etaMinutes >= 60.0 Then
+                                etaText = $", ETA ~{etaMinutes / 60.0:F1}h"
+                            Else
+                                etaText = $", ETA ~{etaMinutes:F0}m"
+                            End If
+                        End If
+                        statusText = $"String conversion: chunk {current:N0} of {total:N0}, {elapsed:hh\:mm\:ss} elapsed{etaText}"
+                    Else
+                        ' §127 (#127): the parallel §226/§270 converter publishes no per-chunk progress,
+                        ' so derive a rough ETA from the known output size and the observed §270 rate
+                        ' (~5M digits/s at 5B — the conservative large-scale figure; smaller runs finish
+                        ' sooner than predicted).  Shows the digit count too (not redundant with the
+                        ' running-time label).  Labelled "~est" to flag it as a size-based estimate.
+                        Dim etaText As String = ""
+                        If _piDigitsEstimate > 0 Then
+                            Dim remSec As Double = System.Math.Max(0.0, _piDigitsEstimate / 5_000_000.0 - elapsed.TotalSeconds)
+                            etaText = If(remSec >= 3600.0, $", ~est {remSec / 3600.0:F1}h left", $", ~est {remSec / 60.0:F0}m left")
+                        End If
+                        statusText = $"String conversion ({_piDigitsEstimate:N0} digits)... {elapsed:hh\:mm\:ss} elapsed{etaText}"
+                    End If
+                    Me.BeginInvoke(Sub()
+                                       LblStatus.Text = statusText
+                                   End Sub)
+                End Sub, Nothing, 1000, 1000)
+            ' §216: GMP's mpz_get_str crashes with AccessViolation when the output exceeds
+            ' ~2 GB (5B digits = 5 GB output).  Root cause appears to be Int32 overflow in
+            ' mpz_get_str's internal recursive divide-and-conquer.  Route large outputs to
+            ' ChunkedMpzGetStr which extracts 300M-digit slabs via mpz_fdiv_qr / 10^300M and
+            ' calls mpz_get_str on each (each chunk ≤ 300 MB output, well within safe range).
+            ' (_piDigitsEstimate computed above, before the status timer — §127.)
+            Dim _usedChunkedPath As Boolean = False
+            Dim piCharPtr As char_ptr = char_ptr.Zero
+            Dim _strConvSw As New Diagnostics.Stopwatch()
+            _strConvSw.Start()
+            Try
+                ' §226 (issue #37, 2026-05-22): route to parallel recursive-halving
+                ' converter for digits >= 100M (≈ minimum size where the recursion
+                ' tree has enough depth to amortize the power-of-10 precompute
+                ' against parallel fan-out gains).  Above 1.5B, §216 chunked path
+                ' remains as conservative fallback until §226 is 5B-validated.
+                If _piDigitsEstimate >= 1_500_000_000L Then
+                    ' §270 (#90): §226's safe-peel split rule makes the PARALLEL converter 5B-safe.
+                    ' VALIDATED at 5B (π SHA 2218ee06… bit-identical, ~15.6 min vs §216's ~47 min, RAM
+                    ' ~19 GB) ⇒ now the default; opt out with PI_CONV_PARALLEL=0 to use the §216 serial path.
+                    If Environment.GetEnvironmentVariable("PI_CONV_PARALLEL") <> "0" Then
+                        WriteToLog($"[ComputePi§270] Routing 5B to PARALLEL converter (§226 safe-peel, digits~={_piDigitsEstimate:N0}){vbCrLf}")
+                        ParallelMpzGetStr(gmpPi, _piDigitsEstimate)   ' sets _displayNative*
+                    Else
+                        WriteToLog($"[ComputePi§216] Routing to chunked decimal converter (digits~={_piDigitsEstimate:N0} >= 1.5B threshold){vbCrLf}")
+                        ChunkedMpzGetStr(gmpPi, _piDigitsEstimate)   ' sets _displayNativePtr, _displayNativeLen, _displayNativeBufSize
+                    End If
+                    _usedChunkedPath = True
+                ElseIf _piDigitsEstimate >= 100_000_000L Then
+                    WriteToLog($"[ComputePi§226] Routing to parallel decimal converter (digits~={_piDigitsEstimate:N0} >= 100M threshold){vbCrLf}")
+                    ParallelMpzGetStr(gmpPi, _piDigitsEstimate)   ' sets _displayNativePtr, _displayNativeLen, _displayNativeBufSize
+                    _usedChunkedPath = True   ' reuse same downstream flag (display state already set)
+                Else
+                    piCharPtr = gmp_lib.mpz_get_str(char_ptr.Zero, 10, gmpPi)
+                End If
+            Finally
+                _strConvTimer.Dispose()
+            End Try
+            _strConvSw.Stop()
+            WriteToLog($"[ComputePi] mpz_get_str completed in {_strConvSw.Elapsed:mm\:ss\.fff}")
+            ' §217 (2026-05-19, user directive after the 2026-05-19 5B run lost gmpPi.bin):
+            ' NO CHECKPOINT IS DELETED MID-RUN.  This site previously fired right after
+            ' mpz_get_str (or ChunkedMpzGetStr) succeeded, but the run is not done at
+            ' that point — we still need to write pi_digits.txt, run autoverify, and
+            ' cleanly exit.  If any of those fail, the gmpPi.bin checkpoint is the only
+            ' thing standing between us and a 30+ hour SafeMpzDiv re-run from snap_Phase3.
+            ' The load-side validator at line ~7341 silently rejects stale gmpPi.bin
+            ' with a digit-count mismatch, so leaving the file on disk is safe.
+            ' Cleanup happens externally between runs, never here.
+            ' Capture the actual digit count BEFORE clearing gmpPi.
+            ' mpz_sizeinbase returns an estimate within +1; add 2 to match GMP's internal
+            ' alloc of (sizeinbase + 2) bytes.  Used to set _displayNativeLen correctly and
+            ' to decide whether to free the buffer via VirtualFree or _savedGmpFree.
+            Dim _piDigits As Long = CLng(gmp_lib.mpz_sizeinbase(gmpPi, 10))
+            ' §216: when chunked path was used, _displayNativePtr/Len/BufSize are already set.
+            If Not _usedChunkedPath Then
+                _displayNativeBufSize = _piDigits + 2L   ' mirrors GmpAllocFunc's received size
+            End If
+            ' Free gmpPi now (~744 MB native); reinit 1-limb stub so Finally mpz_clears is safe.
+            gmp_lib.mpz_clear(gmpPi)
+            gmp_lib.mpz_init(gmpPi)
+            ' Keep the native char buffer alive — the display timer will stream bytes
+            ' directly from it, avoiding any large managed string allocation.
+            If Not _usedChunkedPath Then
+                _displayNativePtr = piCharPtr.Pointer
+                _displayNativeLen = _piDigits + 1L   ' digits + null terminator position
+            End If
+            LogPhase("String conversion complete")
+    End Sub
+
     Private Function ComputePiGMP(digits As Long, token As CancellationToken) As String
 
         ' §224 (issue #41): trigger CpuTopology detection + logging on first run.
@@ -5116,117 +5236,7 @@ NumeratorDone:
 
             If token.IsCancellationRequested Then Return ""
 
-            If _logLevel >= 2 Then WriteToLog($"[ComputePi] mpz_get_str: converting result to string")
-            Dim _strConvStart As DateTime = DateTime.Now
-            ' §127 (#127): output digit count — known up front, so the parallel-converter status (which
-            ' publishes no per-chunk progress) can show a rough size-based ETA.  Also used for routing below.
-            Dim _piDigitsEstimate As Long = CLng(gmp_lib.mpz_sizeinbase(gmpPi, 10))
-            Dim _strConvTimer As New System.Threading.Timer(
-                Sub(state As Object)
-                    Dim elapsed As TimeSpan = DateTime.Now - _strConvStart
-                    ' §74 (issue #74): when ChunkedMpzGetStr is running it publishes (current,total)
-                    ' so a 2-hour conversion shows visible chunk progress every ~minute instead of
-                    ' a single mm:ss timer that's indistinguishable from a hang.  Snapshot both
-                    ' fields locally to avoid a torn read across the conditional and the format.
-                    Dim total As Long = _chunkConvTotal
-                    Dim current As Long = _chunkConvCurrent
-                    Dim statusText As String
-                    If total > 0 Then
-                        Dim etaText As String = ""
-                        If current > 0 AndAlso current < total Then
-                            Dim etaMinutes As Double = elapsed.TotalMinutes * CDbl(total - current) / CDbl(current)
-                            If etaMinutes >= 60.0 Then
-                                etaText = $", ETA ~{etaMinutes / 60.0:F1}h"
-                            Else
-                                etaText = $", ETA ~{etaMinutes:F0}m"
-                            End If
-                        End If
-                        statusText = $"String conversion: chunk {current:N0} of {total:N0}, {elapsed:hh\:mm\:ss} elapsed{etaText}"
-                    Else
-                        ' §127 (#127): the parallel §226/§270 converter publishes no per-chunk progress,
-                        ' so derive a rough ETA from the known output size and the observed §270 rate
-                        ' (~5M digits/s at 5B — the conservative large-scale figure; smaller runs finish
-                        ' sooner than predicted).  Shows the digit count too (not redundant with the
-                        ' running-time label).  Labelled "~est" to flag it as a size-based estimate.
-                        Dim etaText As String = ""
-                        If _piDigitsEstimate > 0 Then
-                            Dim remSec As Double = System.Math.Max(0.0, _piDigitsEstimate / 5_000_000.0 - elapsed.TotalSeconds)
-                            etaText = If(remSec >= 3600.0, $", ~est {remSec / 3600.0:F1}h left", $", ~est {remSec / 60.0:F0}m left")
-                        End If
-                        statusText = $"String conversion ({_piDigitsEstimate:N0} digits)... {elapsed:hh\:mm\:ss} elapsed{etaText}"
-                    End If
-                    Me.BeginInvoke(Sub()
-                                       LblStatus.Text = statusText
-                                   End Sub)
-                End Sub, Nothing, 1000, 1000)
-            ' §216: GMP's mpz_get_str crashes with AccessViolation when the output exceeds
-            ' ~2 GB (5B digits = 5 GB output).  Root cause appears to be Int32 overflow in
-            ' mpz_get_str's internal recursive divide-and-conquer.  Route large outputs to
-            ' ChunkedMpzGetStr which extracts 300M-digit slabs via mpz_fdiv_qr / 10^300M and
-            ' calls mpz_get_str on each (each chunk ≤ 300 MB output, well within safe range).
-            ' (_piDigitsEstimate computed above, before the status timer — §127.)
-            Dim _usedChunkedPath As Boolean = False
-            Dim piCharPtr As char_ptr = char_ptr.Zero
-            Dim _strConvSw As New Diagnostics.Stopwatch()
-            _strConvSw.Start()
-            Try
-                ' §226 (issue #37, 2026-05-22): route to parallel recursive-halving
-                ' converter for digits >= 100M (≈ minimum size where the recursion
-                ' tree has enough depth to amortize the power-of-10 precompute
-                ' against parallel fan-out gains).  Above 1.5B, §216 chunked path
-                ' remains as conservative fallback until §226 is 5B-validated.
-                If _piDigitsEstimate >= 1_500_000_000L Then
-                    ' §270 (#90): §226's safe-peel split rule makes the PARALLEL converter 5B-safe.
-                    ' VALIDATED at 5B (π SHA 2218ee06… bit-identical, ~15.6 min vs §216's ~47 min, RAM
-                    ' ~19 GB) ⇒ now the default; opt out with PI_CONV_PARALLEL=0 to use the §216 serial path.
-                    If Environment.GetEnvironmentVariable("PI_CONV_PARALLEL") <> "0" Then
-                        WriteToLog($"[ComputePi§270] Routing 5B to PARALLEL converter (§226 safe-peel, digits~={_piDigitsEstimate:N0}){vbCrLf}")
-                        ParallelMpzGetStr(gmpPi, _piDigitsEstimate)   ' sets _displayNative*
-                    Else
-                        WriteToLog($"[ComputePi§216] Routing to chunked decimal converter (digits~={_piDigitsEstimate:N0} >= 1.5B threshold){vbCrLf}")
-                        ChunkedMpzGetStr(gmpPi, _piDigitsEstimate)   ' sets _displayNativePtr, _displayNativeLen, _displayNativeBufSize
-                    End If
-                    _usedChunkedPath = True
-                ElseIf _piDigitsEstimate >= 100_000_000L Then
-                    WriteToLog($"[ComputePi§226] Routing to parallel decimal converter (digits~={_piDigitsEstimate:N0} >= 100M threshold){vbCrLf}")
-                    ParallelMpzGetStr(gmpPi, _piDigitsEstimate)   ' sets _displayNativePtr, _displayNativeLen, _displayNativeBufSize
-                    _usedChunkedPath = True   ' reuse same downstream flag (display state already set)
-                Else
-                    piCharPtr = gmp_lib.mpz_get_str(char_ptr.Zero, 10, gmpPi)
-                End If
-            Finally
-                _strConvTimer.Dispose()
-            End Try
-            _strConvSw.Stop()
-            WriteToLog($"[ComputePi] mpz_get_str completed in {_strConvSw.Elapsed:mm\:ss\.fff}")
-            ' §217 (2026-05-19, user directive after the 2026-05-19 5B run lost gmpPi.bin):
-            ' NO CHECKPOINT IS DELETED MID-RUN.  This site previously fired right after
-            ' mpz_get_str (or ChunkedMpzGetStr) succeeded, but the run is not done at
-            ' that point — we still need to write pi_digits.txt, run autoverify, and
-            ' cleanly exit.  If any of those fail, the gmpPi.bin checkpoint is the only
-            ' thing standing between us and a 30+ hour SafeMpzDiv re-run from snap_Phase3.
-            ' The load-side validator at line ~7341 silently rejects stale gmpPi.bin
-            ' with a digit-count mismatch, so leaving the file on disk is safe.
-            ' Cleanup happens externally between runs, never here.
-            ' Capture the actual digit count BEFORE clearing gmpPi.
-            ' mpz_sizeinbase returns an estimate within +1; add 2 to match GMP's internal
-            ' alloc of (sizeinbase + 2) bytes.  Used to set _displayNativeLen correctly and
-            ' to decide whether to free the buffer via VirtualFree or _savedGmpFree.
-            Dim _piDigits As Long = CLng(gmp_lib.mpz_sizeinbase(gmpPi, 10))
-            ' §216: when chunked path was used, _displayNativePtr/Len/BufSize are already set.
-            If Not _usedChunkedPath Then
-                _displayNativeBufSize = _piDigits + 2L   ' mirrors GmpAllocFunc's received size
-            End If
-            ' Free gmpPi now (~744 MB native); reinit 1-limb stub so Finally mpz_clears is safe.
-            gmp_lib.mpz_clear(gmpPi)
-            gmp_lib.mpz_init(gmpPi)
-            ' Keep the native char buffer alive — the display timer will stream bytes
-            ' directly from it, avoiding any large managed string allocation.
-            If Not _usedChunkedPath Then
-                _displayNativePtr = piCharPtr.Pointer
-                _displayNativeLen = _piDigits + 1L   ' digits + null terminator position
-            End If
-            LogPhase("String conversion complete")
+            ConvertResultToDecimal(gmpPi)
 
             LogPhase($"Done! {digits:N0} digits computed")
             Return ""

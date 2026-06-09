@@ -6499,3 +6499,13 @@ The numerator stage in ComputePiGMP is now a single call.  Clean 9-value boundar
 was already block-local; mpz results propagate through the shared .Pointer.  No logic change.
 **Validated: 1B from-scratch π SHA `b153e8d5…` bit-identical** (r0/r1/r2 ran from the extracted helper).
 Build clean.  This is the issue's headline target (ComputePiGMP ~1000 lines) — first orchestration lift.
+
+## §280 (cont.) — Decompose: lift ConvertResultToDecimal out of ComputePiGMP (2026-06-09, issue #113, extraction 3)
+
+The final decimal-conversion stage (~110-line block: status timer + §127 size-ETA, the §270 parallel /
+§216 chunked / mpz_get_str size-routing, the _displayNative* field setup, and the gmpPi free/reinit) is
+lifted VERBATIM out of ComputePiGMP into `ConvertResultToDecimal(gmpPi)`.  Clean single-input boundary —
+it only sets instance fields and clears gmpPi, nothing the caller needs after.  No logic change.
+**Validated: 1B from-scratch π SHA `b153e8d5…` bit-identical** ("String conversion complete" ran from the
+extracted method).  Build clean.  ComputePiGMP has now shed ~200 lines across two whole stages (numerator
+§280-ext2 + conversion §280-ext3), each now a single readable call.
