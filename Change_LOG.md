@@ -6468,3 +6468,14 @@ refreshes the real current stage (observed wrong in the 5B run). (b) The combine
 title ETA** (was a multi-hour no-ETA gap): the Phase-1 poll feeds a *true* progress fraction
 (chunks done / total), the Phase-2 poll a cost-based refresh, both throttled to ~20 s so `[ETA§259]`
 isn't spammed. Together with the §116/§126 terminal state, this closes #126's "cover all stages" option.
+
+## §278 — Split Form1.vb into logical partial-class files (2026-06-08, issue #114)
+
+Pure file-move (no logic change) — `Form1.vb` 10,632 → **5,751 lines**, with ~4,900 lines moved into six
+new `Partial Class Form1` files following the established §258–260 pattern: `Form1.Mul.vb` (SafeMpzMul),
+`Form1.Reciprocal.vb` (SafeMpzReciprocal), `Form1.Divide.vb` (SafeMpzDiv), `Form1.Sqrt.vb`
+(SafeMpzSqrt), `Form1.BinarySplit.vb` (ChunkWork + BinarySplitGMP), `Form1.Convert.vb` (the §216/§226/§270
+decimal converters). Each block was extracted on verified method boundaries (4-space `End Sub`/`Function`)
+so no member was dropped, duplicated, or split. Compiles identically (Debug build clean; `--test-chunkedgrid`
+fullEq=True exercises the moved SafeMpzMul); behaviour confirmed by the post-split 5B run. The remaining
+candidates (GmpRaw wrappers, chunked-grid, mpz helpers) are a possible follow-up.
