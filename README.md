@@ -79,13 +79,19 @@ The computation uses the **Chudnovsky algorithm** with **binary splitting**, whi
 | **Write to File** checkbox | When checked, the full digit string is saved to `pi_digits.txt` in the output directory (default `C:\PiOutput`) after computation. |
 | **Verify after compute** checkbox | When checked, the known-digit verification (see **Verify Now**) runs automatically as soon as the computation finishes, with the result reported in the status bar — no dialog boxes. |
 | **RAM Threshold** spinner | Node-count threshold deciding RAM vs disk per combine level: if a level's node count is ≤ this value it stays in RAM (faster); above it, nodes are written to the NVMe cache (less RAM). Auto-detected from available RAM at startup (≥16 GB → 200,000; ≥8 GB → 100,000; <8 GB → 1). Mirrors the `-Threshold` script parameter / `--threshold` CLI flag. |
-| **Log Level** spinner | Runtime logging verbosity, 0–5 (0 = errors only, 2 = phase milestones [default], rising to 5 = exceptionally detailed per-operation dumps). Mirrors the `--log-level` CLI flag. |
+| **Log level** dropdown | Runtime logging verbosity as a described 0–5 dropdown (§277), replacing the older opaque spinner: `0 — Silent (errors + crashes only)`, `1 — Errors + result`, `2 — Phase milestones (default)`, `3 — Sub-phase trace`, `4 — Detailed (mul diagnostics)`, `5 — Allocator/affinity (very large)`. Higher levels write strictly more — level 5 produces per-operation limb dumps and is gigabytes at 5 B digits, so leave it at 2 for production runs. Mirrors the `--log-level` CLI flag. |
+| **Auto-checkpoint (resume)** checkbox | (§277) When checked, a RAM snapshot is written at the end of each Phase 2 combine level (and at the Phase-3 boundary), so an interrupted run **auto-resumes from the last completed level** on the next launch instead of restarting from scratch. Impact: adds modest per-level snapshot I/O to the NVMe cache, in exchange for crash/resume safety on multi-hour runs. Resume is automatic *only if this box is checked again* on the next run and the same Output directory + digit count are used. Auto-enabled for runs ≥ 100 M digits (see note below). Mirrors `--auto-checkpoint`. |
+| **Auto-OK dialogs (unattended)** checkbox | (§277/#119) When checked, spontaneous informational/error dialogs — including a mid-run OOM notice and the global unhandled-exception modal — are logged and auto-dismissed so an **unattended** interactive run never blocks waiting for a click. Impact: the run proceeds (or fails) without pausing; the dialog text still lands in the phase log with a `[DIALOG]` prefix. Close/Cancel **confirmation** prompts are never auto-confirmed. |
+| **Output** directory field + **Browse** | (§277) Sets the output directory (digits file, phase log, and `NodeCache\`); defaults to `C:\PiOutput`. Browse opens a folder picker. Mirrors `--output-dir`. Point a resume run at the **same** directory the original run used, or its checkpoints won't be found. |
 | **Verify Now** button | Searches the computed digits for three known substrings and reports whether they appear at the correct positions: `999999` (expected at position 762, the Feynman point), `777777777` (expected at position 24,658,601), and `999999999` (nine 9s, expected at position 564,665,206). Searches the full native buffer. |
 | **Status** bar | Shows the current phase (e.g., "Streaming 1,000,000,000 digits...") or any error message. |
+| **Window title** | (§116/§126/§127) During a run the title shows live progress and a projected ETA (`π 1,000,000,000 — ~2h14m remaining`); at completion it switches to a terminal state (Done / Verified) so it never freezes on a stale ETA. GUI-only. |
 | **Running Time** label | Elapsed wall-clock time since Start was clicked, updated every second. |
 | **Displayed** label | Running count of digits shown in the output panel so far. |
 | **Phase log** list box | Timestamped log of major computation phases (chunk processing, combine levels, string conversion, streaming). Each entry shows elapsed time since Start. |
 | **Output panel** | Black-background, lime-on-black RichTextBox showing the Pi digits, prefixed with `3.`. For runs larger than 250,000 digits it becomes a movable 250,000-digit window with a TrackBar beneath it that scrubs across the full result — each slice is read on demand from the native buffer (O(1) per move), avoiding the O(n²) cost of streaming a billion digits into the control (§271). |
+
+> **Large-run safety auto-enable (§118).** For an *interactive* run of **≥ 100 M digits**, clicking **Start** automatically forces **Write-to-File ON**, **Auto-checkpoint ON**, and **Display OFF** (logged at level 1), so a multi-hour run can never finish with nothing saved, no resume point, and an expensive billion-digit render. Headless runs are left untouched — they set these explicitly via flags. To keep one of these off on a large interactive run, change it *after* Start has logged the auto-enable, or drive the run headlessly.
 
 ---
 
@@ -106,6 +112,8 @@ The executable accepts the following flags (most are also surfaced through `Run-
 | `--checkpoint-from-level` | `N` | Serialize nodes at level ≥ `N` to disk (enables resume). |
 | `--resume-from-level` | `N` | Skip Phase 1 and levels `1..N-1`; load checkpoint files for level `N`. |
 | `--auto-checkpoint` | — | Write a RAM snapshot at the end of each level; auto-resume on the next launch. |
+| `--require-free-ram` | — | Headless only (§120): **abort before start** (exit code 3) if available RAM is below the projected peak + headroom, instead of only logging the `[WARN]`. CLI form of `PI_REQUIRE_FREE_RAM=1`. |
+| `--help`, `-h`, `/?`, `/help` | — | Print the full CLI flag reference (to the parent console if attached, and always to `%TEMP%\pi_usage.txt`) and exit (§103). |
 
 **Diagnostic / benchmark harnesses** (each runs after GMP init, writes results to `%TEMP%\*_test.txt`, then exits; several are tuned by the test-only environment variables above):
 
@@ -116,11 +124,12 @@ The executable accepts the following flags (most are also surfaced through `Run-
 | `--test-eta` | ETA-estimator self-test (§259). |
 | `--test-advisor` | Performance-advisor self-test (§260). |
 | `--test-dopscan` | DOP / memory-bandwidth saturation sweep (§263). |
+| `--test-cgdopscan` | Chunked-grid DOP-headroom sweep — best-of-N timing of `SafeMpzMul_ChunkedGrid` at raw DOP {1,3,6,9,12,16,20,24} to find the throughput knee (§281). Tuned by `PI_DOPSCAN_LIMBS`, `PI_CGDOP_CELL`, `PI_CGDOP_REPS`. |
 | `--test-gridscan` | Split-factor (k×k grid) comparison (§265). |
 | `--test-cellsweep` | Chunked-grid cell-size sweep at 5 B sizes (§266). |
 | `--test-recipconv` | Reciprocal-Newton convergence probe (§272). |
 
-> There is currently no `--help` flag; unknown arguments are ignored. (Tracked separately.)
+> Unknown arguments are ignored. Use `--help` (or `-h` / `/?`) for the built-in flag reference.
 
 ---
 
@@ -134,7 +143,7 @@ A high-level overview of everything that was changed from the original implement
 
 **Three-pass multiply (§7, §46, §47):** The final `gmpNumer *= finalQ` multiplication (~1.1 GB × ~1.1 GB) peaks at ~2.3 GB, exceeding available headroom after the other live buffers. `finalQ` is split into three equal bit-thirds (Q0, Q1, Q2) and multiplied separately; the three partial products are shifted and summed to reconstruct the full result. Peak per-pass is ~1.2 GB.
 
-**`SafeMpzMul` (§17–§45, §160):** GMP's internal FFT uses a 32-bit `mp_size_t` (signed `int` on Windows MSVC), and very large operands also push GMP's Schönhage-Strassen FFT past the range where it returns reliably. `SafeMpzMul` therefore splits whenever the **combined** operand size `szA + szB` exceeds `SAFE_LIMB_THRESHOLD = 5,000,000` limbs (the conservative cap set by §160). It is a schoolbook 3×3 split: each operand is divided into three equal thirds by bit position and the nine sub-products are computed separately with GMP's fast routines, which never see an operand large enough to trigger the problem. Recursive: sub-products that still exceed the threshold recurse. (At the very largest scales the dominant multiplies — both the divide and the top binary-split combine merges — route instead through the chunked-grid path — see the Change Log, §251/§262/§267–§269/§273.)
+**`SafeMpzMul` (§17–§45, §160):** GMP's internal FFT uses a 32-bit `mp_size_t` (signed `int` on Windows MSVC), and very large operands also push GMP's Schönhage-Strassen FFT past the range where it returns reliably. `SafeMpzMul` therefore splits whenever the **combined** operand size `szA + szB` exceeds `SAFE_LIMB_THRESHOLD = 5,000,000` limbs (the conservative cap set by §160). It is a schoolbook 3×3 split: each operand is divided into three equal thirds by bit position and the nine sub-products are computed separately with GMP's fast routines, which never see an operand large enough to trigger the problem. Recursive: sub-products that still exceed the threshold recurse. (At the very largest scales the dominant multiplies — the divide's reciprocal, `a×r`, `q×b` and numerator R-multiplies, the top binary-split combine merges, and the square-root final-adjustment squarings — route instead through the chunked-grid path — see the Change Log, §251/§262/§267–§269/§273–§275.)
 
 ---
 
@@ -296,7 +305,7 @@ ThreadPool.SetMinThreads(Environment.ProcessorCount, Environment.ProcessorCount)
 
 **Headless mode (§63):** All three `MessageBox.Show` dialogs are gated behind `If Not _headless Then`. In headless mode the text is written to the phase log with a `[DIALOG]` prefix so automated runs leave a full audit trail without blocking.
 
-**`Run-PiCompute.ps1` (§63, §70, §94):** PowerShell script that clean-builds and launches the exe. Machine-independent: it builds in **Debug** by default (pass `-UseRelease` for a Release build) and auto-detects the exe by globbing `bin\<config>\**\PI-BillionDigits.exe` after the build (no hardcoded TFM folder); the output directory defaults to `C:\PiOutput` (overridable via `-OutputDir`). Parameters: `-Digits N` (default 1B), `-OutputDir <path>`, `-LogLevel N` (0–5, default 1), `-Threshold N`, `-CheckpointFromLevel N`, `-ResumeFromLevel N`, `-AutoCheckpoint`, `-BackupCheckpoint`, `-UseRelease`, `-Trace`, `-ReportOnly <path>`.
+**`Run-PiCompute.ps1` (§63, §70, §94):** PowerShell script that clean-builds and launches the exe. Machine-independent: it builds in **Debug** by default (pass `-UseRelease` for a Release build) and auto-detects the exe by globbing `bin\<config>\**\PI-BillionDigits.exe` after the build (no hardcoded TFM folder); the output directory defaults to `C:\PiOutput` (overridable via `-OutputDir`). Parameters: `-Digits N` (default 1B), `-OutputDir <path>`, `-LogLevel N` (0–5, default 1), `-Threshold N`, `-CheckpointFromLevel N`, `-ResumeFromLevel N`, `-AutoCheckpoint`, `-BackupCheckpoint`, `-UseRelease`, `-Trace`, `-TraceMode <none|cpu|…>`, `-TraceDir <path>` (default `.\traces`), `-Test`, `-ReportOnly <path>`.
 
 **Quick start:**
 ```powershell
@@ -331,7 +340,8 @@ The application reads a number of `PI_*` environment variables to tune or overri
 | `PI_CONV_PARALLEL` | on (`0` = off) | Use the parallel recursive-halving decimal converter (§270/§226) at ≥ 1.5 B digits; `0` reverts to the §216 serial converter. |
 | `PI_CG_ADAPTIVE` | on (`0` = off) | Adaptive chunked-grid cell size (§267/§268); `0` restores the fixed 1.5 M-limb cell. |
 | `PI_CG_CELL_MAX` | `16000000` | Maximum chunked-grid cell size in limbs (clamped 1,500,000–16,700,000); keeps the cell below GMP's FFT limit. |
-| `PI_CG_DOP` | `ProcessorCount` (capped 16) | Degree of parallelism for chunked-grid cells. |
+| `PI_CG_DOP` | `ProcessorCount` | Degree of parallelism for chunked-grid cells. §282 raised the old flat cap of 16 to the host's core count (the §281 probe showed real throughput past DOP 16 on a 24-core box) and then *wave-balances* (see `PI_CG_BALANCE`). An explicit value still overrides, clamped to `ProcessorCount`. |
+| `PI_CG_BALANCE` | on (`0` = off) | §282 wave-balancing: pack chunked-grid cells into the fewest **even** waves (`ceil(nCells/DOP)` waves of equal size) rather than greedy cap-sized waves, removing the ragged short tail wave that made a high DOP slower than a lower one. Purely a scheduling change — the product is bit-identical. `0` reverts to greedy cap-sized waves. |
 | `PI_RECIP_SHORTMUL` | on (`0` = off) | Route the reciprocal-Newton capped-iteration multiplies through the chunked grid (§251/§254); `0` uses the §gen path. |
 | `PI_RECIP_SHORTMUL_MAXDOP` | `9` | DOP gate — engage the chunked reciprocal only when §gen's DOP ≤ this (the low-DOP 5 B regime). |
 | `PI_DIV_AR_SHORTMUL` | on (`0` = off) | Compute the divide's `a×r` as a chunked-grid **HIGH** product (§262). |
@@ -353,7 +363,9 @@ The application reads a number of `PI_*` environment variables to tune or overri
 | `PI_TEST_DOPGATE` | off (`1` = on) | At startup, dump the would-be §gen DOP for the 1 B/5 B reciprocal sizes to `%TEMP%\dopgate_test.txt`. |
 | `PI_CG_ISOLATE` | off (`1` = on) | `--test-chunkedgrid`: run only the 68 M×52 M case. |
 | `PI_CELLSWEEP_GEN` | off (`1` = on) | `--test-cellsweep`: also run the §gen recursive baseline (RAM-heavy; may page). |
-| `PI_DOPSCAN_LIMBS` | `24000000` | `--test-dopscan` / `--test-gridscan` operand size in limbs (min 6,000,000). |
+| `PI_DOPSCAN_LIMBS` | `24000000` | `--test-dopscan` / `--test-gridscan` operand size in limbs (min 6,000,000). Also sets the `--test-cgdopscan` operand size (default 48,000,000 there). |
+| `PI_CGDOP_CELL` | `8000000` | `--test-cgdopscan` chunked-grid cell size in limbs (min 1,000,000; clamped so `cell·2` stays FFT-safe). |
+| `PI_CGDOP_REPS` | `3` | `--test-cgdopscan` best-of-N repetitions per DOP (min 1) — min wall-time suppresses transient contention noise. |
 | `PI_RECIPCONV_LIMBS` | `1000000` | `--test-recipconv` reciprocal operand size in limbs (min 1,000). |
 | `PI_RECIPCONV_KDIV` | `1` | `--test-recipconv`: `kBits = bBits + bBits/KDIV`; set `3` to mimic the real divide-reciprocal regime. |
 
